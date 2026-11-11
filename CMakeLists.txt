@@ -2322,6 +2322,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_compile_definitions(strix_device_profile PRIVATE STRIX_DEVICE_PROFILE_HIP=1 __HIP_PLATFORM_AMD__=1)
     target_link_libraries(strix_device_profile PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
     strix_target_warnings(strix_device_profile)
+    if(WIN32)
+        # Windows has no KFD/DRM sysfs: the deployment probe asks the HIP runtime (src/deploy/device.cpp).
+        target_compile_definitions(strix_deploy PRIVATE STRIX_DEPLOY_HIP_PROBE=1 __HIP_PLATFORM_AMD__=1)
+        target_include_directories(strix_deploy SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+        target_link_libraries(strix_deploy PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        if(BUILD_TESTING)
+            add_executable(strix-deploy-hip-probe-tests tests/deploy_hip_probe_tests.cpp)
+            target_link_libraries(strix-deploy-hip-probe-tests PRIVATE strix_deploy)
+            strix_target_warnings(strix-deploy-hip-probe-tests)
+            add_test(NAME strix-deploy-hip-probe-tests COMMAND strix-deploy-hip-probe-tests)
+        endif()
+    endif()
     # The HIP compiler treats the toolkit include directory as implicit and searches /usr/include first, so a
     # distribution HIP development package there (another HIP version) silently wins over the toolkit headers
     # the runtime library belongs to. Put the toolkit headers first for every HIP translation unit.

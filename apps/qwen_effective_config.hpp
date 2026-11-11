@@ -1694,8 +1694,10 @@ inline void intersect_cache_cgroup_limits(PrefillMemory& result, const std::stri
     }
     result.cache_limits_known=true;
 }
-// Read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
+// Linux: read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
 // visibility is unknown capacity and declines; HIP is never initialized here.
+// Windows has no sysfs: the deployment probe asks the HIP runtime (strix/deploy/device.hpp),
+// which applies the visibility variables itself.
 inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, bool cache_limits=false) {
     PrefillMemory result;
     (void)cache_limits;
@@ -1724,6 +1726,8 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
     for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
         if (const char* value = std::getenv(name); value && *value) return result;
+#endif
+#if defined(__linux__) || defined(_WIN32)
     const auto device = strix::deploy::probe_device();
     result.gtt_limit = device.gtt_total_bytes;
     result.gtt_used = device.gtt_used_bytes;

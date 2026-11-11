@@ -10,6 +10,10 @@
 #include <sstream>
 #include <stdexcept>
 
+#if defined(STRIX_DEPLOY_HIP_PROBE)
+#include <hip/hip_runtime_api.h>
+#endif
+
 namespace strix::deploy {
 namespace {
 namespace fs = std::filesystem;
@@ -67,7 +71,61 @@ void fake_memory(DeviceFacts& d) {
     if (d.unified) { d.gtt_total_bytes = d.mem_total_bytes; d.gtt_used_bytes = 0; }
     else { d.vram_total_bytes = d.mem_total_bytes; d.vram_used_bytes = 0; }
 }
+#if defined(STRIX_DEPLOY_HIP_PROBE)
+// Windows: no KFD topology or DRM counters exist; the HIP runtime is the only source of the architecture. A
+// deliberate deviation from the Linux contract above (which never initializes HIP), limited to queries: the
+// properties and the memory info of each device, the current device restored. Any failure leaves every
+// fact unknown, as on a Linux host without a visible GPU.
+std::vector<DeviceFacts> probe_hip_devices() {
+    int count = 0, current = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count <= 0 || hipGetDevice(&current) != hipSuccess) return {};
+    std::vector<DeviceFacts> result;
+    for (int index = 0; index < count; ++index) {
+        hipDeviceProp_t properties{};
+        std::size_t free_bytes = 0, total_bytes = 0;
+        const bool observed = hipGetDeviceProperties(&properties, index) == hipSuccess &&
+            hipSetDevice(index) == hipSuccess && hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess;
+        if (!observed || free_bytes > total_bytes) {
+            (void)hipSetDevice(current);
+            return {};
+        }
+        DeviceFacts d;
+        const std::string_view arch(properties.gcnArchName);
+        d.gfx_target = std::string(arch.substr(0, arch.find(':')));
+        d.gfx_target_version = gfx_target_version(d.gfx_target);
+        if (properties.multiProcessorCount > 0) d.cu_count = static_cast<std::uint32_t>(properties.multiProcessorCount);
+        // Integrated GPUs allocate from the memory the runtime reports, as KFD's local_mem_size == 0.
+        d.unified = properties.integrated != 0;
+        d.mem_total_bytes = total_bytes;
+        d.mem_free_bytes = free_bytes;
+        if (d.unified) { d.gtt_total_bytes = total_bytes; d.gtt_used_bytes = total_bytes - free_bytes; }
+        else { d.vram_total_bytes = total_bytes; d.vram_used_bytes = total_bytes - free_bytes; }
+        d.source = "hip";
+        fake_memory(d);
+        result.push_back(std::move(d));
+    }
+    (void)hipSetDevice(current);
+    return result;
+}
+#endif
 } // namespace
+
+std::uint64_t gfx_target_version(std::string_view arch) noexcept {
+    arch = arch.substr(0, arch.find(':'));
+    if (!arch.starts_with("gfx") || arch.size() < 6) return 0;
+    const auto hex = [](char c) -> int {
+        return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+    };
+    const int stepping = hex(arch.back()), minor = hex(arch[arch.size() - 2]);
+    const auto major_text = arch.substr(3, arch.size() - 5);
+    std::uint64_t major = 0;
+    for (const char c : major_text) {
+        if (c < '0' || c > '9') return 0;
+        major = major * 10U + static_cast<std::uint64_t>(c - '0');
+    }
+    if (stepping < 0 || minor < 0 || minor > 9 || major == 0 || major > 99) return 0;
+    return major * 10000U + static_cast<std::uint64_t>(minor) * 100U + static_cast<std::uint64_t>(stepping);
+}
 
 std::string first_drm_device(const std::string& root) {
     for (const auto& p : directories(rooted(root, "/sys/class/drm"))) {
@@ -79,6 +137,9 @@ std::string first_drm_device(const std::string& root) {
 }
 
 std::vector<DeviceFacts> probe_devices(const std::string& root, const std::string& override_device) {
+#if defined(STRIX_DEPLOY_HIP_PROBE)
+    if (root.empty() && override_device.empty()) return probe_hip_devices();
+#endif
     std::vector<DeviceFacts> result;
     for (const auto& node : directories(rooted(root, "/sys/class/kfd/kfd/topology/nodes"))) {
         std::ifstream in(node / "properties", std::ios::binary);
