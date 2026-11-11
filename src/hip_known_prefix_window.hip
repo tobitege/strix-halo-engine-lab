@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/cohort_step_plan.hpp"
+#include "strix/process_environment.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_pipe_dump.hpp"
 #include "strix/dist/communicator.hpp"
@@ -64,7 +65,7 @@ namespace {
 const bool qpf2k_default_env = [] {
     strix::qpf2k::initialize_before_main(
         [](const char* name) { return std::getenv(name); },
-        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+        [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); });
     // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp): fills the opt-in levers that are still unset. Unset = no effect.
     const auto get = [](const char* name) { return std::getenv(name); };
     if (strix::qwen_allon::mode(get) == strix::qwen_allon::Mode::invalid) {
@@ -73,7 +74,7 @@ const bool qpf2k_default_env = [] {
     }
     if (strix::qwen_allon::mode(get) != strix::qwen_allon::Mode::off) {
         const unsigned set = strix::qwen_allon::apply(get,
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+            [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); });
         std::fprintf(stderr, "qwen allon: mode=%s, %u lever variables set (explicit values win)\n",
             strix::qwen_allon::mode_name(strix::qwen_allon::mode(get)), set);
     }

@@ -64,6 +64,8 @@ public:
     }
     // Setup-only FD/stat witness against the original hash+map observation.
     // No rehash and no claim of protection against arbitrary privileged writers.
+    // Windows compares volume, file index, size, write and creation time; a same-size write
+    // through a handle that is still open is not seen (NTFS completes the write time on close).
     void validate_unchanged() const;
     [[nodiscard]] const std::string&
     logical_name() const noexcept {

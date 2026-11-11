@@ -190,6 +190,10 @@ int main() try {
             check(!apply_eager_code_loading(true, [&](const char* name) -> const char* {
                 const auto it = env.find(name); return it == env.end() ? nullptr : it->second.c_str();
             }, [&](const char*, const char*) { return false; }), "the restarted image does not restart again");
+        if (applied) {
+            withdraw_eager_code_loading([&](const char* name) { env.erase(name); return true; });
+            check(env == before, "a failed restart leaves the environment as it found it");
+        }
     }
     for (Environment env : {Environment{}, {{"STRIX_QPF2K_INDEX_BATCH","0"}}, {{"STRIX_QPF2K_DEFAULTS","0"}}, {{"STRIX_BASELINE","1"}}}) {
         const auto config = resolve(plain,env);

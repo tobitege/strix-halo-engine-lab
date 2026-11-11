@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/fnv.hpp"
+#include "strix/process_environment.hpp"
 
 #include <array>
 #include <cstddef>
@@ -348,11 +349,7 @@ inline bool applied(Status status) {
 
 using Export = std::function<bool(const char*, const char*)>;
 inline bool export_environment(const char* key, const char* value) {
-#ifdef _WIN32
-    return _putenv_s(key, value) == 0;
-#else
-    return ::setenv(key, value, 1) == 0;
-#endif
+    return process_environment::set(key, value, true);
 }
 // Exports the switches the profile sets (status set / unqualified / provisional, env levers only; CLI-only levers:
 // profile_args).

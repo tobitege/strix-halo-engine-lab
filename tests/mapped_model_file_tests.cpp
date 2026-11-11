@@ -24,9 +24,9 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
     std::cout
-        << "mapped model file tests skipped on non-Linux\n";
+        << "mapped model file tests skipped on this platform\n";
     return 0;
 #else
     const auto path =
@@ -187,6 +187,8 @@ int main() {
     bool mutation_rejected=false;
     try{moved.validate_unchanged();}catch(const std::runtime_error&){mutation_rejected=true;}
     expect(mutation_rejected,"FD/stat setup witness rejects file mutation after the full-file hash");
+    moved = strix::MappedModelFile{}; // Windows does not remove a file that is still mapped
+    expect(!moved.valid(),"assigning an empty owner releases the mapping");
     std::error_code error;
     std::filesystem::remove(
         path,

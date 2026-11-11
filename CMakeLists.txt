@@ -25,6 +25,19 @@ endif()
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+# clang++ with its GNU-like command line on Windows (the HIP build): CMake links with -nostdlib,
+# which also drops the compiler's own runtime library. Builtins such as __builtin_cpu_supports
+# resolve there, so every target links it; the compiler names the file.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" --print-libgcc-file-name --rtlib=compiler-rt
+        OUTPUT_VARIABLE strix_compiler_runtime OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE strix_compiler_runtime_result)
+    if(NOT strix_compiler_runtime_result EQUAL 0 OR NOT EXISTS "${strix_compiler_runtime}")
+        message(FATAL_ERROR "cannot locate the runtime library of ${CMAKE_CXX_COMPILER}")
+    endif()
+    file(TO_CMAKE_PATH "${strix_compiler_runtime}" strix_compiler_runtime)
+    link_libraries("${strix_compiler_runtime}")
+endif()
 
 # Evaluate after all optional language/toolchain and STRIX option configuration.
 cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixBuildInfo.cmake")
@@ -381,6 +394,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-device-profile-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-device-profile-host-tests)
     add_test(NAME strix-device-profile-host-tests COMMAND strix-device-profile-host-tests)
+    add_executable(strix-process-environment-tests tests/process_environment_tests.cpp)
+    target_include_directories(strix-process-environment-tests PRIVATE include)
+    target_compile_features(strix-process-environment-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-process-environment-tests)
+    add_test(NAME strix-process-environment-tests COMMAND strix-process-environment-tests)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
@@ -749,6 +767,9 @@ add_library(strix_serve STATIC
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
 target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core strix_serve_json)
+if(WIN32)
+    target_link_libraries(strix_serve PUBLIC ws2_32) # http_server.cpp: Winsock
+endif()
 strix_target_warnings(strix_serve)
 
 add_executable(strix-tokenize apps/tokenize_main.cpp)
@@ -3602,8 +3623,16 @@ endif()
 
 if(STRIX_ENABLE_HIP_RUNTIME)
     # Two-rank distributed runtime: transports and the device-buffer communicator.
-    add_library(strix_dist STATIC src/dist_communicator.cpp src/dist_gpu_direct.cpp src/dist_gpu_direct_setup.cpp
-        src/dist_gpu_direct_copy.hip src/dist_host_copy.hip src/dist_staged_ready.hip src/linux_gpu_queue.cpp)
+    # It is written against Linux sockets, threads, USB4 stream devices and DMA-BUF. Other platforms
+    # are single-node: they build the payload CRC and link-opening functions that refuse
+    # (src/dist_unavailable.cpp), and the runtime's programs and tests below exist on Linux only.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(strix_dist_sources src/dist_communicator.cpp src/dist_gpu_direct.cpp src/dist_gpu_direct_setup.cpp
+            src/dist_gpu_direct_copy.hip src/dist_host_copy.hip src/dist_staged_ready.hip src/linux_gpu_queue.cpp)
+    else()
+        set(strix_dist_sources src/dist_unavailable.cpp)
+    endif()
+    add_library(strix_dist STATIC ${strix_dist_sources} src/dist_crc32c.cpp)
     target_include_directories(strix_dist PUBLIC include)
     target_include_directories(strix_dist SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_features(strix_dist PUBLIC cxx_std_20)
@@ -3612,6 +3641,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_link_libraries(strix_dist PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}" Threads::Threads PRIVATE strix_serve)
     strix_target_warnings(strix_dist)
     target_link_libraries(strix_hip_runtime PUBLIC strix_dist)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(strix-dist-tcp-probe apps/dist_tcp_probe_main.cpp)
     target_link_libraries(strix-dist-tcp-probe PRIVATE strix_dist)
     strix_target_warnings(strix-dist-tcp-probe)
@@ -3621,12 +3651,22 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     add_executable(strix-dist-gpu-probe apps/dist_gpu_probe_main.cpp)
     target_link_libraries(strix-dist-gpu-probe PRIVATE strix_dist strix_xport)
     strix_target_warnings(strix-dist-gpu-probe)
+    endif()
     if(BUILD_TESTING)
-        add_executable(strix-dist-transport-tests tests/dist_transport_tests.cpp)
         add_executable(strix-dist-crc32c-tests tests/dist_crc32c_tests.cpp)
         target_compile_features(strix-dist-crc32c-tests PRIVATE cxx_std_20)
+        target_link_libraries(strix-dist-crc32c-tests PRIVATE strix_dist) # strix::dist::crc32c itself
         strix_target_warnings(strix-dist-crc32c-tests)
         add_test(NAME strix-dist-crc32c-tests COMMAND strix-dist-crc32c-tests)
+    endif()
+    if(BUILD_TESTING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(strix-dist-unavailable-tests tests/dist_unavailable_tests.cpp)
+        target_link_libraries(strix-dist-unavailable-tests PRIVATE strix_dist)
+        strix_target_warnings(strix-dist-unavailable-tests)
+        add_test(NAME strix-dist-unavailable-tests COMMAND strix-dist-unavailable-tests)
+    endif()
+    if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(strix-dist-transport-tests tests/dist_transport_tests.cpp)
         add_executable(strix-hip-dist-hostpath-tests tests/hip_dist_hostpath_tests.cpp)
         target_link_libraries(strix-hip-dist-hostpath-tests PRIVATE strix_dist)
         strix_target_warnings(strix-hip-dist-hostpath-tests)

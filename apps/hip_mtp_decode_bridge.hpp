@@ -10,6 +10,7 @@
 #include "strix/dist/communicator.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/process_environment.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/serve/health.hpp"
@@ -207,13 +208,11 @@ struct MtpDecodeTargetParents final {
         std::uint64_t union_generation = 0;
         std::uint64_t retained_window_bytes = 0;
     } window_setup;
+    // Constructor and destructor are defined after MtpBatchSlotSetup: both destroy batch_slots, and the MSVC
+    // standard library needs the element type complete where the vector's destructor is instantiated.
     MtpDecodeTargetParents(std::shared_ptr<HipDecodeExperimentResources> actual,
-        std::shared_ptr<HipLauncherCatalog> launchers,std::shared_ptr<PleLookupBackend> lookup,const PleHashContract& contract)
-        :experiment(std::move(actual)),catalog(std::move(launchers)),ple(std::move(lookup)),hash(contract) {
-        if(!experiment || !catalog || !ple)throw std::invalid_argument("MTP CLI requires actual retained target/launcher/PLE parents");
-        resources=experiment->resources;
-        resources.ple_lookup=ple.get();resources.ple_hash_contract=&hash;resources.ple_prefetch=&prefetch;
-    }
+        std::shared_ptr<HipLauncherCatalog> launchers,std::shared_ptr<PleLookupBackend> lookup,const PleHashContract& contract);
+    ~MtpDecodeTargetParents();
     MtpDecodeTargetParents(const MtpDecodeTargetParents&)=delete;
     MtpDecodeTargetParents& operator=(const MtpDecodeTargetParents&)=delete;
 };
@@ -1133,6 +1132,14 @@ struct MtpBatchSlotSetup {
     DirectLaunchDispatcher* dispatcher = nullptr;
     MtpDecodeWindowFactory make_window;
 };
+inline MtpDecodeTargetParents::MtpDecodeTargetParents(std::shared_ptr<HipDecodeExperimentResources> actual,
+    std::shared_ptr<HipLauncherCatalog> launchers,std::shared_ptr<PleLookupBackend> lookup,const PleHashContract& contract)
+    :experiment(std::move(actual)),catalog(std::move(launchers)),ple(std::move(lookup)),hash(contract) {
+    if(!experiment || !catalog || !ple)throw std::invalid_argument("MTP CLI requires actual retained target/launcher/PLE parents");
+    resources=experiment->resources;
+    resources.ple_lookup=ple.get();resources.ple_hash_contract=&hash;resources.ple_prefetch=&prefetch;
+}
+inline MtpDecodeTargetParents::~MtpDecodeTargetParents()=default;
 class MtpBatchRunner {
     struct EngineCall {
         bool& active;
