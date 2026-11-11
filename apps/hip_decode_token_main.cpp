@@ -6625,6 +6625,11 @@ static int run_decode_entry(
             << "\n";
         std::cout << "}\n";
         emit_device_queue_trace();
+        // Every prompt producer has completed: retire the shared QSA prefill handoff, stage slots and pool
+        // while the streams they were recorded on still exist (the MTP route does this in retire_prompt).
+        // Left to the static destructors, the handoff wait runs at process exit after those streams are gone,
+        // which crashed inside the HIP runtime on Windows.
+        if (known_prefix_backend) strix::release_hip_qsa_prefill_storage();
         return 0;
     }
 
