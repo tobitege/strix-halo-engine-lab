@@ -81,9 +81,9 @@ void fake_memory(DeviceFacts& d) {
 #if defined(STRIX_DEPLOY_HIP_PROBE)
 // Windows: no KFD topology or DRM counters exist; the HIP runtime is the only source of the architecture. A
 // deliberate deviation from the Linux contract above (which never initializes HIP), limited to queries of the
-// device properties. The memory comes from DXGI: the adapter's local segment, which on an APU is the memory
-// the firmware set aside for the GPU, separate from the system RAM Windows uses. A failed HIP query leaves
-// every fact unknown, a failed DXGI query the memory, as on a Linux host without the counters.
+// device properties. The memory is the adapter's dedicated memory (dedicated_memory below), separate from the
+// system RAM Windows uses. A failed HIP query leaves every fact unknown, a failed memory query the memory, as
+// on a Linux host without the counters.
 
 // The dedicated memory of the adapter with this LUID: {size, current use} in bytes. On an APU that is the memory
 // the firmware set aside for the GPU. DXGI's segment budget does not separate it: it reports one local group
@@ -133,7 +133,7 @@ std::vector<DeviceFacts> probe_hip_devices() {
         if (properties.multiProcessorCount > 0) d.cu_count = static_cast<std::uint32_t>(properties.multiProcessorCount);
         d.unified = properties.integrated != 0;
         // Memory: the adapter's dedicated memory (its size and current use), not hipMemGetInfo, which adds the
-        // shared segment Windows backs with system RAM. Unknown when DXGI or the counter does not answer.
+        // shared segment Windows backs with system RAM. Unknown when DXGI or the PDH counter does not answer.
         if (const auto dedicated = dedicated_memory(properties.luid)) {
             const auto used = std::min(dedicated->second, dedicated->first);
             d.mem_total_bytes = dedicated->first;
@@ -141,7 +141,7 @@ std::vector<DeviceFacts> probe_hip_devices() {
             if (d.unified) { d.gtt_total_bytes = dedicated->first; d.gtt_used_bytes = used; }
             else { d.vram_total_bytes = dedicated->first; d.vram_used_bytes = used; }
         }
-        d.source = "hip+dxgi";
+        d.source = "hip+dxgi+pdh";
         fake_memory(d);
         result.push_back(std::move(d));
     }

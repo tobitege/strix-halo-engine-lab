@@ -152,6 +152,15 @@ void run(unsigned factor, unsigned capacity, unsigned count, const ModelManifest
     const auto effective = resolve_effective_config(request,model,{},manifest,
         validated_model_content_identity,{true,true,true},memory);
     require(effective.admitted,effective.error);
+    {
+        // The YaRN ledger prices host and device owners against one pool: a separate host pool refuses.
+        auto split = memory;
+        split.host_available = UINT64_C(64)<<30U;
+        const auto refused = resolve_effective_config(request,model,{},manifest,
+            validated_model_content_identity,{true,true,true},split);
+        require(!refused.admitted && refused.error.find("separate host pool")!=std::string::npos,
+            "YaRN admission refuses a separate host pool");
+    }
     validate_effective_options(effective.options,model);
     require(yarn_environment_refusal(effective.environment,factor).empty(),"effective environment classification");
     for (const auto* value : {"0","1"}) {

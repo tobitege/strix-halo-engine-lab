@@ -209,7 +209,6 @@ void decisions() {
     require(refusal.refused && strix::serve::parse_json(refusal.to_json()).is_object(), "invalid spec refusal remains valid JSON");
     std::cout << "deployment fixture: " << one.hash() << '\n';
 }
-} // namespace
 void architecture_versions() {
     require(gfx_target_version("gfx1151") == 110501U, "gfx1151");
     require(gfx_target_version("gfx1100") == 110000U, "gfx1100");
@@ -219,6 +218,7 @@ void architecture_versions() {
     for (const char* bad : {"", "gfx", "gfx11", "sm_120", "gfxa151", "gfx11g1", "gfx1x51"})
         require(gfx_target_version(bad) == 0U, "malformed architecture name");
 }
+} // namespace
 int main() try {
     probes(); specs(); decisions(); architecture_versions();
     std::cout << "deploy host tests passed\n";

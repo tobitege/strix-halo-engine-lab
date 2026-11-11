@@ -34,13 +34,13 @@ namespace {
 
 // The operating-system side of a mapped model file. Each supported platform supplies the same
 // primitives; MappedModelFile below is one flow over them.
-//   FileState        device, inode, size, mtime (s, ns), ctime (s, ns) of an open file
-//   open_descriptor  read-only descriptor, or -1
-//   descriptor_state state of the open file; false when it cannot be read
-//   content_path     the path the full-file hash opens for this descriptor
-//   content_path_is  whether that path names the open file
-//   map_read_only    read-only mapping of the whole file, or nullptr
-//   read_some        one positioned read; 0 at end of file, throws on error
+//   FileState             device, inode, size, mtime (s, ns), ctime (s, ns) of an open file
+//   open_descriptor       read-only descriptor, or -1
+//   descriptor_state      state of the open file; false when it cannot be read
+//   content_path          the path the full-file hash opens for this descriptor
+//   path_names_open_file  whether that path names the open file
+//   map_read_only         read-only mapping of the whole file, or nullptr
+//   read_some             one positioned read; 0 at end of file, throws on error
 using FileState = std::array<std::uint64_t,7>;
 
 #if defined(__linux__)
@@ -64,7 +64,7 @@ bool descriptor_state(int fd, FileState& out) noexcept {
 std::filesystem::path content_path(const std::filesystem::path&, int fd) {
     return std::filesystem::path("/proc/self/fd") / std::to_string(fd);
 }
-bool content_path_is(const std::filesystem::path&, const FileState&) noexcept { return true; }
+bool path_names_open_file(const std::filesystem::path&, const FileState&) noexcept { return true; }
 void* map_read_only(int fd, std::uint64_t bytes) noexcept {
     void* address = ::mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ, MAP_PRIVATE, fd, 0);
     return address == MAP_FAILED ? nullptr : address;
@@ -114,7 +114,7 @@ bool descriptor_state(int fd, FileState& out) noexcept { return handle_state(os_
 // Windows has no /proc/self/fd: the hash opens the file by its own path, and that path is
 // checked against the open file before and after the pass.
 std::filesystem::path content_path(const std::filesystem::path& path, int) { return path; }
-bool content_path_is(const std::filesystem::path& path, const FileState& state) noexcept {
+bool path_names_open_file(const std::filesystem::path& path, const FileState& state) noexcept {
     const HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -212,7 +212,7 @@ MappedModelFile MappedModelFile::open_read_only(
     static_cast<void>(logical_name);
     static_cast<void>(generations);
     throw std::runtime_error(
-        "mapped model files require native Linux");
+        "mapped model files require Linux or Windows");
 #else
     if (logical_name.empty()) {
         throw std::invalid_argument(
@@ -252,7 +252,7 @@ MappedModelFile MappedModelFile::open_read_only(
             content_path(
                 path,
                 fd);
-        if (!content_path_is(
+        if (!path_names_open_file(
                 hashed_path,
                 before)) {
             throw std::runtime_error(
@@ -271,7 +271,7 @@ MappedModelFile MappedModelFile::open_read_only(
         FileState after_hash {};
         if (!descriptor_state(fd, after_hash) ||
             after_hash != before ||
-            !content_path_is(
+            !path_names_open_file(
                 hashed_path,
                 before)) {
             throw std::runtime_error(
@@ -315,7 +315,7 @@ void MappedModelFile::validate_unchanged() const {
         !descriptor_state(fd_,current) || current!=file_state_)
         throw std::runtime_error("mapped model changed after its original full-file hash");
 #else
-    throw std::runtime_error("mapped model file validation requires native Linux");
+    throw std::runtime_error("mapped model file validation requires Linux or Windows");
 #endif
 }
 void MappedModelFile::advise_dontneed(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept {
@@ -448,7 +448,7 @@ void MappedModelFile::read_at(
     static_cast<void>(byte_offset);
     static_cast<void>(destination);
     throw std::runtime_error(
-        "mapped model direct reads require native Linux");
+        "mapped model direct reads require Linux or Windows");
 #else
     if (!valid() ||
         fd_ < 0) {

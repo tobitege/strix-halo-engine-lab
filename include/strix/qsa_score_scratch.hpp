@@ -123,6 +123,8 @@ public:
     void recorded(std::uintptr_t stream) noexcept { stream_=stream;pending_=true; }
     void drained() noexcept { pending_=false; }
     bool pending() const noexcept { return pending_; }
+    // The stream of the last recorded submission still owes its completion: it must not be destroyed before.
+    bool pending_on(std::uintptr_t stream) const noexcept { return pending_ && stream_==stream; }
 };
 template<class Attend,class Select,class Index>
 void clear_qsa_pending(Attend& b,Select& sb,Index& ib,float*& maxima,std::uint32_t& stride) noexcept {

@@ -1,4 +1,6 @@
 #include "strix/hip_model_residency.hpp"
+#include "strix/host_memory.hpp"
+#include "strix/process_environment.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -149,6 +151,10 @@ void expert_selection_contract() {
 }
 
 int main() try {
+    // STRIX_MODEL_COPY_ALL=0 keeps the registered backing where host and GPU share memory. Where host memory is
+    // a separate pool the copied arena is the only form, so 0 selects it too. (First call: the mode is read once.)
+    expect(strix::process_environment::set("STRIX_MODEL_COPY_ALL", "0", true));
+    expect(strix::hip_model_copy_all_mode() == (strix::host_memory_is_separate_pool() ? 1U : 0U));
     {
         using namespace strix;
         ModelManifest manifest;

@@ -99,10 +99,11 @@ struct PrefillMemory {
     std::optional<std::uint64_t> yarn_registered_storage_step{};
     // Runtime supplies a fresh physical/GTT sample before each registered trial.
     std::function<void(PrefillMemory&)> refresh_registered{};
-    // Set only where host and GPU memory are separate pools (Windows: the firmware's GPU memory next to the RAM
-    // Windows sees). available, total and the GTT facts then describe the GPU pool, which holds the model,
-    // state and workspaces, and host-only items (metadata copies, native host pools, PLE rolling, session and
-    // prefix caches) are priced against this. On a UMA node it stays empty: one pool holds both.
+    // Set only where host and GPU memory are separate pools (strix/host_memory.hpp; observe_separate_pools).
+    // available, total and the GTT facts then describe the GPU pool, which holds the model (as the copied
+    // arena), state and workspaces, and host-only items (metadata copies, native host pools, HTTP slot and
+    // session memory, session and prefix cache defaults) are priced against this. On a UMA node it stays
+    // empty: one pool holds both.
     // Last member: positional initializers of the members above stay valid.
     std::optional<std::uint64_t> host_available{};
 };
@@ -110,6 +111,19 @@ struct PrefillMemory {
 // otherwise the one pool both share.
 inline std::optional<std::uint64_t> host_pool_available(const PrefillMemory& memory) {
     return memory.host_available ? memory.host_available : memory.available;
+}
+// An admission that prices host and device items against one observation (YaRN, the resident PLE fallback,
+// automatic serving T) is valid only where both share a pool; with a separate host pool it declines.
+inline bool one_memory_pool(const PrefillMemory& memory) { return !memory.host_available; }
+// A separate host pool as observed: the GPU pool is the device's dedicated memory, the host pool the RAM the
+// system sees. Without both observations the memory stays unknown and nothing is admitted.
+inline void observe_separate_pools(PrefillMemory& memory, const strix::deploy::DeviceFacts& device,
+    std::optional<std::uint64_t> host_available) {
+    if (!host_available || !device.gtt_total_bytes || !device.gtt_used_bytes ||
+        *device.gtt_used_bytes > *device.gtt_total_bytes) return;
+    memory.host_available = host_available;
+    memory.total = device.gtt_total_bytes;
+    memory.available = *device.gtt_total_bytes - *device.gtt_used_bytes;
 }
 // Kept free of host-only items in a separate host pool, for the rest of the system.
 inline constexpr std::uint64_t separate_host_reserve = UINT64_C(1) << 30;
@@ -1166,6 +1180,9 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         o.model_copy_tier != HipModelCopyTier::none ||
         (copy_all != result.environment.end() && !copy_all->second.empty() && copy_all->second.front() != '0'))
         return notice("automatic T declined for target residency copy, selective copy or copy-all; explicit tiled configuration required");
+    // The committed backing below is the registered target in the one pool it shares with the device.
+    if (!one_memory_pool(memory))
+        return notice("automatic T declined for a separate host memory pool; explicit tiled configuration required");
     if (!memory.available || !memory.gtt_limit || !memory.gtt_used || !memory.estimate)
         return notice("memory observation unavailable; explicit tiled configuration required");
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
@@ -1248,13 +1265,9 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             fit("UMA",total,candidate.known_prefill_uma_budget);
             fit("GTT-used",*memory.gtt_used,*memory.gtt_limit);
             fit("GTT-free",add(required.device_base,add(required.external_device,add(scratch,add(future_device,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom))))),*memory.gtt_limit - *memory.gtt_used);
-            const auto host_only = add(required.external_host,add(required.metadata,add(future_host,
-                add(candidate.prefix_cache_host_bytes,prefill_native_pools(candidate,model).host))));
-            if (memory.host_available) fit("host-RAM",add(host_only,separate_host_reserve),*memory.host_available);
             o = std::move(candidate);
             result.host_compilation = required.organization;
             result.host_compilation["serve_committed_host_peak_bytes"]=total;
-            if (memory.host_available) result.host_compilation["serve_committed_host_only_bytes"]=host_only;
             result.host_compilation["serve_prefill_external_host_bytes"]=required.external_host;
             result.host_compilation["serve_prefill_external_device_bytes"]=required.external_device;
             result.host_compilation["serve_batch_staging_bytes"]=staging;
@@ -1345,11 +1358,7 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
     if (!result.error.empty() || !o.http_serve || !o.known_prefix_prefill_rows || o.deployment_spec ||
         !memory.available || !result.host_compilation.contains("serve_committed_host_peak_bytes")) return;
     try {
-        // Session RAM is host memory: in a separate host pool it fits next to the host-only items.
-        if (memory.host_available && result.host_compilation.contains("serve_committed_host_only_bytes"))
-            fit_http_session_ram(o,prefill_checked_add(result.host_compilation.at("serve_committed_host_only_bytes"),
-                separate_host_reserve),*memory.host_available);
-        else fit_http_session_ram(o,result.host_compilation.at("serve_committed_host_peak_bytes"),
+        fit_http_session_ram(o,result.host_compilation.at("serve_committed_host_peak_bytes"),
             std::min(*memory.available,o.known_prefill_uma_budget));
     } catch (const std::exception& e) { result.error=e.what(); }
 }
@@ -1761,20 +1770,7 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     result.gfx_target = device.gfx_target_version;
     capabilities.target_qualified = device.gfx_target_version == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
-#endif
-#if defined(_WIN32)
-    // Separate pools: the GPU pool is the device's dedicated memory, which holds the model, state and
-    // workspaces; the host pool is the RAM Windows sees. Without both observations nothing is admitted.
-    if (device.gtt_total_bytes && device.gtt_used_bytes && *device.gtt_used_bytes <= *device.gtt_total_bytes) {
-        result.host_available = separate_host_memory_available();
-        if (result.host_available) {
-            result.total = device.gtt_total_bytes;
-            result.available = *device.gtt_total_bytes - *device.gtt_used_bytes;
-            result.usable_ceiling = result.total;
-            result.cache_available = result.available;
-            result.resident = device.gtt_used_bytes;
-        }
-    }
+    observe_separate_pools(result, device, separate_host_memory_available());
 #endif
     return result;
 }

@@ -10,18 +10,21 @@
 #include "strix/dist/transport.hpp"
 #include <memory>
 #include <stdexcept>
+#include <string>
 #endif
 
 namespace strix::qwen_pp {
 #if !STRIX_DIST_PAIR_RUNTIME
 // Built without the pair runtime (STRIX_DIST_PAIR_RUNTIME=0, see strix_dist in CMakeLists.txt): no link to a
-// peer can be opened, so a pair prefill refuses where it would open one. The host path over a given link is
-// the same as below, without the GPU-direct route.
+// peer can be opened, so a pair prefill and a deployment pipeline refuse where they would open one. The host
+// path over a given link is the same as below, without the GPU-direct route.
+[[noreturn]] inline void refuse_pair_link() {
+    throw std::invalid_argument("a link to a peer node needs the pair runtime, which is built on Linux only");
+}
+inline std::unique_ptr<dist::Transport> open_deployment_link(const std::string&, unsigned) { refuse_pair_link(); }
 class PairTransport {
 public:
-    explicit PairTransport(unsigned) {
-        throw std::invalid_argument("pair prefill needs the pair runtime, which is built on Linux only");
-    }
+    explicit PairTransport(unsigned) { refuse_pair_link(); }
     explicit PairTransport(std::unique_ptr<dist::Transport> link) : host_(std::move(link)) {
         if (!host_) throw std::invalid_argument("pair prefill: empty deployment link");
     }
@@ -34,6 +37,20 @@ private:
     std::unique_ptr<dist::Transport> host_;
 };
 #else
+// The link a deployment pipeline opens for its handshake (apps/qwen_deploy.inc); the pair prefill then keeps
+// using it through PairTransport's link constructor.
+inline std::unique_ptr<dist::Transport> open_deployment_link(const std::string& transport, unsigned rank) {
+    if (transport == "usb4auto" || transport == "usb4-auto") {
+        dist::Usb4AutoOptions usb;
+        usb.rank = rank;
+        return dist::usb4_host_auto(usb);
+    }
+    if (transport != "tcp") throw std::invalid_argument("deployment: unsupported pipeline transport");
+    const char* peer = std::getenv("STRIX_QWEN_PF_PIPE_PEER");
+    if (rank && !peer) throw std::invalid_argument("pipeline rank 1 requires --peer");
+    const auto timeout = std::chrono::milliseconds(120000);
+    return rank ? dist::tcp_connect(peer, 29872, timeout) : dist::tcp_listen(29872, timeout);
+}
 // Raw framing/control keeps its original order and CRCs. Only seam payloads
 // become symmetric byte exchanges; the reverse direction is unused scratch.
 class PairTransport {

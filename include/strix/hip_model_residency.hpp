@@ -23,6 +23,8 @@ class HipSetupQuiescenceGuard;
 enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert, experts, all };
 // STRIX_MODEL_COPY_ALL=1|fine|uc (opt-in, default off): 1 = hipMalloc arena, fine = fine-grained device memory,
 // uc = uncached device memory (the MTYPE the fine-grained registered mapping streams with). 0 when unset.
+// Where host memory is a separate pool (strix/host_memory.hpp: Windows), a registered mapping would keep the
+// model in host RAM: the arena is the only form there, unset and 0 mean 1, and the value selects only its memory.
 [[nodiscard]] unsigned hip_model_copy_all_mode() noexcept;
 [[nodiscard]] std::string_view hip_model_copy_tier_name(HipModelCopyTier);
 

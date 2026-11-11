@@ -3,8 +3,11 @@
 // The target defines the macro itself, so this runs on every platform.
 #include "qwen_pair_transport.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,6 +39,11 @@ int main() {
     try { strix::qwen_pp::PairTransport opened(0U); }
     catch (const std::invalid_argument& error) { refused = std::string(error.what()).find("Linux") != std::string::npos; }
     expect(refused, "opening a pair link refuses and names the platform requirement");
+
+    bool deployment_refused = false;
+    try { (void)strix::qwen_pp::open_deployment_link("tcp", 0U); }
+    catch (const std::invalid_argument& error) { deployment_refused = std::string(error.what()).find("Linux") != std::string::npos; }
+    expect(deployment_refused, "a deployment pipeline refuses where it would open its link");
 
     bool empty_refused = false;
     try { strix::qwen_pp::PairTransport empty(std::unique_ptr<strix::dist::Transport>{}); }

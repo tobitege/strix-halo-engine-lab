@@ -349,6 +349,8 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
             return refuse("YaRN resolved rotary/checkpoint contract mismatch");
         if (!memory.available || !memory.total || !memory.gtt_limit || !memory.gtt_used || !memory.estimate)
             return refuse("YaRN memory observation unavailable (MemTotal/MemAvailable/GTT required)");
+        if (!one_memory_pool(memory))
+            return refuse("YaRN admission prices one shared memory pool; this node has a separate host pool");
         if (!capabilities.target_qualified || !capabilities.a8_runtime || content != validated_model_content_identity ||
             qpf2k::has_gsq_gate(manifest)) return refuse("YaRN checkpoint or target route not supported");
         const auto injected = qpf2k::initialize([&](const char* name) -> const char* {

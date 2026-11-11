@@ -25,17 +25,18 @@ struct DeviceFacts {
 // A DRM device override preserves callers' explicit selection (including fixtures).
 // Linux reads KFD/DRM sysfs and never initializes HIP. Windows has no such files: with root and override
 // empty, a build with STRIX_DEPLOY_HIP_PROBE asks the HIP runtime for the device properties (no allocation and
-// no kernel), which initializes it, and DXGI for the adapter's local memory segment (budget and use; not
-// hipMemGetInfo, whose total adds the shared segment backed by system RAM); source is then "hip+dxgi".
-// Without HIP the facts stay unknown.
+// no kernel), which initializes it. The memory is the adapter's dedicated memory: its size from DXGI
+// (DedicatedVideoMemory), its use from the adapter's PDH counter "Dedicated Usage" (not hipMemGetInfo or
+// the DXGI segment budget, whose totals add the shared segment backed by system RAM); source is then
+// "hip+dxgi+pdh". Without HIP the facts stay unknown.
 [[nodiscard]] std::vector<DeviceFacts> probe_devices(const std::string& sysfs_root = "",
                                                      const std::string& drm_device = "");
 // Refuses ambiguous selection by returning unknown facts. Never silently selects GPU 0.
 [[nodiscard]] DeviceFacts probe_device(const std::string& sysfs_root = "",
                                       const std::string& drm_device = "");
 // KFD's gfx_target_version of an architecture name: major * 10000 + minor * 100 + stepping, where the name
-// spells minor and stepping as one hex digit each ("gfx1151" -> 110501, "gfx90a" -> 90010). A ":feature"
-// suffix is ignored. 0 for a name that is not of this form.
+// spells the minor as one decimal digit and the stepping as one hex digit ("gfx1151" -> 110501,
+// "gfx90a" -> 90010). A ":feature" suffix is ignored. 0 for a name that is not of this form.
 [[nodiscard]] std::uint64_t gfx_target_version(std::string_view arch) noexcept;
 // Existing GLM card-first selection, centralized here for its legacy telemetry contract.
 [[nodiscard]] std::string first_drm_device(const std::string& sysfs_root = "");

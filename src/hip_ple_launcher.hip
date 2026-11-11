@@ -3,6 +3,7 @@
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/hip_ple_launcher.hpp"
+#include "strix/hip_model_residency.hpp"
 #include "strix/ple_projection_tile.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -2939,8 +2940,7 @@ void HipPleKnownWindow::stage_serve(std::span<const ExecutionDispatchContext> ro
     if(!enabled || !w.prefill || rows.size()<32U || ple_reclaim::active() || w.stage.active) return;
     const auto workers=ple_detail::serve_stage_workers(std::thread::hardware_concurrency());
     if(!workers) return;
-    const char* copy=std::getenv("STRIX_MODEL_COPY_ALL");
-    if(copy && copy[0] && copy[0]!='0') return;
+    if(hip_model_copy_all_mode()) return;
     auto* backend=dynamic_cast<FileMappedPleLookupBackend*>(rows[0].resources->ple_lookup);
     if(!backend || backend->residency() || (rows[0].resources->ple_prefetch && rows[0].resources->ple_prefetch->active)) return;
     const auto prepared=w.prepare(rows);

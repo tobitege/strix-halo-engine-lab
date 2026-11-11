@@ -66,11 +66,10 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_serve_policy.hpp"
 #include "strix/process_environment.hpp"
+#include "strix/process_restart.hpp"
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
-#elif defined(_WIN32)
-#include <windows.h>
 #endif
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
@@ -641,12 +640,21 @@ private:
     strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
+// The end of every stream this program creates for prompt or serving work. A QSA prefill submission records
+// the shared handoff event on its stream: that handoff completes before the stream goes, on every way out of
+// the program (strix::complete_hip_qsa_prefill_handoff). Fail-stop, like the other teardown steps.
+static void destroy_stream(hipStream_t stream) noexcept {
+    if (!stream) return;
+    try { strix::complete_hip_qsa_prefill_handoff(stream); } catch (...) { std::_Exit(3); }
+    if (hipStreamDestroy(stream) != hipSuccess) std::_Exit(3);
+}
+
 // One stream shared by the window owners of every request of an MTP cohort (a cohort window
 // interleaves their steps); destroyed after the last owner that borrows it.
 class SharedWindowStream final {
 public:
     SharedWindowStream() { check_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create cohort window stream"); }
-    ~SharedWindowStream() { if (stream && hipStreamDestroy(stream) != hipSuccess) std::_Exit(3); }
+    ~SharedWindowStream() { destroy_stream(stream); }
     SharedWindowStream(const SharedWindowStream&) = delete;
     SharedWindowStream& operator=(const SharedWindowStream&) = delete;
     hipStream_t stream = nullptr;
@@ -746,7 +754,7 @@ private:
         serial_status_ = nullptr;
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
         status_ = nullptr;
-        if (scope.stream && !shared_stream_ && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        if (!shared_stream_) destroy_stream(scope.stream);
         scope.stream = nullptr;
     }
     std::shared_ptr<const void> retained_;
@@ -785,7 +793,7 @@ public:
         if (!touched_) return;
         guard_->recover_or_fail_stop();
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
-        if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        destroy_stream(scope.stream);
         // memory_ then releases its own state/scratch before allocator_ dies.
     }
     void initialize(const std::function<void(const strix::ExecutionMemoryBinding&)>& admit) {
@@ -1386,39 +1394,18 @@ static int run_decode_entry(
             [](const char* name) { return std::getenv(name); },
             [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); })) {
         std::fflush(nullptr);
-#if defined(_WIN32)
-        // Windows has no exec: the same program with the same command line runs as a child that
-        // shares the console, the standard handles and the environment with the value set above,
-        // and this process ends with its exit code.
-        std::wstring program(32768U, L'\0');
-        program.resize(GetModuleFileNameW(nullptr, program.data(), static_cast<DWORD>(program.size())));
-        std::wstring command_line(GetCommandLineW());
-        STARTUPINFOW startup{};
-        startup.cb = sizeof(startup);
-        PROCESS_INFORMATION child{};
-        if (!program.empty() && CreateProcessW(program.c_str(), command_line.data(), nullptr, nullptr, TRUE, 0,
-                nullptr, nullptr, &startup, &child)) {
-            CloseHandle(child.hThread);
-            DWORD code = 1U;
-            if (WaitForSingleObject(child.hProcess, INFINITE) != WAIT_OBJECT_0 || !GetExitCodeProcess(child.hProcess, &code))
-                code = 1U;
-            std::_Exit(static_cast<int>(code));
-        }
-        std::fprintf(stderr, "eager code loading: restart failed (Windows error %lu); continuing with deferred loading\n",
-            GetLastError());
-        strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
-#else
+        // Linux repeats the process's own arguments from /proc (see split_process_arguments); where that file
+        // does not exist the restart takes the command line from the process itself.
         std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
         const auto original = strix::decode_cli::split_process_arguments(
             std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
         std::vector<char*> restart;
         for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
         restart.push_back(nullptr);
-        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+        const auto failure = strix::process_restart::run_again(original.empty() ? argv : restart.data());
         std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
-            std::strerror(errno));
+            failure.c_str());
         strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
-#endif
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
@@ -4438,7 +4425,8 @@ static int run_decode_entry(
             const auto before = observe();
             auto retained = estimate;
             // Observations of the last fit, reused if the route falls back to the single runner.
-            auto fit_host = before.available;
+            // The host fit runs against the pool host memory comes from (the same pool on a UMA node).
+            auto fit_host = host_pool_available(before);
             auto fit_device = gtt_free(before);
             auto capacity = resolve_http_bridge_capacity(estimate, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
             if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit: " + capacity.limiting);
@@ -4454,7 +4442,7 @@ static int run_decode_entry(
                 };
                 const auto measured = std::max({estimate, delta(before.available, after.available), delta(gtt_free(before), gtt_free(after))});
                 retained = measured;
-                fit_host = after.available ? before.available : std::nullopt;
+                fit_host = after.available ? host_pool_available(before) : std::nullopt;
                 fit_device = gtt_free(after) ? gtt_free(before) : std::nullopt;
                 capacity = resolve_http_bridge_capacity(measured, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
                 if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
@@ -4476,7 +4464,7 @@ static int run_decode_entry(
                     // Allocated payload includes in-flight capture, not unallocated credits.
                     const auto stats=prefix_store ? prefix_store->stats() : strix::PrefixStateCacheStats{};
                     const auto pressure=observe();
-                    return HttpBridgeGrowthObservation{pressure.available,gtt_free(pressure),
+                    return HttpBridgeGrowthObservation{host_pool_available(pressure),gtt_free(pressure),
                         stats.host_bytes,stats.staging_bytes};
                 });
             if(options.cache_activation->automatic_path) {
@@ -6625,11 +6613,6 @@ static int run_decode_entry(
             << "\n";
         std::cout << "}\n";
         emit_device_queue_trace();
-        // Every prompt producer has completed: retire the shared QSA prefill handoff, stage slots and pool
-        // while the streams they were recorded on still exist (the MTP route does this in retire_prompt).
-        // Left to the static destructors, the handoff wait runs at process exit after those streams are gone,
-        // which crashed inside the HIP runtime on Windows.
-        if (known_prefix_backend) strix::release_hip_qsa_prefill_storage();
         return 0;
     }
 

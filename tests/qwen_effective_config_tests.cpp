@@ -234,6 +234,11 @@ void resident_fallback_tests() {
     const auto admitted=resident_prefill_admission(options,required,memory);
     expect(admitted.at("verified_ple_credit_bytes")==0 && admitted.at("required_bytes")==admitted.at("gross_required_bytes"),
         "fresh resident admission never retains rolling credit");
+    {
+        auto split=memory; split.host_available=64U*gib_bytes; bool refused=false;
+        try {(void)resident_prefill_admission(options,required,split);}catch(const std::runtime_error&){refused=true;}
+        expect(refused,"the resident envelope prices one pool: a separate host pool refuses");
+    }
     for(const bool yarn:{false,true}) for(const bool reserve:{false,true}) {
         auto route=options;if(yarn) route.rotary=RotaryDescriptor::yarn(2);
         route.known_prefill_host_headroom=reserve?yarn_legacy_host_reserve:0;
@@ -3634,6 +3639,11 @@ int main(int argc, char** arguments) {
             "HTTP insufficient memory requires an explicit tiled route");
         pressure=memory; pressure.gtt_limit.reset();
         expect(!resolve(http,pressure).options.known_prefix_prefill_rows,"HTTP unknown GTT declines");
+        pressure=memory; pressure.host_available=64*gib_bytes;
+        const auto separate=resolve(http,pressure);
+        expect(!separate.options.known_prefix_prefill_rows &&
+            separate.serve_prefill_notice.find("separate host memory pool")!=std::string::npos,
+            "HTTP automatic T prices the registered target in one pool: a separate host pool declines");
         auto off=http; off.environment["STRIX_SERVE_PREFILL"]="0";
         expect(!resolve(off,memory).options.known_prefix_prefill_rows,"HTTP T automatic off switch");
         off=http; off.options.baseline=true;
@@ -3835,6 +3845,29 @@ int main(int argc, char** arguments) {
         expect(resolve(request,split).options.session_ram_bytes == (UINT64_C(20) << 30) / 10U &&
             automatic.options.session_ram_bytes == std::min(UINT64_C(8) << 30, *memory.available / 10U),
             "session RAM is sized from the host pool where it is separate");
+        // The observation of separate pools: the GPU pool from the device's dedicated memory, the host pool next to it.
+        strix::deploy::DeviceFacts device;
+        device.gtt_total_bytes = UINT64_C(160) << 30;
+        device.gtt_used_bytes = UINT64_C(2) << 30;
+        PrefillMemory observed;
+        observe_separate_pools(observed, device, UINT64_C(20) << 30);
+        expect(observed.total == device.gtt_total_bytes && observed.available == UINT64_C(158) << 30 &&
+            observed.host_available == UINT64_C(20) << 30 && !one_memory_pool(observed) &&
+            host_pool_available(observed) == observed.host_available,
+            "separate pools: the GPU pool is the dedicated memory, host items go to the host pool");
+        expect(one_memory_pool(memory) && host_pool_available(memory) == memory.available,
+            "one pool: host items are priced against the shared observation");
+        const auto unknown = [&](const strix::deploy::DeviceFacts& facts, std::optional<std::uint64_t> host) {
+            PrefillMemory none;
+            observe_separate_pools(none, facts, host);
+            return !none.available && !none.total && !none.host_available;
+        };
+        auto overfull = device; overfull.gtt_used_bytes = *device.gtt_total_bytes + 1U;
+        auto uncounted = device; uncounted.gtt_used_bytes.reset();
+        auto unsized = device; unsized.gtt_total_bytes.reset();
+        expect(unknown(device, std::nullopt) && unknown(overfull, UINT64_C(20) << 30) &&
+            unknown(uncounted, UINT64_C(20) << 30) && unknown(unsized, UINT64_C(20) << 30),
+            "separate pools stay unknown without the host RAM, the size or a consistent use of the GPU pool");
     }
     const auto argv = effective_prefill_argv(automatic.options);
     expect(std::vector<std::string_view>(argv.begin(),argv.end()) ==

@@ -25,6 +25,9 @@ with the USB4 driver and trellis library. Standalone RTX needs Windows WDDM, CUD
 Q2/Q8 model and receipt/state/reference assets. Model manifests, conversion provenance and required
 notices are listed in [models and provenance](../reproduce.md#models-and-provenance).
 
+Windows: [windows.md](windows.md) describes an experimental native build of the Qwen single-node engine and
+how it differs. Linux remains the primary runtime.
+
 Kernel/IOMMU settings belong to the machine owner. Keep USB4 controllers translated; never disable
 IOMMU for speed. Record the running kernel and `amdgpu.iommu_perfopt` in timing receipts and compare
 PerfOpt on/off only on the same kernel.
