@@ -6,7 +6,9 @@ rem usage: build-hip.bat [configure|build|all] [target ...]
 rem   targets default to strix-hip-decode-token
 rem environment:
 rem   ROCM_SDK           the SDK folder that holds bin\ and lib\llvm\bin\clang++.exe (required)
-rem   VCVARS             vcvars64.bat of Visual Studio 2022; found through vswhere when unset
+rem   VCVARS             vcvars64.bat of a Visual Studio with the MSVC 14.4x toolset; found through vswhere
+rem                      when unset (Visual Studio 2022, else a newer one with the 14.44 component)
+rem   VCVARS_ARGS        arguments for it, for example -vcvars_ver=14.44; set by that search when needed
 rem   STRIX_BUILD_DIR    build folder, default <repository>\build-hip
 rem   STRIX_HIP_ARCH     HIP target, default gfx1151
 rem   STRIX_EXTRA_CMAKE  more configure options, for example -DBUILD_TESTING=ON
@@ -30,11 +32,19 @@ if not exist "%ROCM_SDK%\lib\llvm\bin\clang++.exe" (echo no clang++ under %ROCM_
 set "SDK=%ROCM_SDK%"
 set "SDKF=%ROCM_SDK:\=/%"
 
-rem Visual Studio 2022 only: the C++ library of Visual Studio 2026 (MSVC 14.5x) does not compile with the HIP
-rem headers of ROCm SDK 7.14 (its <cmath> comparison functions clash with the SDK's device declarations).
-if "%VCVARS%"=="" for /f "usebackq delims=" %%I in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -version [17.0^,18.0^) -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat"
-if not exist "%VCVARS%" (echo Visual Studio 2022 C++ build tools not found; set VCVARS to its vcvars64.bat & exit /b 2)
-call "%VCVARS%" >nul || exit /b 2
+rem The C++ toolset must be MSVC 14.4x, the one of Visual Studio 2022. The C++ library of 14.5x (Visual Studio
+rem 2026) does not compile with the HIP headers of ROCm SDK 7.14: its cmath comparison functions clash with the
+rem SDK's device declarations. Visual Studio 2022 has 14.4x as its own toolset. A newer Visual Studio can carry
+rem it as the component MSVC v143 14.44, which vcvars selects with -vcvars_ver.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if "%VCVARS%"=="" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -version [17.0^,18.0^) -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat"
+if "%VCVARS%"=="" for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 -property installationPath`) do (
+    set "VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat"
+    set "VCVARS_ARGS=-vcvars_ver=14.44"
+)
+if not exist "%VCVARS%" (echo no Visual Studio with the MSVC 14.4x toolset found; set VCVARS to its vcvars64.bat & exit /b 2)
+call "%VCVARS%" %VCVARS_ARGS% >nul || exit /b 2
+if not "%VCToolsVersion:~0,4%"=="14.4" (echo the C++ toolset is %VCToolsVersion%, MSVC 14.4x is required & exit /b 2)
 
 set "HIP_PLATFORM=amd"
 set "HIP_COMPILER=clang"

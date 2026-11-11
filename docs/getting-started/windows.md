@@ -15,8 +15,9 @@ touches, on a hosted runner without a GPU. No kernel runs there and no model is 
 - GPU memory set aside in the firmware (BIOS) that holds the model, its state and the workspaces. The engine
   uses only this dedicated memory. The UD-Q4_K_XL model needs about 84 GB of it at its peak.
 - A ROCm SDK for Windows with the HIP compiler (tested: TheRock ROCm SDK 7.14.1 for `gfx1151`).
-- Visual Studio 2022 Build Tools with the C++ toolset, CMake and Ninja. The C++ library of Visual Studio 2026
-  (MSVC 14.5x) does not compile with the HIP headers of this SDK; the build script selects 2022.
+- The MSVC 14.4x C++ toolset with CMake and Ninja: Visual Studio 2022 (Build Tools are enough), or Visual
+  Studio 2026 with its component "MSVC v143 (14.44)". The C++ library of MSVC 14.5x does not compile with the
+  HIP headers of this SDK; the build script selects the 14.4x toolset and refuses any other.
 
 ## Build
 

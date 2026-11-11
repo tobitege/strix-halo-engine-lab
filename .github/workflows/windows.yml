@@ -42,7 +42,9 @@ env:
 
 jobs:
   windows-hip-build:
-    # Visual Studio 2022: the C++ library of Visual Studio 2026 does not compile with this SDK's HIP headers.
+    # The build needs the MSVC 14.4x toolset (the C++ library of 14.5x does not compile with this SDK's HIP
+    # headers). This label serves images with Visual Studio 2022 or with Visual Studio 2026 and its 14.44
+    # component; scripts/windows/build-hip.bat selects the toolset on either.
     runs-on: windows-2025
     timeout-minutes: 150
     steps:
