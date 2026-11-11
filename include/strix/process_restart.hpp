@@ -20,7 +20,7 @@ namespace strix::process_restart {
 // identity. Windows has no exec: the program runs again with the process's own command line (the arguments
 // are not used) as a child that shares the console, the standard handles and the environment. The child is in
 // a job that ends it when this process ends, however that happens, and this process waits and ends with the
-// child's exit code.
+// child's exit code. While it waits it leaves Ctrl+C and Ctrl+Break to the child.
 [[nodiscard]] inline std::string run_again(char* const* arguments) {
 #if defined(_WIN32)
     static_cast<void>(arguments);
@@ -44,8 +44,16 @@ namespace strix::process_restart {
         CloseHandle(job);
         return reason;
     }
+    // Ctrl+C and Ctrl+Break reach every process of the console. The restarted program decides what they mean
+    // (a server stops cleanly); this process only waits for it, as the one process under Linux would. Closing
+    // the console still ends this process, and the job ends the child with it. In place before the child runs.
+    const PHANDLER_ROUTINE leave_to_child = [](DWORD event) -> BOOL {
+        return event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT;
+    };
+    SetConsoleCtrlHandler(leave_to_child, TRUE);
     if (!AssignProcessToJobObject(job, child.hProcess) || ResumeThread(child.hThread) == static_cast<DWORD>(-1)) {
         const auto reason = failure();
+        SetConsoleCtrlHandler(leave_to_child, FALSE);
         TerminateProcess(child.hProcess, 1U);
         CloseHandle(child.hThread);
         CloseHandle(child.hProcess);

@@ -5,6 +5,7 @@
 #include "strix/process_environment.hpp"
 #include "strix/process_restart.hpp"
 
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -82,6 +83,46 @@ void restarted_program_ends_with_its_starter(const std::filesystem::path& self) 
     CloseHandle(starter.hProcess);
     std::filesystem::remove(pid_file, ignored);
 }
+
+// Ctrl+Break reaches the waiting process and the restarted program. The waiting process leaves it to the
+// program, whose own handling (here: exit code 43) is what the caller sees; under Linux both are one process.
+// Skipped without a console to send the event through.
+void restarted_program_handles_console_break(const std::filesystem::path& self) {
+    const auto pid_file = std::filesystem::temp_directory_path() /
+        ("strix-process-restart-break-" + std::to_string(GetCurrentProcessId()) + ".pid");
+    std::error_code ignored;
+    std::filesystem::remove(pid_file, ignored);
+    std::wstring command = L"\"" + self.wstring() + L"\" hold \"" + pid_file.wstring() + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION starter{};
+    // A process group of its own: the event goes to the starter and the program it restarts, not to this test.
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
+            &startup, &starter)) {
+        expect(false, "the starter process runs in its own process group");
+        return;
+    }
+    DWORD restarted_pid = 0;
+    for (int attempt = 0; attempt < 300 && restarted_pid == 0; ++attempt) {
+        std::ifstream input(pid_file);
+        if (!(input >> restarted_pid)) { restarted_pid = 0; Sleep(100); }
+    }
+    if (restarted_pid == 0 || !GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, starter.dwProcessId)) {
+        std::cout << "console break check skipped: " << (restarted_pid ? "no console to send Ctrl+Break through"
+                                                                       : "the restarted program did not start") << '\n';
+        expect(restarted_pid != 0, "the restarted program runs before the console break");
+        TerminateProcess(starter.hProcess, 9U);
+    } else {
+        DWORD code = 0;
+        expect(WaitForSingleObject(starter.hProcess, 30000U) == WAIT_OBJECT_0 &&
+            GetExitCodeProcess(starter.hProcess, &code) && code == 43U,
+            "the waiting process leaves Ctrl+Break to the restarted program and ends with its exit code");
+        TerminateProcess(starter.hProcess, 9U); // no effect once it has ended
+    }
+    CloseHandle(starter.hThread);
+    CloseHandle(starter.hProcess);
+    std::filesystem::remove(pid_file, ignored);
+}
 #endif
 } // namespace
 
@@ -96,8 +137,9 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
     if (part == "hold" && argc == 3) {
         if (!restarted()) return run_again(argv);
+        std::signal(SIGBREAK, [](int) { std::_Exit(43); }); // the program's own handling of Ctrl+Break
         { std::ofstream output(argv[2]); output << GetCurrentProcessId() << '\n'; }
-        Sleep(60000U); // ended by the job long before
+        Sleep(60000U); // ended by the job or by Ctrl+Break long before
         return 0;
     }
 #endif
@@ -107,6 +149,7 @@ int main(int argc, char** argv) {
         "the restarted program sees the same arguments and the new environment, and its exit code comes back");
 #if defined(_WIN32)
     restarted_program_ends_with_its_starter(std::filesystem::absolute(argv[0]));
+    restarted_program_handles_console_break(std::filesystem::absolute(argv[0]));
 #endif
     if (failures) return 1;
     std::cout << "process restart: arguments, environment and exit code carried over\n";

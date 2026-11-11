@@ -28,8 +28,9 @@ scripts\windows\build-hip.bat all
 
 The script configures `build-hip` with the SDK's `clang++` inside the Visual Studio environment, builds
 `strix-hip-decode-token` and copies the SDK's HIP runtime DLLs next to it. Windows loads a program's DLLs
-from its own folder first; without the copy it finds the display driver's HIP runtime in `System32`, which is
-another version and fails at the first kernel launch.
+from its own folder first. Without the copy it finds the display driver's HIP runtime in `System32`, which is
+another version and fails at the first kernel launch; on a machine without the AMD driver it finds none, and
+the program does not start.
 
 Tests use their own folder:
 
@@ -68,10 +69,14 @@ file is copied in 32 MiB pieces, and each piece leaves the working set after its
 `--residency copy` is a different mode: it copies the model in one piece and keeps the mapped pages in the
 working set until the copy is complete (23 GB of RAM on the 111 GB file in one measurement). Use the default.
 
+Two options would leave part of a registered model in host RAM and are refused with the default residency:
+`--model-copy-tier` and `--execution-mode graph`.
+
 These parts price host and device memory as one pool and decline under Windows:
 
 - YaRN admission (long contexts beyond the model's native positions).
 - Automatic prefill tiles for the HTTP server. Serving needs an explicit tiled configuration.
+- Deployment planning (`--deploy`).
 - PLE reclaim, rolling PLE and the resident PLE fallback.
 - The late fit of the automatic prefix cache (it relies on cgroup and `/proc` observations).
 
@@ -82,7 +87,8 @@ These parts price host and device memory as one pool and decline under Windows:
   only, no allocation and no kernel).
 - **The eager code loading restart is a child process.** Windows has no `exec`. The program runs again with
   the same command line as a child in a job object and the first process waits and ends with the child's
-  exit code. Ending the first process ends the child.
+  exit code. Ending the first process ends the child. Ctrl+C and Ctrl+Break are left to the child, so a
+  server stops the way it does under Linux.
 - **No pair runtime.** The two-node transport (USB4, TCP, GPU-direct) is built on Linux only. Pair prefill
   and the deployment pipeline refuse where they would open a link.
 - **Model file identity.** The file is identified by volume serial number, file index, size, last write time
@@ -92,14 +98,17 @@ These parts price host and device memory as one pool and decline under Windows:
 ## Measured on one machine
 
 Ryzen AI Max+ PRO 495, Radeon 8065S, 160 GiB dedicated GPU memory, 31.7 GB RAM visible to Windows,
-UD-Q4_K_XL (111 GB), CLI runs under a RAM watchdog, 2026-11-11. These are local measurements, not
-qualified receipts.
+UD-Q4_K_XL (111 GB), CLI runs with the defaults under a RAM watchdog, 32 generated tokens, 2026-11-11. These
+are local measurements, not qualified receipts. The full-file hash at the first load ran at 811 MB/s.
 
-| | Value |
-|---|---|
-| Full-file hash at first load | 811 MB/s |
-| Lowest available RAM during load and run | 19.6 GB |
-| Peak working set of the engine | 1.8 GB |
-| Peak dedicated GPU memory | 84 GB |
-| Prefill, 14,981 prompt tokens | about 19 s (about 790 tokens/s) |
-| Decode | 45 to 63 ms per step |
+| | 14,981 prompt tokens | 32,768 prompt tokens |
+|---|---|---|
+| Prefill tile | 8,192 rows | 16,384 rows |
+| Prefill until the first token | 19.6 s (763 tokens/s) | 36.9 to 39.6 s (828 to 889 tokens/s) |
+| Decode per step | 45.6 to 47.4 ms | 67.4 to 71.6 ms |
+| Lowest available RAM during load and run | 19.3 GB | 18.0 GB |
+| Peak working set of the engine | 1.8 GB | 3.1 GB |
+| Peak dedicated GPU memory (1.9 GB of it other programs) | 84 GB | 88 GB |
+
+The engine reports the time of the whole request and of the decode steps; the prefill time is their
+difference.

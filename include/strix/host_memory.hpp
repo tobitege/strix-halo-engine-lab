@@ -7,7 +7,9 @@ namespace strix {
 // dedicated memory aside, and Windows sees and allocates only the rest. On a Linux UMA node host and device
 // allocations share one pool, which /proc/meminfo describes (strix/linux_uma_observation.hpp).
 // Where the pools are separate, the model lives in the GPU pool (hip_model_copy_all_mode in
-// strix/hip_model_residency.hpp) and host-only items are priced against the host pool.
+// strix/hip_model_residency.hpp; the options that would leave part of it registered are refused, see
+// separate_pool_residency_refusal in apps/qwen_effective_config.hpp) and host-only items are priced against
+// the host pool.
 [[nodiscard]] constexpr bool host_memory_is_separate_pool() noexcept {
 #if defined(_WIN32)
     return true;

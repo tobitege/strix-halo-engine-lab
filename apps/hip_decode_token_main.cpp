@@ -640,9 +640,13 @@ private:
     strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
-// The end of every stream this program creates for prompt or serving work. A QSA prefill submission records
-// the shared handoff event on its stream: that handoff completes before the stream goes, on every way out of
-// the program (strix::complete_hip_qsa_prefill_handoff). Fail-stop, like the other teardown steps.
+// The end of the streams that can carry a QSA prefill submission: those of the known-prompt memories (their own
+// or the cohort's shared one) and of the serving sessions, which are the streams a launch scope of the
+// known-prefix windows and the serving cohorts runs on. A submission records the shared handoff event on its
+// stream: that handoff completes before the stream goes, on every way out of the program
+// (strix::complete_hip_qsa_prefill_handoff). Fail-stop, like the other teardown steps.
+// The two other stream owners of this program stay as they are: the deferred MoE stream carries serial decode
+// steps only (its launch scope cannot nest a known-prefix window's), and the prefix cache streams carry copies.
 static void destroy_stream(hipStream_t stream) noexcept {
     if (!stream) return;
     try { strix::complete_hip_qsa_prefill_handoff(stream); } catch (...) { std::_Exit(3); }
@@ -1711,6 +1715,9 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    if (const auto refusal = strix::decode_cli::separate_pool_residency_refusal(options, strix::host_memory_is_separate_pool());
+        !refusal.empty())
+        throw std::invalid_argument(refusal);
     // Export only after the resolved route has admitted the profile proposals.
     strix::qwen::profile::withdraw_declined(options.product_profile);
     strix::qwen::profile::apply(options.product_profile);

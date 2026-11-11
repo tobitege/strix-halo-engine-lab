@@ -29,6 +29,9 @@ struct QwenDeployment {
         if (o.rotary.mode() != strix::RotaryMode::native || o.residency != strix::HipModelResidencyMode::registered_file_mapping ||
             o.execution.mode != strix::DecodeExecutionMode::eager)
             refusal = "Qwen deployment: rotary/copy/graph owner envelope not bound; use native registered eager route";
+        // The plan fits every owner, host and device, against the node's one measured memory figure.
+        if (!dc::one_memory_pool(memory))
+            refusal = "Qwen deployment prices one shared memory pool; this node has a separate host pool";
         if (pipeline && o.http_serve) refusal = "Qwen pipeline is a CLI prefill/handoff route; HTTP pipeline is unavailable";
         if (refusal.empty() && !o.known_prefix_prefill_rows) refusal = "Qwen deployment requires the existing tiled prefill owner calculator";
         dp::Footprint f;

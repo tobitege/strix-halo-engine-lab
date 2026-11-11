@@ -125,6 +125,19 @@ inline void observe_separate_pools(PrefillMemory& memory, const strix::deploy::D
     memory.total = device.gtt_total_bytes;
     memory.available = *device.gtt_total_bytes - *device.gtt_used_bytes;
 }
+// Where host memory is a separate pool the model must live in the GPU pool. The default residency gets there as
+// the copied arena (hip_model_copy_all_mode) and --residency copy is device memory. A selective copy tier and
+// graph execution leave the rest of a registered model in host RAM, which the admissions do not price: refused.
+inline std::string separate_pool_residency_refusal(const Options& o, bool separate_pool) {
+    if (!separate_pool || o.residency != HipModelResidencyMode::registered_file_mapping) return {};
+    if (o.model_copy_tier != HipModelCopyTier::none)
+        return "--model-copy-tier leaves the rest of the model registered in host RAM; with a separate host "
+               "memory pool use the default residency or --residency copy";
+    if (o.execution.mode == DecodeExecutionMode::graph)
+        return "graph execution keeps the model registered in host RAM; with a separate host memory pool use "
+               "eager execution or --residency copy";
+    return {};
+}
 // Kept free of host-only items in a separate host pool, for the rest of the system.
 inline constexpr std::uint64_t separate_host_reserve = UINT64_C(1) << 30;
 // Both inspection and execution validate explicit-T assets before the inspection exit.

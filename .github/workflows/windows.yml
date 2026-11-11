@@ -19,8 +19,9 @@ env:
   ROCM_DEVICE: gfx1151
   # A short folder: `rocm-sdk init` links device files by paths that must stay below 260 characters.
   ROCM_VENV: C:\rocm
-  # Built and run below. Each of them passes on a Windows Strix Halo machine; the Linux-only tests are not listed.
-  # None of them imports the HIP runtime DLL (see STRIX_WINDOWS_HIP_PROGRAMS).
+  # Built and run below; the Linux-only tests are not listed. Some of them import the HIP runtime DLL
+  # (strix-deploy-tests, the YaRN host test): it loads on a runner without an AMD GPU, and none of them asks
+  # it for a device.
   STRIX_WINDOWS_TESTS: >-
     strix-process-restart-tests
     strix-process-environment-tests
@@ -39,11 +40,8 @@ env:
     strix-env-flags-tests
     strix-engine-profile-common-tests
     strix-ds41-session-cache-tests
-  # Built, and only started under a time limit: these programs import amdhip64_7.dll, and a runner has no AMD
-  # GPU. A step of its own records how they behave there.
-  STRIX_WINDOWS_HIP_PROGRAMS: >-
     strix-deploy-tests
-    strix-hip-decode-token
+    strix-qwen-yarn-host-compile-tests
 
 jobs:
   windows-hip-build:
@@ -93,8 +91,8 @@ jobs:
           STRIX_BUILD_DIR: ${{ github.workspace }}\build-hip
           STRIX_EXTRA_CMAKE: -DBUILD_TESTING=ON
         run: |
-          $targets = "$env:STRIX_WINDOWS_TESTS $env:STRIX_WINDOWS_HIP_PROGRAMS" -split '\s+' | Where-Object { $_ }
-          & scripts\windows\build-hip.bat all @targets 2>&1 | Tee-Object -FilePath windows-hip-build.log
+          $tests = $env:STRIX_WINDOWS_TESTS -split '\s+' | Where-Object { $_ }
+          & scripts\windows\build-hip.bat all strix-hip-decode-token @tests 2>&1 | Tee-Object -FilePath windows-hip-build.log
           exit $LASTEXITCODE
 
       - name: Run the tests
@@ -104,22 +102,17 @@ jobs:
           ctest --test-dir build-hip -R ("^(" + ($tests -join '|') + ")$") --output-on-failure --no-tests=error --timeout 300
           exit $LASTEXITCODE
 
-      - name: Start the programs that import the HIP runtime
-        # Informative, never fails the job: it records how the HIP runtime behaves on a runner without an AMD GPU.
-        # Each program gets 120 seconds (the engine only prints its usage); one that does not return is ended.
-        continue-on-error: true
+      - name: Start the engine without a model
         shell: pwsh
         run: |
-          $stalled = 0
-          foreach ($program in ($env:STRIX_WINDOWS_HIP_PROGRAMS -split '\s+' | Where-Object { $_ })) {
-            $start = @{ FilePath = "build-hip\$program.exe"; PassThru = $true; NoNewWindow = $true; RedirectStandardOutput = "$program.out" }
-            if ($program -eq 'strix-hip-decode-token') { $start.ArgumentList = '--help' }
-            $process = Start-Process @start
-            $null = $process.Handle   # keeps the exit code readable after the process ends
-            if ($process.WaitForExit(120000)) { "${program}: exit code $($process.ExitCode)" }
-            else { $process.Kill($true); $stalled++; "${program}: did not return within 120 s and was ended" }
-          }
-          if ($stalled) { throw "$stalled of the programs that import the HIP runtime did not return on this runner" }
+          # The engine and the SDK's runtime DLLs next to it load, and it prints its usage; no device is touched.
+          # Under a time limit: a program that cannot load a DLL can wait in a system dialog instead of failing.
+          $engine = Start-Process -FilePath build-hip\strix-hip-decode-token.exe -ArgumentList '--help' -PassThru `
+            -NoNewWindow -RedirectStandardOutput engine-usage.out -RedirectStandardError engine-usage.err
+          $null = $engine.Handle   # keeps the exit code readable after the process ends
+          if (-not $engine.WaitForExit(120000)) { $engine.Kill($true); throw 'the engine did not answer --help within 120 s' }
+          Get-Content engine-usage.out, engine-usage.err | Select-Object -First 3
+          if ($engine.ExitCode -ne 0) { throw "the engine ended --help with exit code $($engine.ExitCode)" }
 
       - name: Upload the build log
         if: always()

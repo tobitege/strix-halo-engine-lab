@@ -3868,6 +3868,19 @@ int main(int argc, char** arguments) {
         expect(unknown(device, std::nullopt) && unknown(overfull, UINT64_C(20) << 30) &&
             unknown(uncounted, UINT64_C(20) << 30) && unknown(unsized, UINT64_C(20) << 30),
             "separate pools stay unknown without the host RAM, the size or a consistent use of the GPU pool");
+        // With a separate host pool the model must be in the GPU pool: a registered model with a selective copy
+        // tier or graph execution stays partly in host RAM and is refused; --residency copy is device memory.
+        auto tiered = automatic.options; tiered.model_copy_tier = HipModelCopyTier::experts;
+        auto graphed = automatic.options; graphed.execution.mode = DecodeExecutionMode::graph;
+        auto copied = graphed; copied.residency = HipModelResidencyMode::resident_copy;
+        expect(automatic.options.residency == HipModelResidencyMode::registered_file_mapping &&
+            separate_pool_residency_refusal(automatic.options, true).empty() &&
+            separate_pool_residency_refusal(copied, true).empty() &&
+            separate_pool_residency_refusal(tiered, true).find("--model-copy-tier") != std::string::npos &&
+            separate_pool_residency_refusal(graphed, true).find("graph execution") != std::string::npos,
+            "separate pools refuse the residencies that leave model bytes in host RAM");
+        expect(separate_pool_residency_refusal(tiered, false).empty() && separate_pool_residency_refusal(graphed, false).empty(),
+            "one pool keeps every residency");
     }
     const auto argv = effective_prefill_argv(automatic.options);
     expect(std::vector<std::string_view>(argv.begin(),argv.end()) ==

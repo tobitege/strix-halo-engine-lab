@@ -21,6 +21,7 @@ rem   _CRT_SECURE_NO_WARNINGS       the Windows C runtime marks getenv, fopen an
 setlocal
 set "MODE=%~1"
 if "%MODE%"=="" set "MODE=all"
+if /i not "%MODE%"=="configure" if /i not "%MODE%"=="build" if /i not "%MODE%"=="all" (echo usage: build-hip.bat [configure^|build^|all] [target ...] & exit /b 2)
 for %%I in ("%~dp0..\..") do set "REPO=%%~fI"
 set "BUILD=%REPO%\build-hip"
 if not "%STRIX_BUILD_DIR%"=="" set "BUILD=%STRIX_BUILD_DIR%"
@@ -29,6 +30,7 @@ if not "%STRIX_HIP_ARCH%"=="" set "ARCH=%STRIX_HIP_ARCH%"
 
 if "%ROCM_SDK%"=="" (echo ROCM_SDK is not set & exit /b 2)
 if not exist "%ROCM_SDK%\lib\llvm\bin\clang++.exe" (echo no clang++ under %ROCM_SDK%\lib\llvm\bin & exit /b 2)
+if not exist "%ROCM_SDK%\bin\amdhip64*.dll" (echo no HIP runtime DLL under %ROCM_SDK%\bin & exit /b 2)
 set "SDK=%ROCM_SDK%"
 set "SDKF=%ROCM_SDK:\=/%"
 
@@ -64,7 +66,6 @@ goto collect
 if "%TARGETS%"=="" set "TARGETS=strix-hip-decode-token"
 
 if /i "%MODE%"=="build" goto build
-if /i not "%MODE%"=="configure" if /i not "%MODE%"=="all" (echo usage: build-hip.bat [configure^|build^|all] [target ...] & exit /b 2)
 cmake -S "%REPO%" -B "%BUILD%" -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DCMAKE_CXX_COMPILER=%SDKF%/lib/llvm/bin/clang++.exe ^
@@ -89,6 +90,9 @@ if errorlevel 1 (echo build failed & exit /b 4)
 rem Windows loads a program's DLLs from its own folder before System32, where the display driver's HIP
 rem runtime sits (a different version: it fails at the first kernel launch). The SDK's runtime goes next
 rem to the programs.
-for %%P in ("%SDK%\bin\amdhip64*.dll" "%SDK%\bin\amd_comgr*.dll" "%SDK%\bin\rocm_kpack*.dll") do copy /y "%%~fP" "%BUILD%\" >nul
-if not exist "%BUILD%\amdhip64*.dll" (echo no HIP runtime DLL under %SDK%\bin to put next to the programs & exit /b 5)
+for %%P in ("%SDK%\bin\amdhip64*.dll" "%SDK%\bin\amd_comgr*.dll" "%SDK%\bin\rocm_kpack*.dll") do copy /y "%%~fP" "%BUILD%\" >nul || goto copy_failed
 exit /b 0
+
+:copy_failed
+echo cannot copy the HIP runtime DLLs from "%SDK%\bin" to "%BUILD%"
+exit /b 5
