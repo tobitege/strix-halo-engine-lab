@@ -60,7 +60,10 @@ struct GpuDecoder::Dev {
     }
     _Float16* upload(const H16& v) {
         _Float16* p = alloc(v.size());
-        ck(hipMemcpy(p, v.data(), v.size() * 2, hipMemcpyHostToDevice), "upload");
+        // on the decoder's own stream, not the legacy default stream: a decoder loaded while another stream computes
+        // (the image DiT sampling) neither waits for nor stalls that stream
+        ck(hipMemcpyAsync(p, v.data(), v.size() * 2, hipMemcpyHostToDevice, st), "upload");
+        ck(hipStreamSynchronize(st), "upload");
         return p;
     }
     DevLinear upload(const LinearH& l) { return {upload(l.w), upload(l.b), l.in, l.out}; }

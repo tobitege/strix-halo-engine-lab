@@ -569,11 +569,11 @@
     "engine": "qwen",
     "name": "Batched MTP predictor priming",
     "flag_or_env": "STRIX_MTP_PRIME_ROWS",
-    "default": "OFF (opt-in: STRIX_MTP_PRIME_ROWS=1)",
+    "default": "ON (STRIX_MTP_PRIME_ROWS=0 disables)",
     "exact": "Same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
     "gain": "MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
     "preconditions": "MTP route with a tiled prompt and the production draft chain; other configurations keep the one-row loop.",
-    "off_switch": "unset STRIX_MTP_PRIME_ROWS",
+    "off_switch": "STRIX_MTP_PRIME_ROWS=0 (restart)",
     "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
   },
   {
@@ -2151,6 +2151,17 @@
   },
   {
     "engine": "glm",
+    "name": "Prefill token-ordered MoE input transform",
+    "flag_or_env": "STRIX_GLM_PF_IN_TOKEN",
+    "default": "1",
+    "exact": "Same operations in the same order: FP16 operand rows and all outputs bitwise equal the tile-ordered transform (strix-hip-glm5-pf-exact-moe-tests device-plan arm); pair logits and state digests equal on both ranks at 8K and 32K, exact and FAST.",
+    "gain": "FAST 8K TTFT 10.55 -> 10.21 s (median of 4 ABAB pairs, both orders); exact 8K 13.195 -> 12.868 s; FAST 32K 43.49 -> 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce).",
+    "preconditions": "Device MoE plan (STRIX_GLM_PF_EXACTMOE_PLAN=device, the default); the host plan keeps the tile-ordered kernel.",
+    "off_switch": "STRIX_GLM_PF_IN_TOKEN=0 restores the tile-ordered transform; baseline sets 0; restart both ranks",
+    "doc_anchor": "docs/optimizations.md#glm-pf-in-token"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill scratch capacity",
     "flag_or_env": "STRIX_GLM_PF_SCRATCH",
     "default": "auto",
@@ -2604,11 +2615,11 @@
     "engine": "glm",
     "name": "FAST WMMA prefill linear cores (glm-pf-wmma-x)",
     "flag_or_env": "STRIX_GLM_PF_WMMA",
-    "default": "off (opt-in FAST identity)",
+    "default": "off (glm rank --profile fast enables; opt-in FAST identity)",
     "exact": "FAST identity (new FP32 summation order); pre-registered quality-parity check passed at 1K / 8K / 32K; OFF equals the exact 8K logits anchors on both ranks.",
     "gain": "Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %",
     "preconditions": "Dense calls of 2048+ rows (X3 route); MoE calls on V11/V14.",
-    "off_switch": "unset or STRIX_GLM_PF_WMMA=0",
+    "off_switch": "STRIX_GLM_PF_WMMA=0 (overrides --profile fast); unset stays off without fast",
     "doc_anchor": "docs/optimizations.md#glm-pf-wmma-x"
   },
   {

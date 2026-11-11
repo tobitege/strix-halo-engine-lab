@@ -38,6 +38,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <span>
@@ -47,6 +48,7 @@
 #include <thread>
 #include <vector>
 
+#include "h3/common/alongside.hpp"
 #include "h3/block/device_forward.hpp"
 #include "h3/block/turbo_accel.hpp"
 #include "h3/levers/lora/lora_file.hpp"
@@ -64,6 +66,7 @@
 #include "h3/dist/accel.hpp"
 #include "h3/dist/device_dist.hpp"
 #include "h3/dist/host_dist.hpp"
+#include "h3/dist/pair_link.hpp"
 #include "strix/dist/communicator.hpp"
 #endif
 
@@ -115,6 +118,10 @@ struct Args {
     float sparse_tau = 0.75F;
     std::uint32_t sparse_dense_calls = 3;
     std::string sparse_dense_layers;  // extra dense DiT layers, e.g. "39-42"
+    // preparation overlaps (the same bits either way): the text encoder alongside the DiT residency, the video VAE
+    // loaded during sampling; one node: eager (weights resident before step 1, alongside the TE) or lazy (in step 1)
+    bool serial_te = false, serial_vae = false;
+    std::string prepare = "auto";  // auto | eager | lazy
 };
 
 std::string env_or(const char* k, const std::string& d) {
@@ -135,6 +142,7 @@ void usage() {
         "              [--fast-vae [--fast-vae-weights F]] (h3-vae-fast24-v1, FAST-class) [--decode-only LATENT_DIR (1 node)]\n"
         "              [--dump-velocity] (per step: <out>/velocity/step_NN_{video,audio}_neg_v_bf16.bin + index.txt)\n"
         "              [--dit single|dist] [--world 1|2 --rank R --transport usb4auto|emulate] [--vae-shift 1]\n"
+        "              [--serial-te] [--serial-vae] [--prepare auto|eager|lazy] (preparation overlaps; same bits)\n"
         "asset paths: flags, or env H3_TOKENIZER_DIR, H3_TE_PACK, H3_CKPT, H3_VAE_WEIGHTS, H3_AUDIO_VAE_WEIGHTS, H3_TURBO_LORA,\n"
         "H3_TURBO_MERGED_FC2, H3_TURBO_EGRID, or H3_MODELS (a directory holding the default file names); no built-in location.\n"
         "--fbc (reusing) and --sparse runs cannot be resumed across invocations (their state is not persisted).");
@@ -220,6 +228,12 @@ Args parse(int argc, char** argv) {
         } else if (k == "--fbc-observe") {
             a.fbc = true;
             a.fbc_observe = true;
+        }
+        else if (k == "--serial-te") a.serial_te = true;
+        else if (k == "--serial-vae") a.serial_vae = true;
+        else if (k == "--prepare") {
+            a.prepare = val();
+            if (a.prepare != "auto" && a.prepare != "eager" && a.prepare != "lazy") throw std::runtime_error("--prepare auto | eager | lazy");
         }
         else if (k == "--pdd" || k.rfind("--pdd", 0) == 0) {
             throw std::runtime_error("PDD head banks are not wired in the runner (no PDD checkpoint / gate): " + k + " refused");
@@ -501,6 +515,9 @@ double model_step_s(std::uint32_t S, int world) {
     const double s = static_cast<double>(S);
     return (9.2e-4 * s + 5.07e-8 * s * s) * 1.3 / static_cast<double>(world) + 1.0;
 }
+// One node, --prepare auto: steps up to this (recorded, else modelled) make the DiT resident before step 1, alongside the
+// text encoder; longer steps hide the lazy per-block upload under step 1's compute instead.
+constexpr double kEagerStepMaxS = 10.0;
 
 using strix::h3::io::write_png;
 
@@ -580,15 +597,16 @@ public:
 // world 1, the single-node driver (block DeviceForward: gemm + flash, weights resident after the first forward).
 class SingleBackend final : public DitBackend {
 public:
-    // fused = false for Turbo (the fc1 branch needs the plain fc1 output)
-    SingleBackend(std::unique_ptr<blk::DeviceForward> dev, blk::BlockSource& blocks, const blk::PackedLayout& L, bool fused = true,
-        const blk::SparseAccel* sparse = nullptr)
-        : dev_(std::move(dev)), blocks_(blocks), L_(L), lin_(L.seq_len, fused), sparse_(sparse) {}
+    // lin: GemmDeviceLinear(L.seq_len, fused), fused = false for Turbo / step LoRAs (the fc1 branch needs the plain fc1
+    // output); its blocks are resident already when the caller prepared eagerly, else they upload during the first forward
+    SingleBackend(std::unique_ptr<blk::DeviceForward> dev, blk::BlockSource& blocks, const blk::PackedLayout& L,
+        std::unique_ptr<blk::GemmDeviceLinear> lin, const blk::SparseAccel* sparse = nullptr)
+        : dev_(std::move(dev)), blocks_(blocks), L_(L), lin_(std::move(lin)), sparse_(sparse) {}
     blk::StreamOutputs forward(float, const blk::ForwardPlan& p, const blk::StreamInputs& in, StepInfo& si) override {
         blk::DeviceForwardTaps taps;
         blk::AccelTaps acc;
         taps.accel = &acc;
-        blk::StreamOutputs so = dev_->run(blocks_, L_, p, in, lin_, fa_, &taps);
+        blk::StreamOutputs so = dev_->run(blocks_, L_, p, in, *lin_, fa_, &taps);
         si.flushed = taps.flushed_groups;
         si.bound_rows = taps.attn_bound_rows;
         si.score = taps.attn_score_max;
@@ -622,7 +640,7 @@ private:
     std::unique_ptr<blk::DeviceForward> dev_;
     blk::BlockSource& blocks_;
     const blk::PackedLayout& L_;
-    blk::GemmDeviceLinear lin_;
+    std::unique_ptr<blk::GemmDeviceLinear> lin_;
     blk::FlashDeviceAttention fa_;
     int fbc_reuses_ = 0;
     const blk::SparseAccel* sparse_ = nullptr;
@@ -862,8 +880,9 @@ private:
 };
 
 // Rank 1: DiT weights (loaded at start in the background unless `shared` hands over rank 0's model: emulate) and the
-// video VAE; serves rank 0 until END.
-int serve_rank1(const Args& a, sd::Communicator& comm, ModelSlot* shared) {
+// video VAE; serves rank 0 until END. `connect` returns the communicator (it waits for the pairing, which runs on its own
+// thread from program entry while the checkpoint is opened and the DiT load starts).
+int serve_rank1(const Args& a, const std::function<sd::Communicator&()>& connect, ModelSlot* shared) {
     auto say = [](const char* fmt, auto... v) {
         std::printf("[rank1] ");
         std::printf(fmt, v...);
@@ -871,7 +890,6 @@ int serve_rank1(const Args& a, sd::Communicator& comm, ModelSlot* shared) {
         std::fflush(stdout);
     };
     const double t_all = now_s();
-    Link link(comm);
     blk::SafeTensors st(a.ckpt);
     std::unique_ptr<blk::LoraDiffs> diffs;  // step LoRA: full-weight deltas on the host weights before upload
     if (!a.step_lora.empty()) diffs = std::make_unique<blk::LoraDiffs>(a.step_lora_file, a.lora_strength);
@@ -901,6 +919,8 @@ int serve_rank1(const Args& a, sd::Communicator& comm, ModelSlot* shared) {
             say("DiT weights resident: %.1f GB in %.1f s", m->resident_bytes() / 1e9, now_s() - t0);
             return m;
         });
+    sd::Communicator& comm = connect();
+    Link link(comm);
     std::shared_ptr<const blk::GlobalWeights> gkeep;  // emulate: rank 0's weights the shared model borrows (outlives model)
     std::shared_ptr<dst::DeviceModel> model;
     std::unique_ptr<blk::PackedLayout> lay;
@@ -1058,7 +1078,16 @@ int serve_rank1(const Args& a, sd::Communicator& comm, ModelSlot* shared) {
 struct RankCtx {
 #ifdef H3_CLIP_DIST
     Link* link = nullptr;                             // world 2: the control link to rank 1
+    std::function<Link*()> connect;                   // world 2 while the pairing still runs: waits for it, returns the link
     ModelSlot* slot = nullptr;                          // emulate: hands rank 0's model to the rank 1 thread
+    bool world2() const { return link != nullptr || static_cast<bool>(connect); }
+    Link* peer() {
+        if (!link && connect) {
+            link = connect();
+            connect = nullptr;
+        }
+        return link;
+    }
 #endif
 };
 
@@ -1150,18 +1179,6 @@ int run_decode_only(const Args& a) {
 // Rank 0 (and world 1): the whole clip.
 int run_rank0(const Args& a, RankCtx& ctx) {
     {
-#ifdef H3_CLIP_DIST
-        bool peer_open = ctx.link != nullptr;
-        auto end_peer = [&]() {
-            if (!peer_open) return;
-            Ctl c;
-            c.cmd = kEnd;
-            ctx.link->ctl(c);
-            peer_open = false;
-        };
-#else
-        auto end_peer = []() {};
-#endif
         const Temporal tm = temporal_shape(a.length);
         const int lh = a.height / 16, lw = a.width / 16;
         std::filesystem::create_directories(a.out);
@@ -1175,22 +1192,40 @@ int run_rank0(const Args& a, RankCtx& ctx) {
         auto left = [&]() { return a.budget - (now_s() - t_all); };
         const std::string assets = shared_assets(a);
 #ifdef H3_CLIP_DIST
-        if (ctx.link) {  // HELLO: rank 1 must run the same binary on the same assets and flags (else both exit)
+        // world 2: the link to rank 1 at its first use (the pairing runs on its own thread from program entry, alongside
+        // the text encoder and the DiT residency), then HELLO: rank 1 must run the same binary on the same assets and
+        // flags (else both exit)
+        bool peer_open = ctx.world2(), hello_done = false;
+        auto peer_link = [&]() -> Link* {
+            Link* l = ctx.peer();
+            if (!l || hello_done) return l;
+            hello_done = true;
             Ctl c;
             c.cmd = kHello;
-            ctx.link->ctl(c);
+            l->ctl(c);
             std::array<std::uint8_t, 32> mine{}, peer{};
             {
                 te::Sha256 h;
                 h.update(assets.data(), assets.size());
                 mine = h.finish();
             }
-            peer = ctx.link->swap(mine);
+            peer = l->swap(mine);
             if (peer != mine) {
-                ctx.link->comm().cancel_pending("h3 clip: assets / binary / flags differ between the ranks");
+                l->comm().cancel_pending("h3 clip: assets / binary / flags differ between the ranks");
                 throw std::runtime_error("rank 1 runs a different binary, assets or accelerator flags (HELLO digest mismatch)");
             }
-        }
+            return l;
+        };
+        if (ctx.link) static_cast<void>(peer_link());  // link already up (emulate): HELLO before any model work
+        auto end_peer = [&]() {
+            if (!peer_open) return;
+            Ctl c;
+            c.cmd = kEnd;
+            peer_link()->ctl(c);
+            peer_open = false;
+        };
+#else
+        auto end_peer = []() {};
 #endif
         {
             std::ostringstream id;
@@ -1253,29 +1288,47 @@ int run_rank0(const Args& a, RankCtx& ctx) {
             end_peer();
             return 3;
         }
-        t0 = now_s();
         std::vector<float> hidden = read_vec<float>(od / "te_hidden_f32.bin");
         te::EncodeTimings et;
         double te_load_s = 0, te_ms = 0;
-        if (hidden.size() == static_cast<std::size_t>(L) * blk::kTextDim) {
-            std::printf("[te] %u tokens; reused te_hidden_f32.bin\n", L);
-        } else {
+        const bool te_reused = hidden.size() == static_cast<std::size_t>(L) * blk::kTextDim;
+        auto run_te = [&]() {
+            double tt = now_s();
             {
                 auto enc = te::TextEncoder::load(a.te_pack);
-                te_load_s = now_s() - t0;
-                t0 = now_s();
+                te_load_s = now_s() - tt;
+                tt = now_s();
                 hidden = enc->encode(pres.ids, &et);
             }
-            te_ms = (now_s() - t0) * 1e3;
-            std::printf("[te] %u tokens; tokenize %.1f ms, load %.1f s, encode %.1f ms (forward %.1f), hidden rms %.3f\n", L, tok_ms,
-                te_load_s, te_ms, et.forward_ms, rms(hidden));
-            if (hidden.size() != static_cast<std::size_t>(L) * blk::kTextDim) throw std::runtime_error("text encoder output size");
-            write_bin(od / "te_hidden_f32.bin", hidden.data(), hidden.size() * 4);
+            te_ms = (now_s() - tt) * 1e3;
+        };
+        std::vector<std::uint16_t> text_bf16;  // the DiT's inference dtype
+        auto finish_te = [&](const char* how) {
+            if (te_reused) {
+                std::printf("[te] %u tokens; reused te_hidden_f32.bin\n", L);
+            } else {
+                std::printf("[te] %u tokens; tokenize %.1f ms, load %.1f s, encode %.1f ms (forward %.1f), hidden rms %.3f%s\n", L, tok_ms,
+                    te_load_s, te_ms, et.forward_ms, rms(hidden), how);
+                if (hidden.size() != static_cast<std::size_t>(L) * blk::kTextDim) throw std::runtime_error("text encoder output size");
+                write_bin(od / "te_hidden_f32.bin", hidden.data(), hidden.size() * 4);
+            }
+            std::fflush(stdout);
+            text_bf16 = to_bf16(hidden);
+            hidden.clear();
+            hidden.shrink_to_fit();
+        };
+        // One node: eager residency (all blocks before step 1, read ahead block by block) pays when it hides under the text
+        // encoder, i.e. for short steps; for long steps the lazy upload hides under step 1's compute instead.
+        const bool single_eager = a.dit == "single" && (a.prepare == "eager" || (a.prepare == "auto" && step_est <= kEagerStepMaxS));
+        // The text encoder runs on its own thread while the DiT checkpoint is read and made resident (two-node schedule,
+        // eager single node); the same encoder and DiT arithmetic, peak memory holds both. --serial-te: TE first.
+        const bool te_alongside = !te_reused && !dit_done && !a.serial_te && (a.dit == "dist" || single_eager);
+        std::future<strix::h3::Timed<void>> te_job;
+        if (te_alongside) te_job = strix::h3::start_alongside(run_te);
+        else {
+            if (!te_reused) run_te();
+            finish_te("");
         }
-        std::fflush(stdout);
-        const std::vector<std::uint16_t> text_bf16 = to_bf16(hidden);  // the DiT's inference dtype
-        hidden.clear();
-        hidden.shrink_to_fit();
 
         // ---- 2. DiT: refiner + sampler
         t0 = now_s();
@@ -1313,7 +1366,35 @@ int run_rank0(const Args& a, RankCtx& ctx) {
             final_audio = read_vec<float>(od / "latent_audio_f32.bin");
             if (final_video.size() != nv || final_audio.size() != na) throw std::runtime_error("final latents unreadable");
         }
-        double refiner_ms = 0, dit_load_s = 0, steps_s = 0;
+        double refiner_ms = 0, dit_load_s = 0, steps_s = 0, dit_res_s = 0, te_wait_s = 0, te_thread_s = 0;
+        // rank 0's video decoder (fast 24L or 36L), loaded on a thread during sampling unless --serial-vae
+        struct VideoVae {
+            std::unique_ptr<vae::fast::GpuDecoder> fast;
+            std::unique_ptr<vae::GpuDecoder> full;
+        };
+        auto load_video_vae = [&a]() {
+            VideoVae v;
+            if (a.fast_vae) v.fast = std::make_unique<vae::fast::GpuDecoder>(a.fast_vae_weights);
+            else v.full = std::make_unique<vae::GpuDecoder>(a.vae_video);
+            return v;
+        };
+        std::future<strix::h3::Timed<VideoVae>> vae_job;
+        double vload_bg = -1;  // seconds of the load during sampling (-1: loaded in the VAE stage)
+        auto take_vae = [&]() {
+            if (!vae_job.valid()) return load_video_vae();
+            auto t = vae_job.get();
+            vload_bg = t.seconds;
+            return std::move(t.value);
+        };
+        // the VAE stage's measured (else modelled) time of THIS route (36L: calls split over the ranks; fast 24L: the
+        // whole clip on rank 0 alone)
+        auto vae_estimate = [&]() {
+            const int calls = vae::make_plan(tm.latent_t, lh, lw).calls();
+            const double rec_vae = read_timings(od / "timing.txt").vae_s;
+            return rec_vae > 0 ? rec_vae * 1.1 + 10.0
+                               : (a.fast_vae ? fast_vae_model_s(tm.latent_t, lh, lw) : calls * a.vae_s_per_call / static_cast<double>(a.world) + 20.0) +
+                    15.0;
+        };
         std::vector<double> step_ms;
         std::uint64_t flushed_total = 0;
         double attn_score = 0;
@@ -1357,6 +1438,39 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 dev->set_accel(ao);
                 dev->reset_accel_run();
             }
+            // DiT residency (alongside the text encoder when te_alongside): the two-node model, or the eager single node
+            // (block k + 1 read on a worker while block k uploads); the lazy single node uploads during step 1
+            std::unique_ptr<blk::GemmDeviceLinear> lin;
+#ifdef H3_CLIP_DIST
+            std::shared_ptr<dst::DeviceModel> dist_model;
+#endif
+            {
+                const double tr = now_s();
+                if (a.dit == "single") {
+                    lin = std::make_unique<blk::GemmDeviceLinear>(S, !lora_bypass(a));
+                    if (single_eager) {
+                        dev->prepare(blocks, *lin);
+                        dit_res_s = now_s() - tr;
+                        std::printf("[dit] 1 node: %u blocks, %.1f GB resident before step 1 in %.1f s%s\n", blocks.num_blocks(),
+                            static_cast<double>(lin->resident_bytes()) / 1e9, dit_res_s, te_alongside ? " (alongside the text encoder)" : "");
+                    }
+                } else {
+#ifdef H3_CLIP_DIST
+                    dist_model = std::make_shared<dst::DeviceModel>(g, blocks, blk::count_blocks(st), lora_bypass(a));
+                    dit_res_s = now_s() - tr;
+                    std::printf("[dit] dist model: %u blocks, %.1f GB resident in %.1f s%s\n", dist_model->num_blocks(), dist_model->resident_bytes() / 1e9,
+                        dit_res_s, te_alongside ? " (alongside the text encoder)" : "");
+#endif
+                }
+            }
+            if (te_alongside) {
+                const double tw = now_s();
+                te_thread_s = te_job.get().seconds;
+                te_wait_s = now_s() - tw;
+                finish_te(" (alongside the DiT residency)");
+                std::printf("[te] text encoder thread %.1f s, DiT residency %.1f s, waited %.1f s for the text encoder\n", te_thread_s, dit_res_s,
+                    te_wait_s);
+            }
             std::vector<std::uint16_t> refined;
             {
                 blk::FlashDeviceAttention rfa;
@@ -1374,19 +1488,16 @@ int run_rank0(const Args& a, RankCtx& ctx) {
 #endif
             std::unique_ptr<DitBackend> backend;
             if (a.dit == "single") {
-                backend = std::make_unique<SingleBackend>(std::move(dev), blocks, lay, !lora_bypass(a), sparse.get());
+                backend = std::make_unique<SingleBackend>(std::move(dev), blocks, lay, std::move(lin), sparse.get());
             } else {
 #ifdef H3_CLIP_DIST
                 dev.reset();
-                const double tm0 = now_s();
-                auto model = std::make_shared<dst::DeviceModel>(g, blocks, blk::count_blocks(st), lora_bypass(a));
-                std::printf("[dit] dist model: %u blocks, %.1f GB resident in %.1f s\n", model->num_blocks(), model->resident_bytes() / 1e9,
-                    now_s() - tm0);
                 if (ctx.slot) {
                     ctx.slot->g = g_owned;
-                    ctx.slot->model = model;
+                    ctx.slot->model = dist_model;
                 }
-                if (ctx.link) {
+                if (ctx.world2()) {
+                    Link* link = peer_link();  // the pairing ran alongside everything above
                     Ctl c;
                     c.cmd = kBegin;
                     c.a[0] = L;
@@ -1400,15 +1511,15 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                     c.a[8] = accel_flags(a);
                     c.a[9] = f64bits(a.fbc_threshold);
                     const double tb = now_s();
-                    ctx.link->ctl(c);
-                    ctx.link->bcast(refined.data(), refined.size() * 2, true);
-                    ensure_capacity(ctx.link->comm(), clip_split(a, S));
+                    link->ctl(c);
+                    link->bcast(refined.data(), refined.size() * 2, true);
+                    ensure_capacity(link->comm(), clip_split(a, S));
                     std::printf("[dit] BEGIN sent to rank 1 (%.2f s incl. waiting for its weights)\n", now_s() - tb);
                 }
                 dacc = make_dist_accel(a, turbo.get());
                 const dst::Split split = clip_split(a, S);
                 if (a.sparse) std::printf("[sparse] %s on the two-node schedule: split cut %u of S=%u (both worlds)\n", blk::SparseAccel::kIdentity, split.cut, S);
-                backend = std::make_unique<DistBackend>(g, std::move(model), lay, split, ctx.link, dacc.get());
+                backend = std::make_unique<DistBackend>(g, std::move(dist_model), lay, split, ctx.peer(), dacc.get());
 #endif
             }
             std::fflush(stdout);
@@ -1454,7 +1565,7 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 ++step;
                 std::printf("[step %d/%d] sigma %.6f: %.1f ms%s (host prep %.1f ms, final %.1f ms, flushed %llu, contract %.0f, bound_rows %llu) "
                             "vhash %016llx %016llx%s%s\n",
-                    step, a.steps, sigma, ms, step_ms.size() == 1 && a.dit == "single" ? " incl. DiT weight upload" : "", si.host_prep_ms,
+                    step, a.steps, sigma, ms, step_ms.size() == 1 && a.dit == "single" && !single_eager ? " incl. DiT weight upload" : "", si.host_prep_ms,
                     si.final_ms, static_cast<unsigned long long>(si.flushed), si.score, static_cast<unsigned long long>(si.bound_rows),
                     static_cast<unsigned long long>(fnv_vec(so.video_neg_v)), static_cast<unsigned long long>(fnv_vec(so.audio_neg_v)),
                     si.extra.empty() ? "" : " | ", si.extra.c_str());
@@ -1489,6 +1600,10 @@ int run_rank0(const Args& a, RankCtx& ctx) {
             const double ts0 = now_s();
             const blk::SamplerKind kind = a.sampler == "euler" ? blk::SamplerKind::euler : blk::SamplerKind::res_multistep;
             const std::size_t nsteps = sig.size() - 1;
+            // The video VAE loads on a thread during sampling; decoding waits for it. Only when the remaining steps and
+            // the VAE stage are predicted to fit the budget (a budget stop waits for the load before it returns).
+            if (!a.serial_vae && left() > static_cast<double>(nsteps - carry.next) * step_est * 1.15 + vae_estimate())
+                vae_job = strix::h3::start_alongside(load_video_vae);
             const double setup_s = now_s() - t_all;
             while (carry.next < nsteps) {
                 // one step at a time; checkpoint after each; stop when the next step would not fit (every step, also
@@ -1538,11 +1653,7 @@ int run_rank0(const Args& a, RankCtx& ctx) {
         {
             const int calls = vae::make_plan(tm.latent_t, lh, lw).calls();
             // the VAE is not resumable inside: start it only when the measured (else modelled) time of THIS route fits
-            // (36L: calls split over the ranks; fast 24L: the whole clip on rank 0 alone)
-            const double rec_vae = read_timings(od / "timing.txt").vae_s;
-            const double est = rec_vae > 0 ? rec_vae * 1.1 + 10.0
-                                           : (a.fast_vae ? fast_vae_model_s(tm.latent_t, lh, lw)
-                                                         : calls * a.vae_s_per_call / static_cast<double>(a.world) + 20.0) + 15.0;
+            const double est = vae_estimate();
             if (left() < est) {
                 std::printf("[vae] %d decoder calls (~%.0f s) do not fit the budget (%.0f s left); rerun to decode\n", calls, est, left());
                 end_peer();
@@ -1568,7 +1679,8 @@ int run_rank0(const Args& a, RankCtx& ctx) {
             vae::H16 z(final_video.size());
             for (std::size_t i = 0; i < z.size(); ++i) z[i] = vae::f2h(final_video[i]);  // the VAE's fp16 input
 #ifdef H3_CLIP_DIST
-            if (ctx.link && !a.fast_vae) {
+            if (ctx.world2() && !a.fast_vae) {
+                Link* link = peer_link();
                 // calls split at n/2 + shift (shift = calls moved to rank 0; rank 0 also runs the audio VAE); rank 1
                 // streams its pieces (chunk canvases / the cut chunk's tiles) while it decodes, a receive thread here
                 // pushes them into the assembler next to rank 0's own pieces: the same frames as one node, any cut.
@@ -1582,8 +1694,8 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 c.a[3] = static_cast<std::uint64_t>(r1.first);
                 c.a[4] = static_cast<std::uint64_t>(r1.last);
                 c.a[5] = z.size() * 2;
-                ctx.link->ctl(c);
-                ctx.link->bcast(z.data(), z.size() * 2, true);
+                link->ctl(c);
+                link->bcast(z.data(), z.size() * 2, true);
                 vae::FrameAssembler fa(plan);
                 std::exception_ptr rx_err;
                 std::size_t rx_bytes = 0, rx_pieces = 0;
@@ -1591,10 +1703,10 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 std::thread rx([&]() {
                     try {
                         for (;;) {
-                            const std::uint64_t n = ctx.link->swap(std::uint64_t{0});
+                            const std::uint64_t n = link->swap(std::uint64_t{0});
                             if (n == 0) break;
                             std::vector<std::uint8_t> b(n);
-                            ctx.link->bcast(b.data(), b.size(), false);
+                            link->bcast(b.data(), b.size(), false);
                             fa.push(vae::unpack_piece(plan, b.data(), b.size()));
                             rx_bytes += n;
                             ++rx_pieces;
@@ -1608,7 +1720,8 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 try {
                     if (test_hook("H3_CLIP_TEST_FAIL") == "vae-rank0") throw std::runtime_error("injected failure (H3_CLIP_TEST_FAIL=vae-rank0)");
                     {
-                        vae::GpuDecoder vd(a.vae_video);
+                        VideoVae pre = take_vae();
+                        vae::GpuDecoder& vd = *pre.full;
                         vload_s = now_s() - t0;
                         const vae::H16 zp = vae::denormalize_and_pad(plan, z, vd.head().latents_mean.data(), vd.head().latents_std.data());
                         vd.decode_pieces(plan, zp, r0, [&](vae::DecodePiece&& x) { fa.push(std::move(x)); });
@@ -1620,7 +1733,7 @@ int run_rank0(const Args& a, RankCtx& ctx) {
                 } catch (...) {
                     // cancel FIRST (the receive thread may be blocked in an exchange), then join: never unwind past a
                     // joinable thread; the peer fails at its next exchange
-                    ctx.link->comm().cancel_pending("h3 clip rank 0: VAE stage failed");
+                    link->comm().cancel_pending("h3 clip rank 0: VAE stage failed");
                     rx.join();
                     throw;
                 }
@@ -1637,19 +1750,20 @@ int run_rank0(const Args& a, RankCtx& ctx) {
             } else
 #endif
             if (a.fast_vae) {  // h3-vae-fast24-v1: the whole clip in one pass on rank 0 (world 2: rank 1 only gets END)
-                vae::fast::GpuDecoder vd(a.fast_vae_weights);
+                VideoVae pre = take_vae();
                 vload_s = now_s() - t0;
-                frames = vd.decode(z, tm.latent_t, lh, lw, &vdec_s);
+                frames = pre.fast->decode(z, tm.latent_t, lh, lw, &vdec_s);
                 std::printf("[vae] fast 24L decoder (%s, FAST-class)\n", vae::fast::kIdentity);
             } else {
-                vae::GpuDecoder vd(a.vae_video);
+                VideoVae pre = take_vae();
                 vload_s = now_s() - t0;
-                frames = vd.decode(z, tm.latent_t, lh, lw, &vdec_s);
+                frames = pre.full->decode(z, tm.latent_t, lh, lw, &vdec_s);
             }
         }
         const std::size_t plane = static_cast<std::size_t>(a.height) * a.width;
         const std::size_t F = frames.size() / (3 * plane);
         std::printf("[vae] video: load %.1f s, decode %.1f s -> %zu frames %dx%d\n", vload_s, vdec_s, F, a.width, a.height);
+        if (vload_bg >= 0) std::printf("[vae] video decoder loaded during sampling in %.1f s (load above = the wait for it)\n", vload_bg);
         std::fflush(stdout);
         if (wave.empty()) decode_audio();
         const std::size_t samples = wave.size() / 2;
@@ -1686,7 +1800,8 @@ int run_rank0(const Args& a, RankCtx& ctx) {
               << "  \"timings_s\": {\"te_load\": " << te_load_s << ", \"te_encode\": " << te_ms / 1e3 << ", \"refiner\": " << refiner_ms / 1e3
               << ", \"dit_setup\": " << dit_load_s << ", \"sampling\": " << steps_s << ", \"step_first\": " << step_ms.front() / 1e3
               << ", \"step_steady\": " << steady / 1e3 << ", \"vae_video_load\": " << vload_s << ", \"vae_video\": " << vdec_s
-              << ", \"vae_audio_load\": " << aload_s << ", \"vae_audio\": " << adec_ms / 1e3 << ", \"dump\": " << dump_ms / 1e3
+              << ", \"vae_video_load_during_sampling\": " << std::max(vload_bg, 0.0) << ", \"dit_residency\": " << dit_res_s
+              << ", \"te_thread_alongside_dit\": " << te_thread_s << ", \"te_wait\": " << te_wait_s << ", \"vae_audio_load\": " << aload_s << ", \"vae_audio\": " << adec_ms / 1e3 << ", \"dump\": " << dump_ms / 1e3
               << ", \"total\": " << total_s << "},\n"
               << "  \"flushed_groups_total\": " << flushed_total << ", \"attn_contract_max\": " << attn_score << "\n}\n";
             m.flush();
@@ -1736,7 +1851,7 @@ int main(int argc, char** argv) {
             std::thread th([&, t = std::move(tp1)]() mutable {
                 try {
                     sd::Communicator c1(group1, std::move(t), initial_bytes);
-                    rc1 = serve_rank1(a, c1, &slot);
+                    rc1 = serve_rank1(a, [&c1]() -> sd::Communicator& { return c1; }, &slot);
                 } catch (...) {
                     err1 = std::current_exception();
                 }
@@ -1760,20 +1875,36 @@ int main(int argc, char** argv) {
             if (err1) std::rethrow_exception(err1);
             return rc0 ? rc0 : rc1;
         }
-        sd::Usb4AutoOptions o;
-        o.rank = static_cast<std::uint32_t>(a.rank);
-        o.timeout = std::chrono::milliseconds(240000);  // the ranks reach the rendezvous at different times
-        sd::Usb4Topology topo;
-        const double t0 = now_s();
-        auto t = sd::usb4_host_auto(o, &topo);
-        std::printf("[rank%d] transport %s (%.1f s)\n%s\n", a.rank, t->name().c_str(), now_s() - t0, topo.receipt().c_str());
-        std::fflush(stdout);
-        sd::Communicator comm(a.rank ? group1 : group0, std::move(t), initial_bytes);
-        if (a.rank == 1) return serve_rank1(a, comm, nullptr);
-        Link link(comm);
-        RankCtx ctx;
-        ctx.link = &link;
-        return run_rank0(a, ctx);
+        // The pairing runs on its own thread from here; each rank waits for it at its first message (rank 0: BEGIN, after
+        // the text encoder and the DiT residency; rank 1: after its checkpoint is open and the DiT load has started).
+        dst::PairLinkJob pairing = dst::start_pair_link(dst::pair_link_options(static_cast<std::uint32_t>(a.rank)));
+        std::unique_ptr<sd::Communicator> comm;
+        auto connect = [&]() -> sd::Communicator& {
+            const double tw = now_s();
+            auto paired = pairing.get();
+            std::printf("[rank%d] transport %s (%.1f s; on its own thread from start, waited %.1f s)\n%s\n", a.rank,
+                paired.value.transport->name().c_str(), paired.seconds, now_s() - tw, paired.value.topology.receipt().c_str());
+            std::fflush(stdout);
+            comm = std::make_unique<sd::Communicator>(a.rank ? group1 : group0, std::move(paired.value.transport), initial_bytes);
+            return *comm;
+        };
+        std::unique_ptr<Link> link;
+        try {
+            if (a.rank == 1) return serve_rank1(a, connect, nullptr);
+            RankCtx ctx;
+            ctx.connect = [&]() {
+                link = std::make_unique<Link>(connect());
+                return link.get();
+            };
+            return run_rank0(a, ctx);
+        } catch (const std::exception& e) {
+            if (!pairing.valid()) throw;
+            // failed before the pairing finished: do not wait up to its timeout for a peer that will get no message
+            std::fprintf(stderr, "strix-h3-clip: %s\n", e.what());
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
 #else
         throw std::runtime_error("world 2 needs the two-node schedule (dist package) in the build");
 #endif

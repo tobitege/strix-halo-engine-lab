@@ -57,6 +57,9 @@
 
 #include "glm/engine/glm_mem.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
+#include "glm_deploy_owners.hpp"
+#include "glm/load/glm_rank_plan.hpp"
+#include "glm/xfer/glm_xfer_exchange.hpp"
 #include "glm/rtxpf/import/glm_import_socket.hpp"
 #include "glm/serve/glm_serve_control.hpp"
 #include "glm/serve/glm_serve_import.hpp"
@@ -97,6 +100,7 @@ namespace sv = strix::serve;
 namespace rd = strix::glm::rank_defaults;
 namespace sp = strix::glm::spec;
 namespace gi = strix::glm::import;
+#include "glm_deploy.inc"
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_signal{0};
@@ -721,13 +725,14 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
+                                 "[--host H] [--port P] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
         }
         const auto t_start = std::chrono::steady_clock::now();
         ge::Options opt;
+        GlmDeployment deployment;
         opt.model_dir = argv[1];
         opt.slots = 8;
         std::string transport_spec, host = "127.0.0.1", model_id = "glm-5.3-flash", api_key_file;
@@ -755,7 +760,9 @@ int main(int argc, char** argv) {
                 if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
                 return argv[++i];
             };
-            if (a == "--world") { rank_args.push_back(a); rank_args.push_back(next()); opt.world = static_cast<std::uint32_t>(std::stoul(rank_args.back())); }
+            if (a == "--deploy") deployment.file = next();
+            else if (a == "--deploy-check") deployment.check = true;
+            else if (a == "--world") { rank_args.push_back(a); rank_args.push_back(next()); opt.world = static_cast<std::uint32_t>(std::stoul(rank_args.back())); }
             else if (a == "--identity" || a == "--prefill" || a == "--max-rows" || a == "--decode-xch" || a == "--mtp-k" ||
                      a == "--mtp-adaptive" || a == "--mtp-spec") {
                 rank_args.push_back(a);
@@ -835,6 +842,14 @@ int main(int argc, char** argv) {
         rd::fallback_without_handshake(eff, request, rd::process_env());
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
         if (rd::max_rows_auto(eff)) eff.max_rows = {std::to_string(rd::kFallbackMaxRows), "auto-4096-serve"};
+        if (!deployment.file.empty() || deployment.check) {
+            opt.mtp = mtp_on; opt.spec = mtp_on;
+            std::string refusal;
+            if (prefix_cache_bytes || !import_listen.empty() || !rtx_prefill.empty())
+                refusal = "GLM deployment: prefix cache/import peak owners not sized; disable those routes";
+            deployment.prepare(opt, eff, transport_spec, refusal);
+            if (deployment.check || print_config) return deployment.inspect(opt.rank);
+        }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
             std::printf("serve slots=%u capacity=%llu batch=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
@@ -875,6 +890,7 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             std::string receipt;
             auto transport = strix::glm::rank_transport::open_transport(transport_spec, opt.rank, receipt);
+            if (deployment.provider) deployment.resolve_live(opt, *transport);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
@@ -916,6 +932,7 @@ int main(int argc, char** argv) {
                      std::to_string(eng.prefill_pipeline()) + " mtp " + std::to_string(mtp_on ? 1 : 0) + " g2 " + std::to_string(serve_g2 ? 1 : 0) +
                      " kmax " + std::to_string(eff.kmax) + " adaptive " + std::to_string(eff.adaptive ? 1 : 0) + "\n";
             hello.identity_hash = gs::fnv1a64(ident);
+            if (deployment.plan) hello.identity_hash = gs::fnv1a64(deployment.plan->hash(), hello.identity_hash);
         }
         hello.capacity = opt.capacity;
         hello.slots = opt.slots;
@@ -1372,6 +1389,14 @@ int main(int argc, char** argv) {
         config.model_id = model_id;
         config.default_max_tokens = max_tokens;
         config.http_slots = serial ? 1U : opt.slots;
+        if (deployment.plan) {
+            config.deployment.deployment_json = [p = deployment.plan] { return p->to_json(); };
+            config.deployment.deployment_id = [p = deployment.plan] { return p->hash(); };
+        }
+        config.deployment.capacity_provider = [&lead, &queue, slots = config.http_slots] {
+            const auto q = queue.snapshot();
+            return sv::ServeCapacity{slots, lead.stats().active, std::nullopt, q.queued};
+        };
         config.default_thinking = true;  // the GLM generation prompt ends inside <think>
         config.sampling_policy = "greedy";
         config.chat_renderer = [](const sv::ChatTemplateInput& in) { return sv::render_glm_chat(in); };

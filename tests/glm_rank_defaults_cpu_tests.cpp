@@ -112,10 +112,11 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 40);  // one item per environment selector
+    CHECK(rd::env_items().size() == 41);  // one item per environment selector
     const auto normal = resolve({}, {});
     const auto baseline = resolve({"--baseline"}, {});
     for (const auto& [key, off] : Env{{"STRIX_GLM_PF_SEQPAR", "0"}, {"STRIX_GLM_PF_AUX_COMBINE", "0"},
+                                     {"STRIX_GLM_PF_IN_TOKEN", "0"},
                                      {"STRIX_GLM_PF_SCRATCH", "full"}, {"STRIX_GLM_PF_ATTN_QWIN", "0"}}) {
         CHECK(baseline.env.at(key).value == off);
         CHECK(baseline.env.at(key).source == "baseline");

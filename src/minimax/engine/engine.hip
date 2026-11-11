@@ -25,6 +25,7 @@
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/deploy/device.hpp"
 
 #include <strix_trellis.h>
 
@@ -46,6 +47,21 @@ extern "C" int strix_trellis_lab_last_tile() __attribute__((weak));
 namespace strix::minimax::engine {
 
 namespace {
+
+// Physical-device telemetry shares the deployment probe. Allocator admission and
+// nested allocation guards below retain hipMemGetInfo's established behavior.
+std::uint64_t device_used_bytes() {
+    bool selected = false;
+    for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
+        if (const char* value = std::getenv(name); value && *value) selected = true;
+    if (!selected) {
+        const auto facts = strix::deploy::probe_device();
+        if (facts.mem_total_bytes) return facts.mem_total_bytes - facts.mem_free_bytes;
+    }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    detail::hip_ok(hipMemGetInfo(&free_bytes, &total_bytes), "meminfo");
+    return total_bytes - free_bytes;
+}
 
 using namespace detail;
 namespace msa = strix::minimax::msa;
@@ -844,10 +860,8 @@ struct Engine::Impl {
             }
             hip_ok(hipDeviceSynchronize(), "load layer");
             if (L % 10 == 9) {
-                std::size_t fr = 0, tot = 0;
-                hip_ok(hipMemGetInfo(&fr, &tot), "meminfo");
                 std::printf("mm rank %u: loaded layers 0-%u, %.1f s, %.1f GiB read, device used %.1f GiB\n", rank, L,
-                            secs(t0, Clock::now()), pack.gib_read(), static_cast<double>(tot - fr) / 1073741824.0);
+                            secs(t0, Clock::now()), pack.gib_read(), static_cast<double>(device_used_bytes()) / 1073741824.0);
                 std::fflush(stdout);
             }
         }
@@ -860,9 +874,7 @@ struct Engine::Impl {
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
-        std::size_t fr = 0, tot = 0;
-        hip_ok(hipMemGetInfo(&fr, &tot), "meminfo");
-        r.device_gib = static_cast<double>(tot - fr) / 1073741824.0;
+        r.device_gib = static_cast<double>(device_used_bytes()) / 1073741824.0;
         r.direct_io = env_flag("STRIX_MM_LOAD_DIRECT", true);
         r.index_weight_bytes = index_bytes;
         r.index_weight_saved_bytes = index_saved;

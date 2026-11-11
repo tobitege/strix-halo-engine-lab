@@ -874,7 +874,29 @@ void test_request_fields() {
     check(without_offer == rig.engine.prompt() && offered != without_offer, "tool_choice none renders no tools");
 }
 
+void test_deployment_surface() {
+    Rig rig;
+    Writer absent; rig.api.handle(get("/v1/deployment"), absent);
+    check(absent.status == 404, "no active deployment is 404");
+    mo::MinimaxApiOptions options;
+    options.deployment.deployment_json = [] { return R"({"schema":"strix-deployment-v1"})"; };
+    options.deployment.deployment_id = [] { return "0123456789abcdef"; };
+    options.deployment.capacity_provider = [] { return sv::ServeCapacity{8, 0, 4096, 0}; };
+    mo::MinimaxApi api(fake_tokenizer(), rig.queue, options, rig.observer);
+    Writer plan; api.handle(get("/v1/deployment"), plan);
+    check(plan.status == 200 && plan.body == R"({"schema":"strix-deployment-v1"})", "shared plan handler");
+    Writer health; api.handle(get("/health"), health);
+    check(at(sv::parse_json(health.body), "deployment_id").as_string() == "0123456789abcdef", "health deployment identity");
+    Writer status; api.handle(get("/api/status"), status);
+    check(at(at(sv::parse_json(status.body), "capacity"), "kv_bytes_free").as_int() == 4096, "capacity callback");
+    Writer drained; api.handle(post("/admin/drain", ""), drained);
+    check(drained.status == 200 && at(sv::parse_json(drained.body), "drained").as_bool(), "shared drain handler");
+    Writer draining; api.handle(get("/health"), draining);
+    check(draining.status == 503 && !rig.queue.submit({}), "drain health and admission");
+}
+
 int main() {
+    test_deployment_surface();
     test_request_fields();
     test_unarmed_non_stream();
     test_armed_stream();

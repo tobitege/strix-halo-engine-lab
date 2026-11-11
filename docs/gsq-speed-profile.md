@@ -42,8 +42,8 @@ not the A8 dot4 identity. Measured against a float64 oracle (kernel suite): rela
 A8 dot4. Generated tokens therefore differ from the A8 path after a few dozen to a few hundred tokens, as production's
 fast prefill differs from its A8 prefill.
 
-Kernels: `src/hip_moe_gsq_f16_prefill.inc` (gate/up + down, every GSQ gate type x {Q2_0, IQ4_NL} down),
-`src/hip_moe_gsq_wmma_prefill.inc` (Q2_0 iu8 WMMA, exact to dot4), decoders in `src/hip_moe_gsq_weights.inc`. Tests:
+Kernels: `src/moe_core/hip_moe_gsq_f16_prefill.inc` (gate/up + down, every GSQ gate type x {Q2_0, IQ4_NL} down),
+`src/moe_core/hip_moe_gsq_wmma_prefill.inc` (Q2_0 iu8 WMMA, exact to dot4), decoders in `src/moe_core/hip_moe_gsq_weights.inc`. Tests:
 `ctest -R strix-hip-moe-prefill-gsq-tests`.
 
 ## Receipts

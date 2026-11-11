@@ -140,6 +140,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         geometry.compact_scores = geometry.compact_scores && item.qsa_score_ring_workspace_bytes != 0;
     };
     collect_geometry(plan);
+    auto slot_metadata = plan.host_metadata_payload_bytes;
     geometry.primary_compact_bytes = add(geometry.ring_bytes,geometry.terminal_logits_bytes);
     for (const auto rows : options.known_prefix_tail_rows) {
         const auto tail = make_plan(rows);
@@ -147,6 +148,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
             registered.growth=add(registered.growth,add(add(tail.arena.physical.total_bytes,add(8U,union_bytes)),
                 add(tail.host_metadata_payload_bytes,tail.qsa_score_ring_workspace_bytes)));
         collect_geometry(tail);
+        slot_metadata = add(slot_metadata, tail.host_metadata_payload_bytes);
         result.tails = add(result.tails, add(add(tail.arena.physical.total_bytes, 65552U),tail.qsa_score_ring_workspace_bytes));
         result.metadata = add(result.metadata, add(tail.host_metadata_payload_bytes, tail.host_metadata_payload_bytes));
         if (options.known_prefix_prefill_rows == 16384U)
@@ -194,6 +196,9 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         const auto external=qwen_prefill_external_memory(options,model);
         result.external_host=external.host;
         result.external_device=external.device;
+        result.http_slot_state = add(state.device_total_bytes, state.host_total_bytes);
+        result.http_slot_retained = http_slot_retained_bytes(state.device_total_bytes, state.host_total_bytes,
+            decode_scratch, slot_metadata, std::max(external.host, external.device));
     }
     result.organization.merge(std::map<std::string,std::uint64_t>{{"serial_execution_identity",compiled.execution_identity},
         {"serial_kernel_plan_identity",compiled.kernel_plan_identity},

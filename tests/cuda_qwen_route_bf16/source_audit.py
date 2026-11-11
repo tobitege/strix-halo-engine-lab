@@ -13,7 +13,7 @@ FILES = [
     "cmake/QwenCuda.cmake", "include/strix/prefill_identity.hpp",
     "include/strix/qwen_profile_table.hpp", "src/cuda/qwen_handoff.hpp",
     "src/cuda/qwen_handoff.cpp", "src/hip_moe_q4k_a8_known_rows.hip",
-    "src/hip_moe_experts_launcher.hip", "src/hip_moe_da16_down_body.inc",
+    "src/hip_moe_experts_launcher.hip", "src/moe_core/hip_moe_da16_down_body.inc",
     "src/hip_moe_prefill_commit.inc", "apps/cuda_qwen_prefix_cache.hpp",
     "src/cuda/qwen_prefix_identity.cpp", "tests/cuda/qwen_moe_tests.cu",
     "tests/cuda/qwen_route_bf16_e2e.cu",
@@ -64,6 +64,17 @@ def select_false(source, condition):
         source = source[:start] + source[else_open+1:else_end] + source[else_end+1:]
     return source
 
+def shared_include_paths(source):
+    # The historical parent may still include the two-line forwarding shims.
+    # Normalize only those includes; every implementation byte is still compared.
+    shims = {"hip_moe_" + name + ".inc" for name in (
+        "da16_down_body", "f16x_down_body", "f16x_project_body", "gsq_f16_prefill",
+        "gsq_weights", "gsq_wmma_prefill", "prefill_core2", "prefill_da16",
+        "prefill_g3", "prefill_p1", "prefill_p1da16")}
+    return re.sub(r'(?m)^(#include ")([^"\n]+)(")',
+                  lambda m: m[1] + ("moe_core/" if m[2] in shims else "") + m[2] + m[3], source)
+
+
 def checks(source, parent):
     out = {}
     def check(name, ok):
@@ -75,11 +86,11 @@ def checks(source, parent):
         "#if defined(__HIPCC__) || defined(__CUDACC__)\n__host__ __device__")
     check("helper_only_cuda_annotation_no_math_change", helper == expected)
     for name in ["src/hip_moe_route_bf16.inc", "src/hip_moe_q4k_a8_known_rows.hip",
-                 "src/hip_moe_experts_launcher.hip", "src/hip_moe_da16_down_body.inc",
+                 "src/hip_moe_experts_launcher.hip", "src/moe_core/hip_moe_da16_down_body.inc",
                  "src/hip_moe_prefill_commit.inc", "include/strix/prefill_identity.hpp",
                  "include/strix/qwen_profile_table.hpp", "src/cuda/qwen_handoff.hpp",
                  "src/cuda/qwen_handoff.cpp"]:
-        check("unchanged:" + name, source[name] == parent[name])
+        check("unchanged:" + name, shared_include_paths(source[name]) == shared_include_paths(parent[name]))
     moe = source["src/cuda/qwen_moe.cu"]
     old_moe = parent["src/cuda/qwen_moe.cu"]
     for name in ["down_kernel", "down_rows_kernel", "merge_kernel"]:

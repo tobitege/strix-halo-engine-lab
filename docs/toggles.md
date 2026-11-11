@@ -24,11 +24,19 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 
 | Profile | What it does |
 |---|---|
-| `--profile default` | Exact path. Same bits as the reference path. This is the default. |
+| `--profile default` | Current production path; exports no profile overrides. This is the default. |
 | `--profile fast` | Adds only qualified bit-changing options. Rows that are not qualified yet stay off (see `--allow-pending`). |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
 
-The FAST rows per engine are in [optimizations.md](optimizations.md#product-profiles-pair).
+Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
+MiniMax has no named product profile: `--profile NAME:PROMPT.u32:STEPS` runs a timed session.
+GLM rank accepts `--profile default|fast|quality` (also `--profile=NAME`); its bare `--profile` still enables kernel timing
+and can be combined with a named profile. GLM `fast` sets only `STRIX_GLM_PF_WMMA=1`; an explicit environment
+value wins, and `--baseline` / `STRIX_GLM_BASELINE=1` vetoes the profile addition. `quality` uses default settings
+with a notice. Both ranks must agree on the effective WMMA setting; existing startup guards still apply.
+
+See the [Qwen profiles](optimizations.md#qwen-product-profiles),
+[DeepSeek pair profiles](optimizations.md#product-profiles-pair) and [GLM FAST row](optimizations.md#glm-pf-wmma-x).
 FAST changes the numerics. Use it when throughput matters more than bit-identical output.
 
 | Switch | Engine | Default | What it does |
@@ -37,7 +45,7 @@ FAST changes the numerics. Use it when throughput matters more than bit-identica
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on in `fast`) | FP16 GDN chunk in prefill. |
 | `--prefill-exact-fp16` | qwen | off | Forces the exact FP16 prefill path. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Relaxed MoE epilogue. |
-| `STRIX_GLM_PF_WMMA=1` | glm | off | WMMA prefill. Opt-in FAST identity. |
+| `STRIX_GLM_PF_WMMA=1` | glm | off (on in rank `--profile fast`) | WMMA prefill. Opt-in FAST identity; `=0` disables even in `fast`. |
 
 ## The regime rule
 
@@ -119,7 +127,9 @@ Pair setup: [pair-setup.md](pair-setup.md).
 
 | Flag | Engine | Default | What it does |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | all | `default` | See [Profiles](#profiles-exact-vs-fast). |
+| `--profile default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `default` | See [Profiles](#profiles-exact-vs-fast). |
+| `--profile` (bare) | glm rank | off | Kernel timing; preserved alongside named profiles. |
+| `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Timed session, not a product profile. |
 | `--allow-pending` | pair apps | off | Lets `fast` apply rows that are not qualified yet. |
 | `--print-effective-config` | all | off | Prints the resolved configuration and exits before device work. |
 | `STRIX_DS41_BASELINE=1` | deepseek | off | Turns off every production default. Runs the plain command as it ran before. |
@@ -200,6 +210,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |
+| `STRIX_GLM_PF_IN_TOKEN` | glm | 1 | [glm-pf-in-token](optimizations.md#glm-pf-in-token) |
 | `STRIX_GLM_PF_KDA_PACK` | glm | 0 | [glm-pf-kda-pack](optimizations.md#glm-pf-kda-pack) |
 | `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
@@ -332,7 +343,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_XFER` | minimax | XFER on, PFX loaded, interleave on | [mm-routes](optimizations.md#mm-routes) |
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
-| `STRIX_MTP_PRIME_ROWS` | qwen | OFF (opt-in: STRIX_MTP_PRIME_ROWS=1) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
 ### Exact vs FAST (9)

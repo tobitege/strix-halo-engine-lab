@@ -1,4 +1,5 @@
 #include "strix/ctx_exact_memory.hpp"
+#include "strix/deploy/binding.hpp"
 #pragma once
 #include "strix/rotary_descriptor.hpp"
 #include "strix/qsa_committed_pool.hpp"
@@ -252,6 +253,9 @@ struct Options {
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
+    std::string deploy_file;
+    bool deploy_check = false;
+    std::shared_ptr<const strix::deploy::Spec> deployment_spec;
     bool print_model_graph = false, print_plan = false;
     bool print_cache_family = false;
     strix::RotaryDescriptor rotary = strix::RotaryDescriptor::native();
@@ -1976,6 +1980,12 @@ inline Options parse_options(
         if (argument == "--print-model-graph") { options.print_model_graph = true; continue; }
         if (argument == "--print-plan") { options.print_plan = true; continue; }
         if (argument == "--print-effective-config") { options.print_effective_config = true; continue; }
+        if (argument == "--deploy") {
+            if (!options.deploy_file.empty() || index + 1 >= argc) throw std::invalid_argument("--deploy requires one FILE|auto");
+            options.deploy_file = argv[++index];
+            continue;
+        }
+        if (argument == "--deploy-check") { options.deploy_check = true; options.print_effective_config = true; continue; }
         if (argument == "--known-prefix-window=0" || argument == "--known-prefix-full-rows=0" ||
             argument == "--known-prefix-expert-union=0" || argument == "--known-window-router-rows=0" ||
             argument == "--known-prefix-prefill-rows=0") {
@@ -3335,6 +3345,15 @@ inline Options parse_options(
                 throw std::invalid_argument("conflicting --rope-yarn and STRIX_QWEN_ROPE_YARN");
             yarn_factor = yarn_cli ? cli : env;
         }
+    }
+    if (!options.deploy_file.empty() || options.deploy_check) {
+        auto spec = strix::deploy::load_spec(options.deploy_file.empty() ? "auto" : options.deploy_file);
+        if (strix::deploy::pinned(spec, "context")) {
+            if (options.context_explicit && options.context_tokens != spec.context)
+                throw std::invalid_argument("deployment context pin differs from --context");
+            options.context_tokens = spec.context; options.context_explicit = true;
+        } else spec.context = static_cast<std::uint32_t>(options.context_tokens);
+        options.deployment_spec = std::make_shared<const strix::deploy::Spec>(std::move(spec));
     }
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);

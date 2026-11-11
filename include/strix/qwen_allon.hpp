@@ -45,8 +45,6 @@ inline constexpr std::array levers{
         "Q4_K gate/up direct-B fragments (plain CLI prefill only); native gate pending"},
     Lever{"qsa_kv_pair", "STRIX_QSA_FAST_KV_PAIR", "1", false,
         "single-image paired QSA attend loader; fixture byte-equal, native pending"},
-    Lever{"mtp_prime_rows", "STRIX_MTP_PRIME_ROWS", "1", false,
-        "262,144-token MTP prompt 210.9-213.2 -> 202.8-203.8 s, digests equal"},
     Lever{"mtp_device_handoff", "STRIX_MTP_DEVICE_HANDOFF", "1", false,
         "MTP cycle without a host fence; same launches and stream order"},
     Lever{"decode_fuse", "STRIX_QWEN_DECODE_FUSE", "1", false,

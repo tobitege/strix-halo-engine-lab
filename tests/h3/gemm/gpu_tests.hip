@@ -700,6 +700,9 @@ int main(int argc, char** argv) {
     test_projection<128U>(1U, 5376U, 128U, 16U);      // M = 1
     test_projection<256U>(1U, 14336U, 256U, 17U);
     test_projection<128U>(2400U, 512U, 256U, 18U);    // 10 row tiles: grouped raster crosses its 8-tile groups
+    test_projection<64U>(333U, 7168U, 448U, 23U);     // BN 64 (narrow image-scale tiles), 7 output tiles
+    test_projection<64U>(600U, 14336U, 128U, 24U);    // BN 64 at K 14336, 3 row tiles
+    test_packed_operand<64U>();
     test_projection<256U>(2305U, 256U, 512U, 19U);    // 10 row tiles, 2 output tiles, tail of 1 row
     test_swiglu_and_segments<128U>(259U, 21U);
     test_swiglu_and_segments<256U>(259U, 22U);

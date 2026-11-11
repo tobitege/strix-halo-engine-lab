@@ -26,6 +26,15 @@ inline bool http_slot_memory_fits(std::uint64_t retained, std::uint64_t active_p
     const auto remaining = bytes - headroom - retained;
     return remaining >= active_peak;
 }
+inline std::uint64_t http_slot_retained_bytes(std::uint64_t state_device, std::uint64_t state_host,
+    std::uint64_t arena, std::uint64_t metadata, std::uint64_t external) {
+    std::uint64_t total = 0;
+    for (const auto n : {state_device, state_host, arena, metadata, external}) {
+        if (n > UINT64_MAX-total) throw std::overflow_error("HTTP slot retained overflow");
+        total += n;
+    }
+    return total;
+}
 struct HttpServingMemory {
     std::uint64_t shared_host = 0, shared_device = 0, slot_host = 0, slot_device = 0;
 };

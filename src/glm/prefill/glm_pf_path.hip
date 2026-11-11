@@ -10,6 +10,7 @@
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/engine/glm_kvshard.hpp"
+#include "glm/xfer/glm_xfer_exchange.hpp"
 
 #include <strix_trellis.h>
 
@@ -603,6 +604,10 @@ PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64
     b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows, b.moe_route, b.attention_rows);
     b.workspace = tierb == TierB::wmma ? GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows) : 0;
     if (kv_shard) b.workspace += kKvShardPrefillTemporaryBytes;
+    // Covers both explicit/default pipeline 2, including seqpar auto admission.
+    // Native install_prefill separately admits this owner before constructing it.
+    if (kda_heads == 32 && mla_heads == 32 && tierb == TierB::gemv && !kv_shard && max_rows >= 2)
+        b.pipeline = xfer::SeqparExchange::workspace_bytes(max_rows);
     const std::uint64_t RC = std::max(8U, max_rows);
     b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + (5ULL + (mtp ? 9ULL : 0ULL)) * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
     return b;

@@ -151,7 +151,7 @@ void GenerationTicket::finish(GenerationStats stats, std::string error) {
 std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     auto ticket = std::make_shared<GenerationTicket>();
     const std::lock_guard lock(mutex_);
-    if (stopping_ || entries_.size() >= max_queued_) return nullptr;
+    if (stopping_ || draining_ || entries_.size() >= max_queued_) return nullptr;
     ticket->submitted_queue_position_ = entries_.size();
     ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
@@ -399,6 +399,35 @@ void GenerationQueue::observe_locked(const ObserveDelta& d) noexcept {
     o.computed_tokens += d.computed_tokens;
     o.ttft_seconds.add(d.ttft_bucket, d.ttft_seconds);
     o.decode_tokens_per_second.add(d.decode_bucket, d.decode_tokens_per_second);
+}
+
+bool GenerationQueue::begin_drain() {
+    const std::lock_guard lock(mutex_);
+    const bool first = !draining_;
+    draining_ = true;
+    return first;
+}
+
+bool GenerationQueue::draining() const {
+    const std::lock_guard lock(mutex_);
+    return draining_;
+}
+
+bool GenerationQueue::drained() const {
+    const std::lock_guard lock(mutex_);
+    return draining_ && totals_.running == 0 && totals_.queued == 0 && external_running_ == 0;
+}
+
+bool GenerationQueue::try_begin_external_work() {
+    const std::lock_guard lock(mutex_);
+    if (stopping_ || draining_) return false;
+    ++external_running_;
+    return true;
+}
+
+void GenerationQueue::finish_external_work() {
+    const std::lock_guard lock(mutex_);
+    --external_running_;
 }
 
 bool GenerationQueue::stopping() const {

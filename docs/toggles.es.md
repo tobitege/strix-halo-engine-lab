@@ -24,11 +24,20 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 | Perfil | Qué hace |
 |---|---|
-| `--profile default` | Ruta exacta. Los mismos bits que la ruta de referencia. Es el valor por defecto. |
+| `--profile default` | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
 | `--profile fast` | Añade solo opciones cualificadas que cambian bits. Las filas aún no cualificadas siguen apagadas (ver `--allow-pending`). |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
 
-Las filas FAST por motor están en [optimizations.md](optimizations.md#product-profiles-pair).
+Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
+MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
+los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM, `fast` solo activa `STRIX_GLM_PF_WMMA=1`;
+un valor explícito del entorno prevalece y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil.
+`quality` usa los ajustes por defecto y lo avisa. Ambos ranks deben acordar el valor efectivo de WMMA;
+siguen vigentes las guardas de arranque existentes.
+
+Véanse los [perfiles Qwen](optimizations.md#qwen-product-profiles),
+[perfiles del par DeepSeek](optimizations.md#product-profiles-pair) y la [fila FAST de GLM](optimizations.md#glm-pf-wmma-x).
 FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una salida idéntica bit a bit.
 
 | Interruptor | Motor | Por defecto | Qué hace |
@@ -37,7 +46,7 @@ FAST cambia la numérica. Úsalo cuando el rendimiento importe más que una sali
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on en `fast`) | Chunk GDN en FP16 durante el prefill. |
 | `--prefill-exact-fp16` | qwen | off | Fuerza la ruta de prefill FP16 exacta. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Epílogo MoE relajado. |
-| `STRIX_GLM_PF_WMMA=1` | glm | off | Prefill WMMA. Identidad FAST opcional. |
+| `STRIX_GLM_PF_WMMA=1` | glm | off (on con `--profile fast` en rank) | Prefill WMMA. Identidad FAST opcional; `=0` la desactiva incluso en `fast`. |
 
 ## La regla de régimen
 
@@ -119,7 +128,9 @@ Montaje del par: [pair-setup.es.md](pair-setup.es.md).
 
 | Flag | Motor | Por defecto | Qué hace |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | todos | `default` | Ver [Perfiles](#perfiles-exacto-frente-a-fast). |
+| `--profile default\|fast\|quality` | qwen, par deepseek, gemma4/nemotron, glm rank | `default` | Ver [Perfiles](#perfiles-exacto-frente-a-fast). |
+| `--profile` (sin valor) | glm rank | off | Tiempos de kernels; se conserva junto a los perfiles con nombre. |
+| `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Sesión con tiempos, no un perfil de producto. |
 | `--allow-pending` | apps de par | off | Deja que `fast` aplique filas aún no cualificadas. |
 | `--print-effective-config` | todos | off | Imprime la configuración resuelta y sale antes de tocar el dispositivo. |
 | `STRIX_DS41_BASELINE=1` | deepseek | off | Apaga todos los defaults de producción. Ejecuta el comando simple como antes. |
@@ -200,6 +211,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |
+| `STRIX_GLM_PF_IN_TOKEN` | glm | 1 | [glm-pf-in-token](optimizations.md#glm-pf-in-token) |
 | `STRIX_GLM_PF_KDA_PACK` | glm | 0 | [glm-pf-kda-pack](optimizations.md#glm-pf-kda-pack) |
 | `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
@@ -332,7 +344,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_XFER` | minimax | XFER on, PFX loaded, interleave on | [mm-routes](optimizations.md#mm-routes) |
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
-| `STRIX_MTP_PRIME_ROWS` | qwen | OFF (opt-in: STRIX_MTP_PRIME_ROWS=1) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: desactivar) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
 ### Exacto frente a FAST (9)

@@ -2,6 +2,7 @@
 
 #include "chat_runner.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/deployment.hpp"
 
 namespace strix::gemma4::engine {
 
@@ -12,7 +13,7 @@ class Api {
 public:
     Api(Backend& backend, std::shared_ptr<const gemma4::serve::Tokenizer> tokenizer,
         DraftFactory drafts = {}, DraftMode mode = DraftMode::automatic, std::string model = "nemotron-bolt-e4b",
-        Request defaults = {});
+        Request defaults = {}, strix::serve::DeploymentCallbacks deployment = {});
     ~Api();
     void handle(const strix::serve::HttpRequest& request, strix::serve::HttpResponseWriter& writer);
 private:

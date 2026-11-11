@@ -134,6 +134,7 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     Request defaults;
     std::string model;
     strix::serve::GenerationQueue queue;
+    strix::serve::DeploymentCallbacks deployment;
     std::shared_ptr<CostModel> costs = std::make_shared<CostModel>();
     std::mutex mutex;
     std::mutex backend_mutex;
@@ -154,9 +155,15 @@ struct Api::Impl final : strix::serve::GenerationEngine {
     const bool prefix_cache = batched && [] { const auto* p = std::getenv("STRIX_G4_SERVE_PREFIX"); return !p || std::string(p) != "0"; }();
     const std::size_t prefix_bytes = env_count("STRIX_G4_SERVE_PREFIX_MB",4096,1U << 20U) << 20U;
     std::thread worker;
-    Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings)
+    Impl(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request settings,
+        strix::serve::DeploymentCallbacks callbacks)
         : backend(b), adapter(std::move(t)), drafts(std::move(d)), mode(m), defaults(std::move(settings)), model(std::move(name)),
-          worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {}
+          deployment(std::move(callbacks)), worker([this] { if (batched) batch_loop(); else queue.run(*this); }) {
+        if (!deployment.capacity_provider) deployment.capacity_provider = [this] {
+            const auto q = queue.snapshot();
+            return strix::serve::ServeCapacity{batched ? slots : 1, q.running, std::nullopt, q.queued};
+        };
+    }
     ~Impl() override {
         { std::lock_guard lock(mutex); for (auto& [id,t] : tasks) { (void)id; t->cancelled = true; } }
         queue.shutdown(); worker.join();
@@ -352,7 +359,18 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         int failure_status = 400;
         std::string task_id;
         try {
-            if (req.method == "GET" && req.path == "/health") { writer.send(200,"application/json","{\"status\":\"ok\"}"); return; }
+            if (req.method == "GET" && req.path == "/health") {
+                Json health = Json::object(); health.set("status", Json(queue.draining() ? "draining" : "ok"));
+                strix::serve::deployment_health(health, deployment);
+                writer.send(queue.draining() ? 503 : 200, "application/json", health.dump()); return;
+            }
+            if (strix::serve::handle_deployment_route(req, writer, queue, deployment)) return;
+            if (req.method == "GET" && req.path == "/api/status") {
+                Json status = Json::object(); status.set("schema", Json("strix-serve-status-v1"));
+                status.set("model", Json(model));
+                strix::serve::deployment_status(status, deployment, queue, batched ? slots : 1);
+                writer.send(200, "application/json", status.dump()); return;
+            }
             if (req.method == "GET" && req.path == "/v1/models") {
                 writer.send(200,"application/json",Json(Json::Object{{"object","list"},{"data",Json(Json::Array{
                     Json(Json::Object{{"id",model},{"object","model"},{"owned_by","local"}})})}}).dump()); return;
@@ -368,6 +386,8 @@ struct Api::Impl final : strix::serve::GenerationEngine {
                     {"unsupported",Json(Json::Array{"response_format","logprobs","stop","penalties","forced tool_choice"})}}).dump()); return;
             }
             if (req.method == "POST" && req.path == "/v1/gemma4/features") {
+                strix::serve::QueueExternalWork work(queue);
+                if (!work) { failure_status = 503; throw std::runtime_error("the server is draining or shutting down"); }
                 const auto request = features::parse_request(strix::serve::parse_json_unique(req.body),&adapter);
                 features::Result result;
                 try {
@@ -478,8 +498,9 @@ struct Api::Impl final : strix::serve::GenerationEngine {
         }
     }
 };
-Api::Api(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request defaults)
-    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults))) {}
+Api::Api(Backend& b, std::shared_ptr<const gemma4::serve::Tokenizer> t, DraftFactory d, DraftMode m, std::string name, Request defaults,
+    strix::serve::DeploymentCallbacks deployment)
+    : impl_(std::make_unique<Impl>(b,std::move(t),std::move(d),m,std::move(name),std::move(defaults),std::move(deployment))) {}
 Api::~Api() = default;
 void Api::handle(const HttpRequest& r, HttpResponseWriter& w) { impl_->handle(r,w); }
 } // namespace strix::gemma4::engine

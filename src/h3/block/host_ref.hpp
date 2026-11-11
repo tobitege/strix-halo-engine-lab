@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -133,6 +134,30 @@ struct BlockSource {
     virtual ~BlockSource() = default;
     virtual std::shared_ptr<const BlockWeights> block(std::uint32_t i) = 0;
     virtual std::uint32_t num_blocks() const = 0;
+};
+// Block weights in a given order, block k + 1 read from the source (checkpoint read, adaLN folding) on a worker while
+// the caller uploads block k. One thread calls the source at a time (sequential hand-off), so the caller sees the same
+// weights as a serial src.block() loop. Used by the eager single-node and the pair residency.
+class BlockReadAhead {
+public:
+    BlockReadAhead(BlockSource& src, std::vector<std::uint32_t> order) : src_(src), order_(std::move(order)) { start(); }
+    // Block order[k] of the k-th call; null after the last.
+    std::shared_ptr<const BlockWeights> next() {
+        if (!ahead_.valid()) return nullptr;
+        auto b = ahead_.get();
+        start();
+        return b;
+    }
+
+private:
+    void start() {
+        if (k_ < order_.size()) ahead_ = std::async(std::launch::async, [this, i = order_[k_]] { return src_.block(i); });
+        ++k_;
+    }
+    BlockSource& src_;
+    std::vector<std::uint32_t> order_;
+    std::size_t k_ = 0;
+    std::future<std::shared_ptr<const BlockWeights>> ahead_;
 };
 struct FileBlockSource final : BlockSource {
     FileBlockSource(const SafeTensors& st, std::uint32_t basis, bool cache, LoadPolicy pol = {});

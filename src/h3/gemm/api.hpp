@@ -33,6 +33,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -182,8 +184,28 @@ inline void check(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows
     if (bad) throw std::invalid_argument(std::string("h3 gemm: ") + bad);
 }
 inline void launched(const char* what) { hip_check(hipGetLastError(), what); }
-// Tile width: measured fastest per shape on gfx1151; identical bits either way.
-inline bool wide_tiles(std::uint32_t rows, const Weights& w) { return w.n >= 16384U && rows >= 32768U; }
+// Narrow-tile row limit (see plain_width).
+constexpr std::uint32_t kNarrowRowsMax = 8192U;
+// Tile width: measured fastest per shape on gfx1151; identical bits either way (int32 accumulation over the full K,
+// per-element epilogue). Narrow 64-column tiles for the n <= 8192 projections (attention out, fc2) at image-scale
+// rows: 1280 rows x 5376 give only 210 128-column tiles, a ragged last wave on 40 CUs; 64-column tiles measured
+// 7-8 % faster there (gfx1151 kernel trace: out 2259 -> 2096 us, fc2 4648 -> 4257 us per call).
+// int8_convrot only: the W4A8 B-fetch kernel measured 1.9 % slower per image step with 64-column tiles.
+// STRIX_H3_GEMM_BN=64/128/256 forces one plain width where it divides n (benchmarks).
+inline int env_width(const char* name, std::initializer_list<int> allowed) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return 0;
+    const int v = std::atoi(e);
+    for (const int a : allowed) if (a == v) return v;
+    throw std::invalid_argument(std::string("h3 gemm: ") + name + " must be one of the documented tile widths");
+}
+inline unsigned plain_width(std::uint32_t rows, const Weights& w) {
+    static const int forced = env_width("STRIX_H3_GEMM_BN", {64, 128, 256});
+    if (forced && w.n % static_cast<unsigned>(forced) == 0U) return static_cast<unsigned>(forced);
+    if (w.n >= 16384U && rows >= 32768U) return 256U;
+    if (w.operand == Operand::int8_convrot && w.n <= 8192U && rows <= kNarrowRowsMax) return 64U;
+    return 128U;
+}
 }  // namespace detail
 
 inline void linear(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t rows, const Weights& w, Workspace& ws, std::uint16_t* y,
@@ -196,8 +218,11 @@ inline void linear(const std::uint16_t* x, std::uint64_t x_ld, std::uint32_t row
     a.a = ws.codes(); a.b = w.codes; a.row_scale = ws.row_scale(); a.ch_scale = w.scales; a.m = rows; a.n = w.n; a.k = w.k;
     a.out.ptr[0] = y; a.out.ld = y_ld; a.out.seg_cols = w.n;
     set_operand(a, w);
-    if (detail::wide_tiles(rows, w)) launch_gemm<256U, dev::Epi::plain>(a, stream);
-    else launch_gemm<128U, dev::Epi::plain>(a, stream);
+    switch (detail::plain_width(rows, w)) {
+        case 256U: launch_gemm<256U, dev::Epi::plain>(a, stream); break;
+        case 64U: launch_gemm<64U, dev::Epi::plain>(a, stream); break;
+        default: launch_gemm<128U, dev::Epi::plain>(a, stream); break;
+    }
     detail::launched("gemm launch");
 }
 

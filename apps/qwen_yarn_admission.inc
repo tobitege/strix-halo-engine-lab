@@ -105,8 +105,8 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_DEFAULTED", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_QPF2K_DEFAULTS", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_F16", YarnEnvironmentClass::nonrotary, ""},
-    // No rotary: DA16 certificate down (src/hip_moe_prefill_da16.inc:140;
-    // src/hip_moe_da16_down_body.inc:103-104) only rounds route-dot storage;
+    // No rotary: DA16 certificate down (src/moe_core/hip_moe_prefill_da16.inc:140;
+    // src/moe_core/hip_moe_da16_down_body.inc:103-104) only rounds route-dot storage;
     // scalar/vector merge/commit (src/hip_moe_experts_launcher.hip:2768,2773;
     // src/hip_moe_prefill_commit.inc:18,71,115-117) only widens it before FMA.
     // Match the candidate parser: empty or any 0-prefix is OFF, all other

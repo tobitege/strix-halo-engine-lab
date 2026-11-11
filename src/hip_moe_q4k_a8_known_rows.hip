@@ -1633,7 +1633,7 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue(PrefillRows v,unsign
 // LDS-only barrier: the staged tiles are complete (lgkmcnt) but the next step's global loads stay
 // in flight (__syncthreads would also wait for them, as its workgroup fence does).
 #include "moe_core/qwen_grouped_tiles.inc"
-#include "hip_moe_prefill_core2.inc"
+#include "moe_core/hip_moe_prefill_core2.inc"
 // qpf2k core2 bit 6 (gate/up only): one CTA owns two consecutive 128-assignment CSR batches of one expert (256 rows) x
 // 64 outputs of gate and up (128 B columns), so each dequantized weight tile serves up to 256 rows; same per-wave tile
 // (64 rows x 16 gate + 16 up columns), operands and K order as the base. Otherwise the F16Tile shape.
@@ -1688,7 +1688,7 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
     unsigned hidden,unsigned outputs,const uint4* a16) {
 #define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
-#include "hip_moe_f16x_project_body.inc"
+#include "moe_core/hip_moe_f16x_project_body.inc"
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
@@ -1752,22 +1752,22 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
-#include "hip_moe_f16x_down_body.inc"
+#include "moe_core/hip_moe_f16x_down_body.inc"
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 #undef STRIX_F16X_DOWN_GUARD
 }
-#include "hip_moe_gsq_weights.inc"
-#include "hip_moe_gsq_f16_prefill.inc"
-#include "hip_moe_gsq_wmma_prefill.inc"
+#include "moe_core/hip_moe_gsq_weights.inc"
+#include "moe_core/hip_moe_gsq_f16_prefill.inc"
+#include "moe_core/hip_moe_gsq_wmma_prefill.inc"
 #include "hip_moe_prefill_route.inc"
-#include "hip_moe_prefill_g3.inc"
-#include "hip_moe_prefill_p1.inc"
+#include "moe_core/hip_moe_prefill_g3.inc"
+#include "moe_core/hip_moe_prefill_p1.inc"
 #include "hip_moe_route_bf16.inc"
-#include "hip_moe_prefill_da16.inc"
+#include "moe_core/hip_moe_prefill_da16.inc"
 #include "hip_moe_prefill_tile64.inc"
 #include "hip_moe_prefill_tiers.inc"
-#include "hip_moe_prefill_p1da16.inc"
+#include "moe_core/hip_moe_prefill_p1da16.inc"
 #include "hip_moe_prefill_small.inc"
 // MoE tune bit 4: the FP16 images of the prompt rows (configured maximum rows x max_hidden halves, reserved at setup).
 HipPrefillPool& f16_prefill_a16_pool(){static HipPrefillPool pool;return pool;}

@@ -29,6 +29,13 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 
 <a id="hardware"></a>
 
+## Otro hardware
+
+El planificador reserva la memoria medida del dispositivo para KV del contexto
+solicitado, workspace y formatos/topologías compatibles antes de cargar. Consulte
+[despliegue en otro hardware](docs/deployment.es.md) para inspección, ejemplos TOML,
+API de orquestación y límites actuales, incluidos los runtimes INT4 pendientes.
+
 ## Inicio rápido
 
 Un nodo. Necesita el toolchain de ROCm, el GGUF del modelo y un fichero `prompt.ids` generado con el tokenizador.

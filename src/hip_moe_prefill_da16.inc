@@ -1,2 +1,0 @@
-// Compatibility include: grouped-prefill implementation lives in the shared core.
-#include "moe_core/hip_moe_prefill_da16.inc"

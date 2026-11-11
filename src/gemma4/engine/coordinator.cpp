@@ -1,4 +1,5 @@
 #include "coordinator.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
 #include "gemma4/prefill/prefill.hpp"
 
@@ -18,9 +19,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Json = strix::serve::Json;
 double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now()-start).count(); }
-bool env_on(const char* name) { const auto* v = std::getenv(name); return !v || std::string(v) != "0"; }
 // PREFILL_BATCH (STRIX_G4_PREFILL_BATCH=0 off): streams with prompt chunks pending share one prefill call per step.
-bool prefill_batch_enabled() { static const bool on = env_on("STRIX_G4_PREFILL_BATCH"); return on; }
+bool prefill_batch_enabled() { static const bool on = strix::env_flag_default_on("STRIX_G4_PREFILL_BATCH"); return on; }
 void require(bool ok, const char* message) { if (!ok) throw std::invalid_argument(message); }
 void add(dflash::Acceptance& a, const dflash::Acceptance& b) {
     a.cycles += b.cycles; a.attempted += b.attempted; a.eligible += b.eligible;
@@ -147,7 +147,7 @@ Json effective_config(const Backend& backend, const Request& request, bool draft
     switches.set("STRIX_G4_DFLASH",enabled);
     const auto multi = MultiStreamConfig::from_environment();
     switches.set("STRIX_G4_DRAFT_MULTI",multi.enabled);
-    if (!switches.find("STRIX_G4_TOKENIZER_HEAP")) switches.set("STRIX_G4_TOKENIZER_HEAP",env_on("STRIX_G4_TOKENIZER_HEAP"));
+    if (!switches.find("STRIX_G4_TOKENIZER_HEAP")) switches.set("STRIX_G4_TOKENIZER_HEAP",strix::env_flag_default_on("STRIX_G4_TOKENIZER_HEAP"));
     j.set("off_switches",switches);
     j.set("auto_policy",multi.enabled ?
         "stream-survival-cost-v1; C1 length bins; Beta(1,2) minus one posterior SD; decay 0.98; measured cycle upper/plain lower; >=5% gain; bounded calibration probes; "

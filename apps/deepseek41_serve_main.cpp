@@ -118,6 +118,7 @@
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/deepseek41_describe.hpp"
+#include "strix/deploy/binding.hpp"
 #include "strix/deepseek41_serve_observe.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
 #include "strix/ds41_expert_tp.hpp"
@@ -201,6 +202,10 @@ struct Args : strix::deepseek41::ServeCachePolicy {
     std::uint32_t dspark_seed_rows = 128;  // the device prefill keeps the inputs of its last rows for the drafter (0: none)
     std::string hetero_listen, hetero_token;  // split decode (ds41_hetero_stage.hpp)
     std::uint32_t hetero_cut = 22, hetero_groups = 2;
+    std::string deploy;
+    bool deploy_check = false;
+    std::shared_ptr<const strix::deploy::Spec> deploy_spec;
+    std::shared_ptr<const strix::deploy::Plan> deployment_plan;
 };
 
 // Fill only compatible implicit settings, then apply order-independent OFF vetoes.
@@ -411,7 +416,7 @@ std::string dspark_markov_identity(const Args& a) {
 Control hello(const Args& a) {
     Control c;
     c.command = static_cast<std::uint32_t>(Command::hello);
-    c.group_hash = fnv(a.group_id);
+    c.group_hash = fnv(a.deployment_plan ? a.group_id + "/" + a.deployment_plan->hash() : a.group_id);
     c.epoch = a.epoch;
     c.model_bytes = std::filesystem::file_size(a.model);
     c.exe_hash = fnv(executable_sha256());
@@ -1517,6 +1522,7 @@ struct ServeState {
     std::atomic<bool> stats_wanted{true};
     Clock::time_point wanted_at{};
     std::uint64_t pool_free = 0;
+    std::uint64_t kv_bytes_free = 0; // scheduler-owned allocator snapshot, protected by mutex
     strix::deepseek41::BatchSpecStats spec;
     bool spec_published = false;
     // what a status or metrics read copies under the mutex (it formats after unlocking)
@@ -1854,8 +1860,21 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     }
     ServeState state;
     state.comm = comm.stats();  // the start-up exchanges, before any HTTP thread reads the copy
-    if (a.pool != 0U) state.pool_free = fwd.pool_free_positions();
+    if (a.pool != 0U) {
+        state.pool_free = fwd.pool_free_positions();
+        state.kv_bytes_free = fwd.pool_free_bytes();
+    }
     serve::GenerationQueue queue(a.max_queue);
+    if (a.deployment_plan) {  // --deploy: the agreed plan, immutable for the life of the process
+        config.deployment.deployment_json = [plan = a.deployment_plan] { return plan->to_json(); };
+        config.deployment.deployment_id = [plan = a.deployment_plan] { return plan->hash(); };
+    }
+    config.deployment.capacity_provider = [&] {
+        const auto q = queue.snapshot();
+        const std::lock_guard lock(state.mutex);
+        return serve::ServeCapacity{a.slots, state.busy,
+            a.pool ? std::optional<std::uint64_t>{state.kv_bytes_free} : std::nullopt, q.queued};
+    };
     config.on_drain = [&] {
         state.draining.store(true);
         queue.shutdown();  // queued requests end, new ones are refused; running ones finish
@@ -2177,9 +2196,21 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     std::uint32_t pending_snaps = 0;  // session snapshots rank 0 took after the last step (rank 1 takes them on the next control)
     std::vector<std::uint32_t> pool_ops;              // KV pool operations since the last step (sent to rank 1)
     std::deque<serve::TakenJob> pool_waiting;         // taken from the queue, waiting for room in the KV pool (FIFO)
+    const auto publish_pool = [&] {
+        if (!a.pool) return;
+        const auto bytes = fwd.pool_free_bytes();
+        const std::lock_guard lock(state.mutex);
+        state.kv_bytes_free = bytes;
+    };
+    const auto pool_reserve = [&](std::uint32_t slot, std::uint32_t positions) {
+        const bool ok = fwd.reserve(slot, positions);
+        publish_pool(); // reserve may release an older range even when it fails
+        return ok;
+    };
     const auto pool_release = [&](std::uint32_t slot) {
         if (a.pool == 0U) return;
         fwd.release(slot);
+        publish_pool();
         pool_ops.push_back(kPoolRelease << 30U | slot << 24U);
     };
     std::deque<Parked> parked;  // imported states waiting for their request (oldest first)
@@ -2327,7 +2358,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         std::uint32_t want = 0;
         if (a.pool != 0U) {
             want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, std::uint64_t{st.position} + j.reserve_tokens + 1U));
-            if (!fwd.reserve(slot, want)) {
+            if (!pool_reserve(slot, want)) {
                 res.status = 503;
                 res.error = "the KV pool has no room for the state";
                 j.done.set_value(res);
@@ -3038,7 +3069,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             const auto c = session_call(command, 0);
                             if (strix::deepseek41::session_prompt_extends(*c, prompt) && !free_slots.empty()) {
                                 slot = free_slots.back();
-                                if (a.pool && !fwd.reserve(slot, a.context)) throw std::runtime_error("session_budget");
+                                if (a.pool && !pool_reserve(slot, a.context)) throw std::runtime_error("session_budget");
                                 reserved = true;
                                 if (a.pool) pool_ops.push_back(kPoolReserve << 30U | slot << 24U | a.context);
                                 command.set("op", serve::Json(info.ram ? "resume" : "restore"));
@@ -3089,7 +3120,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 if (free_slots.empty()) unpark_oldest();  // a parked state gives its slot to a request that needs one
                 if (a.pool != 0U) {  // room for the prompt and every token it may generate, or wait (FIFO)
                     const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{r->job.job.max_tokens} + 1U));
-                    if (!fwd.reserve(free_slots.back(), want)) {
+                    if (!pool_reserve(free_slots.back(), want)) {
                         if (want > a.pool) {  // never fits
                             serve::GenerationStats st;
                             st.prompt_tokens = prompt.size();
@@ -3325,7 +3356,10 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
     return agreed;
 }
 
+#include "deepseek41_deploy.inc"
+
 void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
+    if (a.deploy_spec) resolve_live_deployment(a, rank, *transport);
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
@@ -3416,8 +3450,7 @@ void describe(const Args& a) {
     std::shared_ptr<const strix::ds41::dspark::LoadedWeights> dw;
     if (!a.dspark.empty()) dw = strix::ds41::dspark::load_weights(a.model, a.dspark);
     for (std::uint32_t r = 0; r < 2U; ++r) {
-        auto o = forward_options(a, nullptr, r);
-        const auto f = BatchForward::footprint(a.model, o);
+        const auto f = Ds41FootprintProvider(a).native_footprint(a.context, a.slots, r);
         serve::Json mem = serve::Json::object();
         mem.set("rank", serve::Json(static_cast<std::uint64_t>(r)));
         mem.set("resident_weights_bytes", serve::Json(f.weights));
@@ -3480,7 +3513,9 @@ int main(int argc, char** argv) try {
             return std::string(argv[++i]);
         };
         const auto u32 = [&] { return static_cast<std::uint32_t>(std::stoul(next())); };
-        if (s == "--rank") a.rank = u32();
+        if (s == "--deploy") a.deploy = next();
+        else if (s == "--deploy-check") a.deploy_check = true;
+        else if (s == "--rank") a.rank = u32();
         else if (s == "--transport") a.transport = next();
         else if (s == "--group-manifest") a.manifest = next();
         else if (s == "--layers") a.layers = u32();
@@ -3566,8 +3601,10 @@ int main(int argc, char** argv) try {
         else throw std::invalid_argument("unknown argument " + s);
     }
     (void)tp_set;
-    if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json");
+    if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json | --deploy FILE|auto [--deploy-check]");
     if (!a.manifest.empty()) apply_manifest(a);
+    if (a.deploy_check && a.deploy.empty()) a.deploy = "auto";
+    if (!a.deploy.empty()) prepare_deployment(a);
     if (a.session_ram_bytes && a.session_ram_bytes < (16ULL << 20U) + std::uint64_t{a.context} * 2048ULL) {
         a.session_ram_bytes = 0; a.session_dir.clear();
         std::fprintf(stderr, "session cache: off (effective manifest context exceeds RAM budget)\n");
@@ -3575,6 +3612,15 @@ int main(int argc, char** argv) try {
     // The device prefill runs the expert-TP identity too (d647d6d4) and the cache namespace records the decode identity
     // (prefix_namespace_from_env), so the agent profile applies with STRIX_DS41_EXPERT_TP=1 as well.
     apply_cache_profile(a);
+    if (a.deploy_check) {
+        strix::ds41::expert_tp::set_decode_default(false);
+        if (a.device_prefill && strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
+        // Pair inspection needs the orchestrator's measured peer entry; never invented.
+        const auto plan = strix::deploy::resolve(*a.deploy_spec,
+            strix::deploy::inspection_devices(*a.deploy_spec, a.rank, strix::deploy::probe_device()), Ds41FootprintProvider(a));
+        std::printf("%s\n", plan.to_json().c_str());
+        return plan.refused ? 2 : 0;
+    }
     std::fprintf(stderr, "prefix policy: profile %s, host %llu MiB/rank, block %u, reserve %llu MiB after predicted allocations, inrun %u reach %u, before-tail %u, session %u, disk %s limit %s\n",
                  a.cache_profile.c_str(), static_cast<unsigned long long>(a.prefix_cache_mb), a.prefix_block,
                  static_cast<unsigned long long>(a.prefix_reserve_mb), a.prefix_inrun ? 1U : 0U, a.prefix_inrun_reach,
@@ -3600,7 +3646,7 @@ int main(int argc, char** argv) try {
     if (a.prefix_inrun && a.prefix_cache_mb == 0U) throw std::invalid_argument("--prefix-inrun-snapshots needs --prefix-cache-mb (or --cache-profile agent)");
     if (a.prefix_session && !a.dspark.empty())
         throw std::invalid_argument("--prefix-session-snapshots is not exact with --dspark (verify-window rows leave another state than the prefill)");
-    if (a.describe_parts) {
+    if (a.describe_parts && !a.deploy_check) {
         strix::deepseek41::EngineDescribeOptions o;
         o.engine_name = "strix-deepseek41-serve";
         o.backend = "hip";
@@ -3625,7 +3671,7 @@ int main(int argc, char** argv) try {
     // tensors (read in place, no second copy): prefill and decode give the same bits as the expert-TP decode alone.
     strix::ds41::expert_tp::set_decode_default(false);
     if (a.device_prefill && strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
-    if (a.describe) {
+    if (a.describe && !a.deploy_check) {
         describe(a);
         return 0;
     }

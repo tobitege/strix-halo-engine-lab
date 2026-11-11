@@ -140,7 +140,7 @@ struct HipMtpRuntime::Impl {
     bool defer_reconcile=false;
     // Rows of a submitted, not yet completed prime_hidden_rows_submit (STRIX_PREFILL_PIPE).
     std::size_t primed_rows=0;
-    // STRIX_MTP_PRIME_ROWS (opt-in "1", default off = one row at a time; part of STRIX_QWEN_ALLON): per-row scratch of the batched prompt priming.
+    // STRIX_MTP_PRIME_ROWS (default on; "0" restores one row at a time): per-row scratch of the batched prompt priming.
     std::unique_ptr<unsigned char,void(*)(unsigned char*)> prime_scratch{nullptr,[](unsigned char* p){(void)hipFree(p);}};
     std::uint64_t prime_slot=0;
     bool prime_unavailable=false;
@@ -580,7 +580,7 @@ struct HipMtpRuntime::Impl {
     // cache rows), row t in its own scratch slot and reading its target hidden in place. Only the owner's KV/raw-index
     // rows, pool frontier and status word are shared with the one-row path; its staging buffers are not written.
     bool prime_rows_admitted() const {
-        static const bool on=[]{const char* v=std::getenv("STRIX_MTP_PRIME_ROWS");return v && v[0]=='1' && !v[1];}();
+        static const bool on=[]{const char* v=std::getenv("STRIX_MTP_PRIME_ROWS");return !v || (v[0]=='1' && !v[1]);}();
         if(!on || !draft || draft_exact || !hc_inject || owner->model().hc_count!=4U || !hip_mtp_hyper_mix_draft_rows_supported() ||
            owner->view(HipMtpBuffer::hyper_workspace).address%16U)return false;
         return hip_mtp_draft_q4(reinterpret_cast<const void*>(owner->tensors().eh_projection.runtime->address))!=nullptr;

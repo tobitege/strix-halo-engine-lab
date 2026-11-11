@@ -9,6 +9,7 @@
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "qwen_deploy_provider.hpp"
 #include "qwen_model_description_hook.hpp"
 #include "../src/model_graph/qwen_adapter.hpp"
 #include "qwen_yarn_registered_admission.hpp"
@@ -145,6 +146,7 @@
 #include <vector>
 
 namespace {
+#include "qwen_deploy.inc"
 // File-backed tensors (the PLE n-gram table) are read row by row on the host during decode.
 // Another process can evict them, turning those reads into random disk I/O while the GPU waits
 // (and every fault pulls a whole readahead window for a ~100-byte row). Mark them random-access
@@ -1199,6 +1201,7 @@ static int run_decode_entry(
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
+            "  --deploy FILE|auto --deploy-check (host-only deployment JSON; includes effective config)\n"
             "  --profile default|fast|quality (default: current qualified settings)\n"
             "  --allow-pending (benchmark runnable pending profile rows; unqualified)\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
@@ -1274,7 +1277,10 @@ static int run_decode_entry(
     if (strix::qwen_pp::decode_enabled() && !strix::qwen_pp::pipe_enabled())
         throw std::invalid_argument("pair handoff decode requires STRIX_QWEN_PF_PIPE=1");
     std::vector<char*> pair_arguments;
-    if (strix::qwen_pp::pipe_enabled()) {
+    const bool deploy_requested = std::any_of(argv + 1, argv + argc, [](const char* a) {
+        return std::string_view(a) == "--deploy" || std::string_view(a) == "--deploy-check";
+    });
+    if (strix::qwen_pp::pipe_enabled() || deploy_requested) {
         pair_arguments.push_back(argv[0]);
         bool pair_rank_seen = false;
         const auto pair_setenv = [](const char* key, const char* value) {
@@ -1294,7 +1300,7 @@ static int run_decode_entry(
                 } else pair_setenv(pair_argument == "--peer" ? "STRIX_QWEN_PF_PIPE_PEER" : "STRIX_QWEN_PF_PIPE_TRANSPORT", pair_value);
             } else pair_arguments.push_back(argv[pair_index]);
         }
-        if (!pair_rank_seen) {
+        if (!pair_rank_seen && strix::qwen_pp::pipe_enabled()) {
             const char* pair_inherited_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
             if (!pair_inherited_rank || (std::string_view(pair_inherited_rank) != "0" && std::string_view(pair_inherited_rank) != "1"))
                 throw std::invalid_argument("pair prefill requires --rank 0|1");
@@ -1307,6 +1313,14 @@ static int run_decode_entry(
         parse_options(
             argc,
             argv, true);
+    QwenDeployment deployment;
+    if (options.deployment_spec && options.deployment_spec->topology == "pipeline") {
+        const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
+        if (!r || (std::string_view(r) != "0" && std::string_view(r) != "1"))
+            throw std::invalid_argument("deployment pipeline requires --rank 0|1");
+        (void)::setenv("STRIX_QWEN_PF_PIPE", "1", 1);
+        (void)::setenv("STRIX_QWEN_PF_PIPE_DECODE", "1", 1);
+    }
     if (options.print_model_graph || options.print_plan) {
         auto described_model = strix::ModelContract::qwen38_flash_next();
         described_model.attention_kv_storage = options.attention_kv_storage;
@@ -1416,7 +1430,7 @@ static int run_decode_entry(
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
         "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
-        "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable"};
+        "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable", "--deploy", "--deploy-check"};
     // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
     const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
         "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
@@ -1763,12 +1777,29 @@ static int run_decode_entry(
 
     model.attention_kv_storage = options.attention_kv_storage;
     std::cerr << effective.serve_prefill_notice << strix::decode_cli::effective_config_notice(effective);
+    if (options.print_effective_config && options.deployment_spec) {
+        deployment.resolve(effective, model, manifest, mapped.bytes(), prompt_memory);
+        std::cout << deployment.json() << '\n';
+        return deployment.plan->refused ? 2 : 0;
+    }
     if (options.http_serve || !options.print_effective_config)
         strix::decode_cli::validate_effective_startup(effective);
     strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
         std::cout << strix::decode_cli::effective_config_json(effective);
         return 0;
+    }
+    if (options.deployment_spec) {
+        deployment.resolve(effective, model, manifest, mapped.bytes(), prompt_memory);
+        strix::deploy::require_plan(*deployment.plan);
+        // Apply only what the plan admitted (session RAM, HTTP slot count). Copying the whole
+        // effective options replaced the deferred serve-prefill/UMA settings that the plain launch
+        // resolves at startup, and every --deploy HTTP launch then refused its UMA reservation.
+        options.session_ram_bytes = effective.options.session_ram_bytes;
+        if (strix::decode_cli::ordinary_http_batch_slots(effective.options)) {
+            options.http_batch_cap = effective.options.http_batch_cap;
+            options.http_batch = effective.options.http_batch;
+        }
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
@@ -2635,7 +2666,19 @@ static int run_decode_entry(
         : std::shared_ptr<const strix::HipMtpAssets>{};
     // After registration: pinning the model may evict anything populated before it.
     std::uint64_t warmed_file_backed_bytes = 0;
-    if (!ple_reclaim_requested) warmed_file_backed_bytes = warm_file_backed_tensors(mapped, manifest);
+    const bool defer_http_warm = options.http_serve && options.known_prefix_prefill_rows &&
+        options.rotary.mode() == strix::RotaryMode::native && !ple_reclaim_requested &&
+        residency_policy.mode == strix::HipModelResidencyMode::registered_file_mapping &&
+        residency_policy.copy_tier == strix::HipModelCopyTier::none && !graph_mode;
+    // Credit only this actual read-only mapping, never packs/copies or runtime
+    // owners. This route has no PLE drop credit to overlap with these pages.
+    const auto http_mapping_credit = defer_http_warm
+        ? strix::read_only_registered_mapping_accounting(model_residency.reservation().mapped_reserved_bytes,
+            model_residency.registered_bytes()).reclaimable_bytes : 0U;
+    const auto warm_file_cache = [&] {
+        warmed_file_backed_bytes = warm_file_backed_tensors(mapped, manifest);
+    };
+    if (!ple_reclaim_requested && !defer_http_warm) warm_file_cache();
     if (load_balloon) { (void)hipFree(load_balloon); load_balloon = nullptr; std::cerr << "load balloon: released\n"; }
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
@@ -3688,7 +3731,23 @@ static int run_decode_entry(
                 known_prefill_reservation=physical.reservation;
                 growth=physical.incremental;
                 known_prefill_runtime_payload=0;
+            } else if (defer_http_warm) {
+                known_prefill_reservation = strix::decode_cli::admit_http_prefill_before_warm(
+                    options, prefill_live, growth, known_prefill_runtime_payload, http_mapping_credit,
+                    !deployment.plan, warm_file_cache);
+                effective.options.session_ram_bytes=options.session_ram_bytes;
+                setup_growth=known_prefill_runtime_payload;
             } else {
+                if (options.http_serve && !deployment.plan) {
+                    // Refit against the actual retained ledger before enforcing
+                    // its unchanged limits. A default cap is never a hard owner.
+                    const auto actual = strix::decode_cli::plan_known_prefill_reservation(
+                        prefill_live, growth, known_prefill_runtime_payload, {},
+                        ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U, rolling_metadata, mtp_growth);
+                    strix::decode_cli::fit_http_session_ram(options,actual.setup_peak_reserved_bytes,
+                        options.known_prefill_uma_budget);
+                    effective.options.session_ram_bytes=options.session_ram_bytes;
+                }
                 known_prefill_reservation = strix::decode_cli::plan_known_prefill_reservation(
                     prefill_live, growth, known_prefill_runtime_payload,
                     {options.known_prefill_uma_budget, options.known_prefill_uma_budget},
@@ -4358,13 +4417,15 @@ static int run_decode_entry(
             };
             const auto serving = prompt_memory.serving(options);
             // Future commitments exclude the already resident primary stack and tiled arenas.
-            auto estimate = add(add(state_layout.device_total_bytes, state_layout.host_total_bytes), compiled.arena.total_bytes);
-            estimate = add(estimate, known_prefill_plan->host_metadata_payload_bytes);
-            for (const auto& tail : known_tail_plans) estimate = add(estimate, tail->host_metadata_payload_bytes);
-            // Per-slot owner buffers are independent even though arenas are shared.
+            auto slot_metadata = known_prefill_plan->host_metadata_payload_bytes;
+            for (const auto& tail : known_tail_plans) slot_metadata = add(slot_metadata, tail->host_metadata_payload_bytes);
+            // Same allocation equation used by the device-free deployment compiler.
             const auto external=qwen_prefill_external_memory(options,model);
-            estimate=add(estimate,std::max(external.host,external.device));
-            const auto fixed_headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
+            auto estimate = http_slot_retained_bytes(state_layout.device_total_bytes, state_layout.host_total_bytes,
+                compiled.arena.total_bytes, slot_metadata, std::max(external.host,external.device));
+            auto fixed_headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
+            if (deployment.plan) fixed_headroom = std::max(fixed_headroom,
+                add(deployment.plan->ranks.at(0).margin_bytes, options.session_ram_bytes));
             // Shared bridge assets and the cache's future payload are not resident
             // at this observation boundary. Reserve them once, never per slot.
             // The automatic cache budget is fitted after residency; reserve only explicit payload here.
@@ -4398,6 +4459,17 @@ static int run_decode_entry(
                 if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
             }
             if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit after probe: " + capacity.limiting);
+            if (deployment.plan && capacity.slots < deployment.plan->chosen.slots)
+                throw std::runtime_error("deployment HTTP slots exceed measured native capacity; re-inspect with current memory");
+            if (!deployment.plan && !options.supplied_options.contains("--session-ram-bytes") && fit_host) {
+                // Slots and their measured retained stacks win over optional
+                // default session RAM, just as in deployment candidate sizing.
+                const auto mul=prefill_checked_mul;
+                const auto mandatory=add(headroom,add(serving.shared_host,
+                    add(mul(capacity.slots,serving.slot_host),mul(capacity.slots-1U,retained))));
+                fit_http_session_ram(options,mandatory,*fit_host);
+                effective.options.session_ram_bytes=options.session_ram_bytes;
+            }
             batch_memory_ok = make_http_bridge_growth_check(retained,serving,fixed_headroom,
                 options.prefix_cache_host_bytes,staging_reserve,[observe,gtt_free,prefix_store] {
                     // Allocated payload includes in-flight capture, not unallocated credits.
@@ -4422,7 +4494,8 @@ static int run_decode_entry(
                 cache_prompt_transient=add(cache_prompt_transient,4U*(11U*640U+1U)+2U*4U*10240U*4U);
             }
             options.http_slot_reason = "limited by " + capacity.limiting;
-            batch_slots = !single_route && (capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U))
+            batch_slots = !single_route && (capacity.slots > 1U ||
+                ((options.http_batch_explicit || deployment.plan) && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
@@ -4655,7 +4728,7 @@ static int run_decode_entry(
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                    startup_preflight, release_assets, {}, rewarm_before_listen)
+                    startup_preflight, release_assets, {}, rewarm_before_listen, deployment.callbacks())
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
         if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
@@ -4676,7 +4749,7 @@ static int run_decode_entry(
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen);
+                parents->tiled.rtx_import, startup_preflight, release_assets, rewarm_before_listen, deployment.callbacks());
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
@@ -5628,8 +5701,9 @@ static int run_decode_entry(
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             const char* pair_transport_env = std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
             const std::string_view pair_transport = pair_transport_env ? pair_transport_env : "usb4auto";
-            std::unique_ptr<strix::dist::Transport> pair_link;
-            if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
+            std::unique_ptr<strix::dist::Transport> pair_link = std::move(deployment.pair_link);
+            if (pair_link) { /* Deployment already exchanged measured facts and plan IDs. */ }
+            else if (pair_transport == "usb4auto" || pair_transport == "usb4-auto") {
                 strix::dist::Usb4AutoOptions pair_usb;
                 pair_usb.rank = pair_rank;
                 pair_link = strix::dist::usb4_host_auto(pair_usb);

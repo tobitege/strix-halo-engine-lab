@@ -751,7 +751,11 @@ void chat_tests(const std::filesystem::path& tokenizer_path) {
     const auto tool_frame = std::string("<|tool_call>call:weather{city:<|\"|>Madrid<|\"|>}<tool_call|><|tool_response>");
     const auto tool_ids = tokenizer->encode(tool_frame+"ignored");
     ScriptBackend tool; for (unsigned i = 0; i < 3; ++i) tool.scripts.push_back({adapter.prepare(parsed.input).ids.size(),tool_ids});
-    e::Api api(tool,tokenizer,{},e::DraftMode::off);
+    strix::serve::DeploymentCallbacks deployment;
+    deployment.deployment_json = [] { return R"({"schema":"strix-deployment-v1"})"; };
+    deployment.deployment_id = [] { return "0123456789abcdef"; };
+    deployment.capacity_provider = [] { return strix::serve::ServeCapacity{8, 0, 4096, 0}; };
+    e::Api api(tool,tokenizer,{},e::DraftMode::off,"nemotron-bolt-e4b",{},deployment);
     strix::serve::HttpRequest req; req.method = "POST"; req.path = "/v1/chat/completions"; req.body = request_json.dump();
     Writer writer; api.handle(req,writer); CHECK(writer.status == 200);
     const auto response = strix::serve::parse_json_unique(writer.body);
@@ -782,6 +786,20 @@ void chat_tests(const std::filesystem::path& tokenizer_path) {
     strix::serve::HttpRequest sample_req; sample_req.method = "POST"; sample_req.path = "/v1/chat/completions"; sample_req.body = sampled_json.dump();
     Writer sample_writer; sample_api.handle(sample_req,sample_writer); CHECK(sample_writer.status == 200);
     CHECK(sample_writer.body.find("serial-sampling") != std::string::npos);
+    req.method = "GET"; req.path = "/v1/deployment";
+    Writer plan; api.handle(req,plan);
+    CHECK(plan.status == 200 && plan.body == R"({"schema":"strix-deployment-v1"})");
+    Writer absent; sample_api.handle(req,absent); CHECK(absent.status == 404);
+    req.path = "/health"; Writer health; api.handle(req,health);
+    CHECK(strix::serve::parse_json(health.body).find("deployment_id")->as_string() == "0123456789abcdef");
+    req.path = "/api/status"; Writer status; api.handle(req,status);
+    CHECK(status.status == 200 && strix::serve::parse_json(status.body).find("capacity")->find("kv_bytes_free")->as_int() == 4096);
+    req.method = "POST"; req.path = "/admin/drain"; req.body.clear();
+    Writer drained; api.handle(req,drained);
+    CHECK(drained.status == 200 && strix::serve::parse_json(drained.body).find("drained")->as_bool());
+    req.method = "GET"; req.path = "/health"; Writer draining; api.handle(req,draining); CHECK(draining.status == 503);
+    req.method = "POST"; req.path = "/v1/chat/completions"; req.body = request_json.dump();
+    Writer refused; api.handle(req,refused); CHECK(refused.status == 503);
     std::cout << "chat: checked budget continuation/natural stop, streamed parsing, queued API, tools round trip and SSE passed\n";
 }
 }

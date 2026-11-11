@@ -1,5 +1,6 @@
 // GLM engine: host memory accounting for the rank load (see glm_mem.hpp).
 #include "glm_mem.hpp"
+#include "strix/deploy/device.hpp"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -46,25 +47,6 @@ std::map<std::string, std::uint64_t> read_kb_file(const std::string& path) {
     return m;
 }
 
-bool read_u64(const std::string& path, std::uint64_t& v) {
-    std::ifstream f(path);
-    return static_cast<bool>(f >> v);
-}
-
-std::string find_drm_device() {
-    if (const char* e = std::getenv("STRIX_GLM_DRM_DEVICE"); e != nullptr && *e) return e;
-    std::error_code ec;
-    std::vector<std::string> cands;
-    for (const auto& d : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
-        const std::string n = d.path().filename().string();
-        if (n.rfind("card", 0) != 0 || n.find('-') != std::string::npos) continue;
-        const std::string dev = d.path().string() + "/device";
-        if (std::filesystem::exists(dev + "/mem_info_gtt_total", ec)) cands.push_back(dev);
-    }
-    std::sort(cands.begin(), cands.end());
-    return cands.empty() ? std::string() : cands.front();
-}
-
 std::uint64_t env_gib(const char* name, std::uint64_t def) {
     const char* e = std::getenv(name);
     if (e == nullptr || *e == 0) return def;
@@ -87,7 +69,10 @@ std::string fmt(const char* f, ...) {
 }  // namespace
 
 Probe::Probe(Paths p) : p_(std::move(p)), t0_(now_s()) {
-    if (p_.drm_device.empty()) p_.drm_device = find_drm_device();
+    if (p_.drm_device.empty()) {
+        const char* device = std::getenv("STRIX_GLM_DRM_DEVICE");
+        p_.drm_device = device && *device ? device : strix::deploy::first_drm_device();
+    }
 }
 
 Snapshot Probe::read() const {
@@ -134,11 +119,12 @@ Snapshot Probe::read() const {
     s.rss_shmem = get(st, "RssShmem");
     s.hwm = get(st, "VmHWM");
     if (!p_.drm_device.empty()) {
-        const std::string d = p_.drm_device + "/";
-        const bool tot = read_u64(d + "mem_info_gtt_total", s.gtt_total), used = read_u64(d + "mem_info_gtt_used", s.gtt_used);
-        const bool vram = read_u64(d + "mem_info_vram_used", s.vram_used);
-        read_u64(d + "mem_info_vram_total", s.vram_total);
-        s.gpu = tot && used && vram;
+        const auto d = strix::deploy::probe_device("", p_.drm_device);
+        s.gtt_total = d.gtt_total_bytes.value_or(0);
+        s.gtt_used = d.gtt_used_bytes.value_or(0);
+        s.vram_total = d.vram_total_bytes.value_or(0);
+        s.vram_used = d.vram_used_bytes.value_or(0);
+        s.gpu = d.gtt_total_bytes && d.gtt_used_bytes && d.vram_used_bytes;
     }
     return s;
 }

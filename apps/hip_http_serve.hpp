@@ -230,11 +230,14 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
 // rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
     std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
-    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}, std::function<void()> before_listen = {}) {
-    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets, before_listen](const MtpServeRunner& run,bool selection_mtp_available) {
+    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}, std::function<void()> before_listen = {},
+    serve::DeploymentCallbacks deployment = {}) {
+    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets, before_listen,
+        deployment = std::move(deployment)](const MtpServeRunner& run,bool selection_mtp_available) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
+        config.deployment = deployment;
         config.model_id = options.http_model_id;
         config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
@@ -289,6 +292,10 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, 1, startup, assets);
         serve::GenerationQueue queue(options.http_max_queue);
+        if (!config.deployment.capacity_provider) config.deployment.capacity_provider = [&queue] {
+            const auto q = queue.snapshot();
+            return serve::ServeCapacity{1, q.running, std::nullopt, q.queued};
+        };
         serve::BackendProbeSlot probe([&] { queue.wake_control(); });
         const bool probing = config.health_record && config.health_record->backend_probe_enabled;
         if (probing) {
@@ -342,9 +349,10 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // and seed.
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {},
-    std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}, std::function<void()> before_listen = {}) {
+    std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}, std::function<void()> before_listen = {},
+    serve::DeploymentCallbacks deployment = {}) {
     return [&options, engine_description = std::move(engine_description), startup, assets,
-        supplied_tokenizer = std::move(supplied_tokenizer), before_listen](MtpBatchRunner& runner) {
+        supplied_tokenizer = std::move(supplied_tokenizer), before_listen, deployment = std::move(deployment)](MtpBatchRunner& runner) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
@@ -415,6 +423,11 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             queue.set_idle_control([&] { probe.boundary(serve::BackendProof::control_only); });
             config.health_provider = [&] { return probe.snapshot(); };
         }
+        config.deployment = deployment;
+        if (!config.deployment.capacity_provider) config.deployment.capacity_provider = [&queue, &runner] {
+            const auto q = queue.snapshot();
+            return serve::ServeCapacity{runner.slots(), q.running, std::nullopt, q.queued};
+        };
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;

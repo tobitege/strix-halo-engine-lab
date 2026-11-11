@@ -1,4 +1,6 @@
 #include "glm/prefill/glm_pf_aux.hpp"
+#include "glm_deploy_owners.hpp"
+#include "glm/load/glm_rank_plan.hpp"
 // strix-glm5-rank: GLM-5.3-Flash engine runner (one node or one rank of the TP2 pair).
 //
 //   strix-glm5-rank MODEL_DIR --world 1                      [modes...]   one node (all heads / full I / full vocab)
@@ -93,6 +95,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 namespace ge = strix::glm::engine;
+namespace rd = strix::glm::rank_defaults;
+#include "glm_deploy.inc"
 
 double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
@@ -123,12 +127,15 @@ int main(int argc, char** argv) {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [modes] [--identity r1|r1b|r1b-all] [--idcheck N --prompt T.u32]\n"
                                  "--print-device-profile / STRIX_PRINT_DEVICE_PROFILE=1: HIP probe JSON, then exit (no model/peer)\n"
+                                 "--deploy FILE|auto --deploy-check: host-only deployment JSON (no allocation/peer)\n"
+                                 "--profile default|fast|quality: product policy; bare --profile: kernel timing\n"
                                  "identity: r1 throughout; r1b (default) R1 prompts/R1b generation; "
                                  "r1b-all throughout (reference prefill)\n", argv[0]);
             return 2;
         }
         const auto t_start = Clock::now();
         ge::Options opt;
+        GlmDeployment deployment;
         opt.model_dir = argv[1];
         std::string transport_spec, g3_tokens, prompt, out_path, tf_tokens, state_out, state_in;
         std::string mtp_prefill = "ref", mtp_prefill_gate;
@@ -145,12 +152,18 @@ int main(int argc, char** argv) {
         std::vector<unsigned> pattern;
         bool mem_plan = false, profile = false, tf_check = false, print_config = false, print_graph = false;
         std::string xch_kind = "comm";  // comm = CommExchange (Communicator) | xfer = XferExchange
-        for (int i = 2; i < argc; ++i) {
-            const std::string a = argv[i];
+        namespace rd = strix::glm::rank_defaults;
+        std::vector<std::string> args(argv + 2, argv + argc);
+        strix::profile::Inputs product_inputs;
+        strix::profile::take_options(rd::product_profile_engine, args, product_inputs);
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const std::string a = args[i];
             auto next = [&]() -> std::string {
-                if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
-                return argv[++i];
+                if (i + 1 >= args.size()) throw std::invalid_argument("missing value for " + a);
+                return args[++i];
             };
+            if (a == "--deploy") { deployment.file = next(); continue; }
+            if (a == "--deploy-check") { deployment.check = true; continue; }
             if (a == "--ab" || a == "--aba" || a == "--g3-sweep" || a == "--aba-attn3" || a == "--aba-xch" ||
                 a == "--g4" || a == "--tf" || a == "--spec-oracle" || a == "--spec-run" || a == "--state-in" || a == "--state-out" ||
                 a == "--mtp-prefill-gate" || a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study")  // the pf modes install their own paths
@@ -236,15 +249,23 @@ int main(int argc, char** argv) {
         }
         if (mtp_prefill != "ref" && mtp_prefill != "chunked")
             throw std::invalid_argument("--mtp-prefill must be ref or chunked");
-        namespace rd = strix::glm::rank_defaults;
         const auto request = rd::scan(std::vector<std::string>(argv + 2, argv + argc));
         auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
         rd::fallback_without_handshake(eff, request, rd::process_env());
+        if (!deployment.file.empty() || deployment.check) {
+            opt.mtp = eff.mtp.value == "1"; opt.spec = eff.spec.value == "1";
+            deployment.prepare(opt, eff, transport_spec, xch_kind == "xfer" ? "deployment requires --xch comm" : "");
+            if (deployment.check || print_config) return deployment.inspect(opt.rank);
+        }
         if (print_config) {  // dry run: no environment change, no GPU, no peer
             std::fputs(rd::print(eff).c_str(), stdout);
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
+        if (eff.product) {
+            std::fprintf(stderr, "profile %s\n", eff.product->json().c_str());
+            for (const auto& notice : eff.product->notices()) std::fprintf(stderr, "%s\n", notice.c_str());
+        }
         opt.mtp = eff.mtp.value == "1";
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
         opt.auto_rows = rd::max_rows_auto(eff);
@@ -323,6 +344,7 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
             std::string receipt;
             auto transport = open_transport(transport_spec, opt.rank, receipt);
+            if (deployment.provider) deployment.resolve_live(opt, *transport);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
                 if (opt.spec) throw std::invalid_argument("--xch xfer has no speculative merge yet: use --xch comm with --spec 1");

@@ -115,3 +115,13 @@ ctest --test-dir build-h3 -R h3 -LE "gpu|qualification"`. Data-dependent cases r
 | `STRIX_H3_GEMM_QUANT_FAST=0/1` | force one quantiser variant (same bits; default per K) |
 | `STRIX_H3_TE_SPLIT=0` | text encoder fast class `h3-te-lm-fast-f16-v1` (default dense) |
 | `STRIX_H3_TE_VERIFY=0` | skip the te pack sha256 check at load |
+| `--serial-te` | text encoder before the DiT residency (default: on its own thread while the DiT is made resident; same bits) |
+| `--serial-vae` | video decoder loaded after sampling (default: on its own thread during sampling; same bits) |
+| `--prepare auto\|eager\|lazy` | one node: DiT resident before step 1, alongside the text encoder (eager), or uploaded during step 1 (lazy); auto = eager for steps up to 10 s (same bits) |
+
+The preparation overlaps are shared with the image runner (`src/h3/common/alongside.hpp`, `src/h3/dist/pair_link.hpp`):
+the USB4 pairing runs on its own thread from program entry, the text encoder runs while the DiT checkpoint is read and
+made resident (block k + 1 read ahead while block k uploads), and rank 0's video decoder loads during sampling. Peak
+memory holds the text encoder and the DiT together. Measured on the all-on configuration at 1344x768, 22 frames (warm
+cache, outputs byte-identical): two nodes 73.2 -> 60.0 s, one node 100.9 -> 86.1 s; the full 124-frame clip on one
+node 667.9 -> 651.3 s.

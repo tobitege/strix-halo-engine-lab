@@ -6,6 +6,7 @@
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
 #include "strix/serve/health.hpp"
+#include "strix/serve/deployment.hpp"
 
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@
 namespace strix::serve {
 
 struct ApiConfig {
+    DeploymentCallbacks deployment;
     std::shared_ptr<const ServeHealthRecord> health_record;
     HealthProvider health_provider;
     std::string model_id = "qwen3.8-flash-next";
@@ -55,7 +57,7 @@ struct ApiConfig {
     std::function<void(Json& status)> status_extra;
     std::function<std::string()> metrics_extra;
     // POST /admin/drain (authenticated): stop admitting and finish what runs; /health answers 503 "draining" after it.
-    // Unset: the route answers 404.
+    // Optional engine notification; shared admission draining is always installed.
     std::function<void()> on_drain;
     // An arming request to this service (GET /metrics, GET /api/status?detail=1) keeps the instrumentation armed this
     // many seconds more (observe_arm); 0: until the process ends. Unset: STRIX_SERVE_OBSERVE_EXPIRY_S, else 60.

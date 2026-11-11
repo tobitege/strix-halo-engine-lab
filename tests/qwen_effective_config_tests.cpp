@@ -13,6 +13,7 @@
 #include "../apps/qwen_yarn_registered_admission.hpp"
 #include "../apps/qwen_mtp_owner_plan.hpp"
 #include "../apps/known_prefill_reservation.hpp"
+#include "../apps/qwen_deploy_provider.hpp"
 #include "../apps/ple_resident_fallback.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
@@ -30,6 +31,14 @@
 #include <filesystem>
 #include <chrono>
 
+// POSIX test controls, backed by the MSVC process environment on host builds.
+#ifdef _WIN32
+inline int setenv(const char* name, const char* value, int overwrite) {
+    if (!overwrite && std::getenv(name)) return 0;
+    return _putenv_s(name,value);
+}
+inline int unsetenv(const char* name) { return _putenv_s(name,""); }
+#endif
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
@@ -454,6 +463,73 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             expect(resolve(production,tighter).options.known_prefix_prefill_rows==4096,
                 "registered target also consumes GTT and still falls back under GTT pressure");
         }
+        // Measured D9 native ledger. A mapping lease is not a physical pin:
+        // the shared rule credits only its clean, unregistered file pages.
+        constexpr std::uint64_t mapped=111334658048ULL, live_bytes=112090202777ULL;
+        constexpr std::uint64_t growth=15815011044ULL, temporary=16338988ULL;
+        const auto backing=read_only_registered_mapping_accounting(mapped,registered);
+        expect(backing.retained_bytes==registered && backing.reclaimable_bytes==mapped-registered,
+            "native mapping rule fully charges registered pages and credits only their complement");
+        expect(!read_only_registered_mapping_accounting(mapped,mapped).reclaimable_bytes,
+            "fully pinned model mapping receives no reclaimable credit");
+        bool bad_backing=false;
+        try { (void)read_only_registered_mapping_accounting(mapped,mapped+1U); }
+        catch (const std::invalid_argument&) { bad_backing=true; }
+        expect(bad_backing,"mapping rule rejects registered backing larger than the mapping");
+        UmaOwnerInventory live;
+        live.reservation_upper_bound_bytes=live_bytes;
+        live.known_file_mapping_bytes=mapped;
+        for (const auto available : {126701535232ULL,127565436108ULL}) { // 118 and 118.8 GiB
+            observed.available=available;
+            const auto admitted=resolve(production,observed);
+            validate_effective_startup(admitted);
+            expect(admitted.options.known_prefix_prefill_rows==8192 &&
+                admitted.host_compilation.at("target_reclaimable_mapping_bytes")==backing.reclaimable_bytes,
+                "admission and native ledger use the same T8192 reclaimable mapping rule near 118 GiB");
+            for (const bool ram_off : {false,true}) {
+                auto o=admitted.options;
+                if (ram_off) { o.session_ram_bytes=0; o.supplied_options.insert("--session-ram-bytes"); }
+                unsigned warms=0;
+                const auto reservation=admit_http_prefill_before_warm(o,live,growth,temporary,
+                    backing.reclaimable_bytes,true,[&] { ++warms; });
+                expect(warms==1 && reservation.retained_reserved_bytes==99094056317ULL &&
+                    reservation.setup_peak_reserved_bytes==99110395305ULL &&
+                    reservation.reclaimable_file_mapping_credit_bytes==backing.reclaimable_bytes,
+                    "measured D9 ledger admits before warming with default or zero session RAM");
+            }
+            // With no reclaimability proof, the original D9 ledger must refuse.
+            // A real growth overflow still refuses even with the full valid credit.
+            for (const bool reclaimable : {false,true}) {
+                auto o=admitted.options;
+                unsigned warms=0;
+                bool refused=false;
+                const auto required_growth=reclaimable ? growth+32*gib_bytes : growth;
+                try { (void)admit_http_prefill_before_warm(o,live,required_growth,temporary,
+                    reclaimable?backing.reclaimable_bytes:0U,true,[&] { ++warms; }); }
+                catch (const std::invalid_argument& e) {
+                    const std::string message=e.what();
+                    refused=message.find("[known-prefill live_bytes=112090202777")!=std::string::npos &&
+                        message.find("growth_bytes="+std::to_string(required_growth))!=std::string::npos &&
+                        message.find("retained_limit_bytes="+std::to_string(available))!=std::string::npos;
+                }
+                expect(refused && !warms,"unfit native ledger refuses with diagnostics before any warm-up");
+            }
+            auto explicit_ram=admitted.options;
+            explicit_ram.session_ram_bytes=32*gib_bytes;
+            explicit_ram.supplied_options.insert("--session-ram-bytes");
+            unsigned warms=0;
+            bool refused=false;
+            try { (void)admit_http_prefill_before_warm(explicit_ram,live,growth,temporary,
+                backing.reclaimable_bytes,true,[&] { ++warms; }); }
+            catch (const std::invalid_argument& e) {
+                const std::string message=e.what();
+                refused=message.starts_with("explicit --session-ram-bytes") &&
+                    message.find("[known-prefill live_bytes=112090202777")!=std::string::npos &&
+                    message.find("verified_credit_bytes="+std::to_string(backing.reclaimable_bytes))!=std::string::npos;
+            }
+            expect(refused && !warms && explicit_ram.session_ram_bytes==32*gib_bytes,
+                "explicit oversize session RAM is preserved and refuses before warm-up");
+        }
     }
     // Synthetic verified-asset/owner evidence, deliberately far below ceilings.
     memory.serving=[](const Options&) { return HttpServingMemory{gib_bytes,gib_bytes,gib_bytes,gib_bytes}; };
@@ -493,6 +569,141 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     rejected=memory; rejected.available=1;
     expect(resolve(request,rejected).serve_prefill_notice.find("host-available needs")!=std::string::npos,
         "serve_prefill_rejection_details: name failed memory bound and byte counts");
+    {
+        auto low_args=args; low_args.emplace_back("--deploy-check");
+        const auto low=resolve({parse(low_args),request.environment},rejected);
+        expect(low.options.deploy_check && low.options.print_effective_config && low.options.deployment_spec &&
+            !low.options.known_prefix_prefill_rows,"low-memory deploy-check fixture declines every T");
+        const auto reason=deployment_startup_refusal(low);
+        expect(reason.find("host-available needs")!=std::string::npos &&
+            reason.find("--http-serve requires the tiled MTP route")==std::string::npos,
+            "deploy inspection keeps the memory refusal instead of the generic route exception");
+        qwen::deployment::Provider provider({},static_cast<std::uint32_t>(low.options.context_tokens),1,
+            "single","default",reason);
+        deploy::DeviceFacts d; d.mem_total_bytes=1172*gib_bytes/10; d.mem_free_bytes=1;
+        const auto plan=deploy::resolve(*low.options.deployment_spec,{d},provider);
+        const auto json=serve::parse_json(plan.to_json());
+        expect(plan.refused && json.find("refused")->as_bool() &&
+            plan.to_json().find("host-available needs")!=std::string::npos,
+            "low-memory deploy inspection emits parseable structured refusal JSON");
+    }
+    {
+        auto observed=memory;
+        observed.available=1172*gib_bytes/10;
+        observed.estimate=[](const Options& o) {
+            return PrefillRequirements{92*gib_bytes,gib_bytes,gib_bytes,
+                o.known_prefix_prefill_rows*(gib_bytes/1024),gib_bytes/2,gib_bytes/8,gib_bytes,2*gib_bytes};
+        };
+        const auto plain=resolve(request,observed);
+        validate_effective_startup(plain);
+        const auto committed=plain.host_compilation.at("serve_committed_host_peak_bytes");
+        expect(plain.options.known_prefix_prefill_rows==8192 && plain.options.session_ram_bytes>0 &&
+            plain.options.session_ram_bytes<8*gib_bytes &&
+            plain.options.session_ram_bytes==*observed.available-committed,
+            "117.2 GiB plain HTTP fits default RAM after retained owners and margin");
+        expect(plain.options.supplied_options==request.options.supplied_options &&
+            plain.options.known_prefill_host_headroom==4*gib_bytes &&
+            plain.options.known_prefill_uma_budget==*observed.available &&
+            plain.options.http_batch_cap==request.options.http_batch_cap &&
+            plain.options.cache_activation->automatic_path==startup.options.cache_activation->automatic_path,
+            "elastic session sizing preserves margin, UMA limit, slot policy and cache provenance");
+        auto cached=request; cached.options.prefix_cache_host_bytes=gib_bytes;
+        const auto with_cache=resolve(cached,observed);
+        expect(with_cache.options.session_ram_bytes==*observed.available-
+            with_cache.host_compilation.at("serve_committed_host_peak_bytes") &&
+            plain.options.session_ram_bytes-with_cache.options.session_ram_bytes==gib_bytes,
+            "explicit prefix payload is charged exactly once before elastic session RAM");
+        auto exact=observed; exact.available=committed;
+        const auto zero=resolve(request,exact);
+        validate_effective_startup(zero);
+        expect(zero.options.known_prefix_prefill_rows==8192 && !zero.options.session_ram_bytes,
+            "default session cap may become zero without refusing or changing T");
+        auto generous=observed; generous.available=200*gib_bytes;
+        expect(resolve(request,generous).options.session_ram_bytes==8*gib_bytes,
+            "default remains capped at 8 GiB when mandatory owners leave room");
+        auto pinned=request;
+        pinned.options.supplied_options.insert("--session-ram-bytes");
+        pinned.options.session_ram_bytes=8*gib_bytes;
+        const auto oversized=resolve(pinned,observed);
+        expect(oversized.options.session_ram_bytes==8*gib_bytes &&
+            oversized.error.find("explicit --session-ram-bytes")!=std::string::npos &&
+            oversized.error.find("after retained reservation and margin")!=std::string::npos,
+            "explicit oversize RAM stays fixed and gives a named refusal");
+        bool oversized_refused=false;
+        try { validate_effective_startup(oversized); }
+        catch (const std::invalid_argument& e) {
+            oversized_refused=std::string_view(e.what()).find("explicit --session-ram-bytes")!=std::string_view::npos;
+        }
+        expect(oversized_refused,"plain HTTP startup refuses explicit oversize session RAM");
+        pinned.options.session_ram_bytes=0;
+        const auto off=resolve(pinned,observed);
+        validate_effective_startup(off);
+        expect(!off.options.session_ram_bytes && off.options.known_prefix_prefill_rows==plain.options.known_prefix_prefill_rows &&
+            numerical_profile_pair(off.options)==numerical_profile_pair(plain.options),
+            "explicit RAM OFF preserves HTTP tile and arithmetic");
+        auto native=plain.options;
+        UmaOwnerInventory live; live.reservation_upper_bound_bytes=112*gib_bytes;
+        const auto actual=plan_known_prefill_reservation(live,4*gib_bytes,0,{},0,0);
+        fit_http_session_ram(native,actual.setup_peak_reserved_bytes,*observed.available);
+        expect(native.session_ram_bytes==*observed.available-actual.setup_peak_reserved_bytes &&
+            native.session_ram_bytes<plain.options.session_ram_bytes,
+            "native retained ledger refits the default without changing its UMA limit");
+        fit_http_session_ram(native,*observed.available,*observed.available);
+        expect(!native.session_ram_bytes,"native reservation can consume the remaining default session cap");
+        // Exercise the actual post-registration throw boundary, rather than
+        // fitting an estimator-only commitment. Session RAM is not an input to
+        // this ledger: changing its cap cannot cure a mandatory-owner overflow.
+        auto node_args=args;
+        for (const auto* flag : {"--http-batch","--prefix-cache-block-rows"}) {
+            const auto at=std::find(node_args.begin(),node_args.end(),flag);
+            if (at!=node_args.end()) node_args.erase(at,at+2);
+        }
+        const RequestedOptions node_request{parse(node_args),request.environment};
+        node_args.insert(node_args.end(),{"--session-ram-bytes","0"});
+        const RequestedOptions off_request{parse(node_args),request.environment};
+        for (const auto available : {1172*gib_bytes/10,1188*gib_bytes/10}) {
+            auto node=observed; node.available=available;
+            auto admitted=resolve(node_request,node);
+            const auto ram_off=resolve(off_request,node);
+            validate_effective_startup(admitted);
+            validate_effective_startup(ram_off);
+            expect(admitted.options.cache_activation->automatic_path &&
+                !ram_off.options.cache_activation->automatic_path &&
+                admitted.options.known_prefill_uma_budget==ram_off.options.known_prefill_uma_budget &&
+                admitted.options.known_prefix_prefill_rows==ram_off.options.known_prefix_prefill_rows &&
+                admitted.host_compilation==ram_off.host_compilation,
+                "parsed default/RAM-OFF changes cache provenance but not the prefill commitment or UMA limit");
+            auto native_options=admitted.options;
+            UmaOwnerInventory owners;
+            owners.reservation_upper_bound_bytes=112*gib_bytes;
+            const UmaReservationLimits limits{native_options.known_prefill_uma_budget,
+                native_options.known_prefill_uma_budget};
+            const auto mandatory=plan_known_prefill_reservation(owners,4*gib_bytes,0,{},0,0);
+            fit_http_session_ram(native_options,mandatory.setup_peak_reserved_bytes,*limits.retained_bytes);
+            const auto checked=plan_known_prefill_reservation(owners,4*gib_bytes,0,limits,0,0);
+            expect(native_options.session_ram_bytes>0 &&
+                native_options.session_ram_bytes==deploy::fit_elastic_extra(admitted.options.session_ram_bytes,
+                    mandatory.setup_peak_reserved_bytes,*limits.retained_bytes) &&
+                checked.retained_reserved_bytes==mandatory.retained_reserved_bytes,
+                "117 GiB native retained check admits after fitting default RAM with the shared rule");
+            for (const bool disable_ram : {false,true}) {
+                auto arm=native_options;
+                if (disable_ram) { arm.session_ram_bytes=0; arm.supplied_options.insert("--session-ram-bytes"); }
+                const auto over=plan_known_prefill_reservation(owners,8*gib_bytes,0,{},0,0);
+                fit_http_session_ram(arm,over.setup_peak_reserved_bytes,*limits.retained_bytes);
+                bool native_refused=false;
+                try { (void)plan_known_prefill_reservation(owners,8*gib_bytes,0,limits,0,0); }
+                catch (const std::invalid_argument& e) {
+                    const std::string message=e.what();
+                    native_refused=message.starts_with("UMA retained reservation exceeds explicit budget") &&
+                        message.find("[known-prefill live_bytes="+std::to_string(owners.reservation_upper_bound_bytes))!=std::string::npos &&
+                        message.find("growth_bytes="+std::to_string(8*gib_bytes))!=std::string::npos &&
+                        message.find("retained_limit_bytes="+std::to_string(*limits.retained_bytes))!=std::string::npos;
+                }
+                expect(native_refused,"mandatory native UMA overflow refuses with ledger details in default and RAM-OFF arms");
+            }
+        }
+    }
     for (const char* name : {"STRIX_SERVE_PREFILL","STRIX_KNOWN_PREFIX_WINDOW","STRIX_KNOWN_PREFIX_FULL_ROWS",
             "STRIX_KNOWN_PREFIX_EXPERT_UNION","STRIX_KNOWN_WINDOW_ROUTER_ROWS","STRIX_KNOWN_PREFIX_PREFILL_ROWS"}) {
         auto off=request; off.environment[name]="0";
@@ -3308,6 +3519,11 @@ int main(int argc, char** arguments) {
                 args.insert(args.end(), {"--http-batch", batch});
             args.insert(args.end(), {"--profile", "fast", "--print-effective-config"});
             auto selected = RequestedOptions{parse(args), {}};
+            auto deploy_args=args; deploy_args.insert(deploy_args.end(),{"--deploy","auto"});
+            const auto deploy_options=parse(deploy_args);
+            expect(deploy_options.http_batch_explicit==selected.options.http_batch_explicit &&
+                deploy_options.http_batch_cap==selected.options.http_batch_cap &&
+                !deploy_options.deployment_spec->slots,"deployment preserves plain HTTP routing and automatic slots");
             const auto got = resolve(selected, memory);
             expect(got.error.empty() && !got.options.prefill_moe_route_bf16,
                 "fast HTTP and MTP inspection softly decline candidate storage");

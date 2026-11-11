@@ -29,6 +29,13 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 
 <a id="hardware"></a>
 
+## Different hardware
+
+The deployment planner budgets measured device memory for the requested KV context,
+workspace and supported weight formats/topologies before loading. See
+[deployment on different hardware](docs/deployment.md) for inspection, TOML examples,
+orchestrator APIs and current integration limits, including pending INT4 runtimes.
+
 ## Quick start
 
 One node. You need the ROCm toolchain, the model GGUF and a `prompt.ids` file from the tokenizer.

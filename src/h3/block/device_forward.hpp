@@ -104,10 +104,13 @@ struct HostFallbackAttention final : DeviceAttentionOp {
 // The gemm package's device linear (int8 weights resident, fc1 permuted for the fused SwiGLU epilogue).
 class GemmDeviceLinear final : public DeviceLinearOp {
 public:
-    // fused: fc1 permuted for the SwiGLU epilogue (default); false: fc1 in checkpoint order, [rows][28672] output, the
-    // driver runs K5 (needed by the Turbo fc1 branch, which acts on the plain fc1 output)
+    // fused: fc1 returns SwiGLU(fc1) [rows][14336] (default): int8_convrot fc1 permuted for the SwiGLU epilogue, other
+    // operands (W4A8, dense BF16) in checkpoint order + K5 inside run(); same bits either way. false: fc1 in checkpoint
+    // order, [rows][28672] output, the driver runs K5 (needed by the Turbo fc1 branch, which acts on the plain fc1 output)
+    // max_rows 0: weights only (prepare before the row count is known); set_max_rows before the first run.
     GemmDeviceLinear(std::uint32_t max_rows, bool fused = true);
     ~GemmDeviceLinear() override;
+    void set_max_rows(std::uint32_t max_rows);  // (re)allocates the activation workspace; the resident weights stay
     void prepare(const std::shared_ptr<const BlockWeights>& b) override;
     bool prepared(std::uint32_t block) const override;
     void run(std::uint32_t block, LinearKind kind, const std::uint16_t* d_x, std::uint32_t m, std::uint16_t* d_y, void* stream) override;

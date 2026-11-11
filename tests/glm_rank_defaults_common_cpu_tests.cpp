@@ -1,5 +1,4 @@
-// Host-only migration checks. GLM keeps its legacy --profile timing flag;
-// product-profile admission below exercises the common resolver independently.
+// Host-only defaults and product-profile checks. The bare --profile retains kernel timing.
 #include "glm_rank_receipt.hpp"
 #include "glm/engine/glm_kvshard_exchange.hpp"
 #include "glm/engine/glm_mem.hpp"
@@ -30,7 +29,7 @@ void test_common_default_rows() {
     static_assert(std::is_same_v<rd::EnvItem, profile::DefaultItem>);
     const Env absent;
     const auto empty = lookup(absent);
-    CHECK(rd::env_items().size() == 40);
+    CHECK(rd::env_items().size() == 41);
     const auto normal = rd::resolve(rd::scan({}), empty);
     const auto baseline_config = rd::resolve(rd::scan({"--baseline"}), empty);
     CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
@@ -115,6 +114,65 @@ void test_glm_exports_and_precedence() {
     const auto timing = rd::scan({"--profile", "--decode", "64"});
     CHECK(timing.decode && !timing.baseline_flag);
     CHECK(rd::print(rd::resolve(timing, lookup(absent))) == rd::print(plain));
+}
+
+void test_glm_product_profiles() {
+    const Env absent;
+    const auto empty = lookup(absent);
+    const auto exports = [&](const rd::Effective& e) {
+        Env result;
+        rd::apply_env(e, [&](const char* key, const char* value) { result[key] = value; });
+        return result;
+    };
+    const auto plain = rd::resolve(rd::scan({"--decode", "64"}), empty);
+    CHECK(!plain.product);
+    const auto normal_exports = exports(plain);
+    for (const auto* name : {"default", "quality"}) {
+        const auto e = rd::resolve(rd::scan({"--profile", name, "--decode", "64"}), empty);
+        CHECK(e.product && e.product->find("pf_wmma")->value == "0");
+        CHECK(exports(e) == normal_exports);
+        // Exact defaults and inspection lines are unchanged; only the requested profile receipt is appended.
+        CHECK(rd::print(e) == rd::print(plain) + e.product->describe());
+        CHECK(e.product->quality_fallback() == (std::string(name) == "quality"));
+    }
+    auto fast = rd::resolve(rd::scan({"--profile", "fast", "--decode", "64"}), empty);
+    CHECK(fast.product && fast.product->find("pf_wmma")->status == profile::Status::set);
+    CHECK(fast.product->find("pf_wmma")->value == "1");
+    auto wanted = normal_exports;
+    wanted["STRIX_GLM_PF_WMMA"] = "1";
+    CHECK(exports(fast) == wanted); // FAST adds exactly one switch.
+    CHECK(fast.product->qualification() == "qualified");
+    CHECK(rd::print(fast).find("profile lever pf_wmma 1 (profile, bit-changing, STRIX_GLM_PF_WMMA)") != std::string::npos);
+    CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
+    for (const char* value : {"0", "1", "", "1tail"}) {
+        const Env env{{"STRIX_GLM_PF_WMMA", value}};
+        const auto e = rd::resolve(rd::scan({"--profile=fast", "--decode", "64"}), lookup(env));
+        CHECK(e.product->find("pf_wmma")->value == value);
+        CHECK(e.product->find("pf_wmma")->status == (std::string(value) == "0" ? profile::Status::off : profile::Status::explicit_env));
+        CHECK(exports(e).count("STRIX_GLM_PF_WMMA") == 0); // explicit env is never rewritten
+    }
+    for (const auto& args : {std::vector<std::string>{"--profile", "fast", "--baseline"},
+                             std::vector<std::string>{"--baseline", "--profile=fast"}}) {
+        const auto e = rd::resolve(rd::scan(args), empty);
+        CHECK(e.product->find("pf_wmma")->value == "0");
+        CHECK(exports(e) == exports(rd::resolve(rd::scan({"--baseline"}), empty)));
+        const Env explicit_on{{"STRIX_GLM_PF_WMMA", "1"}};
+        CHECK(rd::resolve(rd::scan(args), lookup(explicit_on)).product->find("pf_wmma")->value == "1");
+    }
+    const Env baseline_env{{"STRIX_GLM_BASELINE", "1"}};
+    CHECK(rd::resolve(rd::scan({"--profile", "fast"}), lookup(baseline_env)).product->find("pf_wmma")->value == "0");
+    std::vector<std::string> args{"--profile", "--profile=fast", "--decode", "64"};
+    profile::Inputs input;
+    profile::take_options(rd::product_profile_engine, args, input);
+    CHECK(input.profile == profile::Name::fast);
+    CHECK((args == std::vector<std::string>{"--profile", "--decode", "64"}));
+    CHECK(rd::scan({"--profile", "--profile", "fast", "--decode", "64"}).decode);
+    for (const auto& invalid : {std::vector<std::string>{"--profile", "fastt"},
+                                std::vector<std::string>{"--profile", "fast", "--profile", "default"}}) {
+        bool refused = false;
+        try { (void)rd::scan(invalid); } catch (const std::invalid_argument&) { refused = true; }
+        CHECK(refused);
+    }
 }
 
 void test_common_profile_admission() {
@@ -322,6 +380,7 @@ int main() {
     test_common_default_rows();
     test_glm_exports_and_precedence();
     test_common_profile_admission();
+    test_glm_product_profiles();
     test_partial_receipt();
     std::printf("glm defaults common cpu tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

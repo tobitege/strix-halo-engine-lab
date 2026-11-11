@@ -57,6 +57,7 @@ struct Args {
     unsigned rcap;  // v3 row buckets on (1) / off (0)
     const unsigned* ntiles;  // device tile count (device plan) or null (host plan: grid == tiles)
     bool aux_act = false, aux_combine = false;
+    const std::uint32_t* ids = nullptr;  // [rows][8] routed expert ids on the device (device plan) or null
 };
 // One global load from the device table (entry E = the shared expert): selecting a member of a by-value / kernarg
 // struct with a runtime index forces the struct to scratch (328 B/lane in the first draft).
@@ -83,6 +84,39 @@ __global__ void input_kernel(Args a) {
                               a.input + (std::size_t{pair} * 2U + m) * H + begin, begin, 0, lane);
     }
 }
+// Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN, default on; =0 restores input_kernel; device plan):
+// one CTA per (1024-channel chunk, row);
+// wave w owns H128 block blockIdx.x * 8 + w, loads its four x values once and writes transform_block_at's values for
+// the row's eight routed experts x two matrices and the shared expert, at the same per-(pair, matrix) destination.
+// input_kernel reads the row chunk once per (pair, matrix): 18 reads of a 16 KiB row that is not cache resident at
+// 8K (134 MB of x per layer); this reads it once. Rows the device plan rejects (plan_scatter's test) get only the
+// shared pair, as their routed pairs are in no tile. Same ops, same bits.
+__global__ __launch_bounds__(256) void input_token_kernel(Args a) {
+    const unsigned row = blockIdx.y, wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned begin = (blockIdx.x * 8U + wave) * 128U;
+    const float* x = a.x + std::size_t{row} * H;
+    float xv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xv[j] = x[begin + lane + 32U * static_cast<unsigned>(j)];
+    unsigned e[8];
+    bool bad = false;
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) {
+        e[k] = a.ids[std::size_t{row} * 8U + k];
+        bad = bad || e[k] >= E || (k && e[k] <= e[k - 1]);
+    }
+    for (unsigned k = 0; k < P; ++k) {
+        if (k < 8U && bad) continue;
+        const unsigned expert = k == 8U ? E : e[k];
+        _Float16* out = a.input + (std::size_t{row} * P + k) * 2U * H + begin;
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            const moe::Exl3 w = matrix(a, expert, m);
+            d::transform_block_values(xv, w.suh, out + m * H, begin, 0, lane);
+        }
+    }
+}
+bool input_token_enabled() { return aux::enabled_default_on("STRIX_GLM_PF_IN_TOKEN"); }  // bitwise; 8K -0.31 s
 
 // One wave per 16-output tile, eight waves per H128 block. Each decoded operand is reused
 // across TM independent row chains by compute_slot; the helper fixes DOT2 pair order.
@@ -662,7 +696,8 @@ __global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
 // The grouped variants (v3 and the X cores): input transform, gate/up, activation, down, combine. grid_tiles is the
 // tile count (host plan) or its upper bound (device plan; surplus CTAs return on Args::ntiles).
 void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream) {
-    input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
+    if (a.ids && input_token_enabled()) input_token_kernel<<<dim3(H / 1024, a.rows), 256, 0, stream>>>(a);
+    else input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 gate/up input transform");
     // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
     if ((selected == 11 || selected == 14) && wmma_x::enabled()) {
@@ -942,6 +977,7 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
     Args a{v.rows, v.x, v.weights, v.out, v.table, v.shared, pa.pairs, pa.tiles, pa.groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
            reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, off + E + 1};
+    a.ids = v.ids;
     const auto grid_tiles = static_cast<unsigned>(std::size_t{v.rows} * P / 16U + E + 1U);
     launch_grouped(a, grid_tiles, selected, v.shared, stream);
 }

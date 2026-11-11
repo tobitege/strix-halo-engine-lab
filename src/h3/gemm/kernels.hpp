@@ -6,7 +6,7 @@
 //     the team (lane xor 1, 2, 3 / 4, 8, 12), in 64-bit fixed point relative to the group's max exponent; rounded once
 //     to bf16 (ref fixed_to_bf16); row absmax over the block; s = amax / 127 (IEEE), divisor bf16(s); codes
 //     clamp(rint(bf16(x / sb))). Rows independent: batch invariant.
-//   gemm_kernel: block tile 256 rows x BN outputs (BN 128: 8 waves, BN 256: 16 waves; each wave 64 x 64 = 4 x 4 WMMA
+//   gemm_kernel: block tile 256 rows x BN outputs (BN 64: 4 waves, BN 128: 8 waves, BN 256: 16 waves; each wave 64 x 64 = 4 x 4 WMMA
 //     tiles), 64 K bytes per stage, two LDS stages (64-byte rows, 16-byte chunks XOR-swizzled by (row / 2) % 4), int32
 //     accumulators over the full K (exact, order-free). Epilogue per element: bf16(fp32(acc) * (row_scale * ch_scale)).
 //     Epilogue SwiGLU (fc1 with swiglu_permute()d weights): each wave's 16-column tiles alternate gate / up of the same
@@ -260,9 +260,9 @@ __device__ __forceinline__ unsigned lds_at(unsigned row, unsigned chunk) { retur
 __device__ __forceinline__ void lds_barrier() { __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
 
 template <unsigned BN, Epi E, Operand O = Operand::int8_convrot>
-__global__ __launch_bounds__(BN == 256U ? 512U : 256U) void gemm_kernel(GemmArgs g) {
+__global__ __launch_bounds__(2U * BN) void gemm_kernel(GemmArgs g) {
 #pragma clang fp contract(off)
-    constexpr unsigned Threads = BN == 256U ? 512U : 256U, WavesN = BN / kWN, MT = kWM / 16U, NT = kWN / 16U;
+    constexpr unsigned Threads = 2U * BN, WavesN = BN / kWN, MT = kWM / 16U, NT = kWN / 16U;
     constexpr unsigned StageBytes = (kBM + BN) * 64U;
     constexpr unsigned AChunks = kBM * 4U / Threads, BChunks = BN * 4U / Threads;  // 16-byte chunks per thread
     __shared__ __align__(16) unsigned char lds[2U * StageBytes];
@@ -452,10 +452,10 @@ template <unsigned BN, dev::Epi E> inline void launch_gemm(const dev::GemmArgs& 
                           (1U << g.group_shift) != g.group_size) : (!g.group_fp8 == !g.group_f32)) || g.group_size < 4 ||
             (16 % g.group_size && g.group_size % 16) || g.k % g.group_size)
             throw std::invalid_argument("h3 gemm: invalid packed operand scales");
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E, Operand::w4a8>), dim3(tiles), dim3(BN == 256U ? 512U : 256U), 0, stream, args);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E, Operand::w4a8>), dim3(tiles), dim3(2U * BN), 0, stream, args);
         return;
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(BN == 256U ? 512U : 256U), 0, stream, args);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(dev::gemm_kernel<BN, E>), dim3(tiles), dim3(2U * BN), 0, stream, args);
 }
 
 }  // namespace strix::h3::gemm

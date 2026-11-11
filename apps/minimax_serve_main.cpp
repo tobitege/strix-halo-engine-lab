@@ -43,6 +43,8 @@
 #include "strix/minimax/engine.hpp"
 #include "../src/minimax/model_graph.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "minimax/engine/deployment.hpp"
+#include <iostream>
 #include "minimax/serve/minimax_dspark_policy.hpp"
 #include <filesystem>
 #include "strix/dist/communicator.hpp"
@@ -739,7 +741,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL_DIR --rank R --transport T [--port P] [--bind ADDR] [--slots S] [--capacity C] "
                              "[--max-rows R] [--model-id ID] [--max-tokens N] [--dspark-mode off|auto|on] [--dspark DIR [--dspark-exl3 DIR]] [--admin] "
-                             "[--resume-check P.u32[,...]] [--print-model-graph] [--print-plan]\n", argv[0]);
+                             "[--resume-check P.u32[,...]] [--print-model-graph] [--print-plan] [--deploy FILE|auto] [--deploy-check]\n", argv[0]);
         return 2;
     }
     try {
@@ -758,6 +760,10 @@ int main(int argc, char** argv) {
         mm::Options opt;
         opt.model_dir = argv[1];
         opt.slots = 8;
+        std::string deploy_file;
+        bool deploy_check = false;
+        bool slots_given = false;
+        std::shared_ptr<const strix::deploy::Plan> deployment_plan;
         std::string transport_spec = "usb4-auto", bind = "127.0.0.1", model_id = "minimax-m3.1-flash", dspark_dir, dspark_exl3, check, check_nested;
         std::uint16_t port = 8080;
         std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
@@ -773,12 +779,14 @@ int main(int argc, char** argv) {
                 return argv[++i];
             };
             if (a == "--print-model-graph") print_graph = true;
+            else if (a == "--deploy") deploy_file = next();
+            else if (a == "--deploy-check") deploy_check = true;
             else if (a == "--print-plan") print_plan = true;
             else if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--transport") transport_spec = next();
             else if (a == "--port") port = static_cast<std::uint16_t>(std::stoul(next()));
             else if (a == "--bind") bind = next();
-            else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--slots") { opt.slots = static_cast<std::uint32_t>(std::stoul(next())); slots_given = true; }
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--max-rows") opt.max_rows = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--model-id") model_id = next();
@@ -825,13 +833,57 @@ int main(int argc, char** argv) {
         strix::minimax::defaults::SessionConfig session_config;
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
+        std::optional<strix::deploy::Spec> deploy_spec;
+        std::unique_ptr<mm::FootprintProvider> deploy_provider;
+        if (deploy_check && deploy_file.empty()) deploy_file = "auto";
+        if (!deploy_file.empty()) {
+            auto spec = strix::deploy::load_spec(deploy_file);
+            if (opt.capacity > UINT32_MAX) throw std::invalid_argument("deployment capacity exceeds uint32 range");
+            if (!strix::deploy::pinned(spec,"context")) spec.context = static_cast<std::uint32_t>(opt.capacity);
+            if (!strix::deploy::pinned(spec,"slots") && slots_given) spec.slots = opt.slots;
+            if (!spec.nodes) spec.nodes = 2;
+            const auto link = transport_spec.starts_with("tcp") ? "tcp" : transport_spec;
+            if (spec.link == "auto") spec.link = link;
+            else if (spec.link != link) throw std::invalid_argument("deployment link differs from --transport");
+            if (spec.profile != "auto" && spec.profile != "default")
+                throw std::invalid_argument("MiniMax deployment profile pin unavailable in this build");
+            if (!dspark_dir.empty()) throw std::invalid_argument("deployment DSpark peak sizing unavailable; disable DSpark");
+            const auto* session_cache = std::getenv("STRIX_SESSION_CACHE");
+            if (!session_cache || (std::string_view(session_cache) != "0" && std::string_view(session_cache) != "off") ||
+                !session_options.load.empty() || !session_options.save.empty() || !session_options.prompt.empty())
+                throw std::invalid_argument("deployment session-cache peak sizing unavailable; use --session-cache off and no session restore/save");
+            std::uint64_t scratch_extra = 0;
+            if (const auto* cap = std::getenv("STRIX_MM_PF_MSA_SCRATCH_MB")) {
+                std::size_t end = 0; const auto mb = std::stoull(cap,&end);
+                if (end != std::string_view(cap).size() || mb < 64 || mb > 8192)
+                    throw std::invalid_argument("deployment invalid MSA scratch cap");
+                if (mb > 1152) scratch_extra = (mb-1152)<<20;
+            }
+            deploy_provider = std::make_unique<mm::FootprintProvider>(mm::deployment_model(opt.model_dir),opt.max_rows,model_id,scratch_extra);
+            if (deploy_check) {
+                // Pair inspection needs the orchestrator's measured peer entry; never invented.
+                auto plan = strix::deploy::resolve(spec,
+                    strix::deploy::inspection_devices(spec,opt.rank,strix::deploy::probe_device()),*deploy_provider);
+                std::cout << plan.to_json() << '\n'; return plan.refused ? 2 : 0;
+            }
+            deploy_spec = std::move(spec);
+        }
         std::string receipt;
         auto transport = open_transport(transport_spec, opt.rank, receipt);
+        if (deploy_spec) {
+            auto plan = strix::deploy::resolve_pair(*deploy_spec,*deploy_provider,opt.rank,strix::deploy::probe_device(),
+                [&](auto out, auto in) { transport->exchange(out,in); });
+            strix::deploy::require_plan(plan);
+            opt.capacity = plan.chosen.context; opt.slots = plan.chosen.slots;
+            cli.capacity = opt.capacity; cli.slots = opt.slots;
+            deployment_plan = std::make_shared<const strix::deploy::Plan>(std::move(plan));
+        }
         strix::dist::Group group;
         group.transport_capabilities = 0;
         group.rank = opt.rank;
         group.world = 2;
         group.plan = 0x4d4d5331ULL;  // "MMS1"
+        if (deployment_plan) group.plan ^= std::stoull(deployment_plan->hash(),nullptr,16);
         const std::size_t max_bytes = std::max<std::size_t>(std::size_t{opt.max_rows} * 6144, 256 * 782 * 128) * sizeof(float);
         // exchange module for the decode steps (default on, STRIX_MM_XFER=off disables)
         const char* xfer_env = std::getenv("STRIX_MM_XFER");
@@ -1003,6 +1055,15 @@ int main(int argc, char** argv) {
         oi.draft = drafter != nullptr;
         ms::Observer observer(std::move(oi));
         ms::MinimaxApiOptions ao;
+        ao.http_slots = opt.slots;
+        if (deployment_plan) {
+            ao.deployment.deployment_json = [deployment_plan] { return deployment_plan->to_json(); };
+            ao.deployment.deployment_id = [deployment_plan] { return deployment_plan->hash(); };
+        }
+        ao.deployment.capacity_provider = [&queue, slots = opt.slots] {
+            const auto q = queue.snapshot();
+            return sv::ServeCapacity{slots, q.running, std::nullopt, q.queued};
+        };
         ao.session_enabled = session_runtime != nullptr;
         ao.model_id = model_id;
         ao.default_max_tokens = max_tokens;

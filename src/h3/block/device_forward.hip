@@ -162,11 +162,15 @@ struct GemmDeviceLinear::Impl {
     };
     struct BlockW {
         DevW qkv, out, fc1, fc2;
+        bool fc1_fused = false;  // fc1 permuted for the SwiGLU epilogue (int8_convrot); else checkpoint order + K5
     };
     gemm::Workspace ws;
     std::map<std::uint32_t, BlockW> blocks;
     std::uint64_t bytes = 0;
-    explicit Impl(std::uint32_t max_rows) : ws(max_rows, kFfn) {}
+    std::uint32_t max_rows = 0;
+    DevBuf f1;      // [max_rows][2 * kFfn] bf16: plain fc1 output of blocks the epilogue cannot fuse (allocated on first use)
+    DevBuf silu;    // K5 table for those blocks
+    explicit Impl(std::uint32_t rows) : max_rows(rows) { if (rows) ws = gemm::Workspace(rows, kFfn); }
     void up(DevW& d, const std::int8_t* codes, const float* scales, std::uint32_t n, std::uint32_t k) {
         d.codes.alloc(static_cast<std::size_t>(n) * k);
         d.scales.alloc(static_cast<std::size_t>(n) * 4U);
@@ -191,20 +195,28 @@ GemmDeviceLinear::GemmDeviceLinear(std::uint32_t max_rows, bool fused) : fused_(
 GemmDeviceLinear::~GemmDeviceLinear() = default;
 void GemmDeviceLinear::prepare(const std::shared_ptr<const BlockWeights>& b) {
     if (prepared(b->index)) return;
-    if (fused_ && b->fc1.operand==gemm::Operand::w4a8)
-        throw std::invalid_argument("h3 packed operand: use plain fc1 order");
     Impl::BlockW& d = impl_->blocks[b->index];
     impl_->up(d.qkv, b->qkv);
     impl_->up(d.out, b->out);
-    if (fused_) {
+    // Fused policy per block: the epilogue needs int8_convrot fc1 rows in swiglu order. Packed (W4A8) and dense BF16
+    // fc1 keep checkpoint order and run fc1 + K5 here, so run() still returns SwiGLU(fc1) (same bits either way).
+    if (fused_ && b->fc1.operand==gemm::Operand::int8_convrot && b->fc1.bf16.empty()) {
         const gemm::SwiGLUWeights p = gemm::permute_fc1_for_swiglu(b->fc1.w.data(), b->fc1.ws.data(), b->fc1.n, b->fc1.k);
         impl_->up(d.fc1, p.codes.data(), p.scales.data(), b->fc1.n, b->fc1.k);
+        d.fc1_fused = true;
     } else {
         impl_->up(d.fc1, b->fc1);
     }
     impl_->up(d.fc2, b->fc2);
 }
 bool GemmDeviceLinear::prepared(std::uint32_t block) const { return impl_->blocks.count(block) != 0; }
+void GemmDeviceLinear::set_max_rows(std::uint32_t max_rows) {
+    if (!max_rows) throw std::invalid_argument("device linear: empty workspace");
+    if (max_rows == impl_->max_rows && impl_->ws.max_rows()) return;
+    impl_->ws = gemm::Workspace(max_rows, kFfn);
+    impl_->max_rows = max_rows;
+    impl_->f1 = DevBuf{};  // sized by max_rows on first use
+}
 void GemmDeviceLinear::run(std::uint32_t block, LinearKind kind, const std::uint16_t* d_x, std::uint32_t m, std::uint16_t* d_y, void* stream) {
     const Impl::BlockW& d = impl_->blocks.at(block);
     hipStream_t s = static_cast<hipStream_t>(stream);
@@ -216,8 +228,20 @@ void GemmDeviceLinear::run(std::uint32_t block, LinearKind kind, const std::uint
         case LinearKind::qkv: project(d.qkv,kHidden); break;
         case LinearKind::out: project(d.out,kInner); break;
         case LinearKind::fc1:
-            if (fused_) gemm::linear_fc1_swiglu(d_x, kHidden, m, d.fc1.w, impl_->ws, d_y, kFfn, s);
-            else project(d.fc1,kHidden);
+            if (d.fc1_fused) gemm::linear_fc1_swiglu(d_x, kHidden, m, d.fc1.w, impl_->ws, d_y, kFfn, s);
+            else if (!fused_) project(d.fc1,kHidden);
+            else {
+                if (m > impl_->max_rows) throw std::invalid_argument("device linear: rows above the workspace");
+                if (!impl_->f1.as<void>()) {
+                    impl_->f1.alloc(static_cast<std::size_t>(impl_->max_rows) * 2U * kFfn * 2U);
+                    const auto& st = gemm::silu_table();
+                    impl_->silu = upload(std::vector<std::uint16_t>(st.begin(), st.end()), s);
+                }
+                std::uint16_t* const y = d_y;
+                d_y = impl_->f1.as<std::uint16_t>();
+                project(d.fc1,kHidden);
+                gpu::launch_swiglu(impl_->f1.as<std::uint16_t>(), m, kFfn, impl_->silu.as<std::uint16_t>(), y, stream);
+            }
             break;
         case LinearKind::fc2: project(d.fc2,kFfn); break;
     }
@@ -349,12 +373,14 @@ struct DeviceForward::Impl {
 DeviceForward::DeviceForward(const GlobalWeights& g) : impl_(std::make_unique<Impl>(g)) {}
 DeviceForward::~DeviceForward() = default;
 void DeviceForward::prepare(BlockSource& blocks, DeviceLinearOp& lin) {
-    for (std::uint32_t i=0;i<blocks.num_blocks();++i) {
-        if (!lin.prepared(i) || impl_->blocks.count(i)==0) {
-            const auto b=blocks.block(i);
-            lin.prepare(b);
-            impl_->block_dev(*b);
-        }
+    // Block i + 1 is read and folded on a worker while block i is permuted and uploaded (the same bytes as a serial loop).
+    std::vector<std::uint32_t> todo;
+    for (std::uint32_t i=0;i<blocks.num_blocks();++i)
+        if (!lin.prepared(i) || impl_->blocks.count(i)==0) todo.push_back(i);
+    BlockReadAhead ahead(blocks, std::move(todo));
+    while (const auto b=ahead.next()) {
+        lin.prepare(b);
+        impl_->block_dev(*b);
     }
     hip_check(hipStreamSynchronize(impl_->stream), "prepare blocks");
 }

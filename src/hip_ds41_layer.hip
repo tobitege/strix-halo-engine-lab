@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/ds41_exact_flags.hpp"
@@ -3038,9 +3039,9 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
         // lose to the two launches); else the two launches (the second accumulated)
         // (the auto rule's 822 pick: o_a's count 1024 takes 914 first; the rotation gate and the statistics see two calls)
-        const auto env_on = [](const char* name) { const char* e = std::getenv(name); return e != nullptr && e[0] == '1'; };
         const bool one = v.tall == 1U && v.rows >= 896U && v.row_width == 8192U && v.width == 4096U && v.count != 1024U &&
-                         !env_on("STRIX_DS41_DENSE_TALL_ROTATE") && !env_on("STRIX_DS41_DENSE_STATS") &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_TALL_ROTATE", strix::EnvFlagMatch::first_character) &&
+                         !strix::env_flag_default_off("STRIX_DS41_DENSE_STATS", strix::EnvFlagMatch::first_character) &&
                          static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
                          static_cast<std::size_t>(v.count) * (v.row_width / 32U * 34U) < 0x7fffffffULL &&
                          [] { const char* e = std::getenv("STRIX_DS41_DENSE_FORM"); return !(e && e[0] == '0'); }();

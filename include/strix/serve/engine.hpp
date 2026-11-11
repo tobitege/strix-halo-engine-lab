@@ -345,6 +345,14 @@ public:
     void finish(TakenJob& job, GenerationStats stats, std::string error = {},
         const std::function<void(const GenerationStats&)>& observe = {});
     [[nodiscard]] bool stopping() const;
+    // Close admission atomically with submit, preserving all accepted work and the owner loop.
+    // Returns true only on the first call.
+    bool begin_drain();
+    [[nodiscard]] bool draining() const;
+    [[nodiscard]] bool drained() const;
+    // Direct backend work outside generation (for example feature export) shares drain admission.
+    bool try_begin_external_work();
+    void finish_external_work();
     void shutdown();
     [[nodiscard]] QueueSnapshot snapshot() const;
     [[nodiscard]] ObserveSnapshot observed() const;
@@ -363,6 +371,8 @@ private:
     std::deque<Entry> entries_;
     std::size_t max_queued_;
     bool stopping_ = false;
+    bool draining_ = false;
+    std::uint64_t external_running_ = 0;
     bool control_pending_ = false;
     std::function<void()> idle_control_;
     QueueSnapshot totals_;

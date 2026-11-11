@@ -92,6 +92,14 @@ int main() {
         for (auto& arg : args) argv.push_back(arg.data());
         return parse_options(static_cast<int>(argv.size()), argv.data());
     };
+    expect(http_slot_retained_bytes(10,20,30,40,50)==150);
+    bool retained_overflow=false;
+    try { (void)http_slot_retained_bytes(UINT64_MAX,1,0,0,0); } catch(const std::overflow_error&) { retained_overflow=true; }
+    expect(retained_overflow);
+    auto deploy_auto=parse({"decoder","model.gguf","1","--deploy","auto"});
+    expect(!deploy_auto.http_batch_explicit && !deploy_auto.deployment_spec->slots);
+    auto deploy_single=parse({"decoder","model.gguf","1","--http-batch","0","--deploy","auto"});
+    expect(deploy_single.http_batch_explicit && !deploy_single.http_batch_cap && !deploy_single.deployment_spec->slots);
     auto parsed = parse({"decoder", "model.gguf", "1"});
     expect(!parsed.http_batch_explicit);
     parsed = parse({"decoder", "model.gguf", "1", "--http-batch", "0"});

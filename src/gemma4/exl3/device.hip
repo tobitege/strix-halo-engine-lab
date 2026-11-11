@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 // Adapted mathematical codec and transforms; see notices/ for retained attribution.
 #include "device.hpp"
 #include <hip/hip_runtime.h>
@@ -575,15 +576,14 @@ __global__ void coop_output_group_kernel(CoopGroup g, unsigned rows, unsigned* f
     }
     output_body(w, g.out[t], rows, failure, group);
 }
-bool env_on(const char* name);
 bool coop_saddr() {
-    static const bool enabled = env_on("STRIX_G4_EXL3_COOP_SADDR");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_COOP_SADDR");
     return enabled;
 }
 // Full-rate codebook hash in the scalar-base cooperative core at <= 4 rows
 // (STRIX_G4_EXL3_HASH16=0 keeps v_mul_lo_u32 at every row count).
 bool coop_hash16() {
-    static const bool enabled = env_on("STRIX_G4_EXL3_HASH16");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_HASH16");
     return enabled;
 }
 // Trellis prefetch depth: 1/2/4/8 (Depth 8 falls back to the largest dividing
@@ -861,12 +861,8 @@ bool launch_fused(LinearView w, const _Float16* x, const float* source, float* o
     }
     return false;
 }
-bool env_on(const char* name) {
-    const auto* p = std::getenv(name);
-    return !p || std::string_view(p) != "0";
-}
 bool input_preload() {
-    static const bool enabled = env_on("STRIX_G4_EXL3_INPUT_PRELOAD");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_INPUT_PRELOAD");
     return enabled;
 }
 // Measured-shape policy: whole tiles where outputs supply enough waves and
@@ -883,17 +879,17 @@ unsigned lane_groups(LinearView w, unsigned rows) {
 // direct half-tile windows are as fast or faster beyond. STRIX_G4_EXL3_STAGED=0 disables.
 // STRIX_G4_PREFILL_EXACT_MANYROW=0 keeps EXL3 prompt chunks on the eight-row passes.
 bool rows_enabled() {
-    static const bool enabled = env_on("STRIX_G4_PREFILL_EXACT_MANYROW");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_PREFILL_EXACT_MANYROW");
     return enabled;
 }
 bool lane_staged(unsigned rows) {
-    static const bool enabled = env_on("STRIX_G4_EXL3_STAGED");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_STAGED");
     return enabled && rows <= 2;
 }
 template <unsigned Rows> void launch_core_route(LinearView w, const _Float16* x, float* out, unsigned* failure,
                                                 CoreRoute route, hipStream_t q) {
     if (route == CoreRoute::automatic) {
-        static const bool lane_tile = env_on("STRIX_G4_EXL3_LANE_TILE");
+        static const bool lane_tile = strix::env_flag_default_on("STRIX_G4_EXL3_LANE_TILE");
         const bool eight = lane_groups(w, Rows) == 8;
         route = !lane_tile ? CoreRoute::legacy
               : lane_staged(Rows) ? (eight ? CoreRoute::staged8 : CoreRoute::staged4)
@@ -975,7 +971,7 @@ void coop_core(LinearView w, const _Float16* x, unsigned rows, float* out, float
 // separate linears. Returns false when partials do not fit (nothing launched).
 bool device_group_v2(const LinearView* w, unsigned count, const float* x, unsigned rows, float* const* out, void* scratch,
                      unsigned* failure, hipStream_t q) {
-    static const bool enabled = env_on("STRIX_G4_EXL3_V2_GROUP");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_V2_GROUP");
     if (!enabled || count < 2 || count > max_group) return false;
     CoopGroup g{};
     Group transforms{};
@@ -1036,8 +1032,8 @@ void device_linear_v2(LinearView w, const float* x, unsigned rows, float* out, v
 // source != nullptr additionally fuses the input transform (when it fits LDS).
 bool fused_core(LinearView w, const _Float16* x, const float* source, unsigned rows, float* out, unsigned* failure,
                 hipStream_t q) {
-    static const bool enabled = env_on("STRIX_G4_EXL3_FUSED_OUTPUT") && env_on("STRIX_G4_EXL3_LANE_TILE");
-    static const bool input = env_on("STRIX_G4_EXL3_FUSED_INPUT");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_FUSED_OUTPUT") && strix::env_flag_default_on("STRIX_G4_EXL3_LANE_TILE");
+    static const bool input = strix::env_flag_default_on("STRIX_G4_EXL3_FUSED_INPUT");
     // Measured: the 128-output blocks lose to the narrow lane kernels beyond two rows.
     if (!enabled || rows > 2 || (source && !input)) return false;
     bool launched = false;
@@ -1081,9 +1077,9 @@ bool core_output(LinearView w, const _Float16* x, unsigned rows, float* out, uns
 // STRIX_G4_EXL3_GROUP_LAUNCH=0 issues one fused launch per member instead.
 bool group_launch(const LinearView* w, unsigned count, const float* x, unsigned rows, float* const* out, void* scratch,
                   unsigned* failure, hipStream_t q) {
-    static const bool enabled = env_on("STRIX_G4_EXL3_GROUP_LAUNCH") && env_on("STRIX_G4_EXL3_FUSED_OUTPUT") &&
-                                env_on("STRIX_G4_EXL3_LANE_TILE");
-    static const bool input = env_on("STRIX_G4_EXL3_FUSED_INPUT");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_GROUP_LAUNCH") && strix::env_flag_default_on("STRIX_G4_EXL3_FUSED_OUTPUT") &&
+                                strix::env_flag_default_on("STRIX_G4_EXL3_LANE_TILE");
+    static const bool input = strix::env_flag_default_on("STRIX_G4_EXL3_FUSED_INPUT");
     if (!enabled || rows > 2 || count < 2 || count > max_group) return false;
     FusedGroup g{};
     g.count = count;
@@ -1157,7 +1153,7 @@ void device_linear(LinearView w, const float* x, unsigned rows, float* out, void
 }
 void device_linear_group(const LinearView* w, unsigned count, const float* x, unsigned rows, float* const* out,
                          void* scratch, unsigned* failure, bool shared, gpu::Queue queue) {
-    static const bool grouped = env_on("STRIX_G4_EXL3_GROUP");
+    static const bool grouped = strix::env_flag_default_on("STRIX_G4_EXL3_GROUP");
     if (grouped && shared && count > 1 && v2_active() && rows <= 8 && x && scratch && failure &&
         device_group_v2(w, count, x, rows, out, scratch, failure, static_cast<hipStream_t>(queue)))
         return;
@@ -1461,7 +1457,7 @@ std::size_t partial_bytes(LinearView w, unsigned rows) {
 // Paired LDS layout + next-chunk raw codec prefetch in the many-row core (same
 // bytes); STRIX_G4_EXL3_ROWS_PAIRED=0 runs the previous schedule.
 bool rows_paired() {
-    static const bool enabled = env_on("STRIX_G4_EXL3_ROWS_PAIRED");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_ROWS_PAIRED");
     return enabled;
 }
 // v2/v3 many-row core: raw values into out (one split) or split partials.
@@ -1478,7 +1474,7 @@ void rows_core(LinearView w, const _Float16* transformed, unsigned rows, float* 
     checked();
 }
 bool ffn_fuse_enabled() {
-    static const bool enabled = env_on("STRIX_G4_EXL3_FFN_FUSE");
+    static const bool enabled = strix::env_flag_default_on("STRIX_G4_EXL3_FFN_FUSE");
     return enabled;
 }
 } // namespace

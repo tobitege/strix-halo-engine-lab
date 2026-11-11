@@ -258,8 +258,13 @@ DeviceModel::DeviceModel(const block::GlobalWeights& g, block::BlockSource& src,
     impl_->aproj_w = upload(g.audio_patch_proj.w);
     impl_->aproj_b = upload(g.audio_patch_proj.b);
     impl_->blocks.resize(nblocks);
+    // Host preparation of block i + 1 (checkpoint read, adaLN folding) on a worker while block i uploads; the uploaded
+    // bytes are unchanged.
+    std::vector<std::uint32_t> order(nblocks);
+    for (std::uint32_t i = 0; i < nblocks; ++i) order[i] = i;
+    block::BlockReadAhead ahead(src, std::move(order));
     for (std::uint32_t i = 0; i < nblocks; ++i) {
-        const auto b = src.block(i);
+        const auto b = ahead.next();
         auto& d = impl_->blocks[i];
         auto q = [&](const block::QLinear& l, Buf& c, Buf& sc, gemm::Weights& w, std::array<Buf,3>& packed) {
             if (!l.bf16.empty()) c = upload(l.bf16);
@@ -394,6 +399,11 @@ struct DeviceDistRank::Impl {
     gemm::Workspace ws;
     hipEvent_t source_free[2] = {}, last_use[2] = {};
     bool src_pending[2] = {false, false};
+    // split schedule (DeviceRunOptions::pair_split_tail_pct): exchange stream, per-part source events, V^T buffers
+    hipStream_t sx = nullptr;
+    hipEvent_t part_free[2][2] = {}, ev_produced = nullptr, ev_rx = nullptr;
+    bool part_pending[2][2] = {};
+    Buf vt_own, vt_peer;
     bool in_flight = false;  // a started exchange not yet finished: teardown must cancel the transport first
     bool injected = false;   // a test hook fired (DeviceRunOptions::inject)
     DistAccel* acc = nullptr;  // FAST-class accelerators of the current forward (nullptr = dense)
@@ -439,11 +449,54 @@ struct DeviceDistRank::Impl {
         // Never release TX / RX / events while transport workers may still submit copies that use them.
         if (in_flight && comm) comm->cancel_pending("h3 dist: rank torn down with an exchange in flight");
         if (s) static_cast<void>(hipStreamSynchronize(s));
+        if (sx) static_cast<void>(hipStreamSynchronize(sx));
         for (int j = 0; j < 2; ++j) {
             if (source_free[j]) static_cast<void>(hipEventDestroy(source_free[j]));
             if (last_use[j]) static_cast<void>(hipEventDestroy(last_use[j]));
+            for (int p = 0; p < 2; ++p)
+                if (part_free[j][p]) static_cast<void>(hipEventDestroy(part_free[j][p]));
         }
+        if (ev_produced) static_cast<void>(hipEventDestroy(ev_produced));
+        if (ev_rx) static_cast<void>(hipEventDestroy(ev_rx));
+        if (sx) static_cast<void>(hipStreamDestroy(sx));
         if (s) static_cast<void>(hipStreamDestroy(s));
+    }
+    // Split schedule resources, created on first use (the one-message schedule never allocates them).
+    void ensure_split() {
+        if (sx) return;
+        ck(hipStreamCreateWithFlags(&sx, hipStreamNonBlocking), "exchange stream");
+        for (auto& pf : part_free)
+            for (auto& e : pf) ck(hipEventCreateWithFlags(&e, hipEventDisableTiming), "event");
+        ck(hipEventCreateWithFlags(&ev_produced, hipEventDisableTiming), "event");
+        ck(hipEventCreateWithFlags(&ev_rx, hipEventDisableTiming), "event");
+        const std::size_t vt = std::size_t{kInner} * pitch * 2U;
+        vt_own = Buf(vt);
+        vt_peer = Buf(vt);
+        // V^T columns past the keys are never written: zero, as the padded one-message V^T the peer sends
+        ck(hipMemsetAsync(vt_own.as<void>(), 0, vt, s), "vt clear");
+        ck(hipMemsetAsync(vt_peer.as<void>(), 0, vt, s), "vt clear");
+        for (auto& b : tx) ck(hipMemsetAsync(b.as<void>(), 0, sp.message_bytes(), s), "tx clear");
+        ck(hipStreamSynchronize(s), "split init");
+    }
+    // One part of the split K/V message: the bytes [off, off + bytes) of TX[j] / RX[j]. The exchange runs on sx after
+    // the producer (everything enqueued on s so far): s keeps computing while the message is staged and sent.
+    void start_part(int j, int part, std::size_t off, std::size_t bytes, std::uint32_t layer) {
+        ck(hipEventRecord(ev_produced, s), "produced");
+        ck(hipStreamWaitEvent(sx, ev_produced, 0), "producer wait");
+        in_flight = true;
+        last_started = layer;
+        part_pending[j][part] = comm->start_async(sx, tx[j].as<std::byte>() + off, rx[j].as<std::byte>() + off, bytes,
+            tag(layer | (part ? 0x80000000U : 0U)), last_use[j], part_free[j][part]);
+    }
+    void finish_part(int j, std::size_t off) {
+        comm->finish(sx, rx[j].as<std::byte>() + off);
+        in_flight = false;
+    }
+    void wait_part(int j, int part) {  // TX[j] part bytes may be overwritten only after the transport's D2H
+        if (part_pending[j][part]) {
+            ck(hipStreamWaitEvent(s, part_free[j][part], 0), "tx part lifetime");
+            part_pending[j][part] = false;
+        }
     }
     attn::Queries queries() const { return attn::Queries{q.as<std::uint16_t>(), kHeadDim, kInner, n, kHeads, kHeadDim}; }
     attn::Partials partials() const { return attn::Partials{po.as<float>(), pml.as<float>(), n, kHeads, kHeadDim, bound.as<unsigned>()}; }
@@ -474,6 +527,7 @@ struct DeviceDistRank::Impl {
         if (comm) comm->cancel_pending(why);
         in_flight = false;
         if (s) static_cast<void>(hipStreamSynchronize(s));
+        if (sx) static_cast<void>(hipStreamSynchronize(sx));
     }
 };
 
@@ -622,11 +676,154 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
         ck(hipEventRecord(pev.v[pn++], s), "profile event");
         pcat.push_back(cat);
     };
+    // ---- split schedule (DeviceRunOptions::pair_split_tail_pct): two row parts per block, two messages per block.
+    // Message layout in TX / RX (bf16, ld kInner): [V rows 0..a) | K rows 0..max) | V rows a..max)]; the head message
+    // is the first 2a rows (V_A, K_A), the tail message the rest (K_B, V_B), and K stays one contiguous key block.
+    const std::uint32_t mx = sp.max_rows();
+    const std::uint32_t split_a = opt.pair_split_tail_pct > 0U && opt.pair_split_tail_pct < 100U
+        ? (mx * (100U - opt.pair_split_tail_pct) / 100U) / 64U * 64U : 0U;
+    bool dense_all = true;
+    for (std::uint32_t i = 0; i < nblocks; ++i) dense_all = dense_all && !M.blocks[i].dense_bf16;
+    const bool use_split = role.world == 2U && split_a >= 64U && split_a + 64U <= std::min(sp.rows(0), sp.rows(1)) && dense_all &&
+        !sparse_fw && !fbc_on && !turbo && !opt.hashes && opt.inject == Inject::none;
+    auto split_forward = [&]() {
+        I.ensure_split();
+        const std::uint32_t a = split_a, np = sp.rows(role.peer_block());
+        const unsigned own = role.block(), peer = role.peer_block();
+        const std::size_t head_bytes = std::size_t{2U * a} * kInner * 2U, tail_bytes = std::size_t{2U * (mx - a)} * kInner * 2U;
+        std::uint16_t* vto = I.vt_own.as<std::uint16_t>();
+        std::uint16_t* vtp = I.vt_peer.as<std::uint16_t>();
+        Buf d_mod_next[6];
+        std::uint16_t* mods[2][6];
+        for (int j = 0; j < 6; ++j) {
+            d_mod_next[j] = Buf(std::size_t{mrows} * kHidden * 2);
+            mods[0][j] = mod[j];
+            mods[1][j] = d_mod_next[j].as<std::uint16_t>();
+        }
+        auto kmsg = [&](const Buf& b) { return b.as<std::uint16_t>() + std::size_t{a} * kInner; };
+        auto adaln = [&](std::uint32_t i) {
+            const auto& W = M.blocks[i];
+            rec(i, 0);
+            block::gpu::launch_linear_f64(d_temb.as<float>(), basis, nt, W.ada_w.as<float>(), W.ada_b.as<float>(), W.ada_n, basis,
+                d_ada.as<float>(), sv);
+            block::gpu::launch_mod_vectors(d_ada.as<float>(), mrows, mods[i & 1U], sv);
+            pm(kpAdaln);
+        };
+        // norm1 + QKV + K4 of rows [r, r + m) of block i: Q -> I.q, K -> TX K rows, V^T -> vt_own, V rows -> TX
+        auto pre = [&](std::uint32_t i, std::uint32_t r, std::uint32_t m, int part) {
+            const auto& W = M.blocks[i];
+            std::uint16_t* const* md = mods[i & 1U];
+            const int j = static_cast<int>(i & 1U);
+            block::gpu::launch_rmsnorm_mod(x + std::size_t{r} * kHidden, W.norm1.as<std::uint16_t>(), mr + r, md[1], md[0], m, kHidden,
+                kNormEps, h + std::size_t{r} * kHidden, sv);
+            pm(kpNorm);
+            gemm::linear(h + std::size_t{r} * kHidden, kHidden, m, W.qkv, I.ws, qkv + std::size_t{r} * 3U * kInner, 3U * kInner, s);
+            pm(kpQkv);
+            I.wait_part(j, part);
+            std::uint16_t* tx = I.tx[j].as<std::uint16_t>();
+            const std::uint16_t* src = qkv + std::size_t{r} * 3U * kInner;
+            block::gpu::launch_qk_norm_rope(src, m, W.qn.as<std::uint16_t>(), W.kn.as<std::uint16_t>(), rc + std::size_t{r} * 48U,
+                rs + std::size_t{r} * 48U, kNormEps, I.q.as<std::uint16_t>() + std::size_t{r} * kInner, kmsg(I.tx[j]) + std::size_t{r} * kInner, sv);
+            attn::launch_transpose_v(src + 2U * kInner, kHeadDim, 3U * kInner, m, kHeads, vto + r, kHeadDim * I.pitch, I.pitch, sv);
+            std::uint16_t* vdst = part == 0 ? tx + std::size_t{r} * kInner : tx + (std::size_t{a} + mx + (r - a)) * kInner;
+            ck(hipMemcpy2DAsync(vdst, std::size_t{kInner} * 2U, src + 2U * kInner, std::size_t{3U * kInner} * 2U, std::size_t{kInner} * 2U, m,
+                hipMemcpyDeviceToDevice, s), "v rows");
+            pm(kpRope);
+        };
+        // out projection + gate + norm2 + MLP + gate of rows [r, r + m) of block i (attention output in ao)
+        auto post = [&](std::uint32_t i, std::uint32_t r, std::uint32_t m) {
+            const auto& W = M.blocks[i];
+            std::uint16_t* const* md = mods[i & 1U];
+            std::uint16_t* xr = x + std::size_t{r} * kHidden;
+            std::uint16_t* hr = h + std::size_t{r} * kHidden;
+            std::uint16_t* orow = o + std::size_t{r} * kHidden;
+            std::uint16_t* swr = sw + std::size_t{r} * kFfn;
+            gemm::linear(ao + std::size_t{r} * kInner, kInner, m, W.out, I.ws, orow, kHidden, s);
+            block::gpu::launch_gate_residual(xr, orow, mr + r, md[2], m, kHidden, sv);
+            pm(kpOut);
+            block::gpu::launch_rmsnorm_mod(xr, W.norm2.as<std::uint16_t>(), mr + r, md[4], md[3], m, kHidden, kNormEps, hr, sv);
+            if (unfused) {
+                std::uint16_t* f1 = d_f1.as<std::uint16_t>() + std::size_t{r} * 2U * kFfn;
+                gemm::linear(hr, kHidden, m, W.fc1, I.ws, f1, 2U * kFfn, s);
+                block::gpu::launch_swiglu(f1, m, kFfn, gemm::device_silu_table(), swr, sv);
+            } else {
+                gemm::linear_fc1_swiglu(hr, kHidden, m, W.fc1, I.ws, swr, kFfn, s);
+            }
+            pm(kpFc1);
+            gemm::linear(swr, kFfn, m, W.fc2, I.ws, orow, kHidden, s);
+            block::gpu::launch_gate_residual(xr, orow, mr + r, md[5], m, kHidden, sv);
+            pm(kpFc2);
+        };
+        // block i after its pre parts: scans, local partial, the tail message, the peer partial, merge
+        auto attention = [&](std::uint32_t i) {
+            const int j = static_cast<int>(i & 1U);
+            unsigned* nb_i = I.norms.as<unsigned>() + std::size_t{i} * kAdmitPerBlock;
+            launch_max_norm(I.q.as<std::uint16_t>(), std::uint64_t{n} * kHeads, nb_i, s);
+            launch_max_norm(kmsg(I.tx[j]), std::uint64_t{n} * kHeads, nb_i + 1, s);
+            launch_max_abs_v(qkv, n, nb_i + 2, s);
+            pm(kpScans);
+            const attn::KeyBlock kb_own = I.key_block(kmsg(I.tx[j]), vto, n);
+            attn::launch_partials(Q, &kb_own, 1, P, own, sv);
+            rec(i, 2);
+            pm(kpAttnLocal);
+            const auto f0 = std::chrono::steady_clock::now();
+            I.finish_part(j, head_bytes);
+            res.timing[i].finish_host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+            ck(hipEventRecord(I.ev_rx, I.sx), "rx ready");
+            ck(hipStreamWaitEvent(s, I.ev_rx, 0), "rx wait");
+            rec(i, 3);
+            pm(kpExchWait);
+            const std::uint16_t* rxm = I.rx[j].as<std::uint16_t>();
+            attn::launch_transpose_v(rxm, kHeadDim, kInner, std::min(a, np), kHeads, vtp, kHeadDim * I.pitch, I.pitch, sv);
+            if (np > a)
+                attn::launch_transpose_v(rxm + (std::size_t{a} + mx) * kInner, kHeadDim, kInner, np - a, kHeads, vtp + a, kHeadDim * I.pitch, I.pitch, sv);
+            const attn::KeyBlock kb_peer = I.key_block(kmsg(I.rx[j]), vtp, np);
+            attn::launch_partials(Q, &kb_peer, 1, P, peer, sv);
+            ck(hipEventRecord(I.last_use[j], s), "rx last use");  // the H2D of block i + 2 into RX[j] waits on it
+            attn::launch_merge(P, 2, attn::Output{ao, nullptr, kInner}, sv);
+            rec(i, 4);
+            pm(kpAttnRemote);
+        };
+        // pre(i, tail) is enqueued: hand the head message over, start the tail, then attention
+        auto exchange_and_attend = [&](std::uint32_t i) {
+            const int j = static_cast<int>(i & 1U);
+            rec(i, 1);
+            const auto f0 = std::chrono::steady_clock::now();
+            I.finish_part(j, 0);  // the tail rows were computing meanwhile
+            res.timing[i].finish_host_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+            I.start_part(j, 1, head_bytes, tail_bytes, i);
+            attention(i);
+        };
+        adaln(0);
+        pre(0, 0, a, 0);
+        I.start_part(0, 0, 0, head_bytes, 0);
+        pre(0, a, n - a, 1);
+        exchange_and_attend(0);
+        for (std::uint32_t i = 0; i < nblocks; ++i) {
+            const bool next = i + 1U < nblocks;
+            if (next) adaln(i + 1U);
+            post(i, 0, a);
+            if (next) {
+                pre(i + 1U, 0, a, 0);
+                I.start_part(static_cast<int>((i + 1U) & 1U), 0, 0, head_bytes, i + 1U);
+            }
+            post(i, a, n - a);
+            launch_digest(x, std::size_t{n} * kHidden, std::uint64_t{sp.first(own)} * kHidden,
+                I.digests.as<unsigned long long>() + std::size_t{i} * 2U + own, s);
+            pm(kpDigest);
+            if (A) A->last.blocks_run = i + 1U;
+            if (next) {
+                pre(i + 1U, a, n - a, 1);
+                exchange_and_attend(i + 1U);
+            }
+        }
+    };
     bool reused = false, commit = false;
     try {
         if (fbc_on) A->fbc->begin(x, n, s);
         pm(-1);
-        for (std::uint32_t i = 0; i < nblocks; ++i) {
+        if (use_split) split_forward();
+        else for (std::uint32_t i = 0; i < nblocks; ++i) {
             const auto& W = M.blocks[i];
             const int par = static_cast<int>(i & 1U);
             rec(i, 0);

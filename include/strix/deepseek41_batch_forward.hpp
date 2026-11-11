@@ -40,6 +40,27 @@ class Communicator;
 }
 
 namespace strix::deepseek41 {
+// The shared arena's position units map to compressed KV + index entries in
+// every KV-source layer. Both startup sizing and the scheduler use this rule.
+template<class Roles>
+std::uint64_t batch_pool_storage_bytes(std::uint64_t units, const Roles& roles, unsigned layers,
+                                      std::uint64_t entry_bytes) {
+    std::uint64_t bytes = 0;
+    for (unsigned l = 0; l < layers; ++l)
+        if (roles[l].owns_kv) bytes += units / roles[l].ratio * entry_bytes;
+    return bytes;
+}
+template<class Ranges, class Roles>
+std::uint64_t batch_pool_free_bytes(const Ranges& ranges, const Roles& roles, unsigned layers,
+                                   std::uint64_t entry_bytes) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, units] : ranges) {
+        (void)begin;
+        bytes += batch_pool_storage_bytes(units, roles, layers, entry_bytes);
+    }
+    return bytes;
+}
+
 
 struct BatchForwardOptions {
     std::uint32_t layers = 40;
@@ -114,6 +135,7 @@ public:
     bool reserve(std::uint32_t slot, std::uint32_t positions);
     void release(std::uint32_t slot);                                 // KV pool: the slot's room back (no-op without one)
     [[nodiscard]] std::uint32_t capacity(std::uint32_t slot) const;  // positions the slot may hold now
+    [[nodiscard]] std::uint64_t pool_free_bytes() const;              // sum of unassigned arena ranges (not largest contiguous fit)
     [[nodiscard]] std::uint64_t pool_free_positions() const;          // KV pool: the largest reservation that fits now
     // `to` continues exactly as `from` would (its state copied): measurement runs reuse one filled context.
     void copy_slot(std::uint32_t from, std::uint32_t to);
@@ -173,6 +195,10 @@ public:
     // device prefill in the same process reads them instead of loading a second copy (PrefillOptions::shared_weights).
     // Tensors held in another form (the F8 Engram KV, the BF16 routers, packed overlay sites) are left out.
     [[nodiscard]] std::map<std::string, std::pair<const void*, std::uint64_t>> file_form_weights() const;
+    // Host-only, before load: names and bytes file_form_weights() can return for these options (tensors a load
+    // may convert are left out). A deployment sizes the device prefill's own weights against it.
+    [[nodiscard]] static std::map<std::string, std::uint64_t> file_form_weight_sizes(const std::filesystem::path& gguf,
+                                                                                    const BatchForwardOptions& options);
     [[nodiscard]] const TargetModel& model() const noexcept;
     // The decode identity: true when the routed experts run expert TP (ds41-expert-tp2-i1152-v1), false expert parallel.
     [[nodiscard]] bool expert_tp() const noexcept;

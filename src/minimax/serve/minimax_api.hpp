@@ -21,6 +21,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/deployment.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -70,6 +71,8 @@ struct RequestExtra {
 [[nodiscard]] strix::serve::Json reply_timings(const strix::serve::GenerationStats& stats, const RequestExtra& extra);
 
 struct MinimaxApiOptions {
+    strix::serve::DeploymentCallbacks deployment;
+    std::uint64_t http_slots = 0;
     bool session_enabled = false;
     std::string model_id = "minimax-m3.1-flash";
     std::uint32_t default_max_tokens = 4096;

@@ -687,12 +687,7 @@ struct Engine::Impl {
             (void)kvshard::storage_tokens(opt.capacity);
             if (shard_requested) kv_shard = std::make_unique<KvShard>(*c, opt.rank);
         }
-        if (const char* v = std::getenv("STRIX_GLM_PF_PIPELINE"); v != nullptr) {
-            const std::string value(v);
-            if (value != "1" && value != "2") throw std::invalid_argument("STRIX_GLM_PF_PIPELINE must be 1 or 2");
-            opt.pf_pipeline = value == "2" ? 2U : 1U;
-        }
-        if (opt.pf_pipeline != 1 && opt.pf_pipeline != 2) throw std::invalid_argument("pf_pipeline must be 1 or 2");
+        opt.pf_pipeline = xfer::prefill_pipeline(opt.pf_pipeline, std::getenv("STRIX_GLM_PF_PIPELINE"));
         if ((kv_shard || kv_shard_auto) && opt.pf_pipeline != 1) throw std::invalid_argument("kvshard: prefill pipeline 1 required");
         // STRIX_GLM_PF_SEQPAR: auto (default) | 1 | 0. auto = on for ordinary TP2 replicated attention ownership,
         // off (declined, legacy path) for TP1, external exchange or any KV-shard policy; 1 refuses those cases.

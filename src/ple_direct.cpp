@@ -179,6 +179,17 @@ struct DirectPageCache::Impl {
             throw std::bad_alloc();
         arena.reset(static_cast<std::byte*>(storage));
         counters.peak_owned_bytes = credit_only ? page : capacity;
+        // Every destination page must exist before its first read. A filesystem that reads direct I/O with page faults
+        // disabled (btrfs) retries after faulting the destination in and, when that makes no progress, completes the
+        // read through the page cache instead. The read still succeeds, but the table's file pages become resident,
+        // which is what the O_DIRECT owner exists to avoid and what the end-of-request residency bound rejects.
+        if (!synthetic && !credit_only) {
+            bool populated = false;
+#if defined(MADV_POPULATE_WRITE)
+            populated = ::madvise(storage, static_cast<std::size_t>(capacity), MADV_POPULATE_WRITE) == 0;
+#endif
+            if (!populated) std::memset(storage, 0, static_cast<std::size_t>(capacity));
+        }
         // The checked pread probe remains before drop/credit, including when a
         // kernel denies io_uring. No fallback changes the O_DIRECT descriptor.
         Job probe; probe.run = {0, 0, 1};

@@ -4,6 +4,7 @@
 #include "h3/common/png.hpp"
 #include "h3/vae/image.hpp"
 #include "h3/dist/image_parallel.hpp"
+#include "h3/common/alongside.hpp"
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -11,12 +12,14 @@
 #include <optional>
 #include <span>
 #include <exception>
+#include <future>
 #ifdef STRIX_H3_IMAGE_PNG
 #include <png.h>
 #endif
 #ifdef STRIX_H3_IMAGE_HIP
 #include "h3/block/device_forward.hpp"
 #include "h3/dist/device_dist.hpp"
+#include "h3/dist/pair_link.hpp"
 #include "h3/te/te_gpu.hpp"
 #include "h3/vae/vae_decoder.hpp"
 #include "h3/vae/enc_gpu.hpp"
@@ -27,12 +30,21 @@ namespace b=strix::h3::block;
 namespace v=strix::h3::vae;
 namespace d=strix::h3::dist;
 namespace {
+// --pair-split-tail auto: measured per regime (1024: 20 %, 2048: 30 %; one-message schedule = 0)
+constexpr std::uint32_t kSplitAuto=0xffffffffU;
+[[maybe_unused]] std::uint32_t split_tail_for(std::uint32_t requested,std::uint32_t packed_rows) {
+    return requested!=kSplitAuto?requested:(packed_rows<=2048U?20U:30U);
+}
 struct Args {
     std::string decode_latent,model,prompt,te_pack,output="image.png",vae,dit,tokenizer,pdd;
     std::string transport="usb4gpu";
     std::uint32_t width=1024,height=1024,seed=42,world=1,rank=0,requests=1;
     bool inspect=false,fast_vae=false,fast_sparse=false,dist=false,attn_2p15=false,latent_only=false;
     bool eager_prepare=true,vae_parallel=true;
+    // sequence pair: tail row share of the split K/V schedule (0: one message per block), per-block exposure
+    // receipts; TE before (not alongside) DiT residency; VAE loaded after (not during) sampling
+    std::uint32_t split_tail=kSplitAuto;
+    bool pair_timing=false,serial_te=false,serial_vae=false;
     d::ImageParallel parallel=d::ImageParallel::automatic;
     d::ImageWork work;
     std::vector<std::string> refs;
@@ -60,11 +72,13 @@ Args parse(int argc,char** argv) {
         else if(k=="--parallel") a.parallel=d::image_parallel(val());
         else if(k=="--vae-parallel") { const auto p=val(); if(p!="auto" && p!="off") throw std::invalid_argument("vae parallel must be auto or off"); a.vae_parallel=p=="auto"; }
         else if(k=="--lazy-prepare") a.eager_prepare=false;
+        else if(k=="--pair-split-tail") { const auto v=val(); if(v=="auto") a.split_tail=kSplitAuto; else { a.split_tail=integer(v); if(a.split_tail>=100) throw std::invalid_argument("--pair-split-tail must be auto or 0..99"); } }
+        else if(k=="--pair-timing") a.pair_timing=true; else if(k=="--serial-te") a.serial_te=true; else if(k=="--serial-vae") a.serial_vae=true;
         else if(k=="--transport") { a.transport=val(); if(a.transport!="usb4auto" && a.transport!="usb4gpu" && a.transport!="usb4-host") throw std::invalid_argument("image transport must be usb4auto, usb4gpu or usb4-host"); }
         else if(k=="--print-config") a.inspect=true; else if(k=="--decode-latent") a.decode_latent=val(); else if(k=="--latent-only") a.latent_only=true;
         else if(k=="--fast-vae-fp16") a.fast_vae=true; else if(k=="--fast-sparse") a.fast_sparse=true;
         else if(k=="--dist") a.dist=true; else if(k=="--attn-score-2p15") a.attn_2p15=true;
-        else if(k=="--help") { std::cout<<"strix-h3-image --model MODEL_DIR_OR_FILE [--dit FILE] --prompt TEXT --te-pack TE_PACK [--tokenizer DIR] [--pdd-fused-heads FILE] --width W --height H --seed N [--ref PNG] [--vae FILE] [--output PNG] [--world 2 --rank R --transport usb4gpu|usb4auto|usb4-host] [--parallel auto|sequence|request] [--requests N (same prompt; seed+index)] [--vae-parallel auto|off] [--lazy-prepare] [--dist] [--fast-vae-fp16] [--fast-sparse] [--attn-score-2p15] [--print-config] [--latent-only] [--decode-latent LATENT.f32 (host VAE only)]\n"; std::exit(0); }
+        else if(k=="--help") { std::cout<<"strix-h3-image --model MODEL_DIR_OR_FILE [--dit FILE] --prompt TEXT --te-pack TE_PACK [--tokenizer DIR] [--pdd-fused-heads FILE] --width W --height H --seed N [--ref PNG] [--vae FILE] [--output PNG] [--world 2 --rank R --transport usb4gpu|usb4auto|usb4-host] [--parallel auto|sequence|request] [--requests N (same prompt; seed+index)] [--vae-parallel auto|off] [--pair-split-tail auto|PCT (0..99; auto: 20 up to 2048 packed rows, else 30; 0 = one K/V message per block)] [--pair-timing] [--serial-te] [--serial-vae] [--lazy-prepare] [--dist] [--fast-vae-fp16] [--fast-sparse] [--attn-score-2p15] [--print-config] [--latent-only] [--decode-latent LATENT.f32 (host VAE only)]\n"; std::exit(0); }
         else throw std::invalid_argument("unknown image option");
     }
     a.work=d::image_work(a.parallel,a.requests,a.seed,a.world,a.rank);
@@ -139,6 +153,11 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         std::cout<<"{\"image_stage\":\""<<name<<"\",\"rank\":"<<a.rank<<",\"seconds\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count()<<"}\n";
     };
     auto stage_start=started;
+    // Sequence pair: USB4 pairing (stream discovery, cable measurement) runs alongside TE and DiT residency; the
+    // input/policy agreement and direct setup still happen after both, before any collective.
+    const auto link_opt=d::pair_link_options(a.rank);
+    d::PairLinkJob link;
+    if(a.work.sequence) link=d::start_pair_link(link_opt);
     std::vector<Pixels> refs; std::vector<b::RefBlock> shapes;
     for(const auto& file:a.refs) { refs.push_back(read_png(file)); const auto& p=refs.back();shapes.push_back({b::RefBlock::image,1,unsigned(p.h/16),unsigned(p.w/16),0}); }
     std::vector<float> conditions;
@@ -158,7 +177,7 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     }
     stage("reference_vae",stage_start);stage_start=std::chrono::steady_clock::now();
     std::vector<std::uint16_t> text; std::vector<std::int64_t> tags;
-    {
+    auto run_te=[&] {
         auto tok=te::Tokenizer::load(a.tokenizer);
         std::vector<te::RefItem> items(refs.size());
         const auto prompt=refs.empty() || a.prompt.rfind("Edit <Picture",0)==0 ? a.prompt : "Edit <Picture 1>. "+a.prompt;
@@ -186,9 +205,22 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         text=narrow(hidden);
         const auto layout=te::expand_layout(pres.ids,patches);
         tags.assign(layout.tags.begin(),layout.tags.end());
-    } // TE and vision residency ends before the DiT is loaded.
-    refs.clear(); refs.shrink_to_fit();
-    stage("text_encoder",stage_start);stage_start=std::chrono::steady_clock::now();
+    }; // TE and vision residency end inside run_te.
+    // Sequence pair and eager single node: TE runs on its own thread while the DiT checkpoint is read and made resident
+    // (the same TE and DiT arithmetic; peak memory holds both). The admission check keeps the free memory seen before
+    // both. The single-node block weights do not depend on the row count, which needs the TE's text length.
+    const bool single_eager=!a.work.sequence && !a.dist && a.eager_prepare;
+    const bool te_alongside=(a.work.sequence || single_eager) && !a.serial_te;
+    std::size_t free_before=0,total_before=0;
+    std::future<strix::h3::Timed<void>> te_job;
+    if(te_alongside) {
+        if(hipMemGetInfo(&free_before,&total_before)!=hipSuccess) throw std::runtime_error("image: memory inspection failed");
+        te_job=strix::h3::start_alongside([&run_te] { run_te(); });
+    } else {
+        run_te();
+        refs.clear(); refs.shrink_to_fit();
+        stage("text_encoder",stage_start);stage_start=std::chrono::steady_clock::now();
+    }
     b::SafeTensors st(a.dit,b::CheckpointNames::image_dit);
     std::cout<<"{\"image_checkpoint\":\""<<b::image_operand_identity(st)<<"\",\"timestep\":\""
              <<(st.find("adaln_t_table")?"checkpoint-curve-finite":"raw-mlp-finite")<<"\"}\n";
@@ -199,6 +231,23 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         g.pdd_fused=true;
     }
     b::ImageBlockSource source(st,g,cfg);
+    std::unique_ptr<d::DeviceModel> early_model;
+    std::unique_ptr<b::DeviceForward> forward_owner;  // single node: driver and resident linear weights
+    std::unique_ptr<b::GemmDeviceLinear> linear_owner;
+    if(te_alongside) {
+        const auto residency_start=std::chrono::steady_clock::now();
+        if(a.work.sequence) early_model=std::make_unique<d::DeviceModel>(g,source,50,true);
+        else {
+            forward_owner=std::make_unique<b::DeviceForward>(g);
+            linear_owner=std::make_unique<b::GemmDeviceLinear>(0); // rows set once the text length is known
+            forward_owner->prepare(source,*linear_owner);
+        }
+        stage("dit_residency_alongside_te",residency_start);
+        const auto te_seconds=te_job.get().seconds;
+        refs.clear(); refs.shrink_to_fit();
+        std::cout<<"{\"image_stage\":\"text_encoder\",\"rank\":"<<a.rank<<",\"seconds\":"<<te_seconds<<",\"alongside_dit\":true}\n";
+        stage("te_and_dit_residency",stage_start);
+    }
     b::FlashDeviceAttention attention;
     std::vector<std::vector<float>> latents;
     std::unique_ptr<strix::dist::Communicator> comm;
@@ -216,32 +265,47 @@ int run(const Args& a,const b::ImageConfig& cfg) {
     };
     const auto text_len=static_cast<std::uint32_t>(text.size()/5120);
     const auto L=b::ImageConfig::layout(text_len,a.width,a.height,shapes);
-    std::size_t free_bytes=0,total_bytes=0;
-    if(hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) throw std::runtime_error("image: memory inspection failed");
+    const std::uint32_t split_tail=split_tail_for(a.split_tail,L.seq_len);
+    std::size_t free_bytes=free_before,total_bytes=total_before;
+    if(!te_alongside && hipMemGetInfo(&free_bytes,&total_bytes)!=hipSuccess) throw std::runtime_error("image: memory inspection failed");
     const std::uint64_t latent_hold=a.latent_only?0:std::uint64_t(a.work.requests.size())*24*(a.height/16)*(a.width/16)*sizeof(float);
     if(L.seq_len>(1U<<20) || b::ImageConfig::conservative_bytes(L.seq_len)+latent_hold>free_bytes)
         throw std::runtime_error("image: packed sequence exceeds conservative memory/attention admission; reduce reference area explicitly");
+    // VAE (host head + FAST decoder) loads on a thread during sampling; decoding waits for it (--serial-vae: after
+    // the DiT is released, as before). Off in the sequence pair until measured there.
+    struct VaeSet { std::unique_ptr<v::ImageVae> host; std::unique_ptr<v::GpuDecoder> fast; };
+    auto load_vae=[&a] { VaeSet s;s.host=std::make_unique<v::ImageVae>(a.vae);
+        if(a.fast_vae) s.fast=std::make_unique<v::GpuDecoder>(a.vae,24,true,true);
+        return s; };
+    const bool vae_alongside=!a.latent_only && !a.work.sequence && !a.serial_vae;
+    std::future<strix::h3::Timed<VaeSet>> vae_job;
     {
-        b::DeviceForward forward(g);
+        if(!forward_owner) forward_owner=std::make_unique<b::DeviceForward>(g);
+        auto& forward=*forward_owner;
         if(a.attn_2p15) forward.set_attn_score_limit(b::kAttnScoreLimitExtended);
         text=forward.refine_text(text.data(),text_len,attention);
         std::unique_ptr<b::SparseAccel> sparse;
         if(a.fast_sparse) { sparse=std::make_unique<b::SparseAccel>(0.75F,3,2,"39-42"); b::AccelOptions opt; opt.sparse=sparse.get();forward.set_accel(opt);forward.reset_accel_run(); }
-        b::GemmDeviceLinear linear(L.seq_len,false);
+        // fused fc1+SwiGLU where the operand allows (int8_convrot), else fc1+K5
+        if(linear_owner) linear_owner->set_max_rows(L.seq_len); else linear_owner=std::make_unique<b::GemmDeviceLinear>(L.seq_len);
+        auto& linear=*linear_owner;
         std::unique_ptr<d::DeviceModel> model;
         std::unique_ptr<d::DeviceDistRank> rank;
         const auto prepare_start=std::chrono::steady_clock::now();
         if(a.work.sequence || a.dist) {
             const auto split=d::Split::of(L.seq_len);
-            // Residency before pairing: avoids leaving the link idle during checkpoint preparation.
-            model=std::make_unique<d::DeviceModel>(g,source,50,true);
+            // Residency before the pair agreement (the pairing itself started at entry, on its own thread).
+            model=early_model?std::move(early_model):std::make_unique<d::DeviceModel>(g,source,50,true);
             if(a.work.sequence) {
-                strix::dist::Usb4AutoOptions opt;opt.rank=a.rank;opt.timeout=std::chrono::milliseconds(240000);
-                strix::dist::Usb4Topology topology;
-                auto transport=strix::dist::usb4_host_auto(opt,&topology);
+                const auto link_start=std::chrono::steady_clock::now();
+                auto paired=std::move(link.get().value);
+                stage("pair_link_wait",link_start);
+                const auto& opt=link_opt;
+                const auto& topology=paired.topology;
+                auto transport=std::move(paired.transport);
                 // Agree BEFORE direct setup or size-dependent collectives. usb4auto is the
                 // GPU-preferred alias; usb4-host is an explicit diagnostic off switch.
-                const std::array<std::uint64_t,20> setup={0x4833495331370001ULL,a.width,a.height,a.seed,L.seq_len,
+                const std::array<std::uint64_t,21> setup={0x4833495331370002ULL,split_tail,a.width,a.height,a.seed,L.seq_len,
                     hash(text),hash(conditions),hash(cfg.sigmas),std::uint64_t(a.fast_vae),std::uint64_t(a.attn_2p15),
                     a.requests,std::uint64_t(a.vae_parallel),std::uint64_t(a.latent_only),hash(g.inv_freq),
                     hash(g.video_out.w),hash(g.video_out.b),hash(L.position_ids),hash(tags),
@@ -274,12 +338,15 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             }
             rank=std::make_unique<d::DeviceDistRank>(*model,split,d::Role{a.work.sequence?a.rank:0U,a.work.sequence?2U:1U,false},comm.get());
         } else if(a.eager_prepare) {
-            forward.prepare(source,linear);
+            forward.prepare(source,linear); // no-op for blocks already made resident alongside the TE
         }
         stage("dit_residency_and_pair",prepare_start);
+        if(vae_alongside) vae_job=strix::h3::start_alongside(load_vae);
         d::DeviceRunOptions run_options;
         run_options.hashes=false; // retain mandatory device digests/admission; avoid per-block host residual downloads
         run_options.score_bound=a.attn_2p15?d::kScoreBoundExtended:d::kScoreBound;
+        run_options.pair_split_tail_pct=a.work.sequence?split_tail:0U; // handshaken in the pair setup above
+        run_options.timing=a.work.sequence && a.pair_timing;
         b::StreamInputs input;input.T=1;input.H=a.height/16;input.W=a.width/16;input.text=text;input.cond_video=conditions;
         std::cout<<"{\"image_parallel\":\""<<(a.work.sequence?"sequence":"request")<<"\",\"rank\":"<<a.rank
                  <<",\"packed_tokens\":"<<L.seq_len<<",\"local_requests\":"<<a.work.requests.size()<<"}\n";
@@ -299,6 +366,12 @@ int run(const Args& a,const b::ImageConfig& cfg) {
                 if(rank) {
                     auto f=rank->forward(L,plan,input,d::ForwardTables::build(g,L,plan),50,run_options,nullptr,&pc);
                     if(comm) std::cerr<<"image pair request "<<request<<" step "<<step<<" rank "<<a.rank<<": "<<f.run.comm_stats<<'\n';
+                    if(comm && run_options.timing) {
+                        double blk=0,loc=0,ex=0,fin=0;
+                        for(const auto& t:f.run.timing) { blk+=t.block_ms;loc+=t.local_ms;ex+=t.exposed_ms;fin+=t.finish_host_ms; }
+                        std::cerr<<"image pair timing step "<<step<<" rank "<<a.rank<<": blocks "<<blk<<" ms, K4-end->local-end "<<loc
+                                 <<" ms, local-end->rx-ready (exposed) "<<ex<<" ms, host finish "<<fin<<" ms, split tail "<<run_options.pair_split_tail_pct<<"%\n";
+                    }
                     out=std::move(f.out);
                 }
                 else out=forward.run(source,L,plan,input,linear,attention,nullptr,&pc);
@@ -314,12 +387,18 @@ int run(const Args& a,const b::ImageConfig& cfg) {
             write_f32(output+".latent.f32",result.video);
             if(!a.latent_only) latents.push_back(result.video);
         }
-    } // DiT residency ends before VAE loading.
+    }
+    linear_owner.reset();forward_owner.reset(); // DiT residency ends before decoding (and before VAE loading with --serial-vae or in the pair)
     stage("dit_load_prepare_refiner_sample",stage_start);stage_start=std::chrono::steady_clock::now();
     if(a.latent_only) { std::cout<<"{\"image_complete\":\"latent-only\",\"seconds\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()<<"}"<<std::endl; return 0; }
-    v::ImageVae vae(a.vae);
-    std::unique_ptr<v::GpuDecoder> fast;
-    if(a.fast_vae) fast=std::make_unique<v::GpuDecoder>(a.vae,24,true,true);
+    auto vae_set=(vae_job.valid()?std::move(vae_job):strix::h3::start_alongside(load_vae)).get();
+    v::ImageVae& vae=*vae_set.value.host;
+    std::unique_ptr<v::GpuDecoder> fast=std::move(vae_set.value.fast);
+    // nested in vae_and_png (same start); decode+PNG = vae_and_png - vae_load. Alongside sampling: vae_load is the
+    // load itself (hidden) and vae_load_wait the part left on the critical path.
+    if(vae_alongside) { std::cout<<"{\"image_stage\":\"vae_load\",\"rank\":"<<a.rank<<",\"seconds\":"<<vae_set.seconds<<",\"alongside_dit\":true}\n";
+        stage("vae_load_wait",stage_start); }
+    else stage("vae_load",stage_start);
     v::ImageVae::TileFn fn;
     if(fast) fn=[&](const auto& pq,int h,int w) { v::H16 x(pq.size());for(std::size_t i=0;i<x.size();++i)x[i]=v::f2h(pq[i]);const auto p=fast->decode_call(x,1,h,w);std::vector<float> f(p.size());for(std::size_t i=0;i<f.size();++i)f[i]=v::h2f(p[i]);return f; };
     v::ImageVae::TileDispatch dispatch;

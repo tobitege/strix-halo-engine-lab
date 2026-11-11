@@ -10,6 +10,7 @@ using strix::moe_core::hadamard128;
 using strix::moe_core::half_bits;
 using strix::moe_core::transform_block;
 using strix::moe_core::transform_block_at;
+using strix::moe_core::transform_block_values;
 using strix::moe_core::transform_values;
 using strix::moe_core::hash16;
 using strix::moe_core::mul1_pair;

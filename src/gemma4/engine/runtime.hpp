@@ -19,6 +19,10 @@ struct Options {
 #endif
     std::string prompt, output = "json", backend = default_backend, bind = "127.0.0.1";
     std::uint32_t threads = 16, streams = 1;
+    std::string deploy;
+    bool deploy_check = false;
+    std::uint32_t deployment_context = 0; // zero preserves the native model limit
+    std::uint32_t deploy_node = 0;
     std::uint16_t port = 8080;
     Request request;
     profile::Resolution profile; // --profile default|fast|quality, resolved and exported by parse_options

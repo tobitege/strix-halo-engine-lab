@@ -70,19 +70,28 @@ __device__ __forceinline__ void transform_block(const float* x, const std::uint1
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[begin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
 }
-// Same transform, writing the 128 results at out[obegin ...] (an LDS chunk that starts at channel begin - obegin).
-__device__ __forceinline__ void transform_block_at(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
-                                                   unsigned obegin, unsigned lane) {
+// Same transform on the lane's four x values already in registers (xv[j] = x[begin + lane + 32 j]), so a caller that
+// transforms one block for several (suh, out) pairs loads x once. transform_block_at is this helper behind the loads.
+__device__ __forceinline__ void transform_block_values(const float (&xv)[4], const std::uint16_t* suh, _Float16* out,
+                                                       unsigned begin, unsigned obegin, unsigned lane) {
     float v[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(x[c] * half_bits(suh[c]));
+        const float scaled = materialize(xv[j] * half_bits(suh[c]));
         v[j] = static_cast<float>(static_cast<_Float16>(scaled));
     }
     hadamard128(v, lane);
 #pragma unroll
     for (int j = 0; j < 4; ++j) out[obegin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
+}
+// Same transform, writing the 128 results at out[obegin ...] (an LDS chunk that starts at channel begin - obegin).
+__device__ __forceinline__ void transform_block_at(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
+                                                   unsigned obegin, unsigned lane) {
+    float xv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xv[j] = x[begin + lane + 32U * static_cast<unsigned>(j)];
+    transform_block_values(xv, suh, out, begin, obegin, lane);
 }
 // Same transform, returning the four per-lane values in registers (no store).
 __device__ __forceinline__ void transform_values(const float* x, const std::uint16_t* suh,

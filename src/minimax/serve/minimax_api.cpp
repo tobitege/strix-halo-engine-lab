@@ -403,8 +403,9 @@ void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
     try {
         if (req.method == "GET" && req.path == "/health") {
             sv::Json b = sv::Json::object();
-            b.set("status", sv::Json("ok"));
-            return send_json(w, 200, b);
+            b.set("status", sv::Json(queue_.draining() ? "draining" : "ok"));
+            sv::deployment_health(b, options_.deployment);
+            return send_json(w, queue_.draining() ? 503 : 200, b);
         }
         if (req.method == "GET" && req.path == "/v1/models") {
             sv::Json m = sv::Json::object();
@@ -428,8 +429,11 @@ void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
         if (req.method == "GET" && req.path == "/api/status") {
             const bool detail = query_flag(req.query, "detail");
             if (detail) observe_arm();
-            return send_json(w, 200, observer_.status(queue_.snapshot(), queue_.stopping(), detail));
+            auto status = observer_.status(queue_.snapshot(), queue_.stopping(), detail);
+            sv::deployment_status(status, options_.deployment, queue_, options_.http_slots);
+            return send_json(w, 200, status);
         }
+        if (sv::handle_deployment_route(req, w, queue_, options_.deployment)) return;
         if (options_.admin_sched && req.path == "/admin/sched") return send_json(w, 200, options_.admin_sched(req));
         if (req.method != "POST") return send_error(w, 404, "no route " + req.method + " " + req.path);
         const sv::Json body = sv::parse_request_json(req.body);

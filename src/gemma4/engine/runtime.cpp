@@ -60,6 +60,9 @@ Options parse_options(int argc, char** argv) {
         const auto value = [&]() -> std::string { if (++i == argc) throw std::invalid_argument("missing value for "+arg); return argv[i]; };
         const auto number = [&](std::uint64_t maximum) { const auto n = unsigned_number(value()); if (n > maximum) throw std::invalid_argument("option outside range: "+arg); return n; };
         if (arg == "--model") o.model = value();
+        else if (arg == "--deploy") o.deploy = value();
+        else if (arg == "--deploy-check") o.deploy_check = true;
+        else if (arg == "--deploy-node") o.deploy_node = std::uint32_t(number(255));
         else if (arg == "--exl3-arm") o.exl3_arm = value();
         else if (arg == "--rope-tables") o.rope = value();
         else if (arg == "--tokenizer") o.tokenizer = value();
@@ -99,7 +102,7 @@ Options parse_options(int argc, char** argv) {
     }
     if (o.help) return o;
     o.request.sampling.validate();
-    if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || o.rope.empty()) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
+    if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || (o.rope.empty() && !o.deploy_check)) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
     if (o.output != "json" && o.output != "ids" && o.output != "text") throw std::invalid_argument("output must be json/ids/text");
     if (o.backend != "host" && o.backend != "device") throw std::invalid_argument("backend must be host/device");
     // Explicit options win over the profile; `--draft off` wins over every drafter path.
@@ -135,6 +138,10 @@ Runtime::Runtime(const Options& o) {
     manifest = !o.exl3_arm.empty() ? exl3::load_arm(o.exl3_arm, o.model) :
         o.model.extension() == ".gguf" ? load_gguf_model(o.model) : load_safetensors_model(o.model);
     rope = load_rope_tables(o.rope); manifest.rope_hash = rope.view.hash;
+    if (o.deployment_context) {
+        if (o.deployment_context > manifest.config.max_positions) throw std::invalid_argument("deployment context exceeds native limit");
+        manifest.config.max_positions = o.deployment_context;
+    }
     if (o.backend == "host") backend = std::make_unique<HostBackend>(manifest,rope.view,o.threads);
     else {
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND

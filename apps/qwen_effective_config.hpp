@@ -1,4 +1,7 @@
 #pragma once
+
+#include "strix/deploy/device.hpp"
+#include "strix/deploy/footprint.hpp"
 #include "qwen_yarn_memory.hpp"
 
 #include "strix/compact_stage_images.hpp"
@@ -6,6 +9,7 @@
 #include "strix/qwen_allon.hpp"
 #include "hip_decode_options.hpp"
 #include "known_prefill_reservation.hpp"
+#include "strix/model_mapping_accounting.hpp"
 #include "qwen_moe_route_bf16.hpp"
 #include "qwen_moe_direct_b.hpp"
 #include "http_slot_capacity.hpp"
@@ -44,6 +48,7 @@ struct PrefillRequirements {
     std::uint64_t model_backing = 0, state_d1 = 0, serial_scratch = 0;
     std::uint64_t workspace = 0, metadata = 0, runtime_payload = 0, tails = 0;
     std::uint64_t device_base = 0;
+    std::uint64_t http_slot_retained = 0, http_slot_state = 0;
     std::map<std::string, std::uint64_t> owners{},owner_caps{},owner_actuals{};
     std::map<std::string,unsigned> owner_phases{};
     std::uint64_t mtp_post_setup_peak=0;
@@ -242,10 +247,13 @@ inline void account_http_registered_target(PrefillRequirements& result,const Opt
     const auto ranges=build_registered_residency_ranges(manifest,policy,file_bytes,page);
     for (const auto range:ranges)
         committed=prefill_checked_add(committed,range.end-range.begin);
-    result.model_backing=committed;
-    result.device_base=prefill_checked_add(result.device_base,committed);
+    const auto backing=read_only_registered_mapping_accounting(
+        prefill_checked_add(file_bytes,page-1U)/page*page,committed);
+    result.model_backing=backing.retained_bytes;
+    result.device_base=prefill_checked_add(result.device_base,backing.retained_bytes);
     result.organization["target_mapped_file_bytes"]=file_bytes;
     result.organization["target_registered_backing_bytes"]=committed;
+    result.organization["target_reclaimable_mapping_bytes"]=backing.reclaimable_bytes;
     result.organization["target_file_backed_unregistered_bytes"]=file_backed_unregistered_bytes(manifest,ranges,file_bytes,page);
 }
 inline std::uint64_t prefill_checked_multiply(std::uint64_t a, std::uint64_t b) {
@@ -439,6 +447,18 @@ inline void validate_effective_startup(const EffectiveConfig& config) {
         (!config.options.known_prefix_window || !config.options.known_prefix_prefill_rows))
         throw std::invalid_argument("--rtx-state-import-file requires tiled CLI prefill");
     validate_prefix_state_cache(config.options);
+}
+// Inspection must turn failed route admission into a plan refusal, before the
+// ordinary startup validator can throw a generic missing-tiled-route error.
+inline std::string deployment_startup_refusal(const EffectiveConfig& config) {
+    if (!config.error.empty()) return config.error;
+    try { validate_effective_startup(config); }
+    catch (const std::exception& e) {
+        if (config.options.http_serve && !config.options.known_prefix_prefill_rows &&
+            !config.serve_prefill_notice.empty()) return config.serve_prefill_notice;
+        return e.what();
+    }
+    return {};
 }
 inline void validate_effective_options(const Options& o, const ModelContract& model) {
     if (o.resolved_qsa_prefill_budget.value_or(0U) && (!model.indexer_compress_ratio ||
@@ -1264,6 +1284,48 @@ inline void resolve_session_defaults(Options& o, const ModelContract& model,
     resolve_legacy_session_defaults(o,model,env,available);
     a.session=o.session_management_requested; a.session_reason=o.session_off_reason;
 }
+// Use the deployment resolver's capped-elastic rule without changing the
+// selected HTTP route, its tile, or any explicit reservation/margin.
+inline void fit_http_session_ram(Options& o, std::uint64_t mandatory, std::uint64_t budget) {
+    if (!o.http_serve || !o.known_prefix_prefill_rows) return;
+    const auto fitted=deploy::fit_elastic_extra(o.session_ram_bytes,mandatory,budget);
+    if (o.supplied_options.contains("--session-ram-bytes")) {
+        if (o.session_ram_bytes > fitted)
+            throw std::invalid_argument("explicit --session-ram-bytes " + std::to_string(o.session_ram_bytes) +
+                " exceeds remaining HTTP memory budget " + std::to_string(fitted) +
+                " after retained reservation and margin");
+    } else o.session_ram_bytes=fitted;
+}
+// The native ledger and explicit session cap must both fit before touching the
+// reclaimable table. Keep the warm callback behind this boundary on all arms.
+template <class Warm>
+inline UmaReservationEstimate admit_http_prefill_before_warm(Options& o,
+    const UmaOwnerInventory& live, std::uint64_t growth, std::uint64_t temporary,
+    std::uint64_t mapping_credit, bool fit_session, Warm&& warm) {
+    const auto reservation=plan_known_prefill_reservation(live,growth,temporary,
+        {o.known_prefill_uma_budget,o.known_prefill_uma_budget},mapping_credit,0);
+    if (fit_session) {
+        try { fit_http_session_ram(o,reservation.setup_peak_reserved_bytes,o.known_prefill_uma_budget); }
+        catch (const std::invalid_argument& error) {
+            throw std::invalid_argument(std::string(error.what()) + known_prefill_reservation_ledger(live,
+                growth,temporary,{o.known_prefill_uma_budget,o.known_prefill_uma_budget},mapping_credit));
+        }
+    }
+    warm();
+    return reservation;
+}
+inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemory& memory) {
+    auto& o=result.options;
+    // Deployment fits against its complete slot inventory and its own margin.
+    // Explicit tiles keep their existing no-extra-compilation preflight; their
+    // actual retained ledger fits the cap at native startup instead.
+    if (!result.error.empty() || !o.http_serve || !o.known_prefix_prefill_rows || o.deployment_spec ||
+        !memory.available || !result.host_compilation.contains("serve_committed_host_peak_bytes")) return;
+    try {
+        fit_http_session_ram(o,result.host_compilation.at("serve_committed_host_peak_bytes"),
+            std::min(*memory.available,o.known_prefill_uma_budget));
+    } catch (const std::exception& e) { result.error=e.what(); }
+}
 inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available,
     std::span<const SessionRouteQualification> qualifications=prefix_auto_route_qualifications) {
@@ -1517,6 +1579,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     resolve_serve_prefill(result,model,content,capabilities,memory);
     resolve_session_defaults(result.options,model,request.environment,memory.available);
     resolve_prefix_defaults(result.options,model,request.environment,memory.available);
+    resolve_http_session_ram(result,memory);
     auto& o = result.options;
     // A profile proposal may fall back to builtin storage. Explicit requests
     // retain the hard-refusal contract, including native CLI precedence.
@@ -1661,41 +1724,11 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
     for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
         if (const char* value = std::getenv(name); value && *value) return result;
-    std::error_code error;
-    const std::filesystem::path nodes("/sys/class/kfd/kfd/topology/nodes");
-    std::optional<std::uint64_t> minor;
-    std::uint64_t gfx = 0;
-    unsigned node_count = 0;
-    for (std::filesystem::directory_iterator node(nodes, error), end; !error && node != end; node.increment(error)) {
-        if (++node_count > 256U) return result;
-        std::ifstream properties_file(node->path() / "properties", std::ios::binary);
-        std::array<char, 65537U> payload{};
-        properties_file.read(payload.data(), static_cast<std::streamsize>(payload.size()));
-        const auto bytes = properties_file.gcount();
-        if (bytes < 0 || bytes > 65536) return result;
-        std::istringstream properties(std::string(payload.data(), static_cast<std::size_t>(bytes)));
-        std::string key;
-        std::uint64_t value = 0, render = 0, target = 0;
-        while (properties >> key >> value) {
-            if (key == "drm_render_minor") render = value;
-            if (key == "gfx_target_version") target = value;
-        }
-        if (!render) continue;
-        if (minor) return result;
-        minor = render; gfx = target;
-    }
-    if (!minor || error) return result;
-    const auto device = std::filesystem::path("/sys/class/drm") / ("renderD" + std::to_string(*minor)) / "device";
-    const auto read = [&](const char* name) -> std::optional<std::uint64_t> {
-        std::ifstream file(device / name);
-        std::string text;
-        if (!std::getline(file, text) || text.size() > 32U) return {};
-        try { return parse_u64(text, "GTT observation"); } catch (const std::exception&) { return {}; }
-    };
-    result.gtt_limit = read("mem_info_gtt_total");
-    result.gtt_used = read("mem_info_gtt_used");
-    result.gfx_target=gfx;
-    capabilities.target_qualified = gfx == 110501U;
+    const auto device = strix::deploy::probe_device();
+    result.gtt_limit = device.gtt_total_bytes;
+    result.gtt_used = device.gtt_used_bytes;
+    result.gfx_target = device.gfx_target_version;
+    capabilities.target_qualified = device.gfx_target_version == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
 #endif
     return result;

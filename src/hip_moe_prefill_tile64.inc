@@ -316,10 +316,10 @@ __global__ __launch_bounds__(512) void down_prefill_da16_tile64_remainder(
     [[maybe_unused]] constexpr unsigned route_top_k=0U;
     if constexpr(Certificate) {
 #define STRIX_DA16_CERTIFICATE
-#include "hip_moe_da16_down_body.inc"
+#include "moe_core/hip_moe_da16_down_body.inc"
 #undef STRIX_DA16_CERTIFICATE
     } else {
-#include "hip_moe_da16_down_body.inc"
+#include "moe_core/hip_moe_da16_down_body.inc"
     }
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD

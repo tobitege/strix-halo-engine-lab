@@ -1011,7 +1011,10 @@ struct ApiService::Impl {
             job.ngram_peers.value_or(false) || job.draft_depth_max))
             throw ApiError(400, "invalid_request_error", "session mode requires its fixed draft policy; request draft overrides are unsupported");
         auto ticket = queue.submit(std::move(job));
-        if (!ticket) throw ApiError(429, "rate_limit_error", "the request queue is full");
+        if (!ticket) {
+            if (queue.draining()) throw ApiError(503, "server_error", "the server is draining");
+            throw ApiError(429, "rate_limit_error", "the request queue is full");
+        }
         return ticket;
     }
 
@@ -2033,6 +2036,7 @@ struct ApiService::Impl {
             out.set("observed", std::move(o));
         }
         if (config.status_extra) config.status_extra(out);
+        deployment_status(out, config.deployment, queue, config.http_slots);
         return out;
     }
     std::string metrics() {
@@ -2115,21 +2119,24 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
         if (request.method == "GET" && (request.path == "/health" || request.path == "/v1/health")) {
             std::string state;
             { const std::lock_guard lock(impl.mutex); state = impl.state; }
+            if (impl.queue.draining() && state != "failed") state = "draining";
             if (impl.config.health_record && serve_health_record_enabled()) {
                 BackendHealth evidence;
                 try {
                     if (impl.config.health_record->backend_probe_enabled && impl.config.health_provider)
                         evidence = impl.config.health_provider();
                 } catch (...) { evidence.state = BackendState::failed; }
-                const auto health = render_health(*impl.config.health_record, evidence, state,
+                auto health = render_health(*impl.config.health_record, evidence, state,
                     impl.config.model_id, impl.queue.snapshot(),
                     impl.config.capabilities ? std::string_view(impl.capabilities_id) : std::string_view{});
+                deployment_health(health.body, impl.config.deployment);
                 response.send(health.status, "application/json", health.body.dump());
                 return;
             }
             const bool failed = state == "failed", draining = state == "draining";
             Json out = Json::object(); out.set("status", Json(failed ? "failed" : draining ? "draining" : "ok")); out.set("model", Json(impl.config.model_id));
             if (impl.config.capabilities) out.set("capabilities_id", Json(impl.capabilities_id));
+            deployment_health(out, impl.config.deployment);
             response.send(failed || draining ? 503 : 200, "application/json", out.dump());
             return;
         }
@@ -2140,17 +2147,11 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             return;
         }
         impl.authorize(request);
+        if (handle_deployment_route(request, response, impl.queue, impl.config.deployment, impl.config.on_drain)) return;
         if (request.method == "GET" && request.path == "/v1/cache/stats" && impl.config.state_cache_stats) {
             response.send(200,"application/json",impl.config.state_cache_stats()); return;
         }
         if (impl.config.engine_routes && impl.config.engine_routes(request, response)) return;
-        if (request.method == "POST" && request.path == "/admin/drain" && impl.config.on_drain) {
-            impl.config.on_drain();
-            { const std::lock_guard lock(impl.mutex); if (impl.state != "failed") impl.state = "draining"; }
-            Json out = Json::object(); out.set("status", Json("draining"));
-            response.send(200, "application/json", out.dump());
-            return;
-        }
         if (request.method == "GET" && request.path == "/v1/capabilities" && impl.config.capabilities) {
             response.send(200, "application/json", impl.capabilities_document.dump());
             return;

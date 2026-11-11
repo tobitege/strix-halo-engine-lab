@@ -40,12 +40,16 @@ namespace strix::glm::pf {
 //         Attention qt/e/ob use attention_scratch_rows(max_rows) * rank_heads * (512 + 2304 + 512) floats;
 //         STRIX_GLM_PF_ATTN_QWIN=auto (default) tries full chunk, then 2048 only
 //         after routed scratch fails admission; 0 pins full chunk, 1..65536 pins a window.
+//   pipeline: SeqparExchange channel rings, coherent full-row consumer and
+//         runtime reserve. Pipeline 2 partitions engine_rows into disjoint halves
+//         and serializes the path's column scratch, so it adds no second path.
+//         Native install_prefill admits this separately; deployment includes it.
 //   engine_rows: the engine's row buffers sized max(8, Options::max_rows) (allocated/admitted by the load plan).
 //         Includes two H-wide final hidden buffers and, when mtp, nine H-wide MTP scratch equivalents.
 //         pf_mem_budget mirrors must include (2 + (mtp ? 9 : 0)) * RC * H * 4 bytes: 352 MiB at RC=2048 with MTP.
 //         Decode-only logits/argmax and other fixed-size scratch are outside this row-scaled subtotal.
 struct PrefillBudget {
-    std::uint64_t path = 0, workspace = 0, engine_rows = 0;
+    std::uint64_t path = 0, workspace = 0, engine_rows = 0, pipeline = 0;
     PrefillMoeRoute moe_route;
     unsigned attention_rows = 0;
 };

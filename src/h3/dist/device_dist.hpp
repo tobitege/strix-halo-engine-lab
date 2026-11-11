@@ -68,6 +68,14 @@ struct DeviceRunOptions {
     // Attention admission bound (admission.hpp): kScoreBound 2^14 (default) or kScoreBoundExtended 2^15 (explicit
     // opt-in, e.g. strix-h3-image --attn-score-2p15). Both ranks must use the same value (the image CLI handshakes it).
     double score_bound = kScoreBound;
+    // World 2, dense blocks (no FAST accelerators, hashes or test hooks): each block's K/V goes out as two messages,
+    // head rows [0, a) and tail rows [a, max_rows), a = round_down_64(max_rows (100 - pct) / 100). The out
+    // projection + MLP of block i and the norm + QKV of block i + 1 run per row part, so the head message of block
+    // i + 1 flies while the tail rows compute and the tail message while the local partial runs. Same kernels on row
+    // ranges (row-wise ops, per-row int8 quantization, integer GEMM accumulation), the same key blocks and merge
+    // order: the bits do not change. V travels row-major and is transposed by the receiver. 0 = one message per
+    // block (the reference schedule). Both ranks must use the same value (the image CLI handshakes it).
+    std::uint32_t pair_split_tail_pct = 0;
 };
 
 // Thrown only by the throw_in_flight test hook.

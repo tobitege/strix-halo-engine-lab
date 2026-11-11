@@ -90,8 +90,9 @@ struct UmaReservationEstimate {
 [[nodiscard]] UmaReservationEstimate plan_uma_reservation_growth(
     const UmaOwnerInventory& live, std::uint64_t additional_new_retained_bytes,
     std::uint64_t setup_temporary_bytes, UmaReservationLimits limits = {});
-// Same, with an explicit credit for file-mapping pages of the live inventory that the caller drops and re-reads
-// (STRIX_PLE_RECLAIMABLE): retained = live + growth - credit. The credit cannot exceed the live inventory's known
+// Same, with an explicit credit for reclaimable file-mapping pages of the live inventory:
+// clean read-only unregistered cache, or pages the caller drops and re-reads
+// (STRIX_PLE_RECLAIMABLE). retained = live + growth - credit. The credit cannot exceed the live inventory's known
 // file-mapping bytes; the caller owns the physical bound it encodes.
 [[nodiscard]] UmaReservationEstimate plan_uma_reservation_growth(
     const UmaOwnerInventory& live, std::uint64_t additional_new_retained_bytes,

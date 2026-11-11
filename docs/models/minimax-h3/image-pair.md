@@ -57,6 +57,30 @@ chunks drain at finish. Mixed routes also overlap the host portion. Host fallbac
 uses the existing asynchronous chunk pipeline and double-buffer event hazards.
 Measure exposed communication time instead of assuming full wire hiding.
 
+GPU-direct needs the nodes' USB4 streams in gpu_direct mode (layout 2bq: `data1`
+with `gpu_direct 1` and `gpu_poll 1` on both cables of both nodes). That is a
+root-owned configfs setting of the node, not a per-process choice; in layout 1 the
+receipt says "gpu-direct unavailable ... host path only" and every K/V message
+takes the host path.
+
+Split K/V schedule (`--pair-split-tail auto|PCT`; auto picks 20 up to 2048 packed
+rows, else 30, as measured at 1024 and 2048; 0 restores one message per block). Each block's local rows are cut into a head part and a tail part of
+about PCT % (64-row aligned, same cut on both ranks). The out projection, MLP and
+next block's norm, QKV and K4 run per part: the head K/V message of block i+1 is
+on the wire while the tail rows of block i finish and block i+1's tail is
+produced; the tail message flies during the local partial. A message is V rows
+(row major) plus K rows, so K stays one contiguous key block; the receiver
+transposes V. Row-range launches use the same kernels (row-wise glue, per-row
+int8 quantization, integer GEMM accumulation), the same key blocks and the same
+merge order, so outputs are unchanged. The split applies to dense blocks without
+FAST accelerators, residual hashes or test hooks; otherwise the one-message
+schedule runs. `--pair-timing` prints per-step GPU exposure sums.
+
+Sequence mode starts USB4 pairing on a thread at entry and runs the TE on a
+thread while the DiT checkpoint is made resident (`--serial-te` restores TE
+first). Peak memory then holds TE and DiT together. The memory admission check
+uses the free memory seen before both.
+
 The pair agrees inputs and policy before direct setup, including
 `--attn-score-2p15`. The default attention bound remains 2^14. Every step retains
 mandatory device digests, finite/operand checks and bound-row admission; optional
@@ -67,9 +91,21 @@ hash verification by the operator. Both ranks write complete identical outputs.
 ## Preparation and VAE
 
 Block preparation happens before sampling through the existing uploader and
-finite adaLN preparation. `--lazy-prepare` restores first-use preparation on the
-single-node route. Timings separate residency/pairing from sampling; moving work
-to startup does not establish a cold wall-time improvement.
+finite adaLN preparation. Both routes read block i+1 from the checkpoint on a
+worker while block i is uploaded (the same bytes as a serial loop). The eager
+single-node route also runs the TE on a thread while the DiT is made resident,
+as sequence mode does (`--serial-te` restores TE first; peak memory holds both,
+about +13 GiB). The activation workspace is sized once the TE gives the text
+length. `--lazy-prepare` restores first-use preparation on the single-node route
+(TE first). Timings separate residency/pairing from sampling; moving work to
+startup does not establish a cold wall-time improvement.
+
+Off the sequence pair, the VAE (host head and `--fast-vae-fp16` decoder) loads
+on a thread during sampling and decoding waits for it (`--serial-vae` loads it
+after the DiT is released, as before). The receipts are `vae_load` (the load,
+with `alongside_dit`) and `vae_load_wait` (what is left on the critical path).
+The FAST decoder uploads its weights on its own stream, so loading does not wait
+for or stall the sampling stream.
 
 `--vae-parallel auto|off` controls tile dispatch in sequence mode. The canonical
 spatial tiles, including overlap, are split into two contiguous ranges. Each rank

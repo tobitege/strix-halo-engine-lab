@@ -3,8 +3,32 @@
 // Channel exchanges equal byte counts in each direction.
 #include "glm_traits.hpp"
 #include <stdexcept>
+#include <algorithm>
+#include <limits>
+#include <string_view>
 
 namespace strix::glm::xfer {
+inline unsigned prefill_pipeline(unsigned requested, const char* value) {
+    if (value) {
+        const std::string_view v(value);
+        if (v != "1" && v != "2") throw std::invalid_argument("STRIX_GLM_PF_PIPELINE must be 1 or 2");
+        requested = v == "2" ? 2U : 1U;
+    }
+    if (requested != 1 && requested != 2) throw std::invalid_argument("pf_pipeline must be 1 or 2");
+    return requested;
+}
+// Actual SeqparExchange owners: two depth-sized coherent channel rings,
+// one full-row normalized consumer, and runtime/event reserve. Pipeline 2
+// takes disjoint halves of the existing engine rows; column scratch is shared.
+inline std::size_t seqpar_workspace_bytes(unsigned rows, unsigned depth, std::size_t capacity) {
+    if (depth < 2 || depth > 64) throw std::invalid_argument("glm seqpar: channel depth must be 2..64");
+    constexpr auto max = std::numeric_limits<std::size_t>::max();
+    if (capacity > max-sizeof(Trailer)-4095U) throw std::overflow_error("glm seqpar stride overflow");
+    const auto stride = (capacity+sizeof(Trailer)+4095U) & ~std::size_t{4095};
+    const auto side = GlmSchedule::row_bytes(rows) + (8U << 20U);
+    if (stride > (max-side)/(2U*depth)) throw std::overflow_error("glm seqpar workspace overflow");
+    return 2U*depth*stride + side;
+}
 struct SeqparRows {
     unsigned first, count;
     [[nodiscard]] constexpr std::size_t elements(unsigned width = 4096) const {

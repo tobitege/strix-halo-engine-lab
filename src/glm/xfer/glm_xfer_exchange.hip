@@ -168,10 +168,7 @@ void SeqparExchange::release_reduce_scatter(unsigned lane, hipStream_t consumer)
 
 std::size_t SeqparExchange::workspace_bytes(unsigned max_rows) {
     const auto o = seqpar_options(0, max_rows, nullptr);
-    if (o.depth < 2 || o.depth > 64) throw std::invalid_argument("glm seqpar: channel depth must be 2..64");
-    const auto stride = (o.capacity + sizeof(Trailer) + 4095U) & ~std::size_t{4095};
-    // Includes the direct coherent consumer buffer (128 MiB at 8192 rows).
-    return 2U * o.depth * stride + GlmSchedule::row_bytes(max_rows) + (8U << 20U);
+    return seqpar_workspace_bytes(max_rows, o.depth, o.capacity);
 }
 
 void SeqparExchange::start_reduce_scatter(float* partial, SeqparRows tile, unsigned lane, hipStream_t producer) {

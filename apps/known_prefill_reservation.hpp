@@ -82,15 +82,33 @@ inline PrefillReservationGrowth mtp_prefill_reservation(const MtpPrefillReservat
     }
     return {retained, add(m.replay, m.golden)};
 }
-// Shared plain/MTP admission. Verified credit already equals dropped interior
-// minus C+D+margin. Adding that bound or decode quota again would count it twice.
+// Shared plain/MTP admission. PLE credit already equals dropped interior minus
+// C+D+margin; HTTP can instead credit clean read-only unregistered mapping pages.
+// Adding the PLE bound or decode quota again would count it twice.
 // Metadata is a separate owner. No observed physical/GTT quantity receives credit.
+inline std::string known_prefill_reservation_ledger(const UmaOwnerInventory& live,
+    std::uint64_t growth, std::uint64_t temporary, UmaReservationLimits limits, std::uint64_t credit) {
+    return " [known-prefill live_bytes=" + std::to_string(live.reservation_upper_bound_bytes) +
+        " file_mapping_bytes=" + std::to_string(live.known_file_mapping_bytes) +
+        " growth_bytes=" + std::to_string(growth) + " temporary_bytes=" + std::to_string(temporary) +
+        " verified_credit_bytes=" + std::to_string(credit) + " retained_limit_bytes=" +
+        (limits.retained_bytes ? std::to_string(*limits.retained_bytes) : "unset") + " setup_limit_bytes=" +
+        (limits.setup_peak_bytes ? std::to_string(*limits.setup_peak_bytes) : "unset") + "]";
+}
 inline UmaReservationEstimate plan_known_prefill_reservation(const UmaOwnerInventory& live,
     std::uint64_t growth, std::uint64_t temporary, UmaReservationLimits limits,
     std::uint64_t verified_credit, std::uint64_t rolling_metadata,
     PrefillReservationGrowth mtp = {}) {
-    return plan_uma_reservation_growth(live,
-        prefill_reservation_add(growth, prefill_reservation_add(rolling_metadata, mtp.retained)),
-        prefill_reservation_add(temporary, mtp.temporary), limits, verified_credit);
+    const auto retained_growth = prefill_reservation_add(growth,
+        prefill_reservation_add(rolling_metadata, mtp.retained));
+    const auto setup_temporary = prefill_reservation_add(temporary, mtp.temporary);
+    try {
+        return plan_uma_reservation_growth(live, retained_growth, setup_temporary, limits, verified_credit);
+    } catch (const std::invalid_argument& error) {
+        // Distinguish this post-registration boundary from model/YaRN admission.
+        // Report declared reservations, never imply measured physical residency.
+        throw std::invalid_argument(std::string(error.what()) + known_prefill_reservation_ledger(
+            live,retained_growth,setup_temporary,limits,verified_credit));
+    }
 }
 } // namespace strix::decode_cli

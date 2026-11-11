@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/process_environment.hpp"
 #include "strix/qwen_prefill_pair.hpp"
@@ -730,11 +731,10 @@ struct HipKnownPrefixWindow::Impl {
     // STRIX_WINDOW_INJECT_NORM=1: an inject rows step followed by its HC rows step runs as inject+norm, split-K,
     //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
     //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
-    static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
     bool inject_norm_enabled() const { return allowed_folds.inject_norm && strix_window_inject_norm_enabled(); }
     bool combine_inject_enabled() const {
         if(!allowed_folds.combine_inject) return false;
-        static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on;
+        static const bool on = strix::env_flag_default_off("STRIX_WINDOW_COMBINE_INJECT", strix::EnvFlagMatch::first_character); return on;
     }
     bool commit_combine_enabled() const { return allowed_folds.commit_combine && strix_window_commit_combine_enabled(); }
     std::vector<std::size_t> folded_steps;
