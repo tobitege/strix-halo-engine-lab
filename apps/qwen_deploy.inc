@@ -109,6 +109,9 @@ struct QwenDeployment {
             throw std::invalid_argument("deployment link pin differs from pair transport");
         dp::Plan p;
         if (pipeline && !o.deploy_check && !o.print_effective_config) {
+#if !STRIX_DIST_PAIR_RUNTIME
+            throw std::invalid_argument("deployment pipeline needs the pair runtime, which is built on Linux only");
+#else
             if (transport == "usb4auto" || transport == "usb4-auto") {
                 strix::dist::Usb4AutoOptions usb; usb.rank = rank();
                 pair_link = strix::dist::usb4_host_auto(usb);
@@ -119,6 +122,7 @@ struct QwenDeployment {
                 pair_link = rank() ? strix::dist::tcp_connect(peer, 29872, timeout) : strix::dist::tcp_listen(29872, timeout);
             } else throw std::invalid_argument("deployment: unsupported pipeline transport");
             p = dp::resolve_pair(spec, provider, rank(), local, [&](auto out, auto in) { pair_link->exchange(out, in); });
+#endif
         } else p = dp::resolve(spec, dp::inspection_devices(spec, rank(), local), provider);
         if (!p.refused) {
             const auto node = topology == "single" ? 0U : rank();

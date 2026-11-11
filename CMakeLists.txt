@@ -3623,16 +3623,19 @@ endif()
 
 if(STRIX_ENABLE_HIP_RUNTIME)
     # Two-rank distributed runtime: transports and the device-buffer communicator.
-    # It is written against Linux sockets, threads, USB4 stream devices and DMA-BUF. Other platforms
-    # are single-node: they build the payload CRC and link-opening functions that refuse
-    # (src/dist_unavailable.cpp), and the runtime's programs and tests below exist on Linux only.
+    # It is written against Linux sockets, threads, USB4 stream devices and DMA-BUF. Other platforms are
+    # single-node: strix_dist holds only the payload CRC there, STRIX_DIST_PAIR_RUNTIME=0 tells engines that
+    # no pair link can be opened, and the runtime's programs and tests below exist on Linux only.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(strix_dist_pair_runtime 1)
         set(strix_dist_sources src/dist_communicator.cpp src/dist_gpu_direct.cpp src/dist_gpu_direct_setup.cpp
             src/dist_gpu_direct_copy.hip src/dist_host_copy.hip src/dist_staged_ready.hip src/linux_gpu_queue.cpp)
     else()
-        set(strix_dist_sources src/dist_unavailable.cpp)
+        set(strix_dist_pair_runtime 0)
+        set(strix_dist_sources "")
     endif()
     add_library(strix_dist STATIC ${strix_dist_sources} src/dist_crc32c.cpp)
+    target_compile_definitions(strix_dist PUBLIC STRIX_DIST_PAIR_RUNTIME=${strix_dist_pair_runtime})
     target_include_directories(strix_dist PUBLIC include)
     target_include_directories(strix_dist SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_features(strix_dist PUBLIC cxx_std_20)
@@ -3658,12 +3661,6 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-dist-crc32c-tests PRIVATE strix_dist) # strix::dist::crc32c itself
         strix_target_warnings(strix-dist-crc32c-tests)
         add_test(NAME strix-dist-crc32c-tests COMMAND strix-dist-crc32c-tests)
-    endif()
-    if(BUILD_TESTING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        add_executable(strix-dist-unavailable-tests tests/dist_unavailable_tests.cpp)
-        target_link_libraries(strix-dist-unavailable-tests PRIVATE strix_dist)
-        strix_target_warnings(strix-dist-unavailable-tests)
-        add_test(NAME strix-dist-unavailable-tests COMMAND strix-dist-unavailable-tests)
     endif()
     if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(strix-dist-transport-tests tests/dist_transport_tests.cpp)
@@ -5388,6 +5385,14 @@ if(BUILD_TESTING)
         target_compile_options(strix-qwen-prefill-pair-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
     endif()
     add_test(NAME qwen-prefill-pair COMMAND strix-qwen-prefill-pair-tests)
+    # The pair transport as every platform but Linux builds it (no pair runtime); runs everywhere.
+    add_executable(strix-qwen-pair-transport-unavailable-tests tests/qwen_pair_transport_unavailable_tests.cpp)
+    target_include_directories(strix-qwen-pair-transport-unavailable-tests PRIVATE include apps)
+    target_compile_features(strix-qwen-pair-transport-unavailable-tests PRIVATE cxx_std_20)
+    target_compile_definitions(strix-qwen-pair-transport-unavailable-tests PRIVATE STRIX_DIST_PAIR_RUNTIME=0)
+    target_link_libraries(strix-qwen-pair-transport-unavailable-tests PRIVATE Threads::Threads strix_serve_json)
+    strix_target_warnings(strix-qwen-pair-transport-unavailable-tests)
+    add_test(NAME strix-qwen-pair-transport-unavailable-tests COMMAND strix-qwen-pair-transport-unavailable-tests)
     add_executable(strix-qwen-prefill-staging-crc-tests tests/qwen_prefill_staging_crc_tests.cpp)
     target_include_directories(strix-qwen-prefill-staging-crc-tests PRIVATE tests/qwen_prefill_staging_shim include)
     target_compile_features(strix-qwen-prefill-staging-crc-tests PRIVATE cxx_std_20)

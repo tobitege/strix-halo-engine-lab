@@ -1319,8 +1319,8 @@ static int run_decode_entry(
         const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
         if (!r || (std::string_view(r) != "0" && std::string_view(r) != "1"))
             throw std::invalid_argument("deployment pipeline requires --rank 0|1");
-        (void)::setenv("STRIX_QWEN_PF_PIPE", "1", 1);
-        (void)::setenv("STRIX_QWEN_PF_PIPE_DECODE", "1", 1);
+        (void)strix::process_environment::set("STRIX_QWEN_PF_PIPE", "1", true);
+        (void)strix::process_environment::set("STRIX_QWEN_PF_PIPE_DECODE", "1", true);
     }
     if (options.print_model_graph || options.print_plan) {
         auto described_model = strix::ModelContract::qwen38_flash_next();

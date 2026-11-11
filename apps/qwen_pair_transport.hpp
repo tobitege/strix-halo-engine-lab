@@ -1,9 +1,39 @@
 #pragma once
-#include "strix/dist/open_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include <cstdlib>
+#ifndef STRIX_DIST_PAIR_RUNTIME
+#error "STRIX_DIST_PAIR_RUNTIME comes with strix_dist: link it (directly or through strix_hip_runtime)"
+#endif
+#if STRIX_DIST_PAIR_RUNTIME
+#include "strix/dist/open_transport.hpp"
+#else
+#include "strix/dist/transport.hpp"
+#include <memory>
+#include <stdexcept>
+#endif
 
 namespace strix::qwen_pp {
+#if !STRIX_DIST_PAIR_RUNTIME
+// Built without the pair runtime (STRIX_DIST_PAIR_RUNTIME=0, see strix_dist in CMakeLists.txt): no link to a
+// peer can be opened, so a pair prefill refuses where it would open one. The host path over a given link is
+// the same as below, without the GPU-direct route.
+class PairTransport {
+public:
+    explicit PairTransport(unsigned) {
+        throw std::invalid_argument("pair prefill needs the pair runtime, which is built on Linux only");
+    }
+    explicit PairTransport(std::unique_ptr<dist::Transport> link) : host_(std::move(link)) {
+        if (!host_) throw std::invalid_argument("pair prefill: empty deployment link");
+    }
+    void send(std::span<const std::byte> data) { host_->send(data); }
+    void receive(std::span<std::byte> data) { host_->receive(data); }
+    void abort(const std::string& why) { host_->abort(why); }
+    void finish() {}
+    bool piece(bool, PipeStaging&, std::size_t, std::size_t) { return false; }
+private:
+    std::unique_ptr<dist::Transport> host_;
+};
+#else
 // Raw framing/control keeps its original order and CRCs. Only seam payloads
 // become symmetric byte exchanges; the reverse direction is unused scratch.
 class PairTransport {
@@ -86,4 +116,5 @@ private:
         if (status != hipSuccess) throw std::runtime_error(std::string("pair transport: ") + hipGetErrorString(status));
     }
 };
+#endif
 } // namespace strix::qwen_pp
