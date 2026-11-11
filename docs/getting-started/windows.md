@@ -2,9 +2,12 @@
 
 [Getting started](README.md) · [Engine reference](engine-reference.md) · [Target platform](../architecture/01-target-platform.md)
 
-Linux is the primary runtime and the only one the CI builds and tests. This page describes an experimental
-native Windows build of `strix-hip-decode-token` (Qwen3.8-Flash-Next, one node, `gfx1151`): what it needs,
-how it differs from Linux and what is not available. Nothing here changes the Linux build.
+Linux is the primary runtime. This page describes an experimental native Windows build of
+`strix-hip-decode-token` (Qwen3.8-Flash-Next, one node, `gfx1151`): what it needs, how it differs from Linux
+and what is not available. Nothing here changes the Linux build.
+
+The CI builds it too (`.github/workflows/windows.yml`): the engine and the host tests of the code this build
+touches, on a hosted runner without a GPU. No kernel runs there and no model is loaded; those checks are local.
 
 ## What you need
 

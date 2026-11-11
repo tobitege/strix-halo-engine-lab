@@ -1,0 +1,115 @@
+name: Windows
+
+# Native Windows build of the Qwen single-node engine (docs/getting-started/windows.md) and the host tests of
+# the code that build touches. Hosted runners have no AMD GPU: nothing here runs a kernel or loads a model, and
+# tests labelled gpu are left out.
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ROCM_VERSION: 7.14.1
+  ROCM_DEVICE: gfx1151
+  # A short folder: `rocm-sdk init` links device files by paths that must stay below 260 characters.
+  ROCM_VENV: C:\rocm
+  # Built and run below. Each of them passes on a Windows Strix Halo machine; the Linux-only tests are not listed.
+  STRIX_WINDOWS_TESTS: >-
+    strix-process-restart-tests
+    strix-process-environment-tests
+    strix-host-memory-tests
+    strix-mapped-model-file-tests
+    strix-model-content-hash-tests
+    strix-model-selective-copy-layout-tests
+    strix-qsa-score-scratch-tests
+    strix-qwen-pair-transport-unavailable-tests
+    strix-deploy-tests
+    strix-dist-crc32c-tests
+    strix-qwen-startup-policy-tests
+    strix-qwen-effective-config-tests
+    strix-qpf2k-defaults-tests
+    strix-qwen-product-profile-tests
+    strix-qwen-allon-tests
+    strix-env-flags-tests
+    strix-engine-profile-common-tests
+    strix-ds41-session-cache-tests
+
+jobs:
+  windows-hip-build:
+    # Visual Studio 2022: the C++ library of Visual Studio 2026 does not compile with this SDK's HIP headers.
+    runs-on: windows-2025
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+
+      - name: Restore the ROCm SDK
+        id: rocm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ROCM_VENV }}
+          key: rocm-sdk-windows-${{ env.ROCM_VERSION }}-${{ env.ROCM_DEVICE }}-py${{ steps.python.outputs.python-version }}
+
+      - name: Install the ROCm SDK
+        if: steps.rocm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          python -m venv $env:ROCM_VENV
+          & "$env:ROCM_VENV\Scripts\python.exe" -m pip install --disable-pip-version-check `
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+            "rocm[libraries,devel,device-$env:ROCM_DEVICE]==$env:ROCM_VERSION"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Unpack the ROCm SDK
+        shell: pwsh
+        run: |
+          # The first init unpacks the compiler, headers and libraries; with a restored folder it only checks.
+          & "$env:ROCM_VENV\Scripts\rocm-sdk.exe" init
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $sdk = "$env:ROCM_VENV\Lib\site-packages\_rocm_sdk_devel"
+          if (-not (Test-Path "$sdk\lib\llvm\bin\clang++.exe")) { throw "no clang++ under $sdk" }
+          "ROCM_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build the engine and the tests
+        shell: pwsh
+        env:
+          STRIX_BUILD_DIR: ${{ github.workspace }}\build-hip
+          STRIX_EXTRA_CMAKE: -DBUILD_TESTING=ON
+        run: |
+          $tests = $env:STRIX_WINDOWS_TESTS -split '\s+' | Where-Object { $_ }
+          & scripts\windows\build-hip.bat all strix-hip-decode-token @tests 2>&1 | Tee-Object -FilePath windows-hip-build.log
+          exit $LASTEXITCODE
+
+      - name: Run the tests
+        shell: pwsh
+        run: |
+          $tests = $env:STRIX_WINDOWS_TESTS -split '\s+' | Where-Object { $_ }
+          ctest --test-dir build-hip -R ("^(" + ($tests -join '|') + ")$") --output-on-failure --no-tests=error
+          exit $LASTEXITCODE
+
+      - name: Start the engine without a model
+        shell: pwsh
+        run: |
+          # The program and the SDK's runtime DLLs next to it load; no device is touched.
+          $usage = & build-hip\strix-hip-decode-token.exe --help
+          $code = $LASTEXITCODE
+          $usage | Select-Object -First 1
+          exit $code
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-hip-build-log
+          path: windows-hip-build.log
+          if-no-files-found: ignore
