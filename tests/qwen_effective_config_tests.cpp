@@ -3819,6 +3819,23 @@ int main(int argc, char** arguments) {
     long_context_admission_tests(request,model,info,manifest,capabilities);
     const auto automatic = resolve(request,memory);
     expect(automatic.admitted && automatic.reason == "qualified-prompt", "plain default admits the measured prompt recipe");
+    {
+        // Separate host and GPU pools (Windows: the firmware's GPU memory next to the RAM Windows sees).
+        auto split = memory;
+        split.host_available = UINT64_C(64) << 30;
+        const auto roomy = resolve(request,split);
+        // The same prefill route; only the host-sized caches follow the host pool.
+        expect(roomy.admitted && roomy.reason == "qualified-prompt" &&
+            effective_prefill_argv(roomy.options) == effective_prefill_argv(automatic.options),
+            "a roomy host pool admits the same prefill route as the shared pool");
+        split.host_available = UINT64_C(1) << 30;
+        const auto tight = resolve(request,split);
+        expect(!tight.admitted, "host-only items beyond the host pool decline the plan");
+        split.host_available = UINT64_C(20) << 30;
+        expect(resolve(request,split).options.session_ram_bytes == (UINT64_C(20) << 30) / 10U &&
+            automatic.options.session_ram_bytes == std::min(UINT64_C(8) << 30, *memory.available / 10U),
+            "session RAM is sized from the host pool where it is separate");
+    }
     const auto argv = effective_prefill_argv(automatic.options);
     expect(std::vector<std::string_view>(argv.begin(),argv.end()) ==
         std::vector<std::string_view>(qwen_contract::argv.begin(),qwen_contract::argv.end()), "plain default matches normalized argv contract");

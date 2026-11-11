@@ -24,8 +24,10 @@ struct DeviceFacts {
 // root is a filesystem prefix containing sys/class/..., not the sys directory.
 // A DRM device override preserves callers' explicit selection (including fixtures).
 // Linux reads KFD/DRM sysfs and never initializes HIP. Windows has no such files: with root and override
-// empty, a build with STRIX_DEPLOY_HIP_PROBE asks the HIP runtime (device properties and memory info, no
-// allocation and no kernel), which initializes it; source is then "hip". Without HIP the facts stay unknown.
+// empty, a build with STRIX_DEPLOY_HIP_PROBE asks the HIP runtime for the device properties (no allocation and
+// no kernel), which initializes it, and DXGI for the adapter's local memory segment (budget and use; not
+// hipMemGetInfo, whose total adds the shared segment backed by system RAM); source is then "hip+dxgi".
+// Without HIP the facts stay unknown.
 [[nodiscard]] std::vector<DeviceFacts> probe_devices(const std::string& sysfs_root = "",
                                                      const std::string& drm_device = "");
 // Refuses ambiguous selection by returning unknown facts. Never silently selects GPU 0.

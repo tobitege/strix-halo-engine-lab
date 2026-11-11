@@ -17,6 +17,7 @@
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "strix/host_memory.hpp"
 #include "strix/linux_uma_observation.hpp"
 #include "strix/uma_owner_inventory.hpp"
 #include <map>
@@ -98,7 +99,20 @@ struct PrefillMemory {
     std::optional<std::uint64_t> yarn_registered_storage_step{};
     // Runtime supplies a fresh physical/GTT sample before each registered trial.
     std::function<void(PrefillMemory&)> refresh_registered{};
+    // Set only where host and GPU memory are separate pools (Windows: the firmware's GPU memory next to the RAM
+    // Windows sees). available, total and the GTT facts then describe the GPU pool, which holds the model,
+    // state and workspaces, and host-only items (metadata copies, native host pools, PLE rolling, session and
+    // prefix caches) are priced against this. On a UMA node it stays empty: one pool holds both.
+    // Last member: positional initializers of the members above stay valid.
+    std::optional<std::uint64_t> host_available{};
 };
+// The pool host-only items are priced against: the separate host RAM where the GPU has memory of its own,
+// otherwise the one pool both share.
+inline std::optional<std::uint64_t> host_pool_available(const PrefillMemory& memory) {
+    return memory.host_available ? memory.host_available : memory.available;
+}
+// Kept free of host-only items in a separate host pool, for the rest of the system.
+inline constexpr std::uint64_t separate_host_reserve = UINT64_C(1) << 30;
 // Both inspection and execution validate explicit-T assets before the inspection exit.
 inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
     if(o.http_serve && o.mtp.enabled && o.known_prefix_prefill_rows) {
@@ -875,6 +889,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     throw std::runtime_error("insufficient-memory");
                 if (add(add(live.reservation_upper_bound_bytes, growth), required.runtime_payload) > uma)
                     throw std::runtime_error("insufficient-memory");
+                // Separate host pool: the host-only items (metadata copies, native host pools, PLE rolling) fit
+                // the host RAM too; the checks above price them against the GPU pool as well.
+                if (memory.host_available && add(add(required.metadata, add(prefill_native_pools(candidate, model).host,
+                        rolling_owner)), separate_host_reserve) > *memory.host_available)
+                    throw std::runtime_error("insufficient-memory");
                 (void)plan_uma_reservation_growth(live, growth, required.runtime_payload, {uma, uma});
                 result.ple_reclaim_credit = credit;
                 result.ple_rolling_h = rolling_h;
@@ -1229,9 +1248,13 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             fit("UMA",total,candidate.known_prefill_uma_budget);
             fit("GTT-used",*memory.gtt_used,*memory.gtt_limit);
             fit("GTT-free",add(required.device_base,add(required.external_device,add(scratch,add(future_device,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom))))),*memory.gtt_limit - *memory.gtt_used);
+            const auto host_only = add(required.external_host,add(required.metadata,add(future_host,
+                add(candidate.prefix_cache_host_bytes,prefill_native_pools(candidate,model).host))));
+            if (memory.host_available) fit("host-RAM",add(host_only,separate_host_reserve),*memory.host_available);
             o = std::move(candidate);
             result.host_compilation = required.organization;
             result.host_compilation["serve_committed_host_peak_bytes"]=total;
+            if (memory.host_available) result.host_compilation["serve_committed_host_only_bytes"]=host_only;
             result.host_compilation["serve_prefill_external_host_bytes"]=required.external_host;
             result.host_compilation["serve_prefill_external_device_bytes"]=required.external_device;
             result.host_compilation["serve_batch_staging_bytes"]=staging;
@@ -1322,7 +1345,11 @@ inline void resolve_http_session_ram(EffectiveConfig& result, const PrefillMemor
     if (!result.error.empty() || !o.http_serve || !o.known_prefix_prefill_rows || o.deployment_spec ||
         !memory.available || !result.host_compilation.contains("serve_committed_host_peak_bytes")) return;
     try {
-        fit_http_session_ram(o,result.host_compilation.at("serve_committed_host_peak_bytes"),
+        // Session RAM is host memory: in a separate host pool it fits next to the host-only items.
+        if (memory.host_available && result.host_compilation.contains("serve_committed_host_only_bytes"))
+            fit_http_session_ram(o,prefill_checked_add(result.host_compilation.at("serve_committed_host_only_bytes"),
+                separate_host_reserve),*memory.host_available);
+        else fit_http_session_ram(o,result.host_compilation.at("serve_committed_host_peak_bytes"),
             std::min(*memory.available,o.known_prefill_uma_budget));
     } catch (const std::exception& e) { result.error=e.what(); }
 }
@@ -1577,8 +1604,8 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     };
     auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,charged_memory);
     resolve_serve_prefill(result,model,content,capabilities,memory);
-    resolve_session_defaults(result.options,model,request.environment,memory.available);
-    resolve_prefix_defaults(result.options,model,request.environment,memory.available);
+    resolve_session_defaults(result.options,model,request.environment,host_pool_available(memory));
+    resolve_prefix_defaults(result.options,model,request.environment,host_pool_available(memory));
     resolve_http_session_ram(result,memory);
     auto& o = result.options;
     // A profile proposal may fall back to builtin storage. Explicit requests
@@ -1734,6 +1761,20 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     result.gfx_target = device.gfx_target_version;
     capabilities.target_qualified = device.gfx_target_version == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
+#endif
+#if defined(_WIN32)
+    // Separate pools: the GPU pool is the device's dedicated memory, which holds the model, state and
+    // workspaces; the host pool is the RAM Windows sees. Without both observations nothing is admitted.
+    if (device.gtt_total_bytes && device.gtt_used_bytes && *device.gtt_used_bytes <= *device.gtt_total_bytes) {
+        result.host_available = separate_host_memory_available();
+        if (result.host_available) {
+            result.total = device.gtt_total_bytes;
+            result.available = *device.gtt_total_bytes - *device.gtt_used_bytes;
+            result.usable_ceiling = result.total;
+            result.cache_available = result.available;
+            result.resident = device.gtt_used_bytes;
+        }
+    }
 #endif
     return result;
 }

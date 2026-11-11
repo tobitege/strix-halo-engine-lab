@@ -12,6 +12,13 @@
 
 #if defined(STRIX_DEPLOY_HIP_PROBE)
 #include <hip/hip_runtime_api.h>
+#include <cstring>
+#include <optional>
+#include <utility>
+#include <cwchar>
+#include <dxgi1_4.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #endif
 
 namespace strix::deploy {
@@ -73,38 +80,71 @@ void fake_memory(DeviceFacts& d) {
 }
 #if defined(STRIX_DEPLOY_HIP_PROBE)
 // Windows: no KFD topology or DRM counters exist; the HIP runtime is the only source of the architecture. A
-// deliberate deviation from the Linux contract above (which never initializes HIP), limited to queries: the
-// properties and the memory info of each device, the current device restored. Any failure leaves every
-// fact unknown, as on a Linux host without a visible GPU.
+// deliberate deviation from the Linux contract above (which never initializes HIP), limited to queries of the
+// device properties. The memory comes from DXGI: the adapter's local segment, which on an APU is the memory
+// the firmware set aside for the GPU, separate from the system RAM Windows uses. A failed HIP query leaves
+// every fact unknown, a failed DXGI query the memory, as on a Linux host without the counters.
+
+// The dedicated memory of the adapter with this LUID: {size, current use} in bytes. On an APU that is the memory
+// the firmware set aside for the GPU. DXGI's segment budget does not separate it: it reports one local group
+// that includes the shared segment Windows backs with system RAM. The size is the adapter's
+// DedicatedVideoMemory, the use the "GPU Adapter Memory\Dedicated Usage" counter of the same adapter.
+std::optional<std::pair<std::uint64_t, std::uint64_t>> dedicated_memory(const char (&luid)[8]) {
+    LUID id{};
+    std::memcpy(&id, luid, sizeof(id));
+    std::uint64_t size = 0;
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) return {};
+    IDXGIAdapter1* adapter = nullptr;
+    if (SUCCEEDED(factory->EnumAdapterByLuid(id, __uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter)))) {
+        DXGI_ADAPTER_DESC1 description{};
+        if (SUCCEEDED(adapter->GetDesc1(&description))) size = description.DedicatedVideoMemory;
+        adapter->Release();
+    }
+    factory->Release();
+    if (!size) return {};
+
+    wchar_t path[160];
+    std::swprintf(path, std::size(path), L"\\GPU Adapter Memory(luid_0x%08lX_0x%08lX_phys_0)\\Dedicated Usage",
+        static_cast<unsigned long>(id.HighPart), static_cast<unsigned long>(id.LowPart));
+    PDH_HQUERY query = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) return {};
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> result;
+    PDH_HCOUNTER counter = nullptr;
+    PDH_FMT_COUNTERVALUE value{};
+    if (PdhAddEnglishCounterW(query, path, 0, &counter) == ERROR_SUCCESS && PdhCollectQueryData(query) == ERROR_SUCCESS &&
+        PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, nullptr, &value) == ERROR_SUCCESS &&
+        value.CStatus == PDH_CSTATUS_VALID_DATA && value.largeValue >= 0)
+        result = std::pair<std::uint64_t, std::uint64_t>{size, static_cast<std::uint64_t>(value.largeValue)};
+    PdhCloseQuery(query);
+    return result;
+}
 std::vector<DeviceFacts> probe_hip_devices() {
-    int count = 0, current = 0;
-    if (hipGetDeviceCount(&count) != hipSuccess || count <= 0 || hipGetDevice(&current) != hipSuccess) return {};
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count <= 0) return {};
     std::vector<DeviceFacts> result;
     for (int index = 0; index < count; ++index) {
         hipDeviceProp_t properties{};
-        std::size_t free_bytes = 0, total_bytes = 0;
-        const bool observed = hipGetDeviceProperties(&properties, index) == hipSuccess &&
-            hipSetDevice(index) == hipSuccess && hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess;
-        if (!observed || free_bytes > total_bytes) {
-            (void)hipSetDevice(current);
-            return {};
-        }
+        if (hipGetDeviceProperties(&properties, index) != hipSuccess) return {};
         DeviceFacts d;
         const std::string_view arch(properties.gcnArchName);
         d.gfx_target = std::string(arch.substr(0, arch.find(':')));
         d.gfx_target_version = gfx_target_version(d.gfx_target);
         if (properties.multiProcessorCount > 0) d.cu_count = static_cast<std::uint32_t>(properties.multiProcessorCount);
-        // Integrated GPUs allocate from the memory the runtime reports, as KFD's local_mem_size == 0.
         d.unified = properties.integrated != 0;
-        d.mem_total_bytes = total_bytes;
-        d.mem_free_bytes = free_bytes;
-        if (d.unified) { d.gtt_total_bytes = total_bytes; d.gtt_used_bytes = total_bytes - free_bytes; }
-        else { d.vram_total_bytes = total_bytes; d.vram_used_bytes = total_bytes - free_bytes; }
-        d.source = "hip";
+        // Memory: the adapter's dedicated memory (its size and current use), not hipMemGetInfo, which adds the
+        // shared segment Windows backs with system RAM. Unknown when DXGI or the counter does not answer.
+        if (const auto dedicated = dedicated_memory(properties.luid)) {
+            const auto used = std::min(dedicated->second, dedicated->first);
+            d.mem_total_bytes = dedicated->first;
+            d.mem_free_bytes = dedicated->first - used;
+            if (d.unified) { d.gtt_total_bytes = dedicated->first; d.gtt_used_bytes = used; }
+            else { d.vram_total_bytes = dedicated->first; d.vram_used_bytes = used; }
+        }
+        d.source = "hip+dxgi";
         fake_memory(d);
         result.push_back(std::move(d));
     }
-    (void)hipSetDevice(current);
     return result;
 }
 #endif

@@ -191,6 +191,7 @@ add_library(strix_core STATIC
     src/offline_compile_provenance.cpp
     src/uma_owner_inventory.cpp
     src/linux_uma_observation.cpp
+    src/host_memory.cpp
     src/preflight.cpp
     src/moe_fork_join_arena.cpp
     src/moe_token_cost_backend.cpp
@@ -2326,10 +2327,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Windows has no KFD/DRM sysfs: the deployment probe asks the HIP runtime (src/deploy/device.cpp).
         target_compile_definitions(strix_deploy PRIVATE STRIX_DEPLOY_HIP_PROBE=1 __HIP_PLATFORM_AMD__=1)
         target_include_directories(strix_deploy SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
-        target_link_libraries(strix_deploy PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_link_libraries(strix_deploy PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}" dxgi pdh)
         if(BUILD_TESTING)
             add_executable(strix-deploy-hip-probe-tests tests/deploy_hip_probe_tests.cpp)
-            target_link_libraries(strix-deploy-hip-probe-tests PRIVATE strix_deploy)
+            target_link_libraries(strix-deploy-hip-probe-tests PRIVATE strix_deploy "${STRIX_HIP_RUNTIME_LIBRARY}")
+            target_include_directories(strix-deploy-hip-probe-tests SYSTEM PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+            target_compile_definitions(strix-deploy-hip-probe-tests PRIVATE __HIP_PLATFORM_AMD__=1)
             strix_target_warnings(strix-deploy-hip-probe-tests)
             add_test(NAME strix-deploy-hip-probe-tests COMMAND strix-deploy-hip-probe-tests)
         endif()
