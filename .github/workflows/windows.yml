@@ -39,8 +39,8 @@ env:
     strix-env-flags-tests
     strix-engine-profile-common-tests
     strix-ds41-session-cache-tests
-  # Built, and only started under a time limit: these programs import amdhip64_7.dll. On the first run of this
-  # workflow the one test among them did not return within 25 minutes on a runner without an AMD GPU.
+  # Built, and only started under a time limit: these programs import amdhip64_7.dll, and a runner has no AMD
+  # GPU. A step of its own records how they behave there.
   STRIX_WINDOWS_HIP_PROGRAMS: >-
     strix-deploy-tests
     strix-hip-decode-token

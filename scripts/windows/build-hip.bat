@@ -89,5 +89,6 @@ if errorlevel 1 (echo build failed & exit /b 4)
 rem Windows loads a program's DLLs from its own folder before System32, where the display driver's HIP
 rem runtime sits (a different version: it fails at the first kernel launch). The SDK's runtime goes next
 rem to the programs.
-for %%P in (amdhip64*.dll amd_comgr*.dll rocm_kpack*.dll) do copy /y "%SDK%\bin\%%P" "%BUILD%\" >nul
+for %%P in ("%SDK%\bin\amdhip64*.dll" "%SDK%\bin\amd_comgr*.dll" "%SDK%\bin\rocm_kpack*.dll") do copy /y "%%~fP" "%BUILD%\" >nul
+if not exist "%BUILD%\amdhip64*.dll" (echo no HIP runtime DLL under %SDK%\bin to put next to the programs & exit /b 5)
 exit /b 0
