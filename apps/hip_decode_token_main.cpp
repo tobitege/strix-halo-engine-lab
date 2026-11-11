@@ -63,9 +63,12 @@
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_serve_policy.hpp"
+#include "strix/process_environment.hpp"
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 #include "strix/runtime_allocator.hpp"
 #include "strix/raw_baseline_recording.hpp"
@@ -1275,11 +1278,8 @@ static int run_decode_entry(
         pair_arguments.push_back(argv[0]);
         bool pair_rank_seen = false;
         const auto pair_setenv = [](const char* key, const char* value) {
-#ifdef _WIN32
-            if (_putenv_s(key, value) != 0) throw std::runtime_error("pair prefill environment update failed");
-#else
-            if (setenv(key, value, 1) != 0) throw std::runtime_error("pair prefill environment update failed");
-#endif
+            if (!strix::process_environment::set(key, value, true))
+                throw std::runtime_error("pair prefill environment update failed");
         };
         for (int pair_index = 1; pair_index < argc; ++pair_index) {
             const std::string_view pair_argument(argv[pair_index]);
@@ -1340,7 +1340,7 @@ static int run_decode_entry(
         strix::qwen_allon::gate_long_prompt(options.tokens.size(),
             [](const char* name) { return std::getenv(name); },
             [&](const char* name, const char* value) {
-                if (::setenv(name, value, 1) != 0)
+                if (!strix::process_environment::set(name, value, true))
                     throw std::runtime_error("qwen allon long-prompt gate: setenv failed");
             });
         // Include inherited OFF values after eager exec; report the actual state.
@@ -1369,8 +1369,30 @@ static int run_decode_entry(
         strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
             !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
             [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
+            [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); })) {
         std::fflush(nullptr);
+#if defined(_WIN32)
+        // Windows has no exec: the same program with the same command line runs as a child that
+        // shares the console, the standard handles and the environment with the value set above,
+        // and this process ends with its exit code.
+        std::wstring program(32768U, L'\0');
+        program.resize(GetModuleFileNameW(nullptr, program.data(), static_cast<DWORD>(program.size())));
+        std::wstring command_line(GetCommandLineW());
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION child{};
+        if (!program.empty() && CreateProcessW(program.c_str(), command_line.data(), nullptr, nullptr, TRUE, 0,
+                nullptr, nullptr, &startup, &child)) {
+            CloseHandle(child.hThread);
+            DWORD code = 1U;
+            if (WaitForSingleObject(child.hProcess, INFINITE) != WAIT_OBJECT_0 || !GetExitCodeProcess(child.hProcess, &code))
+                code = 1U;
+            std::_Exit(static_cast<int>(code));
+        }
+        std::fprintf(stderr, "eager code loading: restart failed (Windows error %lu); continuing with deferred loading\n",
+            GetLastError());
+        strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
+#else
         std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
         const auto original = strix::decode_cli::split_process_arguments(
             std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
@@ -1380,6 +1402,8 @@ static int run_decode_entry(
         ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
         std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
             std::strerror(errno));
+        strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
+#endif
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
@@ -1752,10 +1776,11 @@ static int run_decode_entry(
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
     { strix::startup::Phase marker("preflight_reset");
       yarn_preflight_reclaimer.reset(); } // runtime owns a fresh verified drop after registration
-    strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
+    strix::qpf2k::undo_pre_injected([](const char* name) { (void)strix::process_environment::unset(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
-        if (!std::getenv(name.c_str()) || options.baseline) ::setenv(name.c_str(), value.c_str(), 1);
+        if (!std::getenv(name.c_str()) || options.baseline)
+            (void)strix::process_environment::set(name.c_str(), value.c_str(), true);
     }
     strix::qpf2k::defaulted_items = 0U;
     for (const auto& entry : strix::qpf2k::defaults) {
@@ -4311,7 +4336,11 @@ static int run_decode_entry(
             if (reserve_ple && warmed_file_backed_bytes) {
                 strix::HipModelResidencyPolicy policy;
                 policy.coalesce_gap_bytes = options.coalesce_gap_bytes;
+#if defined(__linux__)
                 const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#else
+                const std::uint64_t page = 4096;
+#endif
                 reserved_table_bytes = strix::decode_cli::file_backed_unregistered_bytes(manifest,
                     strix::build_registered_residency_ranges(manifest, policy, mapped.bytes(), page), mapped.bytes(), page);
             }
@@ -5591,11 +5620,7 @@ static int run_decode_entry(
                 throw std::invalid_argument("pair prefill cost-driven chunk selection requires a fresh prompt");
             const auto pair_range = pair_rank == 0U ? "0:" + std::to_string(pair_prediction.cut) :
                 std::to_string(pair_prediction.cut) + ":48";
-#if defined(_WIN32)
-            if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str()) != 0)
-#else
-            if (::setenv("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), 1) != 0)
-#endif
+            if (!strix::process_environment::set("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), true))
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%u cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
                 pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "default"),
@@ -5702,11 +5727,7 @@ static int run_decode_entry(
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_start).count());
                 if (pair_rank == 0U) pair_decode_logits = std::move(pair_final_logits);
                 pair_context = {};
-#if defined(_WIN32)
-                if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", "") != 0)
-#else
-                if (::unsetenv("STRIX_QWEN_PF_LAYER_RANGE") != 0)
-#endif
+                if (!strix::process_environment::unset("STRIX_QWEN_PF_LAYER_RANGE"))
                     throw std::runtime_error("pair handoff full-layer restore failed");
             }
             // pair handoff exports the complete request below, after rank-0 decode.

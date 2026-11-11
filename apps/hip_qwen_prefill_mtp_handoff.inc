@@ -74,21 +74,13 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         ~RestoreRange() { reset(); }
         void reset() {
             qwen_pp::pipe_context={};
-#ifdef _WIN32
-            (void)_putenv_s("STRIX_QWEN_PF_LAYER_RANGE",present?previous.c_str():"");
-#else
-            if(present) (void)::setenv("STRIX_QWEN_PF_LAYER_RANGE",previous.c_str(),1);
-            else (void)::unsetenv("STRIX_QWEN_PF_LAYER_RANGE");
-#endif
+            if(present) (void)process_environment::set("STRIX_QWEN_PF_LAYER_RANGE",previous.c_str(),true);
+            else (void)process_environment::unset("STRIX_QWEN_PF_LAYER_RANGE");
         }
     };
     const char* previous_range=std::getenv("STRIX_QWEN_PF_LAYER_RANGE");
     RestoreRange restore{previous_range?previous_range:"",previous_range!=nullptr};
-#ifdef _WIN32
-    if(_putenv_s("STRIX_QWEN_PF_LAYER_RANGE",range.c_str())!=0)
-#else
-    if(::setenv("STRIX_QWEN_PF_LAYER_RANGE",range.c_str(),1)!=0)
-#endif
+    if(!process_environment::set("STRIX_QWEN_PF_LAYER_RANGE",range.c_str(),true))
         throw std::runtime_error("pair handoff MTP layer range update failed");
     const char* transport_env=std::getenv("STRIX_QWEN_PF_PIPE_TRANSPORT");
     const std::string_view transport=transport_env?transport_env:"usb4auto";

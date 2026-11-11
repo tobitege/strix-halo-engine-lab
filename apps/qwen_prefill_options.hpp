@@ -22,6 +22,13 @@ inline bool apply_eager_code_loading(bool enabled, Get get, Put put) {
         throw std::runtime_error("cannot configure HIP eager code loading");
     return true;
 }
+// After a restart that failed: the image keeps deferred loading, so the value that apply_eager_code_loading
+// set must not stay behind (receipts, cache identities and child processes read the environment).
+template<class Erase>
+inline void withdraw_eager_code_loading(Erase erase) {
+    if (!erase("HIP_ENABLE_DEFERRED_LOADING"))
+        throw std::runtime_error("cannot withdraw HIP eager code loading");
+}
 
 // The restart must repeat the process's own arguments: a runner that wraps the decoder entry
 // forwards a reduced argv, and restarting with that would drop the runner's options.

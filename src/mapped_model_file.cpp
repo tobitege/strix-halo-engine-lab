@@ -19,33 +19,131 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
 #endif
 
 namespace strix {
 namespace {
 
+// The operating-system side of a mapped model file. Each supported platform supplies the same
+// primitives; MappedModelFile below is one flow over them.
+//   FileState        device, inode, size, mtime (s, ns), ctime (s, ns) of an open file
+//   open_descriptor  read-only descriptor, or -1
+//   descriptor_state state of the open file; false when it cannot be read
+//   content_path     the path the full-file hash opens for this descriptor
+//   content_path_is  whether that path names the open file
+//   map_read_only    read-only mapping of the whole file, or nullptr
+//   read_some        one positioned read; 0 at end of file, throws on error
+using FileState = std::array<std::uint64_t,7>;
+
 #if defined(__linux__)
 
-std::array<std::uint64_t,7> file_state(const struct stat& value) {
+FileState file_state(const struct stat& value) {
     return {static_cast<std::uint64_t>(value.st_dev),static_cast<std::uint64_t>(value.st_ino),
         static_cast<std::uint64_t>(value.st_size),static_cast<std::uint64_t>(value.st_mtim.tv_sec),
         static_cast<std::uint64_t>(value.st_mtim.tv_nsec),static_cast<std::uint64_t>(value.st_ctim.tv_sec),
         static_cast<std::uint64_t>(value.st_ctim.tv_nsec)};
 }
-bool same_file_state(
-    const struct stat& left,
-    const struct stat& right) noexcept {
-    return left.st_dev == right.st_dev &&
-           left.st_ino == right.st_ino &&
-           left.st_size == right.st_size &&
-           left.st_mtim.tv_sec ==
-               right.st_mtim.tv_sec &&
-           left.st_mtim.tv_nsec ==
-               right.st_mtim.tv_nsec &&
-           left.st_ctim.tv_sec ==
-               right.st_ctim.tv_sec &&
-           left.st_ctim.tv_nsec ==
-               right.st_ctim.tv_nsec;
+int open_descriptor(const std::filesystem::path& path) noexcept {
+    return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+}
+bool descriptor_state(int fd, FileState& out) noexcept {
+    struct stat value {};
+    if (::fstat(fd, &value) != 0 || value.st_size < 0) return false;
+    out = file_state(value);
+    return true;
+}
+// The hash reads the descriptor itself, so it can never read another file.
+std::filesystem::path content_path(const std::filesystem::path&, int fd) {
+    return std::filesystem::path("/proc/self/fd") / std::to_string(fd);
+}
+bool content_path_is(const std::filesystem::path&, const FileState&) noexcept { return true; }
+void* map_read_only(int fd, std::uint64_t bytes) noexcept {
+    void* address = ::mmap(nullptr, static_cast<std::size_t>(bytes), PROT_READ, MAP_PRIVATE, fd, 0);
+    return address == MAP_FAILED ? nullptr : address;
+}
+void unmap(std::uintptr_t base, std::uint64_t bytes) noexcept {
+    static_cast<void>(::munmap(reinterpret_cast<void*>(base), static_cast<std::size_t>(bytes)));
+}
+void close_descriptor(int fd) noexcept { static_cast<void>(::close(fd)); }
+std::size_t read_some(int fd, std::byte* data, std::size_t bytes, std::uint64_t offset) {
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
+        throw std::overflow_error("mapped model read range does not fit off_t");
+    for (;;) {
+        const auto result = ::pread(fd, data, bytes, static_cast<off_t>(offset));
+        if (result >= 0) return static_cast<std::size_t>(result);
+        if (errno != EINTR) throw std::runtime_error("mapped model pread failed");
+    }
+}
+
+#elif defined(_WIN32)
+
+HANDLE os_handle(int fd) noexcept {
+    return fd < 0 ? INVALID_HANDLE_VALUE : reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+}
+// In the slots of the Linux state: volume serial and file index for device and inode, then the
+// size, the last-write time and the creation time (100 ns ticks; the nanosecond slots stay 0).
+// ChangeTime is left out, as in the hash cache of model_content_hash.cpp: metadata-only
+// hard-link operations move it. Weaker than Linux in one respect: NTFS completes the last-write
+// time only when the writing handle closes, so a same-size write through a handle that is still
+// open is not seen.
+bool handle_state(HANDLE handle, FileState& out) noexcept {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (handle == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(handle, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+    const auto u64 = [](DWORD high, DWORD low) { return (std::uint64_t{high} << 32U) | low; };
+    out = {info.dwVolumeSerialNumber, u64(info.nFileIndexHigh, info.nFileIndexLow),
+        u64(info.nFileSizeHigh, info.nFileSizeLow),
+        u64(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime), 0,
+        u64(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime), 0};
+    return true;
+}
+int open_descriptor(const std::filesystem::path& path) noexcept {
+    int fd = -1;
+    return _wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY | _O_NOINHERIT, _SH_DENYNO, 0) == 0 ? fd : -1;
+}
+bool descriptor_state(int fd, FileState& out) noexcept { return handle_state(os_handle(fd), out); }
+// Windows has no /proc/self/fd: the hash opens the file by its own path, and that path is
+// checked against the open file before and after the pass.
+std::filesystem::path content_path(const std::filesystem::path& path, int) { return path; }
+bool content_path_is(const std::filesystem::path& path, const FileState& state) noexcept {
+    const HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    FileState named{};
+    const bool read = handle_state(handle, named);
+    CloseHandle(handle);
+    return read && named == state;
+}
+void* map_read_only(int fd, std::uint64_t) noexcept {
+    const HANDLE section = CreateFileMappingW(os_handle(fd), nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (section == nullptr) return nullptr;
+    void* address = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(section); // the view keeps the section alive
+    return address;
+}
+void unmap(std::uintptr_t base, std::uint64_t) noexcept {
+    static_cast<void>(UnmapViewOfFile(reinterpret_cast<void*>(base)));
+}
+void close_descriptor(int fd) noexcept { static_cast<void>(_close(fd)); }
+// A positioned read on the descriptor's own handle; one call takes at most a DWORD of bytes.
+std::size_t read_some(int fd, std::byte* data, std::size_t bytes, std::uint64_t offset) {
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(offset & 0xffffffffU);
+    at.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+    DWORD result = 0;
+    if (ReadFile(os_handle(fd), data, static_cast<DWORD>(std::min<std::size_t>(bytes, std::size_t{1} << 30U)), &result, &at))
+        return result;
+    if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+    throw std::runtime_error("mapped model read failed");
 }
 
 #endif
@@ -109,7 +207,7 @@ MappedModelFile MappedModelFile::open_read_only(
     const std::filesystem::path& path,
     std::string logical_name,
     AllocationGenerationSource& generations) {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
     static_cast<void>(path);
     static_cast<void>(logical_name);
     static_cast<void>(generations);
@@ -121,12 +219,8 @@ MappedModelFile MappedModelFile::open_read_only(
             "mapped model logical name must be non-empty");
     }
 
-    const auto native =
-        path.string();
     const int fd =
-        ::open(
-            native.c_str(),
-            O_RDONLY | O_CLOEXEC);
+        open_descriptor(path);
     if (fd < 0) {
         throw std::runtime_error(
             "cannot open model file read-only");
@@ -139,15 +233,14 @@ MappedModelFile MappedModelFile::open_read_only(
 
     try {
         strix::LoaderCapture::record(path, fd);
-        struct stat before {};
-        if (::fstat(fd, &before) != 0 ||
-            before.st_size <= 0) {
+        FileState before {};
+        if (!descriptor_state(fd, before) ||
+            before[2] == 0) {
             throw std::runtime_error(
                 "cannot stat non-empty model file");
         }
         mapped.bytes_ =
-            static_cast<std::uint64_t>(
-                before.st_size);
+            before[2];
         if (mapped.bytes_ >
             static_cast<std::uint64_t>(
                 std::numeric_limits<std::size_t>::max())) {
@@ -155,13 +248,19 @@ MappedModelFile MappedModelFile::open_read_only(
                 "model file size does not fit host size_t");
         }
 
-        const auto proc_path =
-            std::filesystem::path(
-                "/proc/self/fd") /
-            std::to_string(fd);
+        const auto hashed_path =
+            content_path(
+                path,
+                fd);
+        if (!content_path_is(
+                hashed_path,
+                before)) {
+            throw std::runtime_error(
+                "model file changed while establishing content identity");
+        }
         const ModelContentFile content_file{
             mapped.logical_name_,
-            proc_path,
+            hashed_path,
         };
         const auto identities=hash_single_model_content_file(content_file);
         if(identities.file_bytes!=mapped.bytes_)
@@ -169,25 +268,21 @@ MappedModelFile MappedModelFile::open_read_only(
         mapped.content_identity_=identities.content_identity;
         mapped.file_sha256_=identities.file_sha256;
 
-        struct stat after_hash {};
-        if (::fstat(fd, &after_hash) != 0 ||
-            !same_file_state(
-                before,
-                after_hash)) {
+        FileState after_hash {};
+        if (!descriptor_state(fd, after_hash) ||
+            after_hash != before ||
+            !content_path_is(
+                hashed_path,
+                before)) {
             throw std::runtime_error(
                 "model file changed while establishing content identity");
         }
 
         void* address =
-            ::mmap(
-                nullptr,
-                static_cast<std::size_t>(
-                    mapped.bytes_),
-                PROT_READ,
-                MAP_PRIVATE,
+            map_read_only(
                 fd,
-                0);
-        if (address == MAP_FAILED) {
+                mapped.bytes_);
+        if (address == nullptr) {
             throw std::runtime_error(
                 "cannot mmap model file read-only");
         }
@@ -197,15 +292,13 @@ MappedModelFile MappedModelFile::open_read_only(
         mapped.allocation_generation_ =
             generations.next();
 
-        struct stat after_map {};
-        if (::fstat(fd, &after_map) != 0 ||
-            !same_file_state(
-                after_hash,
-                after_map)) {
+        FileState after_map {};
+        if (!descriptor_state(fd, after_map) ||
+            after_map != after_hash) {
             throw std::runtime_error(
                 "model file changed while mapping");
         }
-        mapped.file_state_=file_state(after_map);
+        mapped.file_state_=after_map;
     } catch (...) {
         mapped.release();
         throw;
@@ -216,10 +309,10 @@ MappedModelFile MappedModelFile::open_read_only(
 }
 
 void MappedModelFile::validate_unchanged() const {
-#if defined(__linux__)
-    struct stat current {};
+#if defined(__linux__) || defined(_WIN32)
+    FileState current {};
     if(!valid() || fd_<0 || !file_sha256_.valid() || !content_identity_.valid() ||
-        ::fstat(fd_,&current)!=0 || file_state(current)!=file_state_)
+        !descriptor_state(fd_,current) || current!=file_state_)
         throw std::runtime_error("mapped model changed after its original full-file hash");
 #else
     throw std::runtime_error("mapped model file validation requires native Linux");
@@ -317,7 +410,7 @@ int MappedModelFile::open_direct_read_only() const {
 void MappedModelFile::read_at(
     std::uint64_t byte_offset,
     std::span<std::byte> destination) const {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
     static_cast<void>(byte_offset);
     static_cast<void>(destination);
     throw std::runtime_error(
@@ -334,50 +427,21 @@ void MappedModelFile::read_at(
         throw std::out_of_range(
             "mapped model read exceeds file range");
     }
-    if (byte_offset >
-        static_cast<std::uint64_t>(
-            std::numeric_limits<off_t>::max())) {
-        throw std::overflow_error(
-            "mapped model read offset does not fit off_t");
-    }
-
     std::size_t completed = 0;
     while (completed < destination.size()) {
-        const auto remaining =
-            destination.size() -
-            completed;
-        const auto offset =
-            byte_offset +
-            static_cast<std::uint64_t>(
-                completed);
-        if (offset >
-            static_cast<std::uint64_t>(
-                std::numeric_limits<off_t>::max())) {
-            throw std::overflow_error(
-                "mapped model read range does not fit off_t");
-        }
-
         const auto result =
-            ::pread(
+            read_some(
                 fd_,
                 destination.data() + completed,
-                remaining,
-                static_cast<off_t>(
-                    offset));
-        if (result < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw std::runtime_error(
-                "mapped model pread failed");
-        }
+                destination.size() - completed,
+                byte_offset +
+                    static_cast<std::uint64_t>(
+                        completed));
         if (result == 0) {
             throw std::runtime_error(
                 "mapped model pread reached unexpected EOF");
         }
-        completed +=
-            static_cast<std::size_t>(
-                result);
+        completed += result;
     }
 #endif
 }
@@ -468,19 +532,15 @@ MappedModelFile::build_runtime_binding(
 }
 
 void MappedModelFile::release() noexcept {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     if (mapping_base_ != 0 &&
         bytes_ != 0) {
-        static_cast<void>(
-            ::munmap(
-                reinterpret_cast<void*>(
-                    mapping_base_),
-                static_cast<std::size_t>(
-                    bytes_)));
+        unmap(
+            mapping_base_,
+            bytes_);
     }
     if (fd_ >= 0) {
-        static_cast<void>(
-            ::close(fd_));
+        close_descriptor(fd_);
     }
 #endif
     fd_ = -1;
