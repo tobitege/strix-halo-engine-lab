@@ -191,7 +191,8 @@ int main(int argc,char** argv) {
     write_file(dir/"persistent-model",bytes("abXdefg"));
     check(strix::sha256_file_content(dir/"persistent-model",&stats)!=digest&&!stats.cache_hit);
     // Streaming liveness preserves the full digest and the verified cache hit.
-    const Bytes hash_payload(2U*1024U*1024U+7U,42);
+    // Two full read blocks of the hash (8 MiB each) and a tail: progress at 0, after each block, at the end.
+    const Bytes hash_payload(2U*8U*1024U*1024U+7U,42);
     write_file(dir/"progress-model",hash_payload);
     std::vector<std::uint64_t> hashed_bytes;
     const auto on_hash=[&](auto done,auto total) {
