@@ -95,6 +95,11 @@ public:
     // fails). A cold page cache otherwise faults the file in from one thread. Resident pages are only mapped. The bytes
     // are unchanged; residency afterwards is not guaranteed. Returns the chunks populated synchronously.
     std::size_t prefault_parallel(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const noexcept;
+    // Releases the mapped pages of [byte_offset, byte_offset + bytes), widened to whole pages, after their bytes
+    // were copied elsewhere: Linux pages them out (MADV_PAGEOUT), Windows removes them from the working set
+    // (VirtualUnlock on unlocked pages), where they stay in the standby cache and count as available memory.
+    // Advisory: the bytes are unchanged and a later read faults them in again.
+    void page_out(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept;
 
 private:
     void release() noexcept;

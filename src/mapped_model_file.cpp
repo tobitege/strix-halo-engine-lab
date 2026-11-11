@@ -374,6 +374,40 @@ std::size_t MappedModelFile::prefault_parallel(std::span<const std::pair<std::ui
 #endif
 }
 
+void MappedModelFile::page_out(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept {
+    if (!valid() || !bytes || byte_offset >= bytes_) return;
+#if defined(__linux__)
+    const auto page_size = ::sysconf(_SC_PAGESIZE);
+#elif defined(_WIN32)
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const auto page_size = static_cast<long>(system.dwPageSize);
+#else
+    const long page_size = 0;
+#endif
+    if (page_size <= 0) return;
+    const auto page = static_cast<std::uint64_t>(page_size);
+    const auto first = byte_offset / page * page;
+    const auto last = std::min((byte_offset + std::min(bytes, bytes_ - byte_offset) + page - 1U) / page * page,
+        (bytes_ + page - 1U) / page * page);
+    auto* address = reinterpret_cast<void*>(mapping_base_ + first);
+    const auto length = static_cast<std::size_t>(last - first);
+#if defined(__linux__)
+#if defined(MADV_PAGEOUT)
+    constexpr int pageout = MADV_PAGEOUT;
+#else
+    constexpr int pageout = 21;
+#endif
+    (void)::madvise(address, length, pageout);
+#elif defined(_WIN32)
+    // Documented for pages that are not locked: VirtualUnlock removes them from the working set (it then reports
+    // ERROR_NOT_LOCKED, which is expected here).
+    (void)VirtualUnlock(address, length);
+#else
+    (void)address; (void)length;
+#endif
+}
+
 int MappedModelFile::drop_page_cache(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept {
 #if defined(__linux__)
     if (fd_ < 0) return EBADF;
