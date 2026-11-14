@@ -106,14 +106,19 @@ jobs:
       - name: Start the engine without a model
         shell: pwsh
         run: |
-          # The engine and the SDK's runtime DLLs next to it load, and it prints its usage; no device is touched.
+          # The engine and the SDK's runtime DLLs next to it load and the HIP runtime answers. Every engine binds
+          # its device first (strix::device::bind_hip_main), before it reads --help: on a runner without an AMD
+          # GPU the expected answer is the device gate's refusal, which the HIP runtime's own message completes.
           # Under a time limit: a program that cannot load a DLL can wait in a system dialog instead of failing.
           $engine = Start-Process -FilePath build-hip\strix-hip-decode-token.exe -ArgumentList '--help' -PassThru `
             -NoNewWindow -RedirectStandardOutput engine-usage.out -RedirectStandardError engine-usage.err
           $null = $engine.Handle   # keeps the exit code readable after the process ends
           if (-not $engine.WaitForExit(120000)) { $engine.Kill($true); throw 'the engine did not answer --help within 120 s' }
-          Get-Content engine-usage.out, engine-usage.err | Select-Object -First 3
-          if ($engine.ExitCode -ne 0) { throw "the engine ended --help with exit code $($engine.ExitCode)" }
+          $output = (Get-Content engine-usage.out, engine-usage.err) -join "`n"
+          $output.Split("`n") | Select-Object -First 3
+          $usage = $engine.ExitCode -eq 0 -and $output -match 'Usage: strix-hip-decode-token'
+          $refused = $engine.ExitCode -eq 2 -and $output -match 'device gate: refusing to start: cannot enumerate HIP devices'
+          if (-not ($usage -or $refused)) { throw "the engine ended --help with exit code $($engine.ExitCode)" }
 
       - name: Upload the build log
         if: always()
