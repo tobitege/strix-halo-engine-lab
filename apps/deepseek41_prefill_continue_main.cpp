@@ -3,6 +3,7 @@
 // BatchForward that shares the weights (as the serve), then G exact greedy steps. One JSON line per (case, arm).
 // usage: strix-deepseek41-prefill-continue MODEL manifest.tsv rank G [budget_seconds]
 //   manifest rows: name n ids_path arms (comma list, labels of deepseek41_quality_arms.hpp)
+#include "strix/device/hip_gate.hpp"
 #include "deepseek41_quality_arms.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -21,6 +22,10 @@
 #include <vector>
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     const auto start = std::chrono::steady_clock::now();
     if (argc != 5 && argc != 6) throw std::runtime_error("MODEL manifest.tsv rank G [budget_seconds]");
     const unsigned rank = static_cast<unsigned>(std::stoul(argv[3])), gen = static_cast<unsigned>(std::stoul(argv[4]));

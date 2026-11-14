@@ -1,0 +1,62 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ALL_BUILD", "ALL_BUILD.vcxproj", "{F23F7F77-837D-394A-BC06-0CE38E1EB41B}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21} = {3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}
+		{58705931-8239-3135-BCAD-60982B9D1124} = {58705931-8239-3135-BCAD-60982B9D1124}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "RUN_TESTS", "RUN_TESTS.vcxproj", "{10F11266-3930-369A-95C7-C5F7C38B2745}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21} = {3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ZERO_CHECK", "ZERO_CHECK.vcxproj", "{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}"
+	ProjectSection(ProjectDependencies) = postProject
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "strix-row-layout-tests", "strix-row-layout-tests.vcxproj", "{58705931-8239-3135-BCAD-60982B9D1124}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21} = {3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+		MinSizeRel|x64 = MinSizeRel|x64
+		RelWithDebInfo|x64 = RelWithDebInfo|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F23F7F77-837D-394A-BC06-0CE38E1EB41B}.Debug|x64.ActiveCfg = Debug|x64
+		{F23F7F77-837D-394A-BC06-0CE38E1EB41B}.Release|x64.ActiveCfg = Release|x64
+		{F23F7F77-837D-394A-BC06-0CE38E1EB41B}.MinSizeRel|x64.ActiveCfg = MinSizeRel|x64
+		{F23F7F77-837D-394A-BC06-0CE38E1EB41B}.RelWithDebInfo|x64.ActiveCfg = RelWithDebInfo|x64
+		{10F11266-3930-369A-95C7-C5F7C38B2745}.Debug|x64.ActiveCfg = Debug|x64
+		{10F11266-3930-369A-95C7-C5F7C38B2745}.Release|x64.ActiveCfg = Release|x64
+		{10F11266-3930-369A-95C7-C5F7C38B2745}.MinSizeRel|x64.ActiveCfg = MinSizeRel|x64
+		{10F11266-3930-369A-95C7-C5F7C38B2745}.RelWithDebInfo|x64.ActiveCfg = RelWithDebInfo|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.Debug|x64.ActiveCfg = Debug|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.Debug|x64.Build.0 = Debug|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.Release|x64.ActiveCfg = Release|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.Release|x64.Build.0 = Release|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.MinSizeRel|x64.ActiveCfg = MinSizeRel|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.MinSizeRel|x64.Build.0 = MinSizeRel|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.RelWithDebInfo|x64.ActiveCfg = RelWithDebInfo|x64
+		{3B3ADD6C-BDD7-38AC-A40D-C584CA8EDA21}.RelWithDebInfo|x64.Build.0 = RelWithDebInfo|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.Debug|x64.ActiveCfg = Debug|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.Debug|x64.Build.0 = Debug|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.Release|x64.ActiveCfg = Release|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.Release|x64.Build.0 = Release|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.MinSizeRel|x64.ActiveCfg = MinSizeRel|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.MinSizeRel|x64.Build.0 = MinSizeRel|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.RelWithDebInfo|x64.ActiveCfg = RelWithDebInfo|x64
+		{58705931-8239-3135-BCAD-60982B9D1124}.RelWithDebInfo|x64.Build.0 = RelWithDebInfo|x64
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3563AD4A-C9C8-3553-9726-41FC47DA609B}
+	EndGlobalSection
+	GlobalSection(ExtensibilityAddIns) = postSolution
+	EndGlobalSection
+EndGlobal

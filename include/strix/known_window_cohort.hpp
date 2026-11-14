@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/env_flags.hpp"
 #include "strix/execution_runtime.hpp"
 
 #include <algorithm>
@@ -55,7 +56,7 @@ inline std::uint64_t& known_window_cohort_cycle() noexcept {
     return cycle;
 }
 [[nodiscard]] inline bool known_window_cohort_ab() noexcept {
-    static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_AB"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_COHORT_AB", false);
     return on;
 }
 [[nodiscard]] inline bool known_window_cohort_feature_off(std::string_view feature) {

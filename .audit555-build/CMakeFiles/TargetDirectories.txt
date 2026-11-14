@@ -1,0 +1,5 @@
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/audit555-host.dir
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/session-embed-splice.dir
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/RUN_TESTS.dir
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/ALL_BUILD.dir
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/ZERO_CHECK.dir

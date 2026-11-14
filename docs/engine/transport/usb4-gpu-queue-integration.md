@@ -30,6 +30,25 @@ TX. Producers finish before submission. EAGAIN preserves the same operation;
 a later sequence cannot overtake a prepared predecessor. Mutating ioctls are
 not blindly replayed after an ambiguous interruption or reply.
 
+Descriptor and pool identity (one `fstat` and two `fcntl` per check, plus the pool
+owner's check) are verified at session transitions: open, QUERY/QUEUE, IMPORT, ARM,
+STATS, STOP, RELEASE, RECOVER and group reset. On the hot path (PREPARE, SUBMIT, EVENT,
+RETIRE) of the communicator's device route the identity is re-verified at most every
+100 ms, on the next hot operation, and before any ioctl error other than `EAGAIN`/`EINTR`
+is reported, so a replaced descriptor is named as such; EVENT is not asked while no
+submitted operation is incomplete. The fence, handle, sequence, direction and every reply
+field of each operation are checked on every call. `STRIX_DIST_GPU_QUEUE_LEAN=0` restores
+the identity check before and after every hot ioctl. `GpuQueueExpected::lean` selects the
+mode per queue and `identity_interval` the re-check interval; the adapter's own default
+remains the per-call check.
+
+Lean admission uses the engine's `gpu-lean` transport capability in
+`options.transport_capabilities`, not a driver-advertised lean feature. The
+driver's QUERY/QUEUE capability checks still apply. Lean assumes exclusive
+descriptor ownership: another owner closing, replacing or changing descriptor
+flags between checks can affect an ioctl before detection. An error-triggered
+check cannot undo that ioctl; the strict-mode escape hatch remains available.
+
 This implementation uses **completed batch windows**, not a sliding/adaptive
 slot-refill scheduler. Both imported allocations drain controller access before
 GPU consumers run, avoiding a deadlock on allocation-wide implicit reservation

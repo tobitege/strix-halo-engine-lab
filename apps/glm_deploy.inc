@@ -6,6 +6,8 @@ struct GlmDeployment {
     strix::deploy::Spec spec;
     std::unique_ptr<strix::glm::deployment::Provider> provider;
     std::shared_ptr<const strix::deploy::Plan> plan;
+    std::uint64_t prefix_keep = 0;  // requested kept-prefix bytes per rank; resolve_live lowers it to the plan grant
+    bool prefix_keep_pinned = false;
     static strix::deploy::DeviceFacts observe() {
         const char* selected = std::getenv("STRIX_GLM_DRM_DEVICE");
         return strix::deploy::probe_device("", selected ? selected : strix::deploy::first_drm_device());
@@ -37,6 +39,7 @@ struct GlmDeployment {
         const auto owners = strix::glm::deployment::header_owners(index.tensors(), opt.mtp, routes);
         strix::glm::deployment::Options po;
         po.slots = opt.slots; po.mtp = opt.mtp; po.spec = opt.spec; po.refusal = std::move(refusal);
+        po.prefix_keep_bytes = prefix_keep; po.prefix_keep_pinned = prefix_keep_pinned;
         std::uint64_t configuration = 14695981039346656037ULL;
         for (const char c : rd::print(eff)) configuration = (configuration ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
         po.configuration_id = std::to_string(configuration);
@@ -67,6 +70,14 @@ struct GlmDeployment {
             [&](auto out, auto in) { transport.exchange(out, in); });
         strix::deploy::require_plan(p);
         opt.capacity = p.chosen.context; opt.slots = p.chosen.slots;
+        // Both ranks keep the same snapshots: the pair budget is the smaller rank grant.
+        std::uint64_t grant = prefix_keep;
+        for (const auto& r : p.ranks) {
+            std::uint64_t got = 0;
+            for (const auto& [name, bytes] : r.footprint.extra) if (name == "prefix_keep") got = bytes;
+            grant = std::min(grant, got);
+        }
+        prefix_keep = grant;
         plan = std::make_shared<const strix::deploy::Plan>(std::move(p));
     }
 };

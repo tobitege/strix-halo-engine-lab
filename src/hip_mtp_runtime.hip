@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/hip_mtp_runtime.hpp"
@@ -40,7 +42,7 @@ constexpr std::array<MtpDraftPlanStep,11> native_steps{MtpDraftPlanStep::input_f
     MtpDraftPlanStep::mlp_hyper_mix,MtpDraftPlanStep::routed_and_shared_moe,MtpDraftPlanStep::mlp_combine,
     MtpDraftPlanStep::publish_next_state,MtpDraftPlanStep::output_head_mix,MtpDraftPlanStep::lm_head};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
-void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(message);}
+using strix::hip_check_message;
 bool same_session(const SerialSessionContext& a,const SerialSessionContext& b) {
     return a.execution_identity==b.execution_identity && a.runtime_compatibility_identity==b.runtime_compatibility_identity &&
         a.state_layout_identity==b.state_layout_identity && a.next_position==b.next_position && a.committed_tokens==b.committed_tokens &&
@@ -202,7 +204,7 @@ struct HipMtpRuntime::Impl {
         if(!already_admitted && !validation) local_validation.emplace(owner->admit_native_entry());
         const auto c=context(position);mtp_native::context(c);
         hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
-        check(hipStreamIsCapturing(static_cast<hipStream_t>(owner->stream()),&capture),"MTP capture query failed");
+        hip_check_message(hipStreamIsCapturing(static_cast<hipStream_t>(owner->stream()),&capture),"MTP capture query failed");
         require(capture==hipStreamCaptureStatusNone,"MTP native runtime is eager only");
         preflight_hip_mtp_embedding(c,token);preflight_hip_mtp_input_fusion(fusion());
         preflight_hip_mtp_hyper_mix(c,MtpHyperRole::attention);
@@ -238,7 +240,7 @@ struct HipMtpRuntime::Impl {
     }
     void copy(MtpDeviceView destination,MtpDeviceView source) {
         require(destination.bytes==source.bytes,"MTP copy extents differ");
-        check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),reinterpret_cast<const void*>(source.address),
+        hip_check_message(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),reinterpret_cast<const void*>(source.address),
             static_cast<std::size_t>(source.bytes),hipMemcpyDeviceToDevice,static_cast<hipStream_t>(owner->stream())),"MTP owned copy enqueue failed");
     }
     void failure() noexcept {
@@ -249,9 +251,9 @@ struct HipMtpRuntime::Impl {
     // The owner stream waits for every batch step enqueued for this chain (before completion or reuse).
     void batch_leave() {
         if(!batch_stream) return;
-        if(!batch_exit) check(hipEventCreateWithFlags(&batch_exit,hipEventDisableTiming),"MTP draft batch exit event");
-        check(hipEventRecord(batch_exit,batch_stream),"MTP draft batch exit record");
-        check(hipStreamWaitEvent(static_cast<hipStream_t>(owner->stream()),batch_exit,0),"MTP draft batch exit wait");
+        if(!batch_exit) hip_check_message(hipEventCreateWithFlags(&batch_exit,hipEventDisableTiming),"MTP draft batch exit event");
+        hip_check_message(hipEventRecord(batch_exit,batch_stream),"MTP draft batch exit record");
+        hip_check_message(hipStreamWaitEvent(static_cast<hipStream_t>(owner->stream()),batch_exit,0),"MTP draft batch exit wait");
         batch_stream=nullptr;
     }
     ~Impl() {
@@ -821,11 +823,11 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
         require(m.hidden_size==2560U && m.moe_intermediate_size==640U && m.shared_expert_intermediate_size==640U &&
             m.num_experts==512U && m.num_experts_per_token==10U,"MTP fast draft MoE requires the canonical sidecar geometry");
         float* workspace=nullptr;
-        check(hipMalloc(reinterpret_cast<void**>(&workspace),hip_mtp_fast_moe_workspace_floats*sizeof(float)),"MTP fast draft workspace");
+        hip_check_message(hipMalloc(reinterpret_cast<void**>(&workspace),hip_mtp_fast_moe_workspace_floats*sizeof(float)),"MTP fast draft workspace");
         p.fast_workspace.reset(workspace);
         require(m.hc_count==4U && m.hc_lowrank==320U,"MTP fast draft HC mix requires the canonical sidecar geometry");
         constexpr std::uint64_t inject=4U*10240U;float* hc=nullptr;
-        check(hipMalloc(reinterpret_cast<void**>(&hc),2U*inject*sizeof(float)),"MTP draft HC injection copies");
+        hip_check_message(hipMalloc(reinterpret_cast<void**>(&hc),2U*inject*sizeof(float)),"MTP draft HC injection copies");
         p.hc_inject.reset(hc);
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().attention_hc_inject.runtime->address),inject,hc,p.owner->stream());
         launch_hip_mtp_dequantize_q8(reinterpret_cast<const void*>(p.owner->tensors().mlp_hc_inject.runtime->address),inject,hc+inject,p.owner->stream());
@@ -846,7 +848,7 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
                 else register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream());
             }
         }
-        check(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
+        hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
     }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
 }
@@ -967,10 +969,10 @@ void HipMtpRuntime::draft_batch_enter(std::span<HipMtpRuntime* const> members,vo
         auto& p=*m->impl_;
         require(m->draft_batch_open(),"MTP draft batch member has no open fast greedy chain");
         try {
-            if(!p.batch_entry) check(hipEventCreateWithFlags(&p.batch_entry,hipEventDisableTiming),"MTP draft batch entry event");
+            if(!p.batch_entry) hip_check_message(hipEventCreateWithFlags(&p.batch_entry,hipEventDisableTiming),"MTP draft batch entry event");
             // The cycle-base copy, the head's row gathers and any earlier owner work precede the batch steps.
-            check(hipEventRecord(p.batch_entry,static_cast<hipStream_t>(p.owner->stream())),"MTP draft batch entry record");
-            check(hipStreamWaitEvent(static_cast<hipStream_t>(stream),p.batch_entry,0),"MTP draft batch entry wait");
+            hip_check_message(hipEventRecord(p.batch_entry,static_cast<hipStream_t>(p.owner->stream())),"MTP draft batch entry record");
+            hip_check_message(hipStreamWaitEvent(static_cast<hipStream_t>(stream),p.batch_entry,0),"MTP draft batch entry wait");
             p.batch_stream=static_cast<hipStream_t>(stream);
         } catch(...) {p.failure();throw;}
     }
@@ -988,7 +990,7 @@ constexpr std::array<HipMtpBuffer,14> batch_step_buffers{HipMtpBuffer::embedding
     HipMtpBuffer::attention_workspace,HipMtpBuffer::wide_next,HipMtpBuffer::wide_current};
 std::vector<std::uint8_t> read_device(std::uintptr_t address,std::uint64_t bytes) {
     std::vector<std::uint8_t> v(static_cast<std::size_t>(bytes));
-    if(bytes) check(hipMemcpy(v.data(),reinterpret_cast<const void*>(address),static_cast<std::size_t>(bytes),hipMemcpyDeviceToHost),
+    if(bytes) hip_check_message(hipMemcpy(v.data(),reinterpret_cast<const void*>(address),static_cast<std::size_t>(bytes),hipMemcpyDeviceToHost),
         "MTP draft batch verify readback");
     return v;
 }
@@ -1038,7 +1040,7 @@ void HipMtpRuntime::Impl::batch_verify_poison(std::uint64_t first,std::uint64_t 
     const auto kv=owner->view(HipMtpBuffer::kv);const auto ix=owner->view(HipMtpBuffer::raw_index);
     const auto kv_row=kv.bytes/capacity,ix_row=ix.bytes/capacity;
     const auto poison=[&](std::uintptr_t address,std::uint64_t bytes) {
-        if(bytes) check(hipMemsetAsync(reinterpret_cast<void*>(address),0xff,static_cast<std::size_t>(bytes),stream),"MTP draft batch verify poison");
+        if(bytes) hip_check_message(hipMemsetAsync(reinterpret_cast<void*>(address),0xff,static_cast<std::size_t>(bytes),stream),"MTP draft batch verify poison");
     };
     for(const auto b:batch_step_buffers) if(b!=HipMtpBuffer::wide_current) {const auto v=owner->view(b);poison(v.address,v.bytes);}
     poison(reinterpret_cast<std::uintptr_t>(fast_workspace.get()),hip_mtp_fast_moe_workspace_floats*sizeof(float));
@@ -1047,7 +1049,7 @@ void HipMtpRuntime::Impl::batch_verify_poison(std::uint64_t first,std::uint64_t 
     poison(kv.address+first*kv_row,(rows+guard)*kv_row);poison(ix.address+first*ix_row,(rows+guard)*ix_row);
     copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
     draft->begin_chain();
-    check(hipStreamSynchronize(stream),"MTP draft batch verify poison");
+    hip_check_message(hipStreamSynchronize(stream),"MTP draft batch verify poison");
 }
 void HipMtpRuntime::draft_batch_verify_cap(std::uint32_t requested) {
     auto& p=*impl_;
@@ -1073,13 +1075,13 @@ void HipMtpRuntime::draft_batch_verify_reference(std::span<HipMtpRuntime* const>
             ref.prefix_hash=fnv(read_device(kv.address,ref.first*kv_row))^(fnv(read_device(ix.address,ref.first*ix_row))*31U);
             p.batch_verify_poison(ref.first,rows,ref.guard_rows);
             p.stage_hook=[&](unsigned stage) {
-                check(hipStreamSynchronize(stream),"MTP draft batch verify reference stage");
+                hip_check_message(hipStreamSynchronize(stream),"MTP draft batch verify reference stage");
                 if(stage==0U) ref.stages.emplace_back();
                 ref.stages.back().push_back(draft_batch_step_state(*p.owner,*p.draft,p.fast_workspace.get()));
             };
             try {while(p.chain_launch_step() && p.chain_after_step()) {}} catch(...) {p.stage_hook=nullptr;throw;}
             p.stage_hook=nullptr;
-            check(hipStreamSynchronize(stream),"MTP draft batch verify reference");
+            hip_check_message(hipStreamSynchronize(stream),"MTP draft batch verify reference");
             ref.depth=p.cs.depth;ref.steps=p.cs.k;
             ref.tokens=p.draft->read(ref.steps);
             for(std::uint32_t k=0;k<ref.steps;++k) {
@@ -1111,7 +1113,7 @@ void HipMtpRuntime::draft_batch_verify_reference(std::span<HipMtpRuntime* const>
     }
 }
 void HipMtpRuntime::draft_batch_verify_stage(std::span<HipMtpRuntime* const> rows,void* stream,unsigned stage) {
-    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify stage");
+    hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify stage");
     for(auto* m:rows) {
         auto& p=*m->impl_;
         if(!p.batch_reference) continue;
@@ -1124,7 +1126,7 @@ void HipMtpRuntime::draft_batch_verify_stage(std::span<HipMtpRuntime* const> row
 }
 void HipMtpRuntime::draft_batch_verify_step(std::span<HipMtpRuntime* const> members,std::span<HipMtpRuntime* const> rows,void* stream) {
     // Members that already stopped must keep their final state while the others step on.
-    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify step");
+    hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify step");
     auto& coverage=verify_coverage();++coverage.steps;
     if(rows.size()<members.size()) ++coverage.shrinking_steps;
     for(auto* m:members) {
@@ -1137,7 +1139,7 @@ void HipMtpRuntime::draft_batch_verify_step(std::span<HipMtpRuntime* const> memb
     }
 }
 std::uint32_t HipMtpRuntime::draft_batch_verify_check(std::span<HipMtpRuntime* const> members,void* stream) {
-    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify completion");
+    hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify completion");
     std::uint32_t differing=0;std::uint32_t lo=UINT32_MAX,hi=0;
     for(auto* m:members) {
         auto& p=*m->impl_;
@@ -1366,7 +1368,7 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         p.cycle=false;p.cycle_base.reset();p.base_previous_target.reset();p.base_previous_input.reset();
         p.replay.clear();p.reconcile_final.reset();p.have_replay=false;p.candidates.clear();p.first_cache_reusable=false;
         // Diagnostic only: compare the occupied proposer prefix across schedules.
-        static const bool audit=[] {const char* v=std::getenv("STRIX_MTP_CACHE_AUDIT");return v && v[0]=='1';}();
+        static const bool audit=strix::envcfg::flag("STRIX_MTP_CACHE_AUDIT", false);
         if(audit) {
             const auto cache=cache_state();
             const auto kv_bytes=cache.logical_rows*cache.kv_row_bytes;
@@ -1375,9 +1377,9 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
                 kv_bytes+raw_bytes<=(1ULL<<30U),"MTP cache audit exceeds occupied views or 1 GiB");
             std::vector<std::byte> kv(static_cast<std::size_t>(kv_bytes)),raw(static_cast<std::size_t>(raw_bytes));
             const auto proof=p.owner->admit_native_entry();p.owner->mark_submitted();
-            if(kv_bytes)check(hipMemcpyAsync(kv.data(),reinterpret_cast<const void*>(cache.kv.address),kv.size(),
+            if(kv_bytes)hip_check_message(hipMemcpyAsync(kv.data(),reinterpret_cast<const void*>(cache.kv.address),kv.size(),
                 hipMemcpyDeviceToHost,static_cast<hipStream_t>(p.owner->stream())),"MTP cache audit KV read");
-            if(raw_bytes)check(hipMemcpyAsync(raw.data(),reinterpret_cast<const void*>(cache.raw_index.address),raw.size(),
+            if(raw_bytes)hip_check_message(hipMemcpyAsync(raw.data(),reinterpret_cast<const void*>(cache.raw_index.address),raw.size(),
                 hipMemcpyDeviceToHost,static_cast<hipStream_t>(p.owner->stream())),"MTP cache audit raw-index read");
             p.owner->complete();
             const auto kh=model_content_identity_hex(sha256_bytes(std::span<const std::byte>(kv)));

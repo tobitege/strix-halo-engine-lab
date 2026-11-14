@@ -215,14 +215,14 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
-            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
+            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_PREFILL_FINAL_CONE", "STRIX_HOST_WAIT", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
             "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS", "STRIX_QPF2K_GDN_COOP_LAUNCH",
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE", "STRIX_PREFIX_FAIR_RECLAIM_IDLE",
-            "STRIX_SERVE_PREFILL", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
+            "STRIX_SERVE_PREFILL", "STRIX_SERVE_ROUTE", "STRIX_SERVE_PREFILL_ORG", "STRIX_SERVE_T16K", "STRIX_SERVE_FP16_MTP", "STRIX_PLE_WARM", "STRIX_PLE_SERVE_RESERVE", "STRIX_PLE_REWARM", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
@@ -574,7 +574,7 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     }, result.options.prefill_exact_fp16, result.options.prefill_disabled);
     // Automatic YaRN MTP profiles and verified bundles retain upstream arithmetic.
     // Governed candidates remain excluded until their MTP gates pass.
-    if (result.options.mtp.enabled && (!result.options.mtp_bundle_path.empty() ||
+    if (result.options.mtp.enabled && ((!result.options.mtp_bundle_path.empty() && !result.options.mtp_native_bundle) ||
         (result.options.rotary.mode() == RotaryMode::yarn && !result.options.prefill_numerical_profile))) {
         const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
             prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
@@ -637,6 +637,56 @@ inline bool plain_mtp_command(const Options& o) noexcept {
         !o.session_live_control && !o.session_mtp_fixed &&
         !o.prefix_cache_host_bytes && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty();
 }
+// The one prompt-prefill route rule. The single-request CLI and HTTP serving both take the tiled known-prefix
+// organization, the primary tile and the prefill arithmetic from here, so the two cannot drift. The CLI passes its
+// prompt. A server creates its owners before prompts arrive: it passes the largest request its context admits and
+// its own constraints, and keeps its memory and slot admission around the candidates returned here.
+struct PromptRouteShape {
+    std::uint64_t prompt_rows = 0;      // CLI: this prompt. Server: the largest admissible request.
+    bool keep_decode_profile = false;   // Server: the resolved decode arithmetic is a startup contract.
+    bool t16k_allowed = true;           // Server: STRIX_SERVE_T16K=0 keeps the T8192 owner.
+};
+struct PromptRoute {
+    std::uint32_t primary_rows = 0;
+    std::optional<OptionSource> t16k_policy_source;
+    std::string t16k_declined;          // why T16384 is not the primary tile; empty when it is
+    std::string arithmetic_fallback;    // why the automatic FP16 prefill arithmetic is not selected
+};
+inline constexpr std::array<std::uint32_t, 7> prompt_route_ladder{8192U,4096U,2048U,1024U,256U,64U,16U};
+inline PromptRoute resolve_prompt_route(Options& candidate, const Environment& requested,
+    const PrefillCapabilities& capabilities, const PromptRouteShape& shape) {
+    PromptRoute route;
+    candidate.automatic_prefill = true;
+    candidate.known_prefix_window = true;
+    candidate.known_prefix_full_rows = true;
+    candidate.known_prefix_expert_union = true;
+    candidate.known_window_router_rows = true;
+    candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
+    for (const auto rows : prompt_route_ladder)
+        if (rows <= shape.prompt_rows) { candidate.known_prefix_prefill_rows = rows; break; }
+    const bool explicit_t16k = env_is(requested, "STRIX_QPF2K_T16K", "1");
+    if (shape.prompt_rows < 16384U) route.t16k_declined = "largest-request-below-16384";
+    else if (!shape.t16k_allowed) route.t16k_declined = "STRIX_SERVE_T16K=0";
+    else if (explicit_t16k || (!requested.contains("STRIX_QPF2K_T16K") && shape.prompt_rows >= t16k_prompt_threshold)) {
+        candidate.known_prefix_prefill_rows = 16384U;
+        route.t16k_policy_source = explicit_t16k ? OptionSource::explicit_value : OptionSource::automatic;
+    } else route.t16k_declined = requested.contains("STRIX_QPF2K_T16K") ? "STRIX_QPF2K_T16K-disabled" :
+        "largest-request-below-threshold-" + std::to_string(t16k_prompt_threshold);
+    route.primary_rows = candidate.known_prefix_prefill_rows;
+    apply_measured_prompt_organization(candidate);
+    if (!candidate.numerical_profile_explicit && !shape.keep_decode_profile) candidate.numerical_profile = dense_a8_profile;
+    const bool f16_off = env_is(requested, "STRIX_PREFILL_F16", "0");
+    if (candidate.prefill_numerical_profile) route.arithmetic_fallback = shape.keep_decode_profile ? "explicit-prefill-profile" : "";
+    else if (f16_off) route.arithmetic_fallback = shape.keep_decode_profile ? "STRIX_PREFILL_F16=0" : "";
+    else if (candidate.numerical_profile != dense_a8_profile)
+        route.arithmetic_fallback = shape.keep_decode_profile ? "decode-profile-not-dense-a8" : "";
+    else if (!capabilities.fp16_operands) route.arithmetic_fallback = "fp16-operands-not-qualified";
+    else {
+        candidate.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+        candidate.prefill_profile_automatic = true;
+    }
+    return route;
+}
 // The single-session MTP route: MTP owned only by the documented MTP window organization
 // (mtp_window_organization_option: the documented group 3-4 --mtp* options, the window kernel organization and the
 // known-prefix window options; any other route-owning or low-level option excludes it), the plain MTP command
@@ -653,6 +703,22 @@ inline bool single_session_mtp_route(const Options& o, const Environment& enviro
         !o.prompt_lookup && !o.teacher_forced_score && o.raw_recording_path.empty() && o.validation_final_state_path.empty() &&
         o.rotary.mode() != RotaryMode::yarn && !explicit_execution_control(environment) &&
         qualified_checkpoint_content(manifest, verified_content) && capabilities.target_qualified;
+}
+// One organisation value, one application: the single-request route and the resident server both come here after
+// their route is admitted. provenance limits the source rows this call may rewrite (an earlier application keeps its own).
+inline unsigned apply_prefill_organization(EffectiveConfig& result, const Environment& requested,
+    const qpf2k::Organization& policy, unsigned provenance) {
+    const unsigned injected = qpf2k::apply_organization(policy, [&](const char* name) -> const char* {
+        const auto it = result.environment.find(name);
+        return it == result.environment.end() ? nullptr : it->second.c_str();
+    }, [&](const char* name, const char* value) { result.environment.emplace(name, value); return true; });
+    for (const auto& entry : qpf2k::defaults)
+        if ((provenance & qpf2k::bit(entry.item)) && result.environment.contains(entry.name)) result.sources[entry.name] =
+            injected & qpf2k::bit(entry.item) ? OptionSource::automatic : OptionSource::explicit_value;
+    if (result.environment.contains("STRIX_QPF2K_MOE_DEFAULTED"))
+        result.sources["STRIX_QPF2K_MOE_DEFAULTED"] = requested.contains("STRIX_QPF2K_MOE_DEFAULTED") ?
+            OptionSource::explicit_value : OptionSource::automatic;
+    return injected;
 }
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
@@ -675,17 +741,8 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         result.environment["STRIX_QWEN_ROPE_YARN"] = "off";
         result.sources["STRIX_QWEN_ROPE_YARN"] = OptionSource::explicit_value;
     }
-    const auto inject = [&](unsigned allowed) {
-        const unsigned injected = qpf2k::initialize([&](const char* name) -> const char* {
-            const auto it = result.environment.find(name);
-            return it == result.environment.end() ? nullptr : it->second.c_str();
-        }, [&](const char* name, const char* value) { result.environment.emplace(name, value); return true; }, allowed);
-        for (const auto& entry : qpf2k::defaults)
-            if (result.environment.contains(entry.name)) result.sources[entry.name] =
-                injected & qpf2k::bit(entry.item) ? OptionSource::automatic : OptionSource::explicit_value;
-        if (result.environment.contains("STRIX_QPF2K_MOE_DEFAULTED"))
-            result.sources["STRIX_QPF2K_MOE_DEFAULTED"] = request.environment.contains("STRIX_QPF2K_MOE_DEFAULTED") ?
-                OptionSource::explicit_value : OptionSource::automatic;
+    const auto inject = [&](const qpf2k::Organization& policy) {
+        (void)apply_prefill_organization(result, request.environment, policy, ~0U);
     };
     // Baseline disables the new policy and all controlled environment items;
     // argv organization/arithmetic still goes through the historical resolver.
@@ -710,9 +767,12 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     }
     const bool single_session_mtp = single_session_mtp_route(o, request.environment, manifest, verified_content, capabilities);
     const auto decline = [&](std::string reason) {
+        // The default drafter bundle exists only on the automatic prompt route; the caller falls back to plain decode.
+        if (o.mtp_native_bundle && o.mtp.enabled && !o.known_prefix_window)
+            throw std::invalid_argument("automatic prompt route declined with the drafter bundle (" + reason + ")");
         result.reason = std::move(reason);
-        if (!baseline) inject(qpf2k::historical_items |
-            (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U));
+        if (!baseline) inject(qpf2k::Organization{qpf2k::historical_items |
+            (single_session_mtp ? qpf2k::bit(qpf2k::Item::dispatch_fuse) : 0U), ~0U});
         if (o.prefill_profile_deferred && !o.numerical_profile_explicit) o.numerical_profile = dense_a8_profile;
         const auto schedule = result.environment.find("STRIX_QPF2K_SCHED");
         const bool injected_gsq = qpf2k::has_gsq_gate(manifest) && schedule != result.environment.end() &&
@@ -762,8 +822,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
     };
     if (ctx_exact_memory_enabled(exact_environment,"STRIX_QSA_SCORE_RING"))
         (void)qsa_score_ring_rows_override(exact_environment("STRIX_QSA_SCORE_RING_ROWS"));
-    if (o.route_owned || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
-        o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || o.mtp.supplied || o.mtp.enabled || !o.mtp.cohort.empty() || o.teacher_forced_score ||
+    // A drafter bundle found beside the model keeps the automatic prompt route: it adds exact MTP decode to it.
+    const bool bundle_default = o.mtp_native_bundle && !o.route_owned_beyond_mtp;
+    if ((o.route_owned && !bundle_default) || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
+        o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || ((o.mtp.supplied || o.mtp.enabled) && !bundle_default) ||
+        !o.mtp.cohort.empty() || o.teacher_forced_score ||
         !o.raw_recording_path.empty() || !o.validation_final_state_path.empty()) return decline("explicit-route");
     if (explicit_execution_control(request.environment)) return decline("explicit-diagnostic-or-execution-control");
     for (const auto& entry : qpf2k::defaults)
@@ -791,35 +854,15 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         capabilities.a8_runtime, false);
     if (!organization.automatic_applied) return decline(organization.reason);
     try {
-        candidate.automatic_prefill = true;
-        candidate.known_prefix_window = true;
-        candidate.known_prefix_full_rows = true;
-        candidate.known_prefix_expert_union = true;
-        candidate.known_window_router_rows = true;
-        candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
-        for (const auto rows : {8192U,4096U,2048U,1024U,256U,64U,16U})
-            if (rows <= candidate.tokens.size()) { candidate.known_prefix_prefill_rows = rows; break; }
-        const bool explicit_t16k = env_is(request.environment, "STRIX_QPF2K_T16K", "1");
-        if (candidate.tokens.size() >= 16384U && (explicit_t16k ||
-            (!request.environment.contains("STRIX_QPF2K_T16K") && candidate.tokens.size() >= t16k_prompt_threshold))) {
-            candidate.known_prefix_prefill_rows = 16384U;
-            result.t16k_policy_source = explicit_t16k ? OptionSource::explicit_value : OptionSource::automatic;
-        }
+        const auto route = resolve_prompt_route(candidate, request.environment, capabilities, {candidate.tokens.size()});
+        const bool explicit_t16k = route.t16k_policy_source == OptionSource::explicit_value;
+        result.t16k_policy_source = route.t16k_policy_source;
+        result.arithmetic_fallback = route.arithmetic_fallback;
         if (!o.context_explicit) {
             const auto needed = prefill_checked_add(static_cast<std::uint64_t>(o.tokens.size()), std::max(o.generate_tokens, UINT64_C(512)));
             candidate.context_tokens = std::min(model.max_position_embeddings,
                 std::max(UINT64_C(8192), prefill_checked_add(needed, 511U) / 512U * 512U));
             candidate.unqualified_context = candidate.context_tokens != 8192U;
-        }
-        apply_measured_prompt_organization(candidate);
-        if (!candidate.numerical_profile_explicit) candidate.numerical_profile = dense_a8_profile;
-        if (!candidate.prefill_numerical_profile && !capabilities.fp16_operands &&
-            candidate.numerical_profile == dense_a8_profile && !env_is(request.environment, "STRIX_PREFILL_F16", "0"))
-            result.arithmetic_fallback = "fp16-operands-not-qualified";
-        if (!candidate.prefill_numerical_profile && capabilities.fp16_operands &&
-            candidate.numerical_profile == dense_a8_profile && !env_is(request.environment, "STRIX_PREFILL_F16", "0")) {
-            candidate.prefill_numerical_profile = DecodeNumericalProfile::fast_prefill_f16wmma_v1;
-            candidate.prefill_profile_automatic = true;
         }
         constexpr std::uint64_t mib = 1024U * 1024U, gib = 1024U * mib;
         const auto uma = std::min(120U * gib, *memory.available) / mib * mib;
@@ -953,19 +996,24 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                 result.organization = std::move(organization);
                 result.reason = rows == 16384U ? (explicit_t16k ? "opt-in-t16k" : "automatic-t16k") : "qualified-prompt";
                 result.admitted = true;
-                inject(~0U);
+                inject(qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request));
                 return result;
             } catch (const std::overflow_error&) { throw; }
               catch (const KnownPrefillBudgetExceeded&) { failed_reason = "insufficient-memory"; }
               catch (const std::runtime_error&) { failed_reason = "insufficient-memory"; }
-              catch (const std::exception&) { failed_reason = "candidate-not-admitted"; }
+              catch (const std::exception& error) {
+                  failed_reason = "candidate-not-admitted";
+                  if (bundle_default) failed_reason += std::string(": ") + error.what();
+              }
             if (!result.tile_fallback.empty()) result.tile_fallback += ',';
             result.tile_fallback += "T" + std::to_string(rows) + ':' + failed_reason;
         }
         return decline(failed_reason);
     } catch (const std::overflow_error&) { return decline("memory-overflow"); }
       catch (const std::runtime_error&) { return decline("insufficient-memory"); }
-      catch (const std::exception&) { return decline("candidate-not-admitted"); }
+      catch (const std::exception& error) {
+          return decline(bundle_default ? std::string("candidate-not-admitted: ") + error.what() : "candidate-not-admitted");
+      }
     return result;
 }
 // Single admission registry: flip a serving entry only after its native exactness gate passes.
@@ -1170,7 +1218,8 @@ inline void resolve_legacy_prefix_defaults(Options& o, const ModelContract& mode
 // HTTP prompts arrive after startup. Size a shared tiled owner against context,
 // preserving the already resolved arithmetic and every explicit organization.
 inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& model,
-    std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
+    std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory,
+    const Environment& requested, const gguf::FileInfo& info, const ModelManifest& manifest) {
     auto& o = result.options;
     if (!o.http_serve) return;
     const auto notice = [&](std::string reason) {
@@ -1200,23 +1249,110 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         return notice("memory observation unavailable; explicit tiled configuration required");
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
     std::string attempts;
-    for (const auto rows : {8192U,4096U,2048U,1024U,256U,64U,16U}) {
+    // The shared route rule, asked for the largest request this context admits. Serving adds its own
+    // constraints: the resolved decode arithmetic stays, every resident slot must still fit beside a
+    // T16384 owner, and STRIX_SERVE_T16K=0 / STRIX_SERVE_ROUTE=0 keep the earlier owner / arithmetic.
+    PromptRouteShape shape;
+    shape.prompt_rows = std::min<std::uint64_t>(o.context_tokens, model.max_position_embeddings);
+    shape.keep_decode_profile = true;
+    shape.t16k_allowed = !env_is(requested,"STRIX_SERVE_T16K","0");
+    const bool shared_route = !env_is(requested,"STRIX_SERVE_ROUTE","0");
+    std::vector<std::uint32_t> trials;
+    std::string arithmetic = "arithmetic preserved";
+    {
+        auto probe = o;
+        const auto route = resolve_prompt_route(probe,requested,capabilities,shape);
+        if (shared_route && route.primary_rows == 16384U) trials.push_back(16384U);
+        else if (shared_route && shape.prompt_rows >= 16384U) attempts += "T16384:" + route.t16k_declined + "; ";
+    }
+    trials.insert(trials.end(),prompt_route_ladder.begin(),prompt_route_ladder.end());
+    for (const auto rows : trials) {
         if (rows > o.context_tokens || rows > model.max_position_embeddings) {
             attempts += "T" + std::to_string(rows) + ":context; "; continue;
         }
         auto candidate = o;
-        candidate.automatic_prefill = true;
-        candidate.known_prefix_window = true;
-        candidate.known_prefix_full_rows = true;
-        candidate.known_prefix_expert_union = true;
-        candidate.known_window_router_rows = true;
+        std::string fp16_declined, decode_declined;
+        bool decode_adopted = false, governed_mtp_exclusion = false;
+        auto adopted_organization = result.organization;
+        if (shared_route) {
+            // A governed MTP owner (explicit sidecar) takes the automatic arithmetic without the fast prefill
+            // options its gates have not passed: the exclusion verified bundles already take. The off switch
+            // STRIX_SERVE_FP16_MTP=0 is read before any validation, so it never depends on the option mask.
+            const auto governed_mtp = [](const Options& c) { return c.mtp.enabled && !c.mtp_native_bundle; };
+            const bool governed_fp16 = !env_is(requested,"STRIX_SERVE_FP16_MTP","0");
+            const auto validate_automatic_prefill = [&](Options& c) {
+                try { validate_prefill_numerical_profile_cli(c); }
+                catch (const std::exception&) {
+                    if (!governed_mtp(c)) throw;
+                    const auto excluded = prefill_option_bit(PrefillOption::hc_output_wmma) |
+                        prefill_option_bit(PrefillOption::index_proj_wmma) | prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                        prefill_option_bit(PrefillOption::index_score_wmma) | (result.prefill_option_mask & kPrefillGdnChunkRev3);
+                    auto governed = c;
+                    governed.prefill_disabled |= excluded;
+                    governed.resolved_prefill_option_mask = result.prefill_option_mask & ~excluded;
+                    bool admitted = true;
+                    try { validate_prefill_numerical_profile_cli(governed); }
+                    catch (const std::exception&) { admitted = false; }
+                    if (!admitted) throw; // the first refusal is the reported reason
+                    c = std::move(governed);
+                    governed_mtp_exclusion = true;
+                }
+            };
+            // A server that owns no decode arithmetic takes the single-request decode profile through the same
+            // rule; an explicit profile, low-level flags or a non-automatic organization keep the resolved one.
+            if (!candidate.numerical_profile_explicit && candidate.numerical_profile != dense_a8_profile &&
+                !candidate.prefill_numerical_profile && !candidate.any_low_level_flag) {
+                try {
+                    auto adopted = candidate;
+                    auto organization = resolve_optimization_profile(adopted,model,info,manifest,content,
+                        capabilities.a8_runtime,false);
+                    if (!organization.automatic_applied) throw std::runtime_error(organization.reason);
+                    auto single = shape;
+                    single.keep_decode_profile = false;
+                    (void)resolve_prompt_route(adopted,requested,capabilities,single);
+                    validate_numerical_profile_cli(adopted);
+                    // The combined decode/prefill candidate is validated with the governed exclusions applied.
+                    if (adopted.prefill_profile_automatic) {
+                        if (governed_mtp(adopted) && !governed_fp16) throw std::runtime_error("STRIX_SERVE_FP16_MTP=0");
+                        validate_automatic_prefill(adopted);
+                    }
+                    auto validation = organization;
+                    apply_numerical_profile(adopted,model,manifest,content,capabilities.a8_runtime,validation);
+                    candidate = std::move(adopted);
+                    adopted_organization = std::move(organization);
+                    decode_adopted = true;
+                } catch (const std::exception& error) { decode_declined = error.what(); governed_mtp_exclusion = false; }
+            }
+            fp16_declined = resolve_prompt_route(candidate,requested,capabilities,shape).arithmetic_fallback;
+            if (!decode_declined.empty() && !fp16_declined.empty()) fp16_declined += " (" + decode_declined + ")";
+            if (candidate.prefill_profile_automatic) {
+                // An arithmetic the switch or the serving validators refuse falls back to the resolved one, with its reason.
+                try {
+                    if (governed_mtp(candidate) && !governed_fp16) throw std::runtime_error("STRIX_SERVE_FP16_MTP=0");
+                    validate_automatic_prefill(candidate);
+                } catch (const std::exception& first) {
+                    candidate.prefill_numerical_profile.reset();
+                    candidate.prefill_profile_automatic = false;
+                    fp16_declined = first.what();
+                }
+            }
+        } else {
+            candidate.automatic_prefill = true;
+            candidate.known_prefix_window = true;
+            candidate.known_prefix_full_rows = true;
+            candidate.known_prefix_expert_union = true;
+            candidate.known_window_router_rows = true;
+            candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
+            // Required row-invariant organizations of the tiled known-prefix route.
+            candidate.q51_slot_parallel_down = true;
+            candidate.wave8_q8_gdn_input = true;
+            candidate.wave8_q8_gdn_output = true;
+        }
         candidate.known_prefix_prefill_rows = rows;
-        candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
-        // Required row-invariant organizations of the tiled known-prefix route.
-        candidate.q51_slot_parallel_down = true;
-        candidate.wave8_q8_gdn_input = true;
-        candidate.wave8_q8_gdn_output = true;
-        if (!candidate.known_prefill_metadata_explicit) candidate.known_prefill_metadata_budget = gib;
+        // T16384 compiles under the UMA ceiling; the actual requirement replaces the bound below.
+        if (rows == 16384U && !candidate.known_prefill_metadata_explicit)
+            candidate.known_prefill_metadata_budget = std::min(120*gib,*memory.available);
+        if (!candidate.known_prefill_metadata_explicit && rows != 16384U) candidate.known_prefill_metadata_budget = gib;
         if (!candidate.known_prefill_uma_explicit) candidate.known_prefill_uma_budget = std::min(120*gib,*memory.available);
         // Serving retains uniform logits storage and all tail owners. The CLI's
         // compact/pruned 8 GiB ceiling must not force a spurious T8192 fallback.
@@ -1237,10 +1373,23 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     throw std::runtime_error("STRIX_PROMPT_BATCH_ROWS creates an unsupported extra group owner; "
                         "unset it or use an explicit tiled configuration with group workspace/metadata budgets");
             }
-            const auto required = memory.estimate(candidate);
             const auto add = prefill_checked_add;
+            if (rows == 16384U && !candidate.known_prefill_headroom_explicit) {
+                const auto pools = prefill_native_pools(candidate,model);
+                candidate.known_prefill_host_headroom = std::max(candidate.known_prefill_host_headroom,add(pools.host,pools.device));
+            }
+            PrefillRequirements required;
+            try { required = memory.estimate(candidate); }
+            catch (const std::exception& error) {
+                if (!candidate.prefill_profile_automatic) throw;
+                candidate.prefill_numerical_profile.reset();
+                candidate.prefill_profile_automatic = false;
+                fp16_declined = std::string("fp16-plan-not-admitted: ") + error.what();
+                required = memory.estimate(candidate);
+            }
             const auto scratch = add(required.workspace,required.tails);
             if (!candidate.known_prefill_workspace_explicit) candidate.known_prefill_workspace_budget = scratch;
+            if (rows == 16384U && !candidate.known_prefill_metadata_explicit) candidate.known_prefill_metadata_budget = required.metadata;
             // The same owner calculation admits the future bridge at runtime.
             // Missing asset evidence cannot establish even one runnable slot.
             if (candidate.mtp.enabled && !memory.serving)
@@ -1251,8 +1400,14 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             state_request.recurrent_storage=candidate.gdn_recurrent_storage;
             const auto staging=qwen_http_batch_staging_reserve(candidate,model,
                 build_serial_session_state_layout(model,state_request));
-            const auto future_host = add(staging,add(serving.shared_host,serving.slot_host));
-            const auto future_device = add(staging,add(serving.shared_device,serving.slot_device));
+            // The T16384 owner is admitted only beside every resident slot; smaller owners keep their one-slot bound.
+            const std::uint64_t slots = rows == 16384U ? std::max<std::uint64_t>(1U,candidate.http_batch) : 1U;
+            // Same equation as the runtime capacity (strix::serve::resolve_bridge_capacity): every slot pays its
+            // bridge cost and every slot after the first also pays its retained decode/state stack, in both pools.
+            const auto mul = prefill_checked_multiply;
+            const auto extra_stacks = mul(slots - 1U,required.http_slot_retained);
+            const auto future_host = add(staging,add(serving.shared_host,add(mul(slots,serving.slot_host),extra_stacks)));
+            const auto future_device = add(staging,add(serving.shared_device,add(mul(slots,serving.slot_device),extra_stacks)));
             const auto growth = add(scratch,add(required.metadata,add(required.runtime_payload,
                 add(future_host,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom)))));
             auto total = add(required.model_backing,add(required.state_d1,add(required.serial_scratch,add(required.external_host,growth))));
@@ -1262,8 +1417,15 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                 return it==result.environment.end() || it->second.empty() || it->second[0]!='0';
             };
             // Opt-in (STRIX_PLE_SERVE_RESERVE=1): on a full node it trades T8192 and slots for a resident table.
+            bool table_reserved=false;
             const auto reserve=result.environment.find("STRIX_PLE_SERVE_RESERVE");
             if(enabled("STRIX_PLE_WARM") && reserve!=result.environment.end() && !reserve->second.empty() && reserve->second[0]=='1')
+                if(const auto table=required.organization.find("target_file_backed_unregistered_bytes");table!=required.organization.end())
+                    { total=add(total,table->second); table_reserved=true; }
+            // The automatic T16384 owner must leave the file-backed table resident beside every requested slot:
+            // without this bound one node at context 33,280 built 3 of 4 slots and re-read part of the table.
+            // STRIX_QPF2K_T16K=1 asks for the owner explicitly and keeps the plain bound.
+            if(rows==16384U && !table_reserved && !env_is(requested,"STRIX_QPF2K_T16K","1"))
                 if(const auto table=required.organization.find("target_file_backed_unregistered_bytes");table!=required.organization.end())
                     total=add(total,table->second);
             const auto fit = [](const char* resource, std::uint64_t need, std::uint64_t limit) {
@@ -1294,7 +1456,47 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     "--known-prefix-uma-budget-bytes", "--known-prefix-host-headroom-bytes",
                     "--q51-slot-parallel-down", "--wave8-q8-gdn-input", "--wave8-q8-gdn-output"})
                 if (!o.supplied_options.contains(flag)) result.sources[flag] = OptionSource::automatic;
-            return notice("automatic T" + std::to_string(rows) + "; " + attempts + "arithmetic preserved");
+            if (shared_route)
+                for (const char* flag : {"--batched-moe-activation", "--prefetch-q8-lm-head", "--wave8-q8-lm-head",
+                        "--wave8-q8-qsa-output"})
+                    if (!o.supplied_options.contains(flag)) result.sources[flag] = OptionSource::automatic;
+            if (decode_adopted) {
+                result.organization = std::move(adopted_organization);
+                result.sources["--numerical-profile"] = OptionSource::automatic;
+            }
+            if (o.prefill_profile_automatic) {
+                result.sources["--prefill-numerical-profile"] = OptionSource::automatic;
+                arithmetic = std::string("arithmetic fp16 (automatic, same rule as the single-request route") +
+                    (decode_adopted ? "; decode profile dense-a8 automatic" : "") +
+                    (governed_mtp_exclusion ? "; governed MTP: hc_output_wmma, index_proj_wmma, index_score_wmma and "
+                        "gdn_fp16_chunk stay off)" : ")");
+                if (governed_mtp_exclusion) result.prefill_option_mask = *o.resolved_prefill_option_mask;
+            } else if (!fp16_declined.empty()) arithmetic += "; automatic fp16 declined: " + fp16_declined;
+            result.arithmetic_fallback = o.prefill_profile_automatic ? std::string() : fp16_declined;
+            if (rows == 16384U) result.t16k_policy_source = env_is(requested,"STRIX_QPF2K_T16K","1") ?
+                OptionSource::explicit_value : OptionSource::automatic;
+            // The admitted owner takes the same prefill organisation value as the single-request route.
+            // STRIX_SERVE_PREFILL_ORG=0 (or the earlier rule, STRIX_SERVE_ROUTE=0) keeps the startup items only;
+            // each item keeps its own "0" switch, and GSQ owners filter injected values in their readers.
+            if (shared_route && !env_is(requested,"STRIX_SERVE_PREFILL_ORG","0")) {
+                const auto policy = qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
+                const unsigned taken = apply_prefill_organization(result,requested,policy,policy.items);
+                unsigned count = 0U;
+                for (unsigned bits = taken; bits; bits &= bits - 1U) ++count;
+                const auto pipe = result.environment.find("STRIX_PREFILL_PIPE");
+                arithmetic += "; prefill organization shared with the single-request route (" + std::to_string(count) +
+                    " items automatic, row pipeline " + (pipe == result.environment.end() ? std::string("0") : pipe->second) + ")";
+                // Every default of the single-request owner this owner does not take is named with its reason.
+                std::string kept;
+                for (const auto& entry : qpf2k::defaults)
+                    if (!((policy.items | qpf2k::historical_items) & qpf2k::bit(entry.item)) &&
+                        !result.environment.contains(entry.name)) {
+                        const char* reason = qpf2k::serving_exclusion_reason(entry.item);
+                        kept += std::string(kept.empty() ? "" : ", ") + entry.name + " (" + (reason ? reason : "UNEXPLAINED") + ")";
+                    }
+                if (!kept.empty()) arithmetic += "; single-request defaults not taken: " + kept;
+            } else arithmetic += "; prefill organization startup items only";
+            return notice("automatic T" + std::to_string(rows) + "; " + attempts + arithmetic);
         } catch (const std::exception& error) {
             attempts += "T" + std::to_string(rows) + ":" + error.what() + "; ";
         }
@@ -1625,7 +1827,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         return r;
     };
     auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,charged_memory);
-    resolve_serve_prefill(result,model,content,capabilities,memory);
+    resolve_serve_prefill(result,model,content,capabilities,memory,proposed.environment,info,manifest);
     resolve_session_defaults(result.options,model,request.environment,host_pool_available(memory));
     resolve_prefix_defaults(result.options,model,request.environment,host_pool_available(memory));
     resolve_http_session_ram(result,memory);
@@ -2136,6 +2338,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     item("STRIX_QSA_DECODE_SELECT", select_off, true);
     item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, true);
     item("STRIX_QSA_CACHE_ONLY", qpf2k::long_context_item_suppression("STRIX_QSA_CACHE_ONLY", config.gsq_owner), true);
+    item("STRIX_PREFILL_FINAL_CONE", qpf2k::long_context_item_suppression("STRIX_PREFILL_FINAL_CONE", config.gsq_owner), true);
     // Chunk-16 GDN core: enabled = auto by call length (or "1": every eligible call); same suppressions.
     item("STRIX_QPF2K_GDN_CHUNK16", qpf2k::long_context_item_suppression("STRIX_QPF2K_GDN_CHUNK16", config.gsq_owner), true);
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);

@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/dist/exchange_direction.hpp"
 #include "strix/dist/staged_ready.hpp"
 #include "strix/dist/transport_caps.hpp"
 #include "strix/dist/host_wait.hpp"
@@ -235,6 +236,13 @@ public:
     // STRIX_DIST_HOST_CRC_OVERLAP=1 additionally prepares TX CRCs and validates RX
     // chunks on persistent workers while the progress thread moves other chunks.
     void exchange(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag);
+    // One-way device transfer of `bytes` (GPU-direct routes only): the sending rank passes sending = true and its
+    // device buffer, the receiving rank sending = false and the buffer to fill; both at the same point with the same
+    // size and tag. Nothing travels in the unused direction and no early receive is posted. The receiver's GPU checks
+    // the in-band identity and checksum as for exchange(); check_exchanges() reports a refusal. Returns false, with
+    // nothing sent, when this size has no pure device route (host or mixed route, or an engine without a one-way
+    // form): the caller then uses its host path. Both ranks get the same answer (same route table).
+    [[nodiscard]] bool transfer(hipStream_t stream, bool sending, void* device, std::size_t bytes, const Tag& tag);
     // The same exchange in two halves, so that work enqueued in between overlaps the transfer. start()
     // enqueues the copy of `local` on `stream` and returns; the progress thread waits on the CPU for that
     // copy, then sends and receives. finish() waits for the peer's message, checks it, and enqueues its
@@ -417,6 +425,10 @@ private:
     // host path), and the mixed route's rings.
     std::size_t direct_bytes_ = 0, direct_offset_ = 0;
     unsigned mix_rings_ = 0;
+    // The exchange in flight is a one-way transfer(): its direction, else both.
+    ExchangeDirection direction_ = ExchangeDirection::both;
+    void direct_hint(std::size_t bytes, unsigned rings);
+    bool one_way_probed_ = false, one_way_ = false;
     CommunicatorStats stats_;
 };
 

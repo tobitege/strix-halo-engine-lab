@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include "hip_mtp_decode_bridge.hpp"
 #include <cstdlib>
 
@@ -219,7 +220,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
             << "  \"optimization_profile_selected\":\"" << decode_receipt::escape_json_string(resolved_profile) << "\",\n"
             << "  \"target_numerical_profile\":\"" << numerical_profile_name(pair.decode) << "\",\n"
             << "  \"mtp_cohort_mode\":\"" << (lockstep ? "lockstep" : "sequential") << "\",\n"
-            << "  \"mtp_cohort_shared_steps\":" << ([] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }() ? "true" : "false") << ",\n"
+            << "  \"mtp_cohort_shared_steps\":" << (strix::envcfg::flag("STRIX_COHORT_SHARED", true) ? "true" : "false") << ",\n"
             << "  \"mtp_cohort_requests\":" << live.size() << ",\n"
             << "  \"mtp_cohort_windows\":" << stats.cohort_windows << ",\n  \"mtp_cohort_window_sessions\":" << stats.cohort_sessions
             << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.solo_windows << ",\n  \"mtp_cohort_chunks\":" << stats.cohort_chunks << ",\n"

@@ -3,6 +3,7 @@
 #include "channel_device.hpp"
 #include "wire.hpp"
 #include "small_progress.hpp"
+#include "strix/hip_argmax_core.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <span>
 #include <stdexcept>
@@ -50,8 +52,11 @@ __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::
 
 [[maybe_unused]] __global__ __launch_bounds__(kArgThreads) void argmax_candidate_kernel(const float* logits, unsigned vn, unsigned ld, std::uint32_t id0,
                                                                        std::uint32_t* tx, ProducerTarget target) {
-    __shared__ float sv[kArgThreads];
-    __shared__ std::uint32_t si[kArgThreads];
+    struct Best {
+        float value;
+        std::uint32_t id;
+    };
+    __shared__ Best sb[kArgThreads];
     __shared__ unsigned bad;
     const unsigned t = threadIdx.x;
     if (t == 0) bad = 0;
@@ -69,19 +74,13 @@ __device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::
         }
     }
     if (!finite) atomicOr(&bad, 1U);
-    sv[t] = bv;
-    si[t] = bi;
-    __syncthreads();
-    for (unsigned s = kArgThreads / 2; s >= 1; s >>= 1U) {
-        if (t < s && better(sv[t + s], si[t + s], sv[t], si[t])) {
-            sv[t] = sv[t + s];
-            si[t] = si[t + s];
-        }
-        __syncthreads();
-    }
+    // Shared tree (R2-07); ordering stays float-compare so the transmitted
+    // value bits are unchanged for non-finite rows.
+    const Best best = strix::argmax::block_reduce<kArgThreads>(
+        sb, t, Best{bv, bi}, [](const Best& a, const Best& b) { return better(b.value, b.id, a.value, a.id) ? b : a; });
     if (t == 0) {
-        tx[2 * blockIdx.x] = __float_as_uint(sv[0]);
-        tx[2 * blockIdx.x + 1] = bad != 0 || si[0] == 0xFFFFFFFFU ? 0xFFFFFFFFU : id0 + si[0];
+        tx[2 * blockIdx.x] = __float_as_uint(best.value);
+        tx[2 * blockIdx.x + 1] = bad != 0 || best.id == 0xFFFFFFFFU ? 0xFFFFFFFFU : id0 + best.id;
     }
     publish(target, gridDim.x);
 }
@@ -167,6 +166,13 @@ void ChannelOptions<Traits>::from_env() {
         small_spin = SmallProgress::parse(v);
     }
     depth = static_cast<unsigned>(env_u64((std::string(Traits::kEnvironment) + "DEPTH").c_str(), depth));
+    {   // Exchange row fold: messages of at most <ENV>FOLD rows may be folded by the progress thread (0 = off). The
+        // default is the engine's measured crossover (Traits::kFoldRows), absent = off.
+        std::uint64_t rows = 0;
+        if constexpr (requires { Traits::kFoldRows; }) rows = Traits::kFoldRows;
+        rows = env_u64((std::string(Traits::kEnvironment) + "FOLD").c_str(), rows);
+        fold_capacity = std::min<std::size_t>(static_cast<std::size_t>(rows) * Traits::kWidth * sizeof(typename Traits::Payload), capacity);
+    }
     if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "PUBLISH").c_str()); v != nullptr && *v != '\0') {
         const std::string s(v);
         if (s == "kernel") publish = Publish::kernel;
@@ -236,6 +242,17 @@ void Channel<Traits>::init() {
     hip_check(hipMemset(counter_dev_, 0, 64), "counter");
     hip_check(hipMalloc(reinterpret_cast<void**>(&gate_dev_), 64), "gate");
     hip_check(hipMemset(gate_dev_, 0, 64), "gate");
+    if (options_.fold_capacity != 0) {
+        fx_stride_ = (options_.fold_capacity + 4095) & ~std::size_t{4095};
+        hip_check(hipHostMalloc(reinterpret_cast<void**>(&fx_host_), fx_stride_ * options_.depth, flags), "fold slots");
+        hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&fx_dev_), fx_host_, 0), "fold slots");
+        std::memset(fx_host_, 0, fx_stride_ * options_.depth);
+        folded_.assign(options_.depth, 0);
+    }
+    if (const char* v = std::getenv((std::string(Traits::kEnvironment) + "RX_TRACE").c_str()); v != nullptr && *v != '\0') {
+        rx_trace_path_ = v;
+        rx_trace_.reserve(std::size_t{1} << 20);
+    }
     if (options_.crc && options_.crc_deferred) crc_worker_ = std::make_unique<CrcWorker>(options_.crc_cpu);
     thread_ = std::thread([this] { run(); });
     if (options_.progress_cpu >= 0) {
@@ -261,6 +278,19 @@ Channel<Traits>::~Channel() {
     }
     crc_worker_.reset();
     (void)hipFree(counter_dev_);
+    if (!rx_trace_path_.empty()) {
+        if (std::FILE* f = std::fopen((rx_trace_path_ + "." + std::to_string(options_.rank)).c_str(), "w")) {
+            for (const auto& r : rx_trace_)
+                std::fprintf(f, "%llu %llu %llu %llu %llu %llu\n", static_cast<unsigned long long>(r.sequence),
+                             static_cast<unsigned long long>(r.kind), static_cast<unsigned long long>(r.bytes),
+                             static_cast<unsigned long long>(r.tx_seen_ns), static_cast<unsigned long long>(r.wire_done_ns),
+                             static_cast<unsigned long long>(r.rx_published_ns));
+            std::fclose(f);
+        }
+    }
+    if (folds_ != 0) std::fprintf(stderr, "xport row_fold rank=%u folded=%llu of %llu exchanges\n", options_.rank,
+                                  static_cast<unsigned long long>(folds_), static_cast<unsigned long long>(stats_.exchanges));
+    if (fx_host_ != nullptr) (void)hipHostFree(fx_host_);
     (void)hipFree(gate_dev_);
     (void)hipHostFree(flags_host_);
     if (options_.rx_memory != Memory::host_coherent) (void)hipFree(rx_alloc_);
@@ -301,7 +331,14 @@ void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
     }
     next_ = s;
     tail_deferred_ = options_.crc && options_.crc_deferred && bytes > kInlineCrcMax;
-    post(Job{s, bytes, tag, false});
+    Job job{s, bytes, tag, false};
+    if (fold_next_ != RowFold::none) {
+        if (!can_fold(bytes)) throw std::invalid_argument("glmxfer: fold of a message outside the fold capacity");
+        job.fold = fold_next_;
+        fold_next_ = RowFold::none;
+    }
+    if (!folded_.empty()) folded_[(s - 1) % options_.depth] = job.fold != RowFold::none ? 1 : 0;
+    post(job);
 }
 
 template<class Traits>
@@ -341,6 +378,8 @@ void Channel<Traits>::send_host(const void* local, void* remote, std::size_t byt
     hip_check(hipStreamWriteValue64(options_.stream, flags_dev_ + kTxFlag, s, 0), "direct host producer ready");
     next_ = s;
     tail_deferred_ = options_.crc && options_.crc_deferred && bytes > kInlineCrcMax;
+    if (fold_next_ != RowFold::none) throw std::invalid_argument("glmxfer: direct host messages are not folded");
+    if (!folded_.empty()) folded_[(s - 1) % options_.depth] = 0;
     post(Job{s, bytes, tag, false, static_cast<const std::byte*>(local), static_cast<std::byte*>(remote)});
 }
 
@@ -368,6 +407,7 @@ const void* Channel<Traits>::recv() {
               "wait for the peer's message");
     received_ = s;
     last_local_ = tx_dev_ + (tx_slot(s) - tx_host_);
+    last_folded_ = !folded_.empty() && folded_[(s - 1) % options_.depth] != 0 ? fx_dev_ + ((s - 1) % options_.depth) * fx_stride_ : nullptr;
     return rx_dev_ + (rx_slot(s) - rx_host_);
 }
 
@@ -377,6 +417,7 @@ RxView Channel<Traits>::recv_view() {
     if (s > next_) throw std::logic_error("glmxfer: recv_view() without a matching send()");
     received_ = s;
     last_local_ = tx_dev_ + (tx_slot(s) - tx_host_);
+    last_folded_ = !folded_.empty() && folded_[(s - 1) % options_.depth] != 0 ? fx_dev_ + ((s - 1) % options_.depth) * fx_stride_ : nullptr;
     return RxView{rx_dev_ + (rx_slot(s) - rx_host_), flags_dev_ + kRxFlag, s, gate_dev_};
 }
 
@@ -471,6 +512,11 @@ void Channel<Traits>::process(const Job& job) {
     if (deferred) prev_tx_crc_ = crc_worker_->wait(tx_ticket);  // TX slot fully read before the stream may reuse it
     prev_deferred_ = deferred;
     if (job.seal) return;
+    if (job.fold != RowFold::none) {  // rank 0's partial first on both ranks; the consumer reads it only after the flag
+        ++folds_;
+        fold_rows(job.fold, fx_host_ + ((job.sequence - 1) % options_.depth) * fx_stride_, options_.rank == 0 ? tx : rx,
+                  options_.rank == 0 ? rx : tx, job.bytes);
+    }
     __atomic_store_n(&flags_host_[kRxFlag], job.sequence, __ATOMIC_RELEASE);
     if (deferred) {
         prev_rx_ticket_ = crc_worker_->submit(rx, job.bytes);  // after the release: off the critical path
@@ -482,6 +528,12 @@ void Channel<Traits>::process(const Job& job) {
     stats_.producer_wait += seconds(t0, t1);
     stats_.wire += seconds(t1, t2);
     stats_.check += seconds(t2, t3);
+    if (!rx_trace_path_.empty() && rx_trace_.size() < rx_trace_.capacity()) {
+        auto ns = [](Clock::time_point t) {
+            return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count());
+        };
+        rx_trace_.push_back(RxTrace{job.sequence, static_cast<std::uint64_t>(job.tag.kind), job.bytes, ns(t1), ns(t2), ns(t3)});
+    }
 }
 
 template<class Traits>

@@ -43,10 +43,27 @@ public:
     std::unique_ptr<Backend> backend;
     DraftFactory drafts;
 };
+// Shared by both executable shells. Validation and deployment inspection run
+// before Runtime construction; model inspection retains its existing loader
+// boundary, including deferred device/drafter preparation.
+struct ServePreparation {
+    Options options;
+    strix::serve::DeploymentCallbacks deployment;
+    std::optional<int> exit_code;
+    // Slot count chosen by a deployment plan (0: no plan, STRIX_G4_SERVE_SLOTS applies).
+    std::uint32_t deployment_slots = 0;
+    std::string output;
+    bool bind_given = false, port_given = false;
+};
+ServePreparation prepare_serve(int argc, char** argv);
+// Library-only activation. Runtime/service/legacy callers deliberately use OFF.
+// This permits execution for operator qualification, not a native fidelity claim.
+enum class NativeInputContinuation { off, exact_g4_v1 };
 // Optional device library implements this factory and engine::Backend/StreamState.
 // Model/tables outlive it; begin() returns its own KvTxn recognized by forward_rows.
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
-std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect = false);
+std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect = false,
+    NativeInputContinuation continuation = NativeInputContinuation::off);
 DraftFactory device_drafts(const dflash::Weights& weights, dflash::RopeView rope, LinearView embedding,
     Backend* backend = nullptr, bool prepare = true, LinearView head = {});
 #endif

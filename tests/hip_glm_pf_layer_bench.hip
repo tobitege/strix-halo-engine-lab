@@ -509,12 +509,14 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
             // Paired stage timings, independent of environment selection. Run with
             // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
-            const unsigned sv[4] = {7, 7, 7, 7}, ov[4] = {7, 10, 7, 10}, gv[4] = {3, 3, 3, 3};  // o-bar v7 / v10 (default: batch of 2 k, 18 KB LDS) ABAB
-            float stage_us[4][3][5]{};
+            // o-bar v10 (default exact) vs the FAST fused attn-wmma core (21: T = 16), gemm v3 on both, order reversed every rep.
+            constexpr unsigned kArms = 2;
+            const unsigned sv[kArms] = {7, 7}, ov[kArms] = {10, 21}, gv[kArms] = {3, 3};
+            float stage_us[kArms][3][5]{};
             for (unsigned rep = 0; rep < 4; ++rep) {
                 // Alternate pair order to limit systematic warm-cache/clock bias.
-                for (unsigned i = 0; i < 4; ++i) {
-                    const unsigned v = rep & 1U ? 3 - i : i;
+                for (unsigned i = 0; i < kArms; ++i) {
+                    const unsigned v = rep & 1U ? kArms - 1 - i : i;
                     P::set_mla_profile(pe);
                     P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, sv[v], ov[v], gv[v]);
                     P::set_mla_profile(nullptr);
@@ -527,7 +529,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            for (unsigned v = 0; v < 4; ++v) {
+            for (unsigned v = 0; v < kArms; ++v) {
                 float sc[3], obar[3], total[3], other[3];
                 for (unsigned rep = 0; rep < 3; ++rep) {
                     sc[rep] = stage_us[v][rep][1];
@@ -551,6 +553,36 @@ int main(int argc, char** argv) {
                             gv[v], C, t0, kHeadsR, sv[v], sc[1], sc[1] / C, ov[v], obar[1], obar[1] / C, other[1] / C, total[1], total[1] / C);
             }
             for (auto& ev : pe) hok(hipEventDestroy(ev), "ev");
+            // FAST fused core vs the exact v10 path on the same inputs: o-bar and MLA output rel L2 / max |d| / cosine.
+            const std::size_t nob = static_cast<std::size_t>(C) * kHeadsR * kKvLora, nmo = static_cast<std::size_t>(C) * kHeadsR * kMlaDim;
+            std::vector<float> ob_ref(nob), mo_ref(nmo), ob_f(nob), mo_f(nmo);
+            P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, 10, 3);
+            hok(hipMemcpyAsync(ob_ref.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+            hok(hipMemcpyAsync(mo_ref.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+            hok(hipStreamSynchronize(g_hs), "sync");
+            const auto cmp = [](const std::vector<float>& a, const std::vector<float>& b, const char* nm, unsigned fv) {
+                double d2 = 0, a2 = 0, b2 = 0, ab = 0, mx = 0;
+                std::size_t bad = 0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    if (!std::isfinite(b[i])) ++bad;
+                    const double d = static_cast<double>(b[i]) - a[i];
+                    d2 += d * d;
+                    a2 += static_cast<double>(a[i]) * a[i];
+                    b2 += static_cast<double>(b[i]) * b[i];
+                    ab += static_cast<double>(a[i]) * b[i];
+                    mx = std::max(mx, std::fabs(d));
+                }
+                std::printf("   MLA attn-wmma o-bar*10+gemm %u vs v10+g3 %s: rel L2 %.3e max|d| %.3e cos %.7f non-finite %zu\n", fv, nm, std::sqrt(d2 / a2), mx,
+                            ab / std::sqrt(a2 * b2), bad);
+            };
+            for (unsigned f = 1; f < kArms; ++f) {
+                P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[f], gv[f]);
+                hok(hipMemcpyAsync(ob_f.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipStreamSynchronize(g_hs), "sync");
+                cmp(ob_ref, ob_f, "o-bar", ov[f] * 10 + gv[f]);
+                cmp(mo_ref, mo_f, "out", ov[f] * 10 + gv[f]);
+            }
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,
                     std::min<unsigned>(cap, P::kMaxTokens), det ? "yes" : "NO");

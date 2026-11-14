@@ -110,12 +110,48 @@ then every chunk uses slot `L & 1`. The same rule covers ungrouped tails and pau
 `STRIX_MMX_FAST_I4_SCOPE=all` (default) runs gate/up/down on IU4; `gate_up` keeps the original EXL3
 FP16 down path and skips down conversion. Scope remains a quality-gated choice.
 
+Quality policy (default on). INT4 noise is flat per layer (2-5 % of the MoE output energy, half of it from the
+4-bit gate/up input), but an early layer's error is amplified by every later router and sparse-attention
+selection, so the same local error costs three times more KL in layers 3-32 than in layers 33-59. By default
+FAST_I4 therefore keeps MoE layers 3-37 on the exact EXL3 operator and runs INT4 in layers 38-59
+(`STRIX_MMX_FAST_I4_EXL3_LAYERS`, a list of layers and ranges such as `3-37`, `!38-59` for the complement, or
+`none` for INT4 in every MoE layer, the pre-policy identity). EXL3 stays resident, so the policy costs no memory
+and skips the conversion of the exact layers. Prompts shorter than `STRIX_MMX_FAST_I4_MIN_ROWS` (default 4096,
+`0` = every length) prefill on EXL3 in every layer, bit-identical to the exact format: the per-layer conversion
+is a fixed cost and INT4 only pays above about 3K rows. Measured at 2K on four chat-template prompts against the
+exact format (pooled last 256 rows each, `MIN_ROWS=0`): KL 0.0139, top-1 agreement 96.5 %, dNLL +0.006 with the
+default policy, against 0.065 / 90.9 % / +0.024 with `none`. The fused chain is bit-identical to the unfused
+calls under the policy. `STRIX_MMX_FAST_I4_SHADOW=1` (measurement only) runs the exact MoE and the exact-weight
+A4 MoE on the same input of every INT4 layer and prints the relative output error per layer at prompt
+completion; the live result stays INT4. `STRIX_MMX_FAST_I4_A8=gate_up|down|all` with
+`STRIX_MMX_FAST_I4_A8_LAYERS` is a study path (two A4 planes per GEMM on the unfused calls); it is slower than
+the exact operator and is not part of the policy. The layer-list grammar, the shadow reducer and the two-plane
+quantiser are shared (`src/core/layer_set.hpp`, `src/core/i4_shadow.hpp`, `src/core/activation_quant.hpp`).
+
 Serial conversion on the engine stream is the default. `STRIX_MMX_FAST_I4_PREFETCH=1` converts
 only the next layer within the current range on a side stream, ordered by slot-free and ready
 events, without adding a host synchronization. Retain it only if 8K TTFT improves by at least
 0.4 s over serial. `STRIX_MMX_FAST_I4_STATS=1` reports event-based converter and whole-group MoE
 times per layer at the existing prompt completion fence; the latter includes inter-chunk gaps.
+The report belongs to the prefill task that completes (a nested child neither prints nor clears
+its parked parent's), gives IU4 and EXL3 launch counts for every MoE layer that launched (also
+for a prompt under the row gate, which has no IU4 launch), and charges sampled time to the
+arithmetic of the sampled group.
 Kernel-chain timing should also use the prefill timeline markers.
+
+With scope `all`, the INT4 chain is the default (`STRIX_MOE_I4_CHAIN=0` selects the unfused calls,
+same bits). It quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose
+epilogue applies SwiGLU and the down input transform, then the down GEMM and the ordered combine.
+It runs once per chunk, so chunk c's MoE overlaps the exchange of chunk c-1.
+The paired gate/up keeps pass-0 FP32 gate values in global scratch (same thread reads them back in
+pass 1, no barrier; `STRIX_MOE_I4_CHAIN_GSAVE=0` selects the register save). The register save needed
+so many VGPRs that the pair was forced to plan 1 (BM64) while the unfused call ran plan 2 (BM128): at
+32K that cost MoE GEMM time and slowed the overlapping attention kernels (+1.2 % TTFT). With the global
+save the plan is chosen freely (VGPR 183-239, no spills; scratch 5·T·inter·4 bytes, ~126 MB at T=4096).
+Measured on the TP2 pair: 8K 12.12 s versus 12.34 s unfused and 12.76 s versus 12.98 s (-1.7 %, both
+orders); 32K 55.23 s versus 55.74 s (-0.9 %, mean of six pairs, three per order; single runs vary ±3 %).
+Chain GEMMs run at 31 % (8K) and 32 % (32K) of the iu4 WMMA peak. State, final-row and token anchors are
+equal and the ranks agree in every run; no regime gate is needed.
 
 `STRIX_MMX_PF_IU4=0` and `--ab pfi4:PROMPT.u32:128` retain the same model load and buffers while
 selecting the original EXL3 prefill arm; `STRIX_MMX_FAKEQ_A4` remains available for quality study.

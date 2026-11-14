@@ -172,20 +172,25 @@ void tests(std::mt19937& rng) {
             ma::enqueue_index_proj_tiled({x, w.packed, iq, ik, rows}, nullptr);
             same(rows, "tiled");
         }
+        if (rows >= 8) {
+            ma::enqueue_index_proj_slab({x, w.packed, iq, ik, rows}, nullptr);
+            same(rows, "slab");
+        }
         if (rows >= 2 && rows <= 8) {
             ma::enqueue_index_proj_decode_lds({x, w.packed, iq, ik, rows}, nullptr);
             same(rows, "decode lds");
         }
         ma::enqueue_index_proj({x, w.packed, iq, ik, rows}, nullptr);
         same(rows, "default");
-        std::printf("index_proj rows %u: %s\n", rows, g_fail == 0 ? "bitwise equal (dense_t, dense_t16, decode rings, tiled)" : "MISMATCH");
+        std::printf("index_proj rows %u: %s\n", rows, g_fail == 0 ? "bitwise equal (dense_t, dense_t16, decode rings, tiled, slab)" : "MISMATCH");
     }
     for (void* p : {static_cast<void*>(x), static_cast<void*>(rq), static_cast<void*>(rk), static_cast<void*>(iq), static_cast<void*>(ik)})
         (void)hipFree(p);
     free_weights(w);
 }
 
-void bench(std::mt19937& rng) {
+// slab_only (STRIX_MMATTN_BENCH=slab): only the prefill slab gate.
+void bench(std::mt19937& rng, bool slab_only) {
     const unsigned L = 60;
     std::vector<Weights> ws;
     for (unsigned l = 0; l < L; ++l) ws.push_back(make_weights(rng, false));
@@ -212,7 +217,7 @@ void bench(std::mt19937& rng) {
         return 1000.0 * ms / (double(reps) * layers);
     };
     // Change B gate: literal A B A x3 for every R2..R8, A = the round-2 default (ring 16 + row split), B = LDS kernel.
-    for (unsigned rows = 2; rows <= 8; ++rows) {
+    if (!slab_only) for (unsigned rows = 2; rows <= 8; ++rows) {
         auto old_k = [&](unsigned l) { ma::enqueue_index_proj_decode({x, ws[l].packed, iq, ik, rows}, 16U, st, rows > 2 ? 2U : 0U); };
         auto lds_k = [&](unsigned l) { ma::enqueue_index_proj_decode_lds({x, ws[l].packed, iq, ik, rows}, st); };
         std::vector<double> ta, tb, ratio;
@@ -232,7 +237,7 @@ void bench(std::mt19937& rng) {
         std::fflush(stdout);
     }
     // Diagnostic (not an ABA): engine dense_t16<8> (2 launches), ring32, round-2 default, LDS; order E R O L E x3.
-    for (unsigned rows : {1U, 2U, 4U, 6U, 8U}) {
+    if (!slab_only) for (unsigned rows : {1U, 2U, 4U, 6U, 8U}) {
         auto arm = [&](int a) {
             return [&, a](unsigned l) {
                 if (a == 0) engine_t16(x, ws[l], iq, ik, rows, st);
@@ -261,7 +266,7 @@ void bench(std::mt19937& rng) {
         std::fflush(stdout);
     }
     // Diagnostic decomposition of the decode kernel (rows 1 and 2): full / no weight loads / pure FMA chain / no FMAs.
-    for (unsigned rows : {1U, 2U, 8U}) {
+    if (!slab_only) for (unsigned rows : {1U, 2U, 8U}) {
         std::vector<double> t[4];
         for (int round = 0; round < 3; ++round)
             for (int mode = 0; mode < 4; ++mode)
@@ -270,7 +275,7 @@ void bench(std::mt19937& rng) {
                     median(t[0]), median(t[1]), median(t[2]), median(t[3]));
     }
     // Prefill: A = engine dense_t16<16>, B = tiled.
-    for (unsigned rows : {1024U, 8192U}) {
+    if (!slab_only) for (unsigned rows : {1024U, 8192U}) {
         const unsigned layers = rows > 2048 ? 6 : 20;
         auto arm = [&](int a) {
             return [&, a](unsigned l) {
@@ -293,6 +298,33 @@ void bench(std::mt19937& rng) {
                     median(t[1]) / median(t[0]), runs.c_str());
         std::fflush(stdout);
     }
+    // Prefill slab gate: literal A B A x3, A = tiled, B = slab.
+    for (unsigned rows : {4096U, 8192U, 1024U, 4096U}) {
+        {
+            const unsigned layers = rows > 2048 ? 12 : 30;
+            auto arm = [&](int a) {
+                return [&, a](unsigned l) {
+                    if (a == 0) ma::enqueue_index_proj_tiled({x, ws[l].packed, iq, ik, rows}, st);
+                    else ma::enqueue_index_proj_slab({x, ws[l].packed, iq, ik, rows}, st);
+                };
+            };
+            std::vector<double> t[2], ratio;
+            std::string runs;
+            for (int round = 0; round < 3; ++round) {
+                const double a1 = time_run(arm(0), layers, 1), b = time_run(arm(1), layers, 1), a2 = time_run(arm(0), layers, 1);
+                t[0].push_back(a1);
+                t[0].push_back(a2);
+                t[1].push_back(b);
+                ratio.push_back(b / (0.5 * (a1 + a2)));
+                char buf[64];
+                std::snprintf(buf, sizeof buf, " [%.0f %.0f %.0f]", a1, b, a2);
+                runs += buf;
+            }
+            std::printf("prefill T %u us/layer: tiled %.0f slab %.0f (B/A median %.3f, worst %.3f)  ABA:%s\n", rows, median(t[0]),
+                        median(t[1]), median(ratio), *std::max_element(ratio.begin(), ratio.end()), runs.c_str());
+            std::fflush(stdout);
+        }
+    }
     (void)hipEventDestroy(e0);
     (void)hipEventDestroy(e1);
     (void)hipStreamDestroy(st);
@@ -313,6 +345,7 @@ int main() {
         return 1;
     }
     std::printf("strix-mmattn-index-proj-tests: all passed\n");
-    if (const char* b = std::getenv("STRIX_MMATTN_BENCH"); b != nullptr && std::strcmp(b, "1") == 0) bench(rng);
+    if (const char* b = std::getenv("STRIX_MMATTN_BENCH"); b != nullptr && (std::strcmp(b, "1") == 0 || std::strcmp(b, "slab") == 0))
+        bench(rng, std::strcmp(b, "slab") == 0);
     return 0;
 }

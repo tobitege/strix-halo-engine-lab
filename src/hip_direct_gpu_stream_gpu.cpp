@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_direct_gpu_stream_gpu.hpp"
 
 #include <algorithm>
@@ -12,9 +13,7 @@ namespace strix::transport {
 namespace {
 static_assert(std::endian::native == std::endian::little, "native terminal record requires little-endian host/GPU ABI");
 static_assert(offsetof(GpuCommitRecord, sequence) == 16 && offsetof(GpuCommitRecord, payload_bytes) == 24);
-void check(hipError_t result, const char* operation) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 bool same_view(const TransportBufferView& a, const TransportBufferView& b) {
     return a.address == b.address && a.bytes == b.bytes && a.allocation_generation == b.allocation_generation && a.domain == b.domain && a.access == b.access;
 }
@@ -84,8 +83,8 @@ struct HipDirectGpuStreamGpu::Impl {
         }
         if (stream) {
             hipDevice_t device = -1; unsigned long long identity = 0; hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-            check(calls.stream_device(stream, &device), "HIP transport stream device"); check(calls.stream_id(stream, &identity), "HIP transport stream identity");
-            check(calls.stream_capture(stream, &capture), "HIP transport capture state");
+            hip_check(calls.stream_device(stream, &device), "HIP transport stream device"); hip_check(calls.stream_id(stream, &identity), "HIP transport stream identity");
+            hip_check(calls.stream_capture(stream, &capture), "HIP transport capture state");
             if (device != binding.device.index || !identity || (stream_identity && identity != stream_identity) || capture != hipStreamCaptureStatusNone) throw std::runtime_error("GPU transport stream replaced or captured");
             if (!stream_identity) stream_identity = identity;
         }
@@ -144,21 +143,21 @@ struct HipDirectGpuStreamGpu::Impl {
         for (std::uint64_t count = 0; count < policy.maximum_completion_polls; ++count) {
             require_before_deadline(); current(); const auto result = calls.query_event(event.handle); current(); require_before_deadline();
             if (result == hipSuccess) { event.complete = true; return; }
-            if (result != hipErrorNotReady) check(result, "HIP transport event completion");
+            if (result != hipErrorNotReady) hip_check(result, "HIP transport event completion");
             if (count + 1 < policy.maximum_completion_polls) { calls.pause(policy.completion_pause); require_before_deadline(); }
         }
         throw std::runtime_error("HIP transport completion budget exhausted; ownership retained");
     }
     void record(Event& event) {
         const auto start = monotonic_now();
-        check(calls.record_event(event.handle, stream), "HIP transport system-fence event record"); event.recorded = true;
+        hip_check(calls.record_event(event.handle, stream), "HIP transport system-fence event record"); event.recorded = true;
         current(); wait(event, start);
     }
     void destroy(Event& event) {
         if (!event.handle) return;
         if (event.destroy_unknown) throw std::runtime_error("HIP transport event destruction previously unproved");
         event.destroy_unknown = true;
-        check(calls.destroy_event(event.handle), "HIP transport event destroy"); event.handle = nullptr; event.destroy_unknown = false;
+        hip_check(calls.destroy_event(event.handle), "HIP transport event destroy"); event.handle = nullptr; event.destroy_unknown = false;
         current(false);
     }
 };
@@ -200,12 +199,12 @@ HipDirectGpuStreamGpu::HipDirectGpuStreamGpu(std::shared_ptr<DirectGpuExportImpo
         for (const auto& pool : i.binding.allocations) if (destination_extent.base < pool.base + pool.bytes && pool.base < destination_extent.base + destination_extent.bytes) {
             throw std::invalid_argument("HIP transport acquire destination aliases an imported allocation");
         }
-        check(i.calls.create_stream(&i.stream, hipStreamNonBlocking), "HIP transport owned stream create");
+        hip_check(i.calls.create_stream(&i.stream, hipStreamNonBlocking), "HIP transport owned stream create");
         if (!i.stream || i.stream == hipStreamLegacy || i.stream == hipStreamPerThread) throw std::runtime_error("HIP transport requires distinct owned stream");
-        check(i.calls.stream_id(i.stream, &i.stream_identity), "HIP transport owned stream identity");
+        hip_check(i.calls.stream_id(i.stream, &i.stream_identity), "HIP transport owned stream identity");
         if (!i.stream_identity) throw std::runtime_error("HIP transport stream has no stable identity");
         i.current();
-        for (auto& host : i.host) { check(i.calls.allocate_host(&host, sizeof(GpuCommitRecord), hipHostMallocDefault), "HIP transport pinned metadata allocation"); if (!host) throw std::runtime_error("HIP transport metadata allocation missing"); }
+        for (auto& host : i.host) { hip_check(i.calls.allocate_host(&host, sizeof(GpuCommitRecord), hipHostMallocDefault), "HIP transport pinned metadata allocation"); if (!host) throw std::runtime_error("HIP transport metadata allocation missing"); }
         i.current();
     } catch (...) {
         i.failed = true;
@@ -236,7 +235,7 @@ void HipDirectGpuStreamGpu::stage_outbound_segments(const TransferDescriptor& de
         i.segments(sources, descriptor.byte_length, false); i.staged = std::make_pair(descriptor, tx);
         std::uintptr_t destination = tx.address;
         for (const auto& source : sources) {
-            check(i.calls.copy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source.address), static_cast<std::size_t>(source.bytes), hipMemcpyDeviceToDevice, i.stream), "HIP transport owned outbound pack");
+            hip_check(i.calls.copy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source.address), static_cast<std::size_t>(source.bytes), hipMemcpyDeviceToDevice, i.stream), "HIP transport owned outbound pack");
             i.current(); destination += source.bytes;
         }
     } catch (...) { impl_->failed = true; throw; }
@@ -258,7 +257,7 @@ void HipDirectGpuStreamGpu::prepare(const DirectDriverOperation& operation) {
     if (!operation.receive_path && (!i.staged || !same_descriptor(i.staged->first, operation.descriptor) || !same_view(i.staged->second, operation.buffer))) throw std::invalid_argument("HIP transport producer has no exact owned staged source");
     entry.emplace(); entry->binding = operation;
     try {
-        for (auto& event : entry->events) { check(i.calls.create_event(&event.handle, hipEventDisableTiming), "HIP transport system-fence event create"); if (!event.handle) throw std::runtime_error("HIP transport event missing"); i.current(); }
+        for (auto& event : entry->events) { hip_check(i.calls.create_event(&event.handle, hipEventDisableTiming), "HIP transport system-fence event create"); if (!event.handle) throw std::runtime_error("HIP transport event missing"); i.current(); }
     } catch (...) { i.failed = true; throw; }
 }
 DirectDriverVisibilityProof HipDirectGpuStreamGpu::publish_terminal(const DirectDriverOperation& operation, const TransportBufferView& terminal, const GpuCommitRecord& record) {
@@ -266,7 +265,7 @@ DirectDriverVisibilityProof HipDirectGpuStreamGpu::publish_terminal(const Direct
         auto& i = *impl_; auto& entry = i.require(operation); i.terminal(operation, terminal);
         if (operation.receive_path || entry.released || !validate_gpu_commit_record(record, operation.descriptor)) throw std::invalid_argument("HIP transport producer commit is foreign or duplicated");
         std::memcpy(i.host[0], &record, sizeof(record));
-        check(i.calls.copy(reinterpret_cast<void*>(terminal.address), i.host[0], sizeof(record), hipMemcpyHostToDevice, i.stream), "HIP transport terminal publish copy");
+        hip_check(i.calls.copy(reinterpret_cast<void*>(terminal.address), i.host[0], sizeof(record), hipMemcpyHostToDevice, i.stream), "HIP transport terminal publish copy");
         i.current(); i.record(entry.events[0]); entry.released = true;
         return {operation, DirectDriverVisibility::producer_release_to_external_dma};
     } catch (...) { impl_->failed = true; throw; }
@@ -276,10 +275,10 @@ DirectDriverCommitRead HipDirectGpuStreamGpu::read_terminal(const DirectDriverOp
         auto& i = *impl_; auto& entry = i.require(operation); i.terminal(operation, terminal);
         if (!operation.receive_path || entry.acquired) throw std::invalid_argument("HIP transport acquire is foreign or duplicated");
         if (operation.descriptor.byte_length > i.execution.receive_destination.bytes || operation.buffer.bytes < operation.descriptor.byte_length) throw std::length_error("HIP transport payload exceeds owned acquire destination");
-        check(i.calls.copy(reinterpret_cast<void*>(i.execution.receive_destination.address), reinterpret_cast<const void*>(operation.buffer.address),
+        hip_check(i.calls.copy(reinterpret_cast<void*>(i.execution.receive_destination.address), reinterpret_cast<const void*>(operation.buffer.address),
             static_cast<std::size_t>(operation.descriptor.byte_length), hipMemcpyDeviceToDevice, i.stream), "HIP transport full payload acquire copy");
         i.current();
-        check(i.calls.copy(i.host[1], reinterpret_cast<const void*>(terminal.address), sizeof(GpuCommitRecord), hipMemcpyDeviceToHost, i.stream), "HIP transport terminal acquire copy");
+        hip_check(i.calls.copy(i.host[1], reinterpret_cast<const void*>(terminal.address), sizeof(GpuCommitRecord), hipMemcpyDeviceToHost, i.stream), "HIP transport terminal acquire copy");
         i.current(); i.record(entry.events[1]); GpuCommitRecord record; std::memcpy(&record, i.host[1], sizeof(record));
         if (!validate_gpu_commit_record(record, operation.descriptor)) throw std::runtime_error("HIP transport acquired terminal record is invalid");
         entry.acquired = true; i.current(); return {record, {operation, DirectDriverVisibility::consumer_acquire_from_external_dma}};
@@ -300,7 +299,7 @@ void HipDirectGpuStreamGpu::consume_received_segments(const DirectDriverOperatio
             !(destinations.size() == 1 && same_view(destination, acquired))) throw std::invalid_argument("HIP transport unpack destination partially aliases acquire source");
         entry.unpacked = true; std::uintptr_t source = acquired.address;
         for (const auto& destination : destinations) {
-            if (destination.address != source) check(i.calls.copy(reinterpret_cast<void*>(destination.address), reinterpret_cast<const void*>(source), static_cast<std::size_t>(destination.bytes), hipMemcpyDeviceToDevice, i.stream), "HIP transport owned inbound unpack");
+            if (destination.address != source) hip_check(i.calls.copy(reinterpret_cast<void*>(destination.address), reinterpret_cast<const void*>(source), static_cast<std::size_t>(destination.bytes), hipMemcpyDeviceToDevice, i.stream), "HIP transport owned inbound unpack");
             i.current(); source += destination.bytes;
         }
     } catch (...) { impl_->failed = true; throw; }
@@ -328,7 +327,7 @@ DirectDriverQuiescenceStatus HipDirectGpuStreamGpu::poll_quiescence() noexcept {
     try {
         impl_->current(false); const auto result = impl_->stream ? impl_->calls.query_stream(impl_->stream) : hipSuccess; impl_->current(false);
         if (result == hipErrorNotReady) return DirectDriverQuiescenceStatus::pending;
-        check(result, "HIP transport stream quiescence"); return DirectDriverQuiescenceStatus::quiescent;
+        hip_check(result, "HIP transport stream quiescence"); return DirectDriverQuiescenceStatus::quiescent;
     } catch (...) { impl_->failed = true; return DirectDriverQuiescenceStatus::failed_retained; }
 }
 DirectPoolReleaseStatus HipDirectGpuStreamGpu::close() noexcept {
@@ -340,13 +339,13 @@ DirectPoolReleaseStatus HipDirectGpuStreamGpu::close() noexcept {
         for (auto& entry : i.operations) if (entry) for (auto& event : entry->events) i.destroy(event);
         if (i.stream) {
             if (i.stream_destroy_unknown) throw std::runtime_error("HIP transport stream destruction unproved");
-            i.stream_destroy_unknown = true; check(i.calls.destroy_stream(i.stream), "HIP transport stream destroy"); i.stream = nullptr; i.stream_destroy_unknown = false;
+            i.stream_destroy_unknown = true; hip_check(i.calls.destroy_stream(i.stream), "HIP transport stream destroy"); i.stream = nullptr; i.stream_destroy_unknown = false;
             i.current(false);
         }
         for (std::size_t index = 0; index < i.host.size(); ++index) if (i.host[index]) {
             i.current(false);
             if (i.host_free_unknown[index]) throw std::runtime_error("HIP transport pinned metadata free unproved");
-            i.host_free_unknown[index] = true; check(i.calls.free_host(i.host[index]), "HIP transport pinned metadata free"); i.host[index] = nullptr; i.host_free_unknown[index] = false;
+            i.host_free_unknown[index] = true; hip_check(i.calls.free_host(i.host[index]), "HIP transport pinned metadata free"); i.host[index] = nullptr; i.host_free_unknown[index] = false;
             i.current(false);
         }
         i.operations = {}; i.execution.lifetime.reset(); i.import_lease.reset(); i.closed = true; return DirectPoolReleaseStatus::released;

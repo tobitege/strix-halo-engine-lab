@@ -1,5 +1,6 @@
 // Shared expert TP on the trellis library (ds41_shexp_tp.hpp, identity ds41-trellis-k5-v1:shexp-tp).
 #include "strix/ds41_shexp_tp.hpp"
+#include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -10,7 +11,7 @@ namespace strix::ds41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("ds41 shexp tp: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("ds41 shexp tp: ", e, what);
 }
 unsigned blocks_for(std::size_t n, unsigned block) { return static_cast<unsigned>((n + block - 1U) / block); }
 

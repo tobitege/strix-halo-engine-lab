@@ -274,6 +274,7 @@ __global__ __launch_bounds__(256) void down_prefill_da16_tile64(const unsigned c
 // qpf2k/moe-mi: the body of down_prefill_f16x_da16 (hip_moe_prefill_da16.inc), included by that kernel (the macros expand to
 // its original lines) and by the P1 + DA16 item function. STRIX_DA16_BATCH_TILE declares batch / tile, STRIX_DA16_GUARD the
 // early return (empty in P1: decided per CTA before), STRIX_DA16_LDS(Stage, Rows) the stage `sb` (indexable) and `rows`.
+#include "strix/env_flags.hpp"
 #include "hip_moe_tile64_down_body.inc"
 #undef STRIX_DA16_CERTIFICATE
 #undef STRIX_DA16_BATCH_TILE
@@ -316,10 +317,14 @@ __global__ __launch_bounds__(512) void down_prefill_da16_tile64_remainder(
     [[maybe_unused]] constexpr unsigned route_top_k=0U;
     if constexpr(Certificate) {
 #define STRIX_DA16_CERTIFICATE
+#define STRIX_DA16_UNIFORM_A false
 #include "moe_core/hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_CERTIFICATE
     } else {
+#define STRIX_DA16_UNIFORM_A false
 #include "moe_core/hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
     }
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
@@ -331,7 +336,7 @@ inline hipEvent_t*& prefill_test_events(){static thread_local hipEvent_t* v=null
 // Bit 0: TILE64 gate/up, bit 1: TILE64 down. STRIX_QPF2K_MOE_TILE64=1 selects both; unset or any other value, neither.
 // The test override (1 both, 2 gate/up only, 3 down only) lets the byte gate check each kernel against today's other one.
 inline unsigned prefill_tile64() {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_TILE64");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_TILE64", false, strix::EnvFlagMatch::exact);
     if(qpf2k::baseline||(prefill_moe_gsq_off()&1U))return 0U;
     const int o=prefill_tile64_override();
     if(o<0)return env?3U:0U;

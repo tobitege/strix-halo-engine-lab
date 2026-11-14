@@ -52,6 +52,30 @@ void policy_tests() {
     for (const auto& entry : qpf2k::defaults)
         if (qpf2k::exact_prefill_items & qpf2k::bit(entry.item))
             expect(!startup.contains(entry.name), "non-decoder clients retain exact prefill opt-ins");
+    {
+        // One organisation value per owner: the server takes the organisation items with the current row-pipeline bits.
+        const auto server = qpf2k::admitted_organization(qpf2k::PrefillOwner::resident_server);
+        const auto get = [](Environment& e) { return [&e](const char* name) -> const char* {
+            const auto it = e.find(name); return it == e.end() ? nullptr : it->second.c_str(); }; };
+        const auto put = [](Environment& e) { return [&e](const char* name, const char* value) {
+            e.emplace(name, value); return true; }; };
+        Environment served;
+        expect(qpf2k::apply_organization(server, get(served), put(served)) == qpf2k::prefill_organization_items &&
+            served.at("STRIX_PREFILL_PIPE") == "255" && qpf2k::serving_pipe_mask == 0xffU && served.at("STRIX_PREFILL_PLE_BATCH") == "1" &&
+            !served.contains("STRIX_PLE_RECLAIMABLE") && !served.contains("STRIX_DISPATCH_FUSE") &&
+            !served.contains("STRIX_QPF2K_SCHED"), "server organisation carries no reclamation, decoding or startup item");
+        Environment single;
+        expect(qpf2k::apply_organization(qpf2k::admitted_organization(qpf2k::PrefillOwner::single_request),
+            get(single), put(single)) == all && single.at("STRIX_PREFILL_PIPE") == "255",
+            "single-request organisation is the complete default set");
+        Environment kept{{"STRIX_PREFILL_PIPE", "0"}, {"STRIX_QPF2K_MOE_HDR", "0"}};
+        const unsigned taken = qpf2k::apply_organization(server, get(kept), put(kept));
+        expect(!(taken & (qpf2k::bit(qpf2k::Item::pipe) | qpf2k::bit(qpf2k::Item::moe_hdr))) &&
+            kept.at("STRIX_PREFILL_PIPE") == "0" && kept.at("STRIX_QPF2K_MOE_HDR") == "0", "explicit off controls are kept");
+        Environment disabled{{"STRIX_QPF2K_DEFAULTS", "0"}};
+        expect(qpf2k::apply_organization(server, get(disabled), put(disabled)) == 0U && disabled.size() == 1U,
+            "defaults off switch suppresses the organisation");
+    }
     qpf2k::defaulted_items = all;
     for (const auto& entry : qpf2k::defaults) {
         expect(automatic.at(entry.name) == entry.on, "non-GSQ default values are unchanged");
@@ -578,7 +602,7 @@ int main(int argc, char** argv) {
         expect(strix_hc_inject_fusion_enabled(), "explicit fusion survives GSQ filtering");
         return 0;
     }
-    expect(qpf2k::defaults.size() == 30U, "all scoped prompt defaults are part of the injected-item contract");
+    expect(qpf2k::defaults.size() == 29U, "all scoped prompt defaults are part of the injected-item contract");
     qpf2k::baseline = true;
     std::map<std::string,std::string> baseline_env;
     expect(initialize(baseline_env) == 0U && baseline_env.empty(), "baseline injects no defaults");

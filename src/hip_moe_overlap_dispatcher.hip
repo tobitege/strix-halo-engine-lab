@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_moe_overlap_dispatcher.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include <hip/hip_runtime.h>
@@ -25,9 +26,7 @@ std::uint64_t overlap_owner_epoch() {
     }
 }
 void require(bool ok, const char* text) { if (!ok) throw std::logic_error(text); }
-void check(hipError_t result, const char* text) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(text) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 bool same_memory(const ExecutionMemoryBinding& a, const ExecutionMemoryBinding& b) {
     return a.execution_identity == b.execution_identity && a.arena_base == b.arena_base &&
            a.arena_bytes == b.arena_bytes && a.allocation_generation == b.allocation_generation;
@@ -131,11 +130,11 @@ struct HipMoeSiblingStreams::Impl {
                 "MoE sibling streams require actual main/resources/guard owners");
         guard->require_original();
         unsigned flags = 0;
-        check(hipStreamGetFlags(main, &flags), "validate borrowed MoE main stream");
+        hip_check(hipStreamGetFlags(main, &flags), "validate borrowed MoE main stream");
         try {
-            check(hipStreamCreateWithFlags(&side, hipStreamNonBlocking), "create MoE sibling stream");
-            check(hipEventCreateWithFlags(&fork, hipEventDisableTiming), "create MoE fork event");
-            check(hipEventCreateWithFlags(&join, hipEventDisableTiming), "create MoE join event");
+            hip_check(hipStreamCreateWithFlags(&side, hipStreamNonBlocking), "create MoE sibling stream");
+            hip_check(hipEventCreateWithFlags(&fork, hipEventDisableTiming), "create MoE fork event");
+            hip_check(hipEventCreateWithFlags(&join, hipEventDisableTiming), "create MoE join event");
         } catch (...) { cleanup(); throw; }
     }
     void cleanup() noexcept {
@@ -174,8 +173,8 @@ struct HipMoeSiblingStreams::Impl {
                 counters.fork_join_tokens < std::numeric_limits<std::uint64_t>::max(), "MoE sibling counters exhausted");
         guard->require_original();
         hipStreamCaptureStatus main_capture{}, side_capture{};
-        check(hipStreamIsCapturing(main, &main_capture), "query MoE main capture");
-        check(hipStreamIsCapturing(side, &side_capture), "query MoE side capture");
+        hip_check(hipStreamIsCapturing(main, &main_capture), "query MoE main capture");
+        hip_check(hipStreamIsCapturing(side, &side_capture), "query MoE side capture");
         require(main_capture == hipStreamCaptureStatusNone && side_capture == hipStreamCaptureStatusNone,
                 "MoE sibling phase one rejects graph capture");
         position = p; committed_before = committed; expected = schedule == MoeTokenSchedule::fork_join ? layers : 0U; forks = joins = 0;
@@ -203,18 +202,18 @@ void HipMoeSiblingStreams::fork_shared(std::uint32_t layer) {
     require(s.forks < s.expected, "too many MoE sibling forks");
     s.layer = layer; s.phase = Impl::Phase::forking;
     try {
-        check(hipEventRecord(s.fork, s.main), "record shared producer-ready");
+        hip_check(hipEventRecord(s.fork, s.main), "record shared producer-ready");
         trace_dependency(QueueDependencyKind::event_record,s.main,s.fork,layer);
         ++s.counters.fork_records; // Actual successful fork-event recording, even if a later operation fails.
         s.work.state = HipMoeWorkState::submitted;
-        check(hipStreamWaitEvent(s.side, s.fork, 0), "side waits for shared input producer");
+        hip_check(hipStreamWaitEvent(s.side, s.fork, 0), "side waits for shared input producer");
         trace_dependency(QueueDependencyKind::event_wait,s.side,s.fork,layer);
     } catch (...) { s.abort(); throw; }
     });
 }
 void HipMoeSiblingStreams::record_shared_done(std::uint32_t layer) {
     auto& s = *impl_; s.protected_call([&] { s.expected_phase(Impl::Phase::forking, layer);
-    try { check(hipEventRecord(s.join, s.side), "record shared branch done");
+    try { hip_check(hipEventRecord(s.join, s.side), "record shared branch done");
         trace_dependency(QueueDependencyKind::event_record,s.side,s.join,layer); }
     catch (...) { s.abort(); throw; }
     ++s.forks; s.phase = Impl::Phase::shared_recorded;
@@ -227,7 +226,7 @@ void HipMoeSiblingStreams::begin_experts(std::uint32_t layer) {
 }
 void HipMoeSiblingStreams::join_before_combine(std::uint32_t layer) {
     auto& s = *impl_; s.protected_call([&] { s.expected_phase(Impl::Phase::routed, layer);
-    try { check(hipStreamWaitEvent(s.main, s.join, 0), "main joins shared before combine");
+    try { hip_check(hipStreamWaitEvent(s.main, s.join, 0), "main joins shared before combine");
         trace_dependency(QueueDependencyKind::event_wait,s.main,s.join,layer); }
     catch (...) { s.abort(); throw; }
     ++s.joins; ++s.counters.join_waits; s.phase = Impl::Phase::idle;
@@ -243,8 +242,8 @@ void HipMoeSiblingStreams::verify_before_commit() {
         s.work.main_completion = hipStreamSynchronize(s.main);
         s.work.side_completion = hipStreamQuery(s.side);
         s.work.completion_queried = true;
-        check(s.work.main_completion, "drain main including shared joins");
-        check(s.work.side_completion, "prove shared stream complete before publication");
+        hip_check(s.work.main_completion, "drain main including shared joins");
+        hip_check(s.work.side_completion, "prove shared stream complete before publication");
         s.work.gpu_completed = true; s.work.state = HipMoeWorkState::gpu_completed;
         s.guard->require_original();
     } catch (...) { s.abort(); throw; }

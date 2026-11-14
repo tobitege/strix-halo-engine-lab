@@ -1,5 +1,6 @@
 // minimax-m3 fused post-exchange kernel (declared order: strix/minimax_moe.hpp).
 #include "strix/hip_minimax_moe.hpp"
+#include "moe_core/route.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"  // dev::transform_block (STRIX_MM_XB_PREP)
 
 #include <cstdint>
@@ -12,7 +13,32 @@ namespace {
 
 constexpr unsigned kWaves = kNormThreads / 32;
 
-template <unsigned Ilp>
+// Strided views of one row's scores in the [2][kExperts][rows] scratch.
+struct RowScores {
+    const float* base;
+    std::uint32_t stride;
+    __device__ float operator[](std::uint32_t e) const { return base[static_cast<std::size_t>(e) * stride]; }
+};
+
+template <class Scores>
+struct StridedRoutePolicy {
+    static constexpr unsigned experts = kExperts, top_k = kTopE;
+    static constexpr float sum_eps = kSumEps, route_scale = kRouteScale;
+    Scores sc, ch;
+    unsigned r;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ float score(std::uint32_t e) const { return sc[e]; }
+    __device__ bool better(std::uint32_t e, std::uint32_t pick) const { return ch[e] > ch[pick]; }
+    __device__ void write_id(unsigned k, std::uint32_t id) const { ids[r * kTopE + k] = id; }
+    __device__ void write_weight(unsigned k, std::uint32_t, float weight) const {
+        weights[r * kTopE + k] = weight;
+    }
+};
+
+// Sum: exchange row fold (xport/row_fold.hpp). part0 is the folded slot = rank 0's partial + rank 1's partial, already
+// added by the exchange progress thread with the same binary32 addition; part1 is null. x = h + folded: same bits.
+template <unsigned Ilp, bool Sum = false>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
     __shared__ __attribute__((aligned(16))) float hs[kHidden];  // 16-byte aligned: mode 2 stages float4 rows here
     __shared__ __attribute__((aligned(16))) float ys[kHidden];
@@ -39,7 +65,7 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
     }
     float* h = v.h + static_cast<std::size_t>(r) * kHidden;
     const float* p0 = v.part0 + static_cast<std::size_t>(r) * kHidden;
-    const float* p1 = v.part1 + static_cast<std::size_t>(r) * kHidden;
+    const float* p1 = Sum ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
     float acc = 0.0F;
     if constexpr (Ilp == 2) {  // STRIX_MM_XB_POSTILP mode 2: the partials (GPU-uncached exchange slots) staged into LDS
         // with coalesced 16-byte loads (4x fewer uncached requests), then the plain chain reads them from LDS: same
@@ -48,15 +74,19 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         const auto* p0v = reinterpret_cast<const float4*>(p0);
         const auto* p1v = reinterpret_cast<const float4*>(p1);
         for (unsigned k = t; k < kHidden / 4U; k += kNormThreads) {
-            const float4 x0 = p0v[k], x1 = p1v[k];
-            reinterpret_cast<float4*>(hs)[k] = x0;
-            reinterpret_cast<float4*>(ys)[k] = x1;
+            if constexpr (Sum) {
+                reinterpret_cast<float4*>(hs)[k] = p0v[k];
+            } else {
+                const float4 x0 = p0v[k], x1 = p1v[k];
+                reinterpret_cast<float4*>(hs)[k] = x0;
+                reinterpret_cast<float4*>(ys)[k] = x1;
+            }
         }
         __syncthreads();
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
-            const float x = hv[q] + (hs[j] + ys[j]);
+            const float x = Sum ? hv[q] + hs[j] : hv[q] + (hs[j] + ys[j]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -70,19 +100,19 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
             const unsigned j = t + q * kNormThreads;
             a[q] = h[j];
             b[q] = p0[j];
-            c[q] = p1[j];
+            c[q] = Sum ? 0.0F : p1[j];
         }
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
-            const float x = a[q] + (b[q] + c[q]);
+            const float x = Sum ? a[q] + b[q] : a[q] + (b[q] + c[q]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
         }
     } else {
         for (unsigned j = t; j < kHidden; j += kNormThreads) {
-            const float x = h[j] + (p0[j] + p1[j]);
+            const float x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -135,23 +165,7 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
     }
     __syncthreads();
     if (t == 0) {
-        std::uint32_t best[kTopE];
-        for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-            std::uint32_t pick = kExperts;
-            for (std::uint32_t e = 0; e < kExperts; ++e) {
-                bool taken = false;
-                for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-                if (taken) continue;
-                if (pick == kExperts || ch[e] > ch[pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-            }
-            best[k] = pick;
-        }
-        float sum = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[best[k]];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            v.ids[r * kTopE + k] = best[k];
-            v.weights[r * kTopE + k] = (sc[best[k]] / (sum + kSumEps)) * kRouteScale;
-        }
+        strix::moe_core::route_topk(StridedRoutePolicy<const float*>{sc, ch, r, v.ids, v.weights});
     }
 }
 
@@ -210,23 +224,7 @@ __global__ __launch_bounds__(kNormThreads) void router_batch_kernel(
     __syncthreads();
     if (t < R && first + t < rows) {
         const unsigned row = t, r = first + row;
-        std::uint32_t best[kTopE];
-        for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-            std::uint32_t pick = kExperts;
-            for (std::uint32_t e = 0; e < kExperts; ++e) {
-                bool taken = false;
-                for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-                if (taken) continue;
-                if (pick == kExperts || ch[row][e] > ch[row][pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-            }
-            best[k] = pick;
-        }
-        float sum = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[row][best[k]];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            ids[r * kTopE + k] = best[k];
-            weights[r * kTopE + k] = (sc[row][best[k]] / (sum + kSumEps)) * kRouteScale;
-        }
+        strix::moe_core::route_topk(StridedRoutePolicy<const float*>{sc[row], ch[row], r, ids, weights});
     }
 }
 
@@ -289,36 +287,13 @@ __global__ __launch_bounds__(kNormThreads) void router_tiled_kernel(std::uint32_
     }
 }
 
-// Strided views of one row's scores in the [2][kExperts][rows] scratch.
-struct RowScores {
-    const float* base;
-    std::uint32_t stride;
-    __device__ float operator[](std::uint32_t e) const { return base[static_cast<std::size_t>(e) * stride]; }
-};
-
 __global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, const float* scores, std::uint32_t* ids,
                                                             float* weights) {
     const unsigned r = blockIdx.x * 256U + threadIdx.x;
     if (r >= rows) return;
     const RowScores sc{scores + r, rows};
     const RowScores ch{scores + static_cast<std::size_t>(kExperts) * rows + r, rows};
-    std::uint32_t best[kTopE];
-    for (unsigned k = 0; k < kTopE; ++k) {  // k-th best by (choice desc, id asc) among the not yet taken
-        std::uint32_t pick = kExperts;
-        for (std::uint32_t e = 0; e < kExperts; ++e) {
-            bool taken = false;
-            for (unsigned q = 0; q < k; ++q) taken |= best[q] == e;
-            if (taken) continue;
-            if (pick == kExperts || ch[e] > ch[pick]) pick = e;  // ascending scan: equal choice keeps the smaller id
-        }
-        best[k] = pick;
-    }
-    float sum = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[best[k]];
-    for (unsigned k = 0; k < kTopE; ++k) {
-        ids[r * kTopE + k] = best[k];
-        weights[r * kTopE + k] = (sc[best[k]] / (sum + kSumEps)) * kRouteScale;
-    }
+    strix::moe_core::route_topk(StridedRoutePolicy<RowScores>{sc, ch, r, ids, weights});
 }
 
 }  // namespace
@@ -328,6 +303,7 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
         const auto* hb = reinterpret_cast<const char*>(v.h);
         const auto* he = hb + std::size_t{v.rows} * kHidden * sizeof(float);
         for (const float* p : {v.part0, v.part1}) {
+            if (p == nullptr) continue;  // folded exchange: one slot
             const auto* pb = reinterpret_cast<const char*>(p);
             const auto* pe = pb + std::size_t{v.rows} * kHidden * sizeof(float);
             if (pb < he && hb < pe) throw std::invalid_argument("minimax post-exchange: ilp form with h overlapping a partial");
@@ -335,7 +311,11 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     }
     if (v.ilp == 2 && ((reinterpret_cast<std::uintptr_t>(v.part0) | reinterpret_cast<std::uintptr_t>(v.part1)) & 15U) != 0)
         throw std::invalid_argument("minimax post-exchange: ilp mode 2 needs 16-byte aligned partials");
-    if (v.ilp == 2) hipLaunchKernelGGL(post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
+        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else hipLaunchKernelGGL((post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.ilp == 2) hipLaunchKernelGGL(post_exchange_kernel<2>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     else if (v.ilp == 1) hipLaunchKernelGGL(post_exchange_kernel<1>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     else hipLaunchKernelGGL(post_exchange_kernel<0>, dim3(v.rows), dim3(kNormThreads), 0, stream, v);
     const hipError_t e = hipGetLastError();

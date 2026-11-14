@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/serve/prompt_service.hpp"
 #include "strix/serve/short_first.hpp"
 
 #include <algorithm>
@@ -43,6 +44,10 @@ enum class Mode : std::uint32_t { off = 0, defer = 1, interleave = 2 };
 struct Options {
     Mode mode = Mode::off;
     double starve_seconds = 30.0;
+    // interleave: prefill of waiting prompts before the next decode step, selected by the live concurrency
+    // (serve::AdmitFirst; STRIX_SERVE_ADMIT_FIRST=auto|0|1, _MIN_LIVE, _GAP_MS). Same prefill path, pieces and units
+    // either way, so the same tokens.
+    serve::AdmitFirst admit_first;
     double tdev_a = 0.17, tdev_b = 0.00169;  // T_dev(P) = a + b P seconds (measured on the two-node pair)
     std::uint32_t unit_rows = 256;           // interleave: rows of one unit while requests decode
     // interleave: prompts shorter than this run their whole prefill at once (no task). On the pair T_dev(64) ~ 0.28 s:
@@ -92,6 +97,7 @@ inline Options options_from(bool device_prefill, Env env) {
     // default interleave with the device prefill since P17.2 (decode stalls <= ~1 s while a long prompt prefills)
     o.mode = mode_for(env("STRIX_DS41_SERVE_SCHED"), device_prefill);
     if (const auto s = env("STRIX_DS41_SERVE_SCHED_STARVE_MS"); !s.empty()) o.starve_seconds = std::stod(s) / 1e3;
+    o.admit_first = serve::AdmitFirst::from_env(env);
     if (const auto s = env("STRIX_DS41_SERVE_SCHED_TDEV"); !s.empty()) {
         const auto c = s.find(',');
         if (c == std::string::npos) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED_TDEV is \"a,b\" (seconds, seconds per token)");

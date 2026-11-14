@@ -9,6 +9,8 @@
 #include "strix/execution_arena.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/runtime_launchers.hpp"
+#include "strix/rows_launch_registry.hpp"
+#include "strix/known_window_cohort.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <exception>
 #include <limits>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <stdexcept>
@@ -277,7 +280,7 @@ struct KnownWindowRun::State {
     const CompiledSerialExecution& serial;
     const ExecutionRuntimeResources& serial_resources;
     const ExecutionMemoryBinding& window_scratch;
-    SerialSessionContext& session;
+    SerialSessionContext* session;
     KnownWindowExecutionHooks hooks;
     std::chrono::steady_clock::time_point timing_mark;
     bool admission_only = false, completed = false, failed = false;
@@ -292,13 +295,47 @@ struct KnownWindowRun::State {
     std::vector<std::vector<ExecutionDispatchContext>> contexts;
     std::vector<const KnownWindowR2Entry*> selected;
     std::vector<const KnownWindowRowsEntry*> selected_rows;
+    const void* binding_preflight_key = nullptr;
     std::vector<DirectLaunchDispatcher> dispatchers;
     KnownWindowResult result;
     SessionStateAddress position_state{};
+    const void* preflight_key = nullptr;
+    std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
+    std::vector<const CompiledLaunchPlan*> launch_keys;
+    std::span<const KnownWindowR2Entry> r2_entries;
+    std::span<const KnownWindowRowsEntry> rows_entries;
+    ExecutionRuntimeResources resource_key;
+    ExecutionMemoryBinding scratch_key;
+    bool admitted = false;
 
     State(const CompiledKnownPrefixWindow& w, const CompiledSerialExecution& s, const ExecutionRuntimeResources& r,
         const ExecutionMemoryBinding& scratch, SerialSessionContext& session_ref, const KnownWindowExecutionHooks& h)
-        : window(w), serial(s), serial_resources(r), window_scratch(scratch), session(session_ref), hooks(h) {}
+        : window(w), serial(s), serial_resources(r), window_scratch(scratch), session(&session_ref), hooks(h),
+          resource_key(r), scratch_key(scratch) {}
+
+    bool reusable(const CompiledKnownPrefixWindow& w, const CompiledSerialExecution& s,
+        const ExecutionRuntimeResources& r, const ExecutionMemoryBinding& scratch,
+        std::span<const CompiledLaunchPlan* const> launch,
+        std::span<const KnownWindowR2Entry> r2, std::span<const KnownWindowRowsEntry> wide,
+        const KnownWindowExecutionHooks& h) const {
+        // Resource objects behind these bindings are immutable under the preflight memo
+        // contract. Check rebinding too; contexts retain pointers into this State.
+        const auto bindings = [](const ExecutionRuntimeResources& v) {
+            return std::tie(v.scratch, v.model_manifest, v.model_weights, v.tensor_access,
+                v.session_state_layout, v.session_state_memory, v.ple_lookup, v.ple_hash_contract,
+                v.ple_prefetch, v.distributed_stage, v.qsa_committed_pool, v.qsa_pool_speculative);
+        };
+        return admitted && &window == &w && &serial == &s && &serial_resources == &r &&
+            &window_scratch == &scratch && rows == w.logical_rows && steps == s.execution.steps.size() &&
+            preflight_key == launch.front() && h.preflight_slots && preflight_slots == *h.preflight_slots &&
+            std::equal(launch.begin(), launch.end(), launch_keys.begin(), launch_keys.end()) &&
+            r2_entries.data() == r2.data() && r2_entries.size() == r2.size() &&
+            rows_entries.data() == wide.data() && rows_entries.size() == wide.size() &&
+            bindings(resource_key) == bindings(r) &&
+            std::tie(scratch_key.execution_identity, scratch_key.arena_base, scratch_key.arena_bytes,
+                scratch_key.allocation_generation) ==
+            std::tie(scratch.execution_identity, scratch.arena_base, scratch.arena_bytes, scratch.allocation_generation);
+    }
 
     void materialize_position(const ExecutionDispatchContext& context, std::uint64_t value) const {
         const auto current = resolve_dispatch_state(context, SessionStateComponent::position_history);
@@ -333,19 +370,31 @@ KnownWindowRun::KnownWindowRun(
     std::span<const CompiledLaunchPlan* const> row_launch,
     std::span<const KnownWindowR2Entry> r2_entries,
     std::span<const KnownWindowRowsEntry> rows_entries,
-    const KnownWindowExecutionHooks& hooks_source, bool caller_scopes)
-    : state_(std::make_unique<State>(window, serial, serial_resources, window_scratch, session, hooks_source)) {
-    auto& st = *state_;
-    const auto& hooks = st.hooks;
+    const KnownWindowExecutionHooks& hooks_source, bool caller_scopes) {
     host_phase_mark("5 captured window prologue");
     const auto timing_begin = std::chrono::steady_clock::now();
-    auto& timing_mark = st.timing_mark;
-    timing_mark = timing_begin;
     // A repeat window of the same owner and launch plans re-checks only what changes per
     // window (tokens, positions, capacity, session); its static admission already passed.
     const void* preflight_key = row_launch.empty() ? nullptr : static_cast<const void*>(row_launch.front());
-    const bool preflight_known = hooks.preflight_memo && preflight_key &&
-        std::find(hooks.preflight_memo->begin(), hooks.preflight_memo->end(), preflight_key) != hooks.preflight_memo->end();
+    const bool preflight_known = hooks_source.preflight_memo && preflight_key &&
+        std::find(hooks_source.preflight_memo->begin(), hooks_source.preflight_memo->end(), preflight_key) != hooks_source.preflight_memo->end();
+    auto* cache = hooks_source.run_cache;
+    const bool reuse = preflight_known && cache && cache->state_ &&
+        cache->state_->reusable(window, serial, serial_resources, window_scratch,
+            row_launch, r2_entries, rows_entries, hooks_source);
+    if (reuse) state_ = std::move(cache->state_);
+    else {
+        if (cache) cache->state_.reset();
+        state_ = std::make_unique<State>(window, serial, serial_resources, window_scratch, session, hooks_source);
+    }
+    auto& st = *state_;
+    st.binding_preflight_key = preflight_key;
+    st.session = &session; st.hooks = hooks_source;
+    st.admission_only = st.completed = st.failed = false;
+    st.result = {}; st.next_lineage = {};
+    const auto& hooks = st.hooks;
+    auto& timing_mark = st.timing_mark;
+    timing_mark = timing_begin;
     const auto rows = window.logical_rows;
     st.rows = rows;
     const auto slot_count = serial.execution.steps.size() * rows;
@@ -422,11 +471,12 @@ KnownWindowRun::KnownWindowRun(
     }
     auto& resources = st.resources;
     auto& requests = st.requests;
-    resources.reserve(rows);
-    for (std::size_t r = 0; r < rows; ++r) resources.push_back(serial_resources);
-    requests.resize(rows);
+    if (!reuse) {
+        resources.assign(rows, serial_resources);
+        for (auto& resource : resources) resource.scratch = &window_scratch;
+        requests.resize(rows);
+    }
     for (std::size_t r = 0; r < rows; ++r) {
-        resources[r].scratch = &window_scratch;
         requests[r].input_token_id = tokens[r];
         requests[r].position = session.next_position + r;
         requests[r].state = session.state;
@@ -459,24 +509,26 @@ KnownWindowRun::KnownWindowRun(
     if (steps > std::numeric_limits<std::uint32_t>::max() / rows)
         throw std::overflow_error("known window logical row-step count overflow");
     auto& contexts = st.contexts;
-    contexts.resize(steps);
-    for (auto& step_rows : contexts) step_rows.resize(rows);
     auto& selected = st.selected;
     auto& selected_rows = st.selected_rows;
-    selected.assign(steps, nullptr);
-    selected_rows.assign(steps, nullptr);
-    std::array<bool, known_window_r2_variant_slots> seen{};
-    for (const auto& entry : r2_entries) {
-        const auto id = static_cast<std::uint32_t>(entry.variant);
-        if (id == 0 || id > 3U || seen[id] || !entry.config || !entry.preflight || !entry.launch)
-            throw std::invalid_argument("known window R2 entry table is invalid or ambiguous");
-        seen[id] = true;
-    }
-    for(const auto& entry:rows_entries) {
-        const auto id=static_cast<std::uint32_t>(entry.variant);
-        if(id<4U || id>=seen.size() || seen[id] || !entry.config || !entry.preflight || !entry.launch)
-            throw std::invalid_argument("known window wide entry table is invalid or ambiguous");
-        seen[id]=true;
+    if (!reuse) {
+        contexts.resize(steps);
+        for (auto& step_rows : contexts) step_rows.resize(rows);
+        selected.assign(steps, nullptr);
+        selected_rows.assign(steps, nullptr);
+        std::array<bool, known_window_r2_variant_slots> seen{};
+        for (const auto& entry : r2_entries) {
+            const auto id = static_cast<std::uint32_t>(entry.variant);
+            if (id == 0 || id > 3U || seen[id] || !entry.config || !entry.preflight || !entry.launch)
+                throw std::invalid_argument("known window R2 entry table is invalid or ambiguous");
+            seen[id] = true;
+        }
+        for(const auto& entry:rows_entries) {
+            const auto id=static_cast<std::uint32_t>(entry.variant);
+            if(id<4U || id>=seen.size() || seen[id] || !entry.config || !entry.preflight || !entry.launch)
+                throw std::invalid_argument("known window wide entry table is invalid or ambiguous");
+            seen[id]=true;
+        }
     }
     auto& result = st.result;
     result.logits.resize(window.logit_row_indices.size());
@@ -496,6 +548,10 @@ KnownWindowRun::KnownWindowRun(
                 pending_writes[flag] = checked_add(pending_writes[flag], rows, "known window state-write count overflow");
         for (std::size_t r = 0; r < rows; ++r) {
             auto& c = contexts[i][r];
+            // These are the only per-cycle dispatch fields. Resource/session bindings
+            // are retained only while the owner and its preflight key still match.
+            c.position = requests[r].position; c.input_token_id = tokens[r];
+            if (reuse) continue;
             const auto& plan = window.row_plan[r];
             const auto& io = plan.io.steps[i];
             const auto& binding = plan.bindings.bindings[i];
@@ -506,10 +562,9 @@ KnownWindowRun::KnownWindowRun(
             c.session_state_layout = resources[r].session_state_layout;
             c.session_state_memory = resources[r].session_state_memory;
             c.resources = &resources[r]; c.reads_state = step.reads_state; c.writes_state = step.writes_state;
-            c.position = requests[r].position; c.input_token_id = tokens[r];
             if (!binding.host_or_runtime_step) c.kernel_id = std::string_view(*binding.kernel_id);
         }
-        if (window.mode[i] != KnownWindowStepMode::r1_row_loop) {
+        if (!reuse && window.mode[i] != KnownWindowStepMode::r1_row_loop) {
             // QSA rows read each row's own context position, never the host word.
             if (window_reads_position(step.reads_state) && window.mode[i]!=KnownWindowStepMode::qsa_rows)
                 throw std::invalid_argument("known window promoted entries cannot consume host position history");
@@ -563,6 +618,10 @@ KnownWindowRun::KnownWindowRun(
     };
     for (std::size_t i = 0; i < steps && !preflight_known; ++i) {
         if(selected_rows[i]) {
+            const KnownWindowRowsBindingScope binding(hooks.rows_binding_cache, preflight_key,
+                hooks.preflight_slots, i, rows, steps,
+                {reinterpret_cast<std::uintptr_t>(selected_rows[i]->preflight),
+                 reinterpret_cast<std::uintptr_t>(selected_rows[i]->config)});
             if (needs(i, 0, selected_rows[i]->preflight, selected_rows[i]->config))
                 selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
         } else if (selected[i]) {
@@ -588,6 +647,13 @@ KnownWindowRun::KnownWindowRun(
     if (hooks.preflight_memo && !preflight_known) hooks.preflight_memo->push_back(preflight_key);
     // Slots this admission proved; a later plan of the owner compares against the newest ones.
     if (!proven.empty()) *hooks.preflight_slots = std::move(proven);
+    if (!reuse && hooks.run_cache) {
+        st.preflight_key = preflight_key;
+        if (hooks.preflight_slots) st.preflight_slots = *hooks.preflight_slots;
+        st.launch_keys.assign(row_launch.begin(), row_launch.end());
+        st.r2_entries = r2_entries; st.rows_entries = rows_entries;
+        st.admitted = true;
+    }
     if (hooks.preflight_only) { st.admission_only = true; return; }
     { const auto ms = window_ms_since(timing_mark); window_host_timing().plan += ms;
       if (preflight_known) { window_host_timing().known_plan += ms; ++window_host_timing().known; } }
@@ -609,8 +675,11 @@ KnownWindowRun::KnownWindowRun(
     }
     host_phase_mark("6d lineage recipe");
     auto& dispatchers = st.dispatchers;
-    dispatchers.reserve(rows);
-    for(const auto* plan:row_launch) dispatchers.emplace_back(*plan);
+    // Admission-only runs have no dispatchers yet; otherwise the launch key owns them.
+    if (dispatchers.empty()) {
+        dispatchers.reserve(rows);
+        for(const auto* plan:row_launch) dispatchers.emplace_back(*plan);
+    }
     // As in the serial session API, a lookup start that returns no handle or
     // throws before host/device mutation is an admission/start failure, not a
     // poisoned target. The backend owns cancellation of any failed start.
@@ -626,7 +695,19 @@ KnownWindowRun::KnownWindowRun(
     }
 }
 
-KnownWindowRun::~KnownWindowRun() = default;
+KnownWindowRunCache::KnownWindowRunCache() = default;
+KnownWindowRunCache::~KnownWindowRunCache() = default;
+
+KnownWindowRun::~KnownWindowRun() {
+    if (!state_ || !state_->admitted || state_->failed) return;
+    auto* cache = state_->hooks.run_cache;
+    if (!cache) return;
+    // Scopes and callbacks belong to this call (cohort callbacks may borrow stack
+    // members). Release them before retaining immutable admission data for the owner.
+    state_->arena_lookup.reset(); state_->binding_scope.reset();
+    state_->hooks = {}; state_->session = nullptr;
+    cache->state_ = std::move(state_);
+}
 bool KnownWindowRun::admission_only() const noexcept { return state_->admission_only; }
 std::size_t KnownWindowRun::steps() const noexcept { return state_->steps; }
 std::uint32_t KnownWindowRun::rows() const noexcept { return state_->rows; }
@@ -684,12 +765,44 @@ void KnownWindowRun::launch_step(std::size_t i) {
                 joint_scope.emplace(correlation);
                 joint_elapsed.emplace(ExecutionPhase::operator_step);
             }
-            if(selected_rows[i]) selected_rows[i]->launch(contexts[i],selected_rows[i]->config);
+            if(selected_rows[i]) {
+                const KnownWindowRowsBindingScope binding(hooks.rows_binding_cache, st.binding_preflight_key,
+                    hooks.preflight_slots, i, rows, steps,
+                    {reinterpret_cast<std::uintptr_t>(selected_rows[i]->preflight),
+                     reinterpret_cast<std::uintptr_t>(selected_rows[i]->config)});
+                selected_rows[i]->launch(contexts[i],selected_rows[i]->config);
+            }
             else selected[i]->launch(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+first,2U),selected[i]->config);
             st.record_promoted(i, width);
         }
         observe();
         return;
+    }
+    // A row-loop step with a registered rows form (token embedding, hyper expand, inject: the same per-element
+    // arithmetic, every row admitted as its one-row launch admits it) runs all rows in one launch when the form
+    // takes them (buffers at one pitch); otherwise row by row below. Position readers, PLE, runtime steps, the
+    // terminal head and a wrapped launcher (the MTP capture tap) stay per row. STRIX_WINDOW_ROW_LOOP_ROWS=0: per row.
+    static const bool rows_loops = [] { const char* v = std::getenv("STRIX_WINDOW_ROW_LOOP_ROWS"); return !v || v[0] != '0'; }();
+    if (rows_loops && !known_window_cohort_feature_off("rowloop") && rows > 1U && i + 1U != steps && !window_reads_position(step.reads_state) && step.op != SerialOp::ple &&
+        !current_execution_telemetry()) {
+        const CompiledStepLauncher* first = nullptr;
+        bool same = true;
+        for (std::size_t r = 0; r < rows && same; ++r) {
+            const auto* launcher = window.row_plan[r].bindings.bindings[i].host_or_runtime_step ? nullptr :
+                st.dispatchers[r].kernel_launcher(contexts[i][r]);
+            if (r == 0) first = launcher;
+            same = launcher && launcher->function == first->function && launcher->user_data == first->user_data;
+        }
+        if (const auto batched = same ? rows_launch_for(first->function) : nullptr;
+            batched && batched(std::span<const ExecutionDispatchContext>(contexts[i].data(), rows), first->user_data)) {
+            for (std::size_t r = 0; r < rows; ++r) {
+                ++result.execution.kernel_steps; ++result.row_loop_dispatches; ++result.execution.completed_steps;
+                result.execution.completion_order.push_back(step.id);
+                result.execution.state.publish_write(step.writes_state);
+            }
+            observe();
+            return;
+        }
     }
     for (std::size_t r = 0; r < rows; ++r) {
         const auto& context = contexts[i][r];
@@ -756,15 +869,15 @@ void KnownWindowRun::fail() {
     st.failed = true;
     if (st.serial_resources.ple_lookup && st.serial_resources.ple_prefetch)
         cancel_ple_lookup_prefetch(*st.serial_resources.ple_lookup, *st.serial_resources.ple_prefetch);
-    st.session.health = SerialSessionHealth::poisoned;
-    st.session.arithmetic_lineage.tainted = true;
+    st.session->health = SerialSessionHealth::poisoned;
+    st.session->arithmetic_lineage.tainted = true;
     try { st.hooks.quiesce_or_fail_stop(); } catch (...) { std::terminate(); }
 }
 
 KnownWindowResult KnownWindowRun::publish() {
     auto& st = *state_;
     if (!st.completed || st.failed) throw std::logic_error("known window publication requires a completed window");
-    auto& session = st.session;
+    auto& session = *st.session;
     const auto rows = st.rows;
     session.state = st.result.execution.state;
     session.arithmetic_lineage = std::move(st.next_lineage);

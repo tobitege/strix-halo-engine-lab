@@ -1,0 +1,7 @@
+# Registry of the example family (same schema as the repository's models/registry.toml).
+schema = 'strix-registry/v1'
+
+[models.skeleton]
+name = 'skeleton'
+family = 'skeleton'
+description = 'models/skeleton.toml'

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/hip_check.hpp"
 #include "strix/deferred_moe_status.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -23,8 +24,8 @@ public:
         resources_.session_state_memory=&shadow_.binding();
         try {
             guard_->require_original();
-            check(hipStreamCreateWithFlags(&scope_.stream,hipStreamNonBlocking),"create deferred MoE stream");
-            check(hipMalloc(&device_,sizeof(host_)),"allocate deferred MoE first-error record");
+            strix::hip_check(hipStreamCreateWithFlags(&scope_.stream,hipStreamNonBlocking),"create deferred MoE stream");
+            strix::hip_check(hipMalloc(&device_,sizeof(host_)),"allocate deferred MoE first-error record");
             scope_.deferred_moe_status={execution_identity,reinterpret_cast<std::uintptr_t>(device_),sizeof(host_),status_generation};
         } catch (...) {
             guard_->recover_or_fail_stop();
@@ -49,14 +50,14 @@ public:
         // This conservative reset still precedes serial preflight. Moving it to
         // construction plus a dirty-state protocol needs owner-level recovery
         // injection coverage; do not infer zero queue work from a preflight error.
-        try { check(hipMemsetAsync(device_,0,sizeof(host_),scope_.stream),"clear deferred MoE first-error record"); }
+        try { strix::hip_check(hipMemsetAsync(device_,0,sizeof(host_),scope_.stream),"clear deferred MoE first-error record"); }
         catch (...) { abort();throw; }
     }
     void complete_before_commit() {
         if(!pending_)throw std::logic_error("deferred MoE completion without active token");
         try {
-            check(hipMemcpyAsync(&host_,device_,sizeof(host_),hipMemcpyDeviceToHost,scope_.stream),"read deferred MoE first-error record");
-            check(hipStreamSynchronize(scope_.stream),"drain deferred MoE token");
+            strix::hip_check(hipMemcpyAsync(&host_,device_,sizeof(host_),hipMemcpyDeviceToHost,scope_.stream),"read deferred MoE first-error record");
+            strix::hip_check(hipStreamSynchronize(scope_.stream),"drain deferred MoE token");
             guard_->require_original();pending_=false;
             strix::check_deferred_moe_status(host_);
             shadow_.publish();++completed_tokens_;
@@ -73,9 +74,6 @@ public:
     [[nodiscard]] const strix::ExecutionRuntimeResources& resources() const noexcept { return resources_; }
     [[nodiscard]] std::uint64_t completed_tokens() const noexcept { return completed_tokens_; }
 private:
-    static void check(hipError_t e,const char* operation) {
-        if(e!=hipSuccess)throw std::runtime_error(std::string(operation)+": "+hipGetErrorString(e));
-    }
     static const strix::SerialSessionStateLayout& layout(const strix::ExecutionRuntimeResources& r) {
         if(!r.session_state_layout)throw std::invalid_argument("deferred MoE missing state layout");
         return *r.session_state_layout;

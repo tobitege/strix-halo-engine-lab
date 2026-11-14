@@ -101,7 +101,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_WIDE", "0"},           {"STRIX_MM_INDEX_CONC", "0"},       {"STRIX_MMX_CRC", "1"},
     {"STRIX_MM_XB_WAIT", "0"},             {"STRIX_MM_XB_INPLACE", "0"},       {"STRIX_MM_XB_PUBLISH", "0"},
     {"STRIX_MM_XB_POSTILP", "0"},          {"STRIX_MM_XB_WARM", "0"},          {"STRIX_MM_DSPARK_ATTN", "0"},
-    {"STRIX_MM_DRAFT_LIN", "lib"},         {"STRIX_MMX_PREFILL_CORE", "lib"},  {"STRIX_MM_PF_MSA_BATCH", "0"},
+    {"STRIX_MM_DRAFT_LIN", "lib"},         {"STRIX_MM_PF_MSA_BATCH", "0"},
     {"STRIX_MMX_LINEAR_V11", "0"},
     {"STRIX_MM_MARKOV", "full"},           {"STRIX_MM_MARKOV_C", "1024"},      {"STRIX_MM_MARKOV_H", "2048"},
     {"STRIX_MM_MARKOV_TOPC", "v1"},
@@ -109,7 +109,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
-    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PF_IDX_TILE", "0"},
+    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PFX_JOINED", "0"},       {"STRIX_MM_PF_IDX_TILE", "0"},
     {"STRIX_MM_PF_IDX_ROWS", "32"},        {"STRIX_MMX_MOE_GU_INTERLEAVE", "0"}, {"STRIX_MMX_MOE_SINGLE", "0"},
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},      {"STRIX_MM_SELECT_ONCE", "0"},
@@ -315,7 +315,7 @@ void test_session_defaults() {
         auto negotiated = md::parse_cli("serve", {});
         check(negotiated.transport == "usb4gpu", "serve requests GPU transport by default");
         negotiated.transport = strix::dist::negotiated_transport(negotiated.transport,
-            direct_live, strix::dist::hyphen_transport);
+            direct_live, md::kRouteHost, md::kRouteGpu);
         for (const EnvMap& request : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "1"}}}) {
             for (const bool explicit_cli : {false, true}) {
                 const auto policy = md::session_policy(negotiated, lookup(request), explicit_cli);

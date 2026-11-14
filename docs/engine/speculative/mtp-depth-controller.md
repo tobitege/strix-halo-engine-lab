@@ -31,6 +31,22 @@ identifies the actual profile separately from native full-forward qualification.
 `STRIX_MTP_CACHE_AUDIT=1` performs bounded readback and hashes occupied proposer
 cache rows for diagnostic schedule comparisons; it must be off during timing.
 
+Schedule dependence of the proposer cache. With `mixed`, the first generated row
+of every cycle keeps the cache row written by the fast proposal path and the
+remaining rows are rebuilt by the Q8 producer, so the proposer cache bytes record
+where the cycles started. In a cohort the cycle boundaries follow wall-clock
+admission (`STRIX_BATCH_SERVICE_MS`), so two runs of the same requests can end
+with different proposer cache bytes and a different arithmetic lineage while
+tokens, logits, hidden states and the target state are bit-identical. With
+`fast` or `teacher` the proposer cache is a function of the tokens only.
+`STRIX_FINAL_STATE_DIGEST=1` therefore reports two digests per request:
+`final_target_state_digest` (target components only; compare this one across
+runs, cohort sizes and against a solo request) and `final_state_digest` (target
+plus proposer cache; schedule-invariant only with a uniform profile). Measured on
+one 1,192-token prompt, 64 generated tokens, single request: `mixed` 998 ms
+(12 cycles, 51/57 accepted), `fast` 1,032 ms (12 cycles, 51/62), `teacher`
+1,069 ms (13 cycles, 50/62); the default stays `mixed`.
+
 These controls remain opt-in proposals. CPU policy tests establish host decision
 contracts only. Qualification additionally requires native target tokens, full
 logits, canonical and physical state, proposer fidelity across cycle boundaries,

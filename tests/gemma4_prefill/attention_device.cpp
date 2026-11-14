@@ -195,7 +195,10 @@ int main(int argc, char** argv) try {
             flash_out.download(fast.data(), flash_out.size());
             double err = 0, ref = 0;
             for (std::size_t i = 0; i < fast.size(); ++i) { const double d = double(fast[i]) - actual[i]; err += d * d; ref += double(actual[i]) * actual[i]; }
-            std::printf("flash dim %u context %u rows %u: rel_rms %.3e\n", c.dim, c.context, c.rows, std::sqrt(err / ref));
+            unsigned long long bits = 1469598103934665603ULL; // FNV-1a of the output bytes: base-vs-new bitwise receipt
+            const auto* fb = reinterpret_cast<const unsigned char*>(fast.data());
+            for (std::size_t i = 0; i < fast.size() * sizeof(float); ++i) bits = (bits ^ fb[i]) * 1099511628211ULL;
+            std::printf("flash dim %u context %u rows %u: rel_rms %.3e flash_bits=%016llx\n", c.dim, c.context, c.rows, std::sqrt(err / ref), bits);
             CHECK(std::sqrt(err / ref) < 2e-3);
         }
         for (unsigned r : {0U, c.rows / 2, c.rows - 1}) for (unsigned h : {0U, 5U}) {

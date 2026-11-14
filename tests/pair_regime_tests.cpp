@@ -1,5 +1,6 @@
 // Shared two-node mode selection (include/strix/pair/regime.hpp) and stage balance (balance.hpp).
 #include "strix/pair/balance.hpp"
+#include "strix/pair/producer_publish.hpp"
 #include "strix/pair/regime.hpp"
 #include <array>
 #include <cstdio>
@@ -9,6 +10,13 @@ namespace {
 void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
 }
 int main() try {
+    {  // producer publication target: off by default, on once the channel flag is set
+        strix::pair::ProducerPublish target;
+        require(!target.on(), "a default producer target does not publish");
+        std::uint64_t flag = 0;
+        target.flag = &flag;
+        require(target.on(), "a producer target with a flag publishes");
+    }
     using strix::pair::Mode;
     const strix::pair::Policy policy;
     require(strix::pair::choose({2048, 4, 0, 0, true}, policy) == Mode::pipeline, "idle pair pipelines a multi-chunk prompt");

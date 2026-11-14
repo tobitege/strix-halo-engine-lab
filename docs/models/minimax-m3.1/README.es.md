@@ -9,6 +9,20 @@ condiciones y el comando de lanzamiento. Cómo se leen las tablas y qué cubre "
 [metodología](../../methodology.es.md). Instrucciones de compilación (biblioteca trellis incluida):
 [primeros pasos](../../getting-started/README.es.md); el par en sí: [dos nodos por USB4](../../pair.es.md).
 
+FAST_I4 opcional en borrador (`STRIX_MMX_MODEL_FORMAT=fast_i4`): el INT4 se produce por capa durante el prefill
+en dos búferes reutilizables; memoria +3.6 GiB; el contexto nunca se reduce; decode sin cambios. Los pesos EXL3
+siguen residentes para cada capa de decode y fila MTP. `STRIX_MMX_FAST_I4_SCOPE=all|gate_up` selecciona INT4 para
+todas las proyecciones de expertos (predeterminado) o solo gate/up. Por defecto INT4 se ejecuta en las capas MoE
+38-59 y las capas 3-37 siguen en EXL3 (`STRIX_MMX_FAST_I4_EXL3_LAYERS`, `none` = todas las capas), y los prompts de
+menos de 4096 filas hacen el prefill en EXL3 (`STRIX_MMX_FAST_I4_MIN_ROWS`): a 2K, KL 0.0139, coincidencia top-1
+96.5 %, dNLL +0.006 frente al formato exacto en cuatro prompts de chat. La conversión en serie es la predeterminada;
+`STRIX_MMX_FAST_I4_PREFETCH=1` activa la precarga ordenada por eventos, pendiente de cualificación de tiempos. Es una
+identidad numérica con pérdida pendiente de las puertas nativas de tiempo y calidad; no hereda la cualificación de la
+ruta exacta de producción. Con el alcance `all`, la cadena MoE INT4 fusionada se ejecuta una vez por chunk de 4096
+filas por defecto (`STRIX_MOE_I4_CHAIN=0` selecciona las llamadas sin fusionar, mismos bits): prefill 8K 12.12 s
+frente a 12.34 s sin fusionar (−1.7 %, ambos órdenes); 32K 55.23 s frente a 55.74 s (−0.9 %, seis pares, ambos órdenes); anclas iguales,
+los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill.md#draft-fast_i4).
+
 <a id="minimax-pair"></a>
 
 ## Ejecución
@@ -21,7 +35,10 @@ Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes
 
 El [resolutor](../../../src/minimax/engine/mm_defaults.cpp) activa el conjunto de producción de decode/prefill/intercambio,
 incluido el modo de prefill MSA 10 (bucle de chunks dentro del bloque con lista de bloques y parciales en LDS, sin
-parciales globales; `STRIX_MM_PF_MSA_REWORK=8` restablece el modo anterior, valores válidos de 0 a 10). `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
+parciales globales; `STRIX_MM_PF_MSA_REWORK=8` restablece el modo anterior, valores válidos de 0 a 10). Identidad FAST opcional: `STRIX_MM_PF_MSA_FLASH=1` (operandos BF16 de un término) o
+`2` (dos términos) ejecuta la atención MSA del prefill de las capas 40-59 en el núcleo flash compartido de WMMA
+dividido por claves (`STRIX_MM_PF_MSA_FLASH_LAYERS` elige las capas; ver
+[mm-pf-msa-flash](../../optimizations.md#mm-pf-msa-flash) para la puerta de calidad por conjunto de capas). `strix-minimax-serve` usa la admisión automática estructural de DSpark con assets
 locales compatibles; las peticiones elegibles sin contención pueden usar draft, mientras que las peticiones en competencia/agrupadas o no admitidas
 se quedan en simple. Véase [admisión y cualificación](../../engine/serving/dspark-auto-qualification.md).
 Una petición de sesión con nombre que no cabe en el contexto devuelve HTTP 400 `context_length_exceeded` (la
@@ -44,7 +61,10 @@ la ruta resuelta por `STRIX_MM_INDEX_PROJ` (`attn` predeterminada, `tiled`, `off
 (predeterminado 1) para decode/verificación (1–8 filas) y prompt (más de 8 filas): la ruta predeterminada `attn`
 carga solo la disposición empaquetada; `tiled` carga la disposición FP16 por bloques (decode, con
 `STRIX_MM_INDEX_DECODE=1`) y la FP16 traspuesta; `off` carga la FP32 traspuesta. Las salidas de prefill y decode
-son idénticas bit a bit a las obtenidas cargando todas las disposiciones. Las demás rutas siguen funcionando:
+son idénticas bit a bit a las obtenidas cargando todas las disposiciones. Con la disposición empaquetada, las filas
+del prompt usan el kernel slab (activaciones como operandos escalares, la etapa de pesos FP16 ampliada una vez en
+LDS): los mismos bits que el kernel tiled anterior en 0,67-0,70x de su tiempo por llamada (banco unitario, 1024-8192
+filas). Las demás rutas siguen funcionando:
 defina ambas variables antes de que el motor cargue. Seleccionar una ruta cuya disposición no se cargó se rechaza
 con un error que pide recargar; un conjunto de disposiciones que no cabe en la memoria del dispositivo hace fallar la carga.
 

@@ -112,6 +112,12 @@ public:
     void dispatch_runtime_step(
         const ExecutionDispatchContext& context) override;
 
+    // The validated kernel launcher dispatch_kernel(context) would call, for a caller that launches several rows
+    // of one step at once (rows_launch_for); null when this dispatcher reports telemetry per dispatch.
+    [[nodiscard]] const CompiledStepLauncher* kernel_launcher(const ExecutionDispatchContext& context) const {
+        return telemetry_ ? nullptr : &launcher_for(context, false);
+    }
+
 private:
     void dispatch(const ExecutionDispatchContext&, bool runtime_step);
     [[nodiscard]] const CompiledStepLauncher&

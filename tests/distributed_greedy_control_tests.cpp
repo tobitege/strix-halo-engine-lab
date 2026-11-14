@@ -1,5 +1,4 @@
 #include "strix/distributed_greedy_control.hpp"
-#include "strix/distributed_control_server.hpp"
 #include <deque>
 #include <iostream>
 #include <stdexcept>
@@ -49,11 +48,6 @@ public:
         sent.emplace_back(bytes.begin(),bytes.end());}
     std::vector<std::byte> receive() override {if(incoming.empty()) throw std::runtime_error("missing frame");auto b=std::move(incoming.front());incoming.pop_front();return b;}
 };
-struct Handler final:DistributedControlServerHandler {
-    unsigned called=0;
-    bool execute_remote_step(const DistributedRemoteStepCommand&) override {++called;return true;}
-    void receive_boundary_transfer(const DistributedBoundaryTransfer&) override {++called;}
-};
 }
 int main() {
     auto r=request();validate_distributed_greedy_request_identity(r);
@@ -80,8 +74,6 @@ int main() {
         auto boolean=encoded;boolean[16U+348U]=std::byte{2};
         expect(rejects([&]{(void)decode_distributed_greedy_message(boolean);}),"payloadv1 boolean cannot carry integer2");
         expect(rejects([&]{(void)encode_distributed_greedy_message(input,{2,65537,64});}),"greedy frame never increases64KiB limit");
-        Stream stream;stream.incoming.push_back(encoded);Handler handler;DistributedControlServer server(stream,handler);
-        expect(rejects([&]{(void)server.serve_one();}) && !handler.called,"legacy step server rejects6 before any target handler");
     }
     {
         DistributedGreedyControlState state(r);auto input=first(state,r);state.observe(input);

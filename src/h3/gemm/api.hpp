@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "h3/gemm/kernels.hpp"
+#include "strix/env_flags.hpp"
 
 namespace strix::h3::gemm {
 
@@ -192,15 +193,12 @@ constexpr std::uint32_t kNarrowRowsMax = 8192U;
 // 7-8 % faster there (gfx1151 kernel trace: out 2259 -> 2096 us, fc2 4648 -> 4257 us per call).
 // int8_convrot only: the W4A8 B-fetch kernel measured 1.9 % slower per image step with 64-column tiles.
 // STRIX_H3_GEMM_BN=64/128/256 forces one plain width where it divides n (benchmarks).
-inline int env_width(const char* name, std::initializer_list<int> allowed) {
-    const char* e = std::getenv(name);
-    if (!e || !*e) return 0;
-    const int v = std::atoi(e);
-    for (const int a : allowed) if (a == v) return v;
-    throw std::invalid_argument(std::string("h3 gemm: ") + name + " must be one of the documented tile widths");
-}
 inline unsigned plain_width(std::uint32_t rows, const Weights& w) {
-    static const int forced = env_width("STRIX_H3_GEMM_BN", {64, 128, 256});
+    static const int forced = [] {
+        constexpr int widths[] = {64, 128, 256};
+        const std::size_t i = strix::env_choice("STRIX_H3_GEMM_BN", 3, {"64", "128", "256"});  // 3 = unset: no forced width
+        return i < 3U ? widths[i] : 0;
+    }();
     if (forced && w.n % static_cast<unsigned>(forced) == 0U) return static_cast<unsigned>(forced);
     if (w.n >= 16384U && rows >= 32768U) return 256U;
     if (w.operand == Operand::int8_convrot && w.n <= 8192U && rows <= kNarrowRowsMax) return 64U;

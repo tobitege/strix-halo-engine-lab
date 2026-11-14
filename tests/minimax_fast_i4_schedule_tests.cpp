@@ -1,5 +1,6 @@
 // Exercise the production host scheduler with independently interleaved device
 // queues. Consumers must see their own layer even when the side queue runs first.
+#include "core/layer_set.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -71,6 +72,78 @@ int main() {
         bool refused = false;
         try { (void)fi::scope(bad); } catch (const std::invalid_argument&) { refused = true; }
         require(refused);
+    }
+    require(fi::min_rows(nullptr) == fi::kMinRows && fi::min_rows("") == fi::kMinRows && fi::min_rows("0") == 0 && fi::min_rows("8192") == 8192);
+    for (const char* bad : {"-1", "4k", " 1", "1e3"}) {
+        bool refused = false;
+        try { (void)fi::min_rows(bad); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused);
+    }
+    {   // Nested child: the engine parks the parent task (move), the child begins its own task, the parent resumes
+        // (move back). The row gate travels with the task, so a short child cannot turn the long parent's INT4 off.
+        struct Task { bool open = false; fi::RowGate i4; };
+        Task task, parked;
+        const auto begin = [&](std::size_t rows) { task = Task{}; task.i4.begin(rows, fi::kMinRows); task.open = true; };
+        begin(26000);
+        require(task.i4.on);
+        parked = std::move(task);
+        task = Task{};
+        begin(512);
+        require(!task.i4.on && parked.i4.on);
+        task = std::move(parked);
+        parked = Task{};
+        require(task.open && task.i4.on);
+        begin(4095);
+        require(!task.i4.on);
+        fi::RowGate zero;
+        zero.begin(1, 0);
+        require(zero.on);
+    }
+    {   // STATS travel with the task like the row gate. A long parent runs IU4 launches, is parked, a short child runs
+        // EXL3 launches below the gate with no timing sample and reports: the child's report has its own launches
+        // only, clearing it leaves the parent's untouched, and the resumed parent still reports its work before the child.
+        struct Task { bool open = false; fi::RowGate i4; fi::TaskStats<4> stats; };
+        Task task, parked;
+        const auto begin = [&](std::size_t rows) { task = Task{}; task.i4.begin(rows, fi::kMinRows); task.open = true; };
+        begin(26000);
+        task.stats.layer[1].count(task.i4.on, 3);
+        task.stats.layer[1].sample(true, 2.0);
+        task.stats.layer[1].converted(0.5);
+        parked = std::move(task);
+        task = Task{};
+        begin(205);
+        require(!task.stats.layer[1].any());
+        task.stats.layer[1].count(task.i4.on, 1);
+        const auto& child = task.stats.layer[1];
+        require(child.any() && child.i4_calls == 0 && child.exl3_calls == 1 && child.i4_samples == 0 && child.exl3_samples == 0);
+        require(fi::LayerStats::mean(child.exl3_ms, child.exl3_samples) == 0.0);  // no sample: counts still print
+        task.stats = {};  // the child's report
+        task = std::move(parked);
+        parked = Task{};
+        auto& parent = task.stats.layer[1];
+        require(parent.i4_calls == 3 && parent.exl3_calls == 0 && parent.i4_samples == 1 && parent.converts == 1);
+        parent.count(true, 2);
+        parent.sample(false, 4.0);  // a mixed layer: time is charged to the arithmetic of the sampled group
+        parent.sample(true, 4.0);
+        require(parent.i4_calls == 5 && parent.i4_ms == 6.0 && parent.exl3_ms == 4.0 && parent.exl3_samples == 1);
+        require(fi::LayerStats::mean(parent.i4_ms, parent.i4_samples) == 3.0 && !task.stats.layer[0].any());
+    }
+    {   // Shared per-layer policy set (core/layer_set.hpp): the keep-EXL3 / W4A8 layer lists of the FAST_I4 engines.
+        namespace sc = strix::core;
+        auto set = [](const char* v) { return sc::parse_layer_set(v, 3, 60, "TEST"); };
+        require(set(nullptr).count() == 0 && set("").count() == 0 && set("none").count() == 0);
+        const auto a = set("3,7-9,59");
+        require(a.count() == 5 && a.test(3) && a.test(7) && a.test(8) && a.test(9) && a.test(59) && !a.test(4) && !a.test(60));
+        const auto b = set("!3-32");
+        require(b.count() == 27 && !b.test(3) && !b.test(32) && b.test(33) && b.test(59) && !b.test(2) && !b.test(60));
+        require(set("!").count() == 57 && set("3-59").count() == 57 && set("!3-59").count() == 0);
+        const auto keep = set(fi::kQualityExl3Layers);   // default: MoE layers 3-37 exact, 38-59 INT4
+        require(keep.count() == 35 && keep.test(3) && keep.test(37) && !keep.test(38) && !keep.test(59));
+        for (const char* bad : {"2", "60", "9-7", "3,", ",3", "3--4", "a", "3 ", "!none", "1000"}) {
+            bool refused = false;
+            try { (void)set(bad); } catch (const std::invalid_argument&) { refused = true; }
+            require(refused);
+        }
     }
     for (bool prefetch : {false, true}) for (unsigned chunks : {1U, 2U, 4U}) {
         Queues q;

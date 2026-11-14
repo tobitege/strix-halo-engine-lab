@@ -1,7 +1,7 @@
 #include "strix/qsa_prefill_stage_plan.hpp"
 // qpf2k/attn microbench + fixtures: production QSA prefill kernels copied verbatim from
 // src/hip_indexed_attention_launcher.hip (0998a0e5) and the qpf2k kernels (src/hip_qsa_prefill_flash.inc).
-// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -x hip).
+// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -Isrc -x hip).
 // Times the QSA prefill part-2 kernels of one layer-chunk (T rows from position P) on synthetic data, the
 // way enqueue_qsa_known_rows runs them for 64-row groups (pool, block scores, selection, batched union +
 // attend), and checks the qpf2k kernels (src/hip_qsa_prefill_flash.inc) bitwise against the production ones.
@@ -10,9 +10,11 @@
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
 // Selection helpers additionally mirror the production union-cap score-preservation control (default false).
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_qwen_dpp_reduce.hpp"  // qwen_dpp::xor32 used by hip_qsa_prefill_flash.inc
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "../src/hip_rounded_stage_image.hpp"
+#include "../src/attn_core/selected_flash_prefill.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,6 +29,10 @@
 #include <vector>
 #include <type_traits>
 
+// Shared by several test TUs, each launching a different subset of these kernels.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 namespace strix {
 namespace {
 constexpr std::uint32_t kThreads = 256;
@@ -212,4 +218,5 @@ __device__ __forceinline__ unsigned qsa_rows_matrix(const QsaRowsInputViews<Rows
 #include "../src/hip_qsa_prefill_flash.inc"
 } // namespace
 } // namespace strix
+#pragma clang diagnostic pop
 

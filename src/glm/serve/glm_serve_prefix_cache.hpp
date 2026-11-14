@@ -1,6 +1,7 @@
 #pragma once
-// Host-only prompt snapshots. Pending nodes are allocated before the paired commit;
-// committing only splices a list node and removes oldest entries (no allocation).
+// Host-only lane snapshots: a thin adapter over strix::serve::ConversationKeep (index, retention, byte ledger, leases,
+// pressure plans). This file only owns the payload bytes and the GLM-specific key (MTP variant). Rank 0 picks the
+// victims, rank 1 replays them; both ranks make the same ledger decisions.
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -8,18 +9,15 @@
 #include <cmath>
 #include <stdexcept>
 #include <list>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "strix/serve/conversation_keep.hpp"
+
 namespace strix::glm::serve {
 
-inline std::uint64_t prefix_hash(std::span<const std::uint32_t> ids) {
-    std::uint64_t h = 14695981039346656037ULL;
-    for (auto t : ids)
-        for (unsigned b = 0; b < 4; ++b) h = (h ^ ((t >> (8 * b)) & 255U)) * 1099511628211ULL;
-    return h;
-}
 inline std::uint64_t prefix_budget_bytes(const std::string& v) {
     std::size_t end = 0;
     const double g = std::stod(v, &end);
@@ -29,99 +27,117 @@ inline std::uint64_t prefix_budget_bytes(const std::string& v) {
     if (g > 0 && bytes == 0) throw std::invalid_argument("--prefix-cache-gib: budget below one byte");
     return bytes;
 }
-inline bool prefix_memory_available(std::istream& f) {
+inline constexpr std::uint64_t kPrefixMemoryFloor = 16ULL * 1024 * 1024 * 1024;  // MemAvailable a snapshot store needs
+// MemAvailable in bytes; nullopt when the line is missing or malformed.
+inline std::optional<std::uint64_t> prefix_memory_bytes(std::istream& f) {
     std::string line;
     while (std::getline(f, line)) {
         if (line.rfind("MemAvailable:", 0) != 0) continue;
         std::istringstream in(line.substr(13));
         std::string value, unit, extra;
         in >> value >> unit;
-        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos || unit != "kB" || (in >> extra)) return false;
-        try { return std::stoull(value) >= 16ULL * 1024 * 1024; }
-        catch (...) { return false; }
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos || unit != "kB" || (in >> extra)) return std::nullopt;
+        try { return std::stoull(value) * 1024ULL; }
+        catch (...) { return std::nullopt; }
     }
-    return false;
+    return std::nullopt;
+}
+inline bool prefix_memory_available(std::istream& f) {
+    const auto b = prefix_memory_bytes(f);
+    return b && *b >= kPrefixMemoryFloor;
 }
 inline bool prefix_memory_available() {
     std::ifstream f("/proc/meminfo");
     return prefix_memory_available(f);
 }
+inline std::optional<std::uint64_t> prefix_memory_bytes() {
+    std::ifstream f("/proc/meminfo");
+    return prefix_memory_bytes(f);
+}
+
+inline std::uint64_t prefix_snapshot_bound(std::uint64_t p) {
+    // Full 45-layer layout + MTP, world=1 and unsharded: upper bound for every served layout.
+    // 34 KDA layers; 11 DSA plus one MTP DSA. Include the seven-word shard header.
+    constexpr std::uint64_t fixed = 34ULL * (64ULL * 128 * 128 * 4 + 3ULL * 64 * 128 * 3 * 4) + 7 * 8;
+    constexpr std::uint64_t per_row = 12ULL * (512 * 2 + 128 * 2 * 2 + 128);
+    if (p > (UINT64_MAX - fixed) / per_row) return UINT64_MAX;
+    return fixed + p * per_row;
+}
 
 class PrefixCache {
 public:
+    using Kind = strix::serve::KeepKind;
+    // What a store prepares: key ids (the prompt, plus the MTP pending token), the rows the snapshot restores, bytes.
     struct Entry {
-        std::uint64_t id = 0, identity = 0, hash = 0, frontier = 0;
+        std::uint64_t id = 0, identity = 0, frontier = 0;
         bool mtp = false;
+        Kind kind = Kind::prompt_end;
         std::vector<std::uint32_t> ids;
         std::vector<std::uint8_t> state;
-        std::uint64_t bytes() const { return state.size() + ids.size() * sizeof(std::uint32_t) + sizeof(Entry) + 2 * sizeof(void*); }
     };
-    explicit PrefixCache(std::uint64_t budget = 0) : budget_(budget) {}
-    const Entry* find(std::span<const std::uint32_t> prompt, bool mtp, std::uint64_t identity) const {
-        const Entry* best = nullptr;
-        for (const auto& e : entries_) {
-            if (e.mtp != mtp || e.identity != identity || e.ids.size() >= prompt.size() || e.frontier >= prompt.size()) continue;
-            const auto head = prompt.first(e.ids.size());
-            if ((!best || e.ids.size() > best->ids.size()) && prefix_hash(head) == e.hash &&
-                std::equal(e.ids.begin(), e.ids.end(), head.begin())) best = &e;
-        }
-        return best;
+    explicit PrefixCache(std::uint64_t budget = 0, strix::serve::PrefixBlockHash hash = nullptr) : keep_(budget, hash) {}
+
+    static strix::serve::KeepIdentity key_of(bool mtp, std::uint64_t identity) { return {identity, mtp ? 1ULL : 0ULL}; }
+    const strix::serve::KeepEntry* find(std::span<const std::uint32_t> prompt, bool mtp, std::uint64_t identity) const {
+        return keep_.find(key_of(mtp, identity), prompt);
     }
-    const Entry* get(std::uint64_t id) const {
-        for (const auto& e : entries_) if (e.id == id) return &e;
+    const strix::serve::KeepEntry* lookup(std::span<const std::uint32_t> prompt, bool mtp, std::uint64_t identity) {
+        return keep_.lookup(key_of(mtp, identity), prompt);
+    }
+    const strix::serve::KeepEntry* get(std::uint64_t id) const { return keep_.get(id); }
+    const std::vector<std::uint8_t>* state(std::uint64_t id) const {
+        for (const auto& p : payload_) if (p.first == id) return &p.second;
         return nullptr;
     }
-    std::uint64_t replacement_id() const {
-        if (pending_.empty()) return 0;
-        const auto& p = pending_.front();
-        for (const auto& e : entries_)
-            if (e.identity == p.identity && e.mtp == p.mtp && e.hash == p.hash && e.ids == p.ids) return e.id;
-        return 0;
-    }
-    std::uint64_t oldest() const { return entries_.empty() ? 0 : entries_.front().id; }
-    bool erase(std::uint64_t id) {
-        for (auto i = entries_.begin(); i != entries_.end(); ++i) {
-            if (i->id != id) continue;
-            bytes_ -= i->bytes();
-            entries_.erase(i);
-            ++evictions;
-            return true;
-        }
-        return false;
-    }
-    void touch(std::uint64_t id) {
-        for (auto i = entries_.begin(); i != entries_.end(); ++i)
-            if (i->id == id) { entries_.splice(entries_.end(), entries_, i); return; }
-    }
-    bool prepare(Entry e) {
-        pending_.clear();
-        if (!budget_ || e.state.empty() || e.bytes() > budget_) return false;
-        pending_.push_back(std::move(e));
+    std::uint64_t replacement_id() const { return keep_.replacement_id(); }
+    std::uint64_t oldest() const { return keep_.oldest(); }
+    bool erase(std::uint64_t id, bool pressure = false) {
+        if (!keep_.erase(id, pressure ? strix::serve::KeepEvict::pressure : strix::serve::KeepEvict::lru)) return false;
+        payload_.remove_if([id](const auto& p) { return p.first == id; });
         return true;
     }
-    void commit(bool accept) {
-        if (accept && !pending_.empty()) {
-            const auto n = pending_.front().bytes();
-            while (const auto id = replacement_id()) (void)erase(id);
-            while (bytes_ > budget_ - n) {
-                bytes_ -= entries_.front().bytes();
-                entries_.pop_front();
-                ++evictions;
-            }
-            bytes_ += n;
-            entries_.splice(entries_.end(), pending_);
-            ++stores;
-        }
-        pending_.clear();
+    void touch(std::uint64_t id) { keep_.touch(id); }
+    bool acquire(std::uint64_t id) { return keep_.acquire(id); }
+    void release(std::uint64_t id) { keep_.release(id); }
+    bool prepare(Entry e) {
+        commit(false);
+        strix::serve::KeepCandidate c;
+        c.id = e.id;
+        c.identity = key_of(e.mtp, e.identity);
+        c.kind = e.kind;
+        c.ids = std::move(e.ids);
+        c.frontier = e.frontier;
+        c.payload_bytes = e.state.size();
+        if (!keep_.can_stage(c.payload_bytes, c.ids.size())) return false;
+        try {
+            pending_payload_.emplace_back(e.id, std::move(e.state));
+            if (!keep_.prepare(std::move(c))) { commit(false); return false; }
+        } catch (...) { commit(false); return false; }
+        return true;
     }
-    void clear() { entries_.clear(); pending_.clear(); bytes_ = 0; }
-    std::uint64_t bytes() const { return bytes_; }
-    std::uint64_t pending_bytes() const { return pending_.empty() ? 0 : pending_.front().bytes(); }
-    std::uint64_t budget() const { return budget_; }
-    std::uint64_t stores = 0, evictions = 0;
+    // Ordered eviction list that makes room for the prepared entry (lead only; the follower replays the erasures).
+    bool victims(std::vector<std::uint64_t>& out) const { return keep_.victims(out); }
+    bool pending_fits() const { return keep_.pending_fits(); }
+    void commit(bool accept) noexcept {
+        if (keep_.commit(accept)) payload_.splice(payload_.end(), pending_payload_);
+        pending_payload_.clear(); // destroy the owner, including vector capacity
+    }
+    bool can_stage(std::uint64_t bytes, std::size_t tokens) const { return keep_.can_stage(bytes, tokens); }
+    std::vector<std::uint64_t> reclaim_plan(std::uint64_t target) const { return keep_.reclaim_plan(target); }
+    std::vector<std::uint64_t> shrink_plan() const { return keep_.shrink_plan(); }
+    void set_budget(std::uint64_t b) { keep_.set_budget(b); }
+    void clear() { commit(false); keep_.clear(); payload_.clear(); }
+    std::uint64_t bytes() const { return keep_.bytes(); }
+    std::uint64_t pending_bytes() const { return keep_.pending_bytes(); }
+    std::uint64_t budget() const { return keep_.budget(); }
+    std::size_t size() const { return keep_.size(); }
+    strix::serve::KeepStats stats() const { return keep_.stats(); }
+    strix::serve::ConversationKeep& keep() { return keep_; }
+    const strix::serve::ConversationKeep& keep() const { return keep_; }
+
 private:
-    std::uint64_t budget_ = 0, bytes_ = 0;
-    std::list<Entry> entries_, pending_;
+    strix::serve::ConversationKeep keep_;
+    std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>> payload_, pending_payload_;
 };
 
 }  // namespace strix::glm::serve

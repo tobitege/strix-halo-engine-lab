@@ -1094,9 +1094,61 @@ void rows_bench(hipStream_t stream) {
     }
 }
 
+// Quantized producer path used by shared experts / fused projection producers.
+// Allocations contain only real activation rows; output tail canaries detect stores.
+template <unsigned Rows>
+void small_quantized_case(hipStream_t stream, unsigned width, unsigned outputs, unsigned flavor) {
+    std::mt19937 rng(19U + Rows + width + outputs + flavor);
+    const auto wh = make_weights(width, outputs, flavor, rng);
+    const auto x = make_inputs(Rows, width, false, flavor, rng);
+    const auto q = quantize_reference(x, Rows, width, q8_rows::kDenseA8Rows);
+    Buffer weights(wh.size()), codes(q.codes.size()), deltas(q.deltas.size() * 4U);
+    weights.upload(wh); codes.upload(q.codes); deltas.upload(q.deltas);
+    Buffer out((Rows * outputs + 16U) * 4U);
+    EngineSite<float, Rows> site{};
+    const unsigned split = outputs / 3U * 2U;
+    site.segments = q8_rows::segments({{weights.p, split},
+        {weights.as<unsigned char>() + static_cast<std::uint64_t>(split) * (width / 32U) * 34U, outputs - split}});
+    site.width = width; site.outputs = outputs; site.output = out.as<float>();
+    const q8_rows::DenseA8Slot slot{codes.as<std::int8_t>(), deltas.as<float>()};
+    const auto verify = [&](const char* name) {
+        check(hipGetLastError(), name);
+        check(hipStreamSynchronize(stream), name);
+        const auto got = out.download<float>();
+        for (unsigned r = 0; r < Rows; ++r)
+            for (unsigned n = 0; n < outputs; ++n)
+                require(std::bit_cast<unsigned>(got[r * outputs + n]) ==
+                    std::bit_cast<unsigned>(reference_output(q, q8_rows::kDenseA8Rows, wh, width, r, n)),
+                    std::string(name) + ": serial reference mismatch");
+        for (unsigned n = Rows * outputs; n < got.size(); ++n)
+            require(std::bit_cast<unsigned>(got[n]) == 0xa5a5a5a5U, std::string(name) + ": output tail overwritten");
+    };
+    out.poison(stream);
+    constexpr unsigned Outs = q8_rows::dense_a8_outs_of<EngineSite<float, Rows>>();
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_kernel<EngineSite<float, Rows>, Outs, false, false>),
+        dim3((outputs + Outs * q8_rows::kWaves - 1U) / (Outs * q8_rows::kWaves)), dim3(q8_rows::kThreads),
+        0, stream, site, slot.codes, slot.deltas);
+    verify("small quantized dot4 control");
+    out.poison(stream);
+    q8_rows::launch_dense_a8_quantized(site, slot, stream);
+    verify("small quantized WMMA dispatch");
+}
+
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (q8_rows::dense_a8_small_enabled()) {
+        for (unsigned width : {64U, 8192U}) for (unsigned outputs : {17U, 65U}) for (unsigned flavor = 0; flavor < 3U; ++flavor) {
+            small_quantized_case<2U>(stream, width, outputs, flavor);
+            small_quantized_case<3U>(stream, width, outputs, flavor);
+            small_quantized_case<4U>(stream, width, outputs, flavor);
+            small_quantized_case<5U>(stream, width, outputs, flavor);
+            small_quantized_case<6U>(stream, width, outputs, flavor);
+            small_quantized_case<7U>(stream, width, outputs, flavor);
+            small_quantized_case<8U>(stream, width, outputs, flavor);
+        }
+        std::cout << "small quantized WMMA == dot4 == serial reference; canaries intact: 84 cases\n";
+    }
     if (std::getenv("STRIX_DENSE_F16_ROWS_BENCH")) { rows_bench(stream); return 0; }
     if (std::getenv("STRIX_INTPREFILL_GATES")) {
         for (const auto& shape : shapes) {

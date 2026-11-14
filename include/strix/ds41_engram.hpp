@@ -23,7 +23,15 @@
 #include <thread>
 #include <vector>
 
+namespace strix::core {
+class DirectRowFetcher;
+}
+
 namespace strix::ds41 {
+
+// Marks a token id of a sequence history (EngramHasher::push, AttentionState::tokens) as a dead n-gram position.
+inline constexpr std::uint32_t kEngramDeadBit = 0x8000'0000U;
+[[nodiscard]] constexpr std::uint32_t engram_dead_token(std::uint32_t token) noexcept { return token | kEngramDeadBit; }
 
 class EngramHasher {
 public:
@@ -31,6 +39,8 @@ public:
     [[nodiscard]] std::uint32_t layers() const noexcept { return static_cast<std::uint32_t>(contract_.layer_ids.size()); }
     [[nodiscard]] std::uint32_t columns() const noexcept { return contract_.rows_per_token(); }
     // Appends `token` to the sequence and writes its rows, [layer][column] (layers() * columns()).
+    // A token with kEngramDeadBit set is a dead position (a row whose embedding was provided, e.g. an image
+    // row): no n-gram reads through it, its own n-grams are all padding, and the bit stays in the history.
     void push(std::uint32_t token, std::span<std::uint64_t> rows);
     // Rows of every token of a sequence starting at position 0 (prompt): [token][layer][column].
     [[nodiscard]] std::vector<std::uint64_t> hash_sequence(std::span<const std::uint32_t> tokens);
@@ -43,7 +53,8 @@ private:
     deepseek41::EngramContract contract_;
     std::vector<std::uint64_t> offsets_;  // [layer][column]
     std::uint32_t pad_ = 0;
-    std::vector<std::uint32_t> history_;  // compressed ids
+    std::vector<std::uint32_t> history_;  // compressed ids; kDead for a dead position
+    static constexpr std::uint32_t kDead = 0xFFFF'FFFFU;
 };
 
 // Location of one Engram table in the model file.
@@ -82,6 +93,7 @@ public:
     EngramRowReader& operator=(const EngramRowReader&) = delete;
     void read(std::span<const EngramRowRequest> requests, std::span<std::uint8_t> out);
     [[nodiscard]] bool direct_io() const noexcept { return direct_; }
+    [[nodiscard]] bool ring_io() const;  // effective backend, serialized with reads
     [[nodiscard]] bool payload_cache() const noexcept;  // a payload cache with room (rows read once are served again)
     [[nodiscard]] EngramReaderStats stats() const;
 
@@ -94,6 +106,9 @@ private:
     std::uint64_t file_bytes_ = 0;
     std::vector<EngramTable> tables_;
     std::vector<std::thread> threads_;
+    // direct I/O on Linux: the batch's rows through one deep read queue (core/direct_row_fetch.hpp) instead of one
+    // positional read per row on the worker threads; the same bytes. STRIX_DS41_ENGRAM_URING=0: the worker threads.
+    std::unique_ptr<core::DirectRowFetcher> fetcher_;
     std::unique_ptr<PayloadCache> cache_;
     mutable std::mutex read_mutex_;  // serializes callers and statistics, including async reader clients
     std::mutex mutex_;

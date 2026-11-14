@@ -1,7 +1,9 @@
 #include "glm/prefill/glm_pf_exact.hpp"
+#include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
+#include "strix/route_receipt.hpp"
 #include <strix_trellis.h>
 #include <algorithm>
 #include <cstdlib>
@@ -156,22 +158,23 @@ __global__ __launch_bounds__(256) void x3_kernel(Mat m, const _Float16* t, float
 }
 // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): 64-row blocks on the WMMA core.
 template<int B, unsigned Rows = 64, unsigned CP = 1, bool FusedInput = false>
-__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, const float* raw = nullptr, std::size_t xs = 0) {
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void w_kernel(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, const float* raw = nullptr, std::size_t xs = 0, unsigned all_frag = 0U) {
     __shared__ wmma_x::StorageR<Rows, FusedInput ? 68U : 36U> lds;
     const unsigned row0 = blockIdx.y * Rows;
     const unsigned nr = rows - row0 < Rows ? rows - row0 : Rows;
     auto at = [&](unsigned r, unsigned) { return XRows{t, y, ys, m.input, row0 + r}; };
-    if constexpr (FusedInput) wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::H128Input{raw, xs, row0});
-    else wmma_x::span<B, CP>(m, at, nr, lds);
+    if constexpr (FusedInput) wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::H128Input{raw, xs, row0}, all_frag != 0U);
+    else wmma_x::span<B, CP>(m, at, nr, lds, aux::Store{}, aux::StagedInput{}, all_frag != 0U);
 }
 template<int B, bool Fused>
 void launch_w(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s,
               const float* raw, std::size_t xs) {
+    const unsigned af = wmma_x::all_fragments();
     if (wmma_x::tile_rows() == 128U && wmma_x::cols_per_wave() == 2U)
-        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+        w_kernel<B, 128, 2, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
     else if (wmma_x::tile_rows() == 128U)
-        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
-    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs);
+        w_kernel<B, 128, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 128U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
+    else w_kernel<B, 64, 1, Fused><<<dim3(m.output / 128U, (rows - 1U) / 64U + 1U), 256, 0, s>>>(m, t, y, ys, rows, raw, xs, af);
 }
 template<int B, unsigned TM>
 void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
@@ -245,24 +248,23 @@ void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys
 }
 }  // namespace
 unsigned x_auto_rows() {
-    // STRIX_GLM_PF_EXACT_X_MIN_ROWS overrides the auto threshold (rows per linear call).
-    const char* p = std::getenv("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
-    if (!p) return 2048;
-    char* end = nullptr;
-    const unsigned long v = std::strtoul(p, &end, 10);
-    if (!*p || *end || v == 0 || v > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACT_X_MIN_ROWS must be 1..65536");
-    return static_cast<unsigned>(v);
+    // glm_pf_dense_policy.hpp: STRIX_GLM_PF_EXACT_X_MIN_ROWS, else 64 rows (32 with the FAST WMMA identity).
+    return dense_policy::auto_min_rows(envcfg::text);
 }
-Route route(unsigned rows) {
-    const char* p = std::getenv("STRIX_GLM_PF_EXACT_X");
-    if (!p || std::strcmp(p, "0") == 0) return Route::tm;
-    if (std::strcmp(p, "1") == 0) return Route::x;
-    if (std::strcmp(p, "2") == 0) return Route::x2;
-    if (std::strcmp(p, "3") == 0) return Route::x3;
-    if (std::strcmp(p, "4") == 0) return Route::x3r8;
-    if (std::strcmp(p, "auto") == 0) return rows >= x_auto_rows() ? Route::x3r8 : Route::tm;
-    throw std::invalid_argument("STRIX_GLM_PF_EXACT_X must be 0, 1, 2, 3, 4 or auto");
+struct RouteSelection {
+    Route route;
+    ::strix::route::Reason bypass;
+};
+static RouteSelection select_route(unsigned rows) {
+    using R = ::strix::route::Reason;
+    static_assert(static_cast<unsigned>(Route::tm) == dense_policy::kTm && static_cast<unsigned>(Route::x) == dense_policy::kX &&
+                  static_cast<unsigned>(Route::x2) == dense_policy::kX2 && static_cast<unsigned>(Route::x3) == dense_policy::kX3 &&
+                  static_cast<unsigned>(Route::x3r8) == dense_policy::kX3r8);
+    const auto pick = dense_policy::choose(rows, envcfg::text);
+    return {static_cast<Route>(pick.route),
+            pick.route == dense_policy::kX3r8 ? R::shape : pick.automatic ? R::short_call : R::wrong_route};
 }
+Route route(unsigned rows) { return select_route(rows).route; }
 unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {
     const unsigned s = bits == 5 && input == 4096 && output == 1024 ? 16U :
         (output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U));
@@ -291,13 +293,22 @@ void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float*
         std::size_t{rows} * (m.input / 128U) > std::size_t{UINT32_MAX} * 4U ||
         std::size_t{rows} > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::max(xs, ys))
         throw std::invalid_argument("glm pf exact: rows, strides or workspace");
-    const Route selected = route(rows);
+    const auto selection = select_route(rows);
+    const Route selected = selection.route;
     const unsigned tm = tile_rows();
     auto* t = static_cast<_Float16*>(ws);
     const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
     const unsigned core = selected == Route::x3r8 && wmma_x::enabled() && m.input % 64U == 0 ? 5U : selected == Route::x3r8 ? 4U : selected == Route::x3 ? 3U :
         selected == Route::x2 ? 1U : (selected == Route::x ? 0U : tm);
     if (core == 5U) wmma_x::dense_calls.fetch_add(1, std::memory_order_relaxed);
+    // Shared route receipt (count only): the family of this call, and the reason a requested WMMA identity was bypassed.
+    if (core == 5U) ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::f16_wmma, rows);
+    else {
+        ::strix::route::launched(::strix::route::Product::dense, ::strix::route::Family::exact, rows);
+        if (::strix::route::enabled() && wmma_x::enabled())
+            ::strix::route::bypass(::strix::route::Product::dense, ::strix::route::Family::f16_wmma,
+                                   selection.bypass, rows);
+    }
     if (core == 5U && aux::input_admitted(m.output) && aux::enabled("STRIX_GLM_PF_AUX_INPUT")) {
 #define CASE(B) case B: launch_w<B, true>(m, t, y, ys, rows, s, x, xs); break
         switch (m.bits) {

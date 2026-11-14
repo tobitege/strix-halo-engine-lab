@@ -290,13 +290,30 @@ bool XferExchange::fused_boundary_rows(const float* part, const float* X, const 
     return true;
 }
 
+XferExchange::ProducerSlot XferExchange::producer_slot(unsigned rows, hipStream_t s) {
+    if (rows == 0 || rows > max_rows_) return {};
+    Exchanger& x = ensure(s);
+    const auto t = x.producer_target();
+    auto* data = static_cast<float*>(x.tx());
+    produced_ = data;
+    return {data, {t.flag, t.counter, t.sequence}};
+}
+
 void XferExchange::boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag,
                                   unsigned rows, unsigned flag_stride, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
     Exchanger& x = ensure(s);
     const std::size_t bytes = GlmSchedule::row_bytes(rows);
     strix::xport::TransportBackend<Exchanger> backend(x);
-    const auto ticket = backend.post_copy(Tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_}, part, bytes);
+    const Tag tag{layer_ % 2 == 0 ? Kind::attn_sum : Kind::ffn_sum, static_cast<std::uint32_t>(layer_ / 2), step_};
+    // A partial produced in the slot of producer_slot() is already written and published by its last kernel.
+    const bool produced = produced_ != nullptr && part == produced_;
+    if (produced_ != nullptr && !produced) throw std::logic_error("glm xfer exchange: producer slot taken but not used by the next boundary");
+    produced_ = nullptr;
+    // STRIX_GLMX_FOLD=N (xport row fold): boundaries of at most N rows have their pair sum (R17, rank 0's partial
+    // first) computed by the exchange progress thread; post_expand then reads one folded slot. Same bits.
+    if (fold_enabled_.load(std::memory_order_relaxed) && x.can_fold(bytes)) x.fold_next(strix::xport::RowFold::sum_f32);
+    const auto ticket = produced ? backend.post_publish(tag, bytes, Publish::producer) : backend.post_copy(tag, part, bytes);
     ++layer_;
     if (use_bracket_) {
         if (bracket_ == nullptr) ok(hipMalloc(reinterpret_cast<void**>(&bracket_), GlmSchedule::row_bytes(max_rows_) * kHc), "bracket");
@@ -304,13 +321,23 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
     }
     const RxView none{};
     if (kwait_) {
-        const RxView v = backend.wait_view(ticket, s);
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
-        else post_expand(X, mix, part, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        RxView v = backend.wait_view(ticket, s);
+        const float* local = part;
+        if (const void* folded = x.last_folded()) {  // the kernel reads the folded slot after its wait (local == nullptr)
+            v.payload = folded;
+            local = nullptr;
+        }
+        if (use_bracket_) post_expand_bracket(bracket_, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
     } else {
         const auto* peer = static_cast<const float*>(backend.wait(ticket, s).remote);
-        if (use_bracket_) post_expand_bracket(bracket_, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
-        else post_expand(X, mix, part, peer, none, rank_, Xout, flag, rows, s, flag_stride);
+        const float* local = part;
+        if (const void* folded = x.last_folded()) {
+            peer = static_cast<const float*>(folded);
+            local = nullptr;
+        }
+        if (use_bracket_) post_expand_bracket(bracket_, mix, local, peer, none, rank_, Xout, flag, rows, s, flag_stride);
+        else post_expand(X, mix, local, peer, none, rank_, Xout, flag, rows, s, flag_stride);
     }
     backend.release(ticket, s);
 }

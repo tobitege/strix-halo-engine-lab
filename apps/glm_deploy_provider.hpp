@@ -16,6 +16,10 @@ struct Options {
     // deploy::int4_moe_formats hook: true only once the FAST_I4 stored/JIT loader
     // and its controls are linked; footprint() then needs its header-only sizing.
     bool int4_runtime = false;
+    // Kept-prefix (conversation cache) host budget per rank. Default: fitted after every mandatory owner (elastic,
+    // may shrink to 0). Pinned (the operator named a size): mandatory, the candidate must hold it.
+    std::uint64_t prefix_keep_bytes = 0;
+    bool prefix_keep_pinned = false;
 };
 class Provider final : public deploy::FootprintProvider {
 public:
@@ -58,6 +62,8 @@ public:
         f.kv_total = add(f.kv_total, mul(c.slots, recurrent));
         f.weights = owners_[rank].weights; f.staging = owners_[rank].staging;
         f.workspace = workspace_(c.context, sharded);
+        if (options_.prefix_keep_bytes)
+            (options_.prefix_keep_pinned ? f.extra : f.elastic_extra).emplace_back("prefix_keep", options_.prefix_keep_bytes);
         if (!options_.configuration_id.empty()) f.extra.emplace_back("configuration:" + options_.configuration_id, 0);
         return f;
     }

@@ -23,6 +23,7 @@
 // steps (whole prompt blocks when nothing decodes). Every request's tokens equal it running alone.
 // --http-slots 1 or STRIX_QRTX_COHORT=0: the old serialized path (one request at a time, generate() to completion).
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
+#include "strix/device/cuda_enumerator.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/cuda_qwen_cohort.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
@@ -656,6 +657,9 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     try {
         const auto o = parse(argc, argv);
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
@@ -677,7 +681,12 @@ int main(int argc, char** argv) {
         serve::GenerationQueue queue(o.max_queue);
         px::Cache prefix_cache(o.engine, o.prefix);
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
-        config.status_extra = [&prefix_cache](serve::Json& status) { status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json())); };
+        // /api/status names the bound device (id, UUID, PCI, attach) next to the prefix cache counters.
+        const std::string device_json = strix::device::receipt_json(strix::device::bind_cuda());
+        config.status_extra = [&prefix_cache, device_json](serve::Json& status) {
+            status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
+            status.set("device", serve::parse_json(device_json));
+        };
         CudaQwenEngine adapter(engine, o, prefix_cache);
         std::optional<CohortServer> cohort;  // --http-slots > 1: continuous batching; 1: the serialized queue.run path
         if (o.http_slots > 1) {

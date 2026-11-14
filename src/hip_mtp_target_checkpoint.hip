@@ -4,6 +4,7 @@
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/indexed_attention_state.hpp"
+#include "strix/hip_check.hpp"
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -13,7 +14,7 @@ namespace strix {
 namespace {
 constexpr std::uint64_t alignment=256;
 void check(hipError_t result) {
-    if(result!=hipSuccess) throw std::runtime_error("MTP target checkpoint HIP operation failed");
+    ::strix::hip_check_message(result, "MTP target checkpoint HIP operation failed");
 }
 bool valid_recorded_lineage(const SerialSessionContext& session) noexcept {
     if(session.next_position==0 && session.committed_tokens==0 &&

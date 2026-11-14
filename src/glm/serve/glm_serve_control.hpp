@@ -21,6 +21,7 @@
 
 #include "glm/serve/glm_serve_import.hpp"
 #include "glm/serve/glm_serve_prefix_cache.hpp"
+#include "strix/pair/lockstep.hpp"
 
 namespace strix::glm::serve {
 
@@ -29,13 +30,15 @@ inline constexpr std::uint32_t kControlVersion = 7;  // paired prefix snapshot p
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
+inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
+inline constexpr std::uint32_t kPrefixPressure = 16U; // prefix_evict pflags: eviction under memory pressure
 inline constexpr std::uint32_t kEnterSeed = 4U;   // mtp_enter pflags: open the C1 decoder from the slot's batched-spec seed
 inline constexpr std::uint32_t kImportFailed = ~0U;  // import_state's token on a rank whose restore failed
 inline constexpr std::uint32_t kImportDsaOnce = 8U;  // import_state pflags: hand-off v2, rank 0 relays the DSA components to rank 1
 inline constexpr std::size_t kControlBytes = 512;
 inline constexpr unsigned kMaxRows = 8;                       // Engine::step takes 1..8 rows
 inline constexpr std::size_t kTokensPerMessage = 16384;       // 64 KiB per prompt message
-inline constexpr std::uint64_t kNoRound = ~std::uint64_t{0};
+using strix::pair::kNoRound;
 
 // mtp_enter: seed the slot's drafter from the last step's row pslot (row[0] = {slot, token it produced, its position}).
 // mtp_run: up to `cycles` verify cycles of slot pslot (the first run opens the decoder from the seed with `budget`).
@@ -107,7 +110,7 @@ struct Hello {
     // hand-off wire version; FNV-1a of the --import-model-sha attestation (operator-supplied, see the README).
     std::uint32_t import_flags = 0;
     std::uint32_t import_wire = 0;
-    std::uint32_t import_pad = 0;
+    std::uint32_t route_fingerprint = 0;  // strix/route_receipt.hpp: 32-bit fold of the numerical-route fingerprint
     std::uint64_t import_model_hash = 0;
     std::uint64_t prefix_cache_bytes = 0;
     bool operator==(const Hello&) const = default;
@@ -158,7 +161,7 @@ static_assert(offsetof(Hello, model_hash) == 0 && offsetof(Hello, identity_hash)
                   offsetof(Hello, slots) == 24 && offsetof(Hello, max_rows) == 28 && offsetof(Hello, step_rows) == 32 &&
                   offsetof(Hello, world) == 36 && offsetof(Hello, mtp) == 40 && offsetof(Hello, mtp_kmax) == 44 &&
                   offsetof(Hello, g2) == 48 && offsetof(Hello, import_flags) == 52 && offsetof(Hello, import_wire) == 56 &&
-                  offsetof(Hello, import_pad) == 60 && offsetof(Hello, import_model_hash) == 64 && offsetof(Hello, prefix_cache_bytes) == 72,
+                  offsetof(Hello, route_fingerprint) == 60 && offsetof(Hello, import_model_hash) == 64 && offsetof(Hello, prefix_cache_bytes) == 72,
               "GLMC v7 Hello layout changed: bump kControlVersion and update these offsets");
 
 inline std::uint32_t fnv1a32(std::span<const std::uint32_t> tokens, std::uint32_t h = 2166136261U) {
@@ -173,10 +176,7 @@ inline std::uint64_t fnv1a64(const void* p, std::size_t n, std::uint64_t h = 146
 }
 inline std::uint64_t fnv1a64(const std::string& s, std::uint64_t h = 14695981039346656037ULL) { return fnv1a64(s.data(), s.size(), h); }
 
-class ProtocolError : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
+using strix::pair::ProtocolError;
 
 using Block = std::array<std::byte, kControlBytes>;
 
@@ -221,6 +221,7 @@ inline std::string hello_mismatch(const Hello& mine, const Hello& peer) {
     f("mtp", mine.mtp, peer.mtp);
     f("mtp_kmax", mine.mtp_kmax, peer.mtp_kmax);
     f("g2", mine.g2, peer.g2);
+    f("route_fingerprint", mine.route_fingerprint, peer.route_fingerprint);
     f("import_flags", mine.import_flags, peer.import_flags);
     f("import_wire", mine.import_wire, peer.import_wire);
     f("import_model_hash", mine.import_model_hash, peer.import_model_hash);
@@ -280,15 +281,16 @@ inline bool consecutive_slots(std::span<const WireRow> rows) {
 class Channel {
 public:
     using Wire = std::function<void(std::span<const std::byte>, std::span<std::byte>, std::uint32_t layer, std::uint64_t request)>;
-    Channel(Wire wire, std::uint32_t rank) : wire_(std::move(wire)), rank_(rank) {}
+    Channel(Wire wire, std::uint32_t rank) : wire_(std::move(wire)), lock_(rank) {}
 
     // One round: fills the bookkeeping fields of `mine` and returns the peer's block after every check.
     Control exchange(Control mine) {
         mine.magic = kControlMagic;
         mine.version = kControlVersion;
-        mine.round = round_;
-        mine.ack_round = round_ == 0 ? kNoRound : round_ - 1;
-        mine.rank = rank_;
+        const strix::pair::LockstepHeader head = lock_.header();
+        mine.round = head.round;
+        mine.ack_round = head.ack_round;
+        mine.rank = head.rank;
         mine.echo_round = echo_round_;
         mine.echo_count = echo_count_;
         mine.echo_token = echo_token_;
@@ -296,17 +298,14 @@ public:
         Control peer;
         if (!wire_) {
             peer = mine;
-            peer.rank = rank_ ^ 1U;
+            peer.rank = head.rank ^ 1U;
         } else {
             const Block out = encode(mine);
             Block in{};
-            wire_(out, in, 0, round_);
+            wire_(out, in, 0, head.round);
             peer = decode(in);
         }
-        if (peer.round != round_) throw ProtocolError("control channel: duplicate / stale round " + std::to_string(peer.round) +
-                                                      ", expected " + std::to_string(round_));
-        if (peer.ack_round != mine.ack_round) throw ProtocolError("control channel: preceding round not acknowledged");
-        if (peer.rank == rank_) throw ProtocolError("control channel: peer reports the same rank");
+        lock_.check({peer.round, peer.ack_round, peer.rank});
         if (peer.echo_round != echo_round_ || peer.echo_count != echo_count_ || peer.echo_token != echo_token_ ||
             peer.echo_hash != echo_hash_)
             throw ProtocolError("cross-rank token mismatch: round " + std::to_string(echo_round_) + " local count " +
@@ -314,7 +313,7 @@ public:
                                 std::to_string(echo_hash_) + ", peer round " + std::to_string(peer.echo_round) + " count " +
                                 std::to_string(peer.echo_count) + " last " + std::to_string(peer.echo_token) + " hash " +
                                 std::to_string(peer.echo_hash));
-        ++round_;
+        lock_.accept({peer.round, peer.ack_round, peer.rank});
         return peer;
     }
 
@@ -330,7 +329,7 @@ public:
             in.assign(m, 0);
             if (sender) std::memcpy(out.data(), tokens.data() + c0, m * 4);
             wire_(std::as_bytes(std::span<const std::uint32_t>(out)), std::as_writable_bytes(std::span<std::uint32_t>(in)),
-                  1, (round_ << 20) | k);
+                  1, (lock_.round() << 20) | k);
             if (!sender) std::memcpy(tokens.data() + c0, in.data(), m * 4);
         }
     }
@@ -354,13 +353,12 @@ public:
         if (!m.empty()) throw ProtocolError("hello mismatch between the ranks: " + m);
     }
 
-    [[nodiscard]] std::uint64_t round() const noexcept { return round_; }
-    [[nodiscard]] std::uint32_t rank() const noexcept { return rank_; }
+    [[nodiscard]] std::uint64_t round() const noexcept { return lock_.round(); }
+    [[nodiscard]] std::uint32_t rank() const noexcept { return lock_.rank(); }
 
 private:
     Wire wire_;
-    std::uint32_t rank_ = 0;
-    std::uint64_t round_ = 0;
+    strix::pair::Lockstep lock_;
     std::uint64_t echo_round_ = kNoRound;
     std::uint32_t echo_count_ = 0, echo_token_ = 0, echo_hash_ = 2166136261U;
 };
@@ -379,7 +377,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
     std::vector<std::uint32_t> out;
     switch (cmd) {
         case Cmd::prefix_evict:
-            if (!cache || !cache->erase(c.prefix_id)) throw ProtocolError("prefix cache: eviction key missing");
+            if (!cache || !cache->erase(c.prefix_id, (c.pflags & kPrefixPressure) != 0)) throw ProtocolError("prefix cache: eviction key missing");
             return out;
         case Cmd::prefix_clear:
             if (!cache) throw ProtocolError("prefix cache unavailable");
@@ -387,8 +385,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             return out;
         case Cmd::prefix_commit:
             if (!cache) throw ProtocolError("prefix cache unavailable");
-            if (c.prefix_ok && (cache->pending_bytes() == 0 || cache->replacement_id() != 0 ||
-                                cache->bytes() > cache->budget() - cache->pending_bytes()))
+            if (c.prefix_ok && (cache->pending_bytes() == 0 || !cache->pending_fits()))
                 throw ProtocolError("prefix cache: commit without paired preparation / lead eviction");
             cache->commit(c.prefix_ok != 0);
             return out;
@@ -399,18 +396,19 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             ch.tokens(prompt, c.plen, sender);
             bool ok = false;
             try {
-                if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); }) {
+                if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); eng.prefix_state_bound(c.ppos); }) {
                     bool available = false;
                     if constexpr (requires { eng.prefix_store_allowed(); }) available = eng.prefix_store_allowed();
                     else available = prefix_memory_available();
-                    if (available) {
+                    cache->commit(false);
+                    if (available && cache->can_stage(eng.prefix_state_bound(c.ppos), prompt.size())) {
                         PrefixCache::Entry e;
                         e.id = c.prefix_id;
                         e.identity = c.prefix_identity;
                         e.mtp = (c.pflags & kPrefillMtp) != 0;
+                        e.kind = (c.pflags & kPrefixReply) ? PrefixCache::Kind::reply_end : PrefixCache::Kind::prompt_end;
                         e.frontier = c.ppos;
                         e.ids = prompt;
-                        e.hash = prefix_hash(e.ids);
                         e.state = eng.state_bytes_upto(c.pslot, c.ppos);
                         ok = cache->prepare(std::move(e));
                     }
@@ -433,11 +431,12 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             try {
                 if (cache && c.pslot < slots) {
                     const auto* e = cache->get(c.prefix_id);
-                    if (e && e->frontier == c.ppos && e->identity == c.prefix_identity &&
-                        e->mtp == ((c.pflags & kPrefillMtp) != 0)) {
-                        if constexpr (requires { eng.restore_state(c.pslot, e->state, c.ppos); }) {
+                    const auto* state = cache->state(c.prefix_id);
+                    if (e && state && e->frontier == c.ppos &&
+                        e->identity == PrefixCache::key_of((c.pflags & kPrefillMtp) != 0, c.prefix_identity)) {
+                        if constexpr (requires { eng.restore_state(c.pslot, *state, c.ppos); }) {
                             eng.reset(c.pslot);
-                            eng.restore_state(c.pslot, e->state, c.ppos);
+                            eng.restore_state(c.pslot, *state, c.ppos);
                             cache->touch(c.prefix_id);
                             ok = true;
                         }

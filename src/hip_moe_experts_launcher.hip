@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -37,6 +39,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -2657,7 +2661,12 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
                 current.bytes > row_memory.arena_bytes - (current.address - row_memory.arena_base) ||
                 current.allocation_generation != row_memory.allocation_generation || base[v].bytes > UINT64_MAX - 255U)
                 throw std::invalid_argument("known-window routed rows view exceeds retained physical allocation");
-            const auto stride = (base[v].bytes + 255U) / 256U * 256U;
+            // Validate the retained arena's stride, including explicit per-arena policies.
+            const auto tight = (base[v].bytes + 255U) / 256U * 256U;
+            const std::array row1{out.rows[r ? 1U : 0U].hidden, out.rows[r ? 1U : 0U].route_indices, out.rows[r ? 1U : 0U].route_weights,
+                out.rows[r ? 1U : 0U].output, out.rows[r ? 1U : 0U].temporary};
+            const auto stride = r && !cohort ? core::retained_row_stride(
+                base[v].address, base[v].bytes, row1[v].address, row1[v].bytes) : tight;
             // Rows of different cohort sessions live in different arenas; every union kernel
             // addresses rows through per-row pointers, so only one session's window keeps the stripe.
             if (current.bytes != base[v].bytes || (!cohort && (stride > (UINTPTR_MAX - base[v].address) / rows.size() ||
@@ -2884,6 +2893,14 @@ __global__ void known_moe_prefill_merge_commit_vec4_i8_kernel(KnownMoePrefillDev
     moe_prefill_merge_z_body_vec4<false, true, true>(view, header, hidden_size, experts, top_k,
         [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
 }
+// RoutePrune merge+commit (MC mode 1): the kernels above with zero-weight slots skipped.
+template <bool Vec4, bool RouteBF16, bool RouteI8>
+__global__ void known_moe_prefill_merge_commit_pruned_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    const auto row_at = [](auto v, unsigned r) { return known_moe_prefill_row(v, r); };
+    if constexpr (Vec4) moe_prefill_merge_z_body_vec4<false, RouteBF16, RouteI8, true>(view, header, hidden_size, experts, top_k, row_at, unsafe);
+    else moe_prefill_merge_z_body<true, false, RouteBF16, RouteI8, true>(view, header, hidden_size, experts, top_k, row_at, unsafe);
+}
 template <unsigned CTAs>
 __global__ void known_moe_prefill_finish_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden, std::uint32_t* record, const unsigned* unsafe) {
@@ -2945,7 +2962,7 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     // (codes, deltas, sums, status, intermediates, accumulation, A8 down image, raw dots) are row 0's
     // offsets inside its own temporary. The first and last chunks keep the full admission, every view
     // is then checked row-striped below, and the striped writes are checked against the striped reads.
-    static const bool shared_env = [] { const char* v = std::getenv("STRIX_PREFILL_MOE_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
+    static const bool shared_env = strix::envcfg::flag("STRIX_PREFILL_MOE_SHARED_ADMISSION", true);
     const bool shared = shared_admission && shared_env;
     enum Derived : unsigned { d_codes, d_deltas, d_sums, d_status, d_intermediates, d_accumulation,
         d_down_codes, d_down_deltas, d_down_sums, d_rawdots, derived_count };
@@ -3129,8 +3146,30 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
         strided.template operator()<float>(accumulation), strided.template operator()<std::uint16_t>(output)};
     return out;
 }
+// Measurement only (STRIX_MOE_ROUTE_CENSUS=<file>): appends each prefill MoE call's routes and route weights
+// (u32 magic, rows, top_k, experts; then rows*top_k f32 weights and u32 expert ids). Synchronizes the stream.
+static void known_moe_route_census(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p,
+                                   hipStream_t stream) {
+    static const char* const path = strix::envcfg::text("STRIX_MOE_ROUTE_CENSUS");
+    if (!path || !*path || !count) return;
+    check_hip(hipStreamSynchronize(stream), "route census sync");
+    const std::uint32_t k = config.top_k;
+    std::vector<float> w(std::size_t{count} * k); std::vector<std::uint32_t> e(w.size());
+    const auto pull = [&](const void* base, std::uint64_t stride, void* out) {
+        const std::size_t span = std::size_t{count - 1U} * stride + k * 4U;
+        if (stride == k * 4U) { check_hip(hipMemcpy(out, base, span, hipMemcpyDeviceToHost), "route census copy"); return; }
+        std::vector<unsigned char> tmp(span);
+        check_hip(hipMemcpy(tmp.data(), base, span, hipMemcpyDeviceToHost), "route census copy");
+        for (std::uint32_t r = 0; r < count; ++r) std::memcpy(static_cast<char*>(out) + std::size_t{r} * k * 4U, tmp.data() + r * stride, k * 4U);
+    };
+    pull(p.rows.route_weights.base, p.rows.route_weights.stride, w.data());
+    pull(p.rows.routes.base, p.rows.routes.stride, e.data());
+    static moe_core::RouteCensusWriter<> writer(path);
+    writer.append(count, k, static_cast<std::uint32_t>(config.expert_count), w.data(), e.data());
+}
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();
+    known_moe_route_census(count, config, p, stream);
     const bool gsq = qpf2k::gsq_model || gsq_a8::gate_type(p.request.gate_type);
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
     bool committed = false;
@@ -3140,6 +3179,11 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
     if (rows.route_bf16 && (!config.prefill_f16wmma || gsq || prefill_merge_commit(gsq)!=1U))
         throw std::invalid_argument("MoE route BF16 requires fast DA16 prefill and MC=1");
     if (prefill_merge_commit(gsq)) rows.unsafe = prefill_admission_word(stream);
+    // RoutePrune (FAST, default off): supported on the DA16 merge+commit tail only (MC 1), whose merge skips pruned slots.
+    const bool prune = config.prefill_moe_route_prune.active();
+    if (prune && (!config.prefill_f16wmma || gsq || prefill_merge_commit(gsq) != 1U))
+        throw std::invalid_argument("MoE route prune requires fast DA16 prefill and MC=1");
+    moe_q4k_a8::known_rows::set_prefill_route_prune(prune ? config.prefill_moe_route_prune : strix::moe_core::RoutePrune{});
     try {
         moe_q4k_a8::known_rows::enqueue_prefill(p.request, rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
             config.prefill_f16wmma ? 3 : -1, p.direct);
@@ -3156,6 +3200,8 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
     }
     // qpf2k core2 bit 9 (STRIX_QPF2K_MOE): the down already ran the ordered merge (last arrival); its guards and non-finite
     // flag run here instead (same accumulation, status and header bits).
+    if (prune && (moe_q4k_a8::known_rows::prefill_fused_merge() || !moe_q4k_a8::known_rows::prefill_certificate_produced()))
+        throw std::invalid_argument("MoE route prune: this call did not take the certified merge+commit tail");
     if (moe_q4k_a8::known_rows::prefill_fused_merge()) {
         // The fused tail writes PrefillRows::clear; the commit reads the accumulation view: they must be the same rows.
         if (reinterpret_cast<std::uintptr_t>(p.rows.clear.base) != reinterpret_cast<std::uintptr_t>(p.device.accumulation.base) ||
@@ -3169,7 +3215,17 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         (void)witness;
         // The fallback choice is device-side and per call. No host fallback count/witness can observe it
         // without a readback; do not add synchronization or claim a host-observed fallback.
-        if (rows.route_i8) {
+        if (prune) {
+            const bool vec4 = prefill_merge_vec4(p.device, config.hidden_size, gsq);
+            const dim3 grid(vec4 ? (config.hidden_size / 4U + 127U) / 128U : (config.hidden_size + 255U) / 256U, count), block(vec4 ? 128 : 256);
+#define STRIX_PRUNED_MERGE(V, B, I) hipLaunchKernelGGL(HIP_KERNEL_NAME(known_moe_prefill_merge_commit_pruned_kernel<V, B, I>), grid, block, 0, \
+                stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe)
+            if (rows.route_i8) { if (vec4) STRIX_PRUNED_MERGE(true, true, true); else STRIX_PRUNED_MERGE(false, true, true); }
+            else if (rows.route_bf16) { if (vec4) STRIX_PRUNED_MERGE(true, true, false); else STRIX_PRUNED_MERGE(false, true, false); }
+            else { if (vec4) STRIX_PRUNED_MERGE(true, false, false); else STRIX_PRUNED_MERGE(false, false, false); }
+#undef STRIX_PRUNED_MERGE
+        }
+        else if (rows.route_i8) {
             if (prefill_merge_vec4(p.device, config.hidden_size, gsq))
                 hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_i8_kernel, dim3((config.hidden_size / 4U + 127U) / 128U, count), dim3(128), 0,
                     stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);

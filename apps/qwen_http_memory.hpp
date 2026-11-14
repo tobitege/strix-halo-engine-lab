@@ -1,4 +1,6 @@
 #pragma once
+#include "http_slot_capacity.hpp"
+#include <cstdlib>
 #include "qwen_prompt_organization.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/indexed_attention_state.hpp"
@@ -6,6 +8,17 @@
 #include "strix/ple_lookup.hpp"
 
 namespace strix::decode_cli {
+// Tap bytes of one tiled MTP prompt: T rows per buffer plus the held row. The prompt allocates two buffers only
+// when STRIX_PREFILL_PIPE bit 1 is effective; the default bound charges two for every slot.
+inline std::uint64_t http_mtp_prompt_tap_bytes(std::uint64_t rows, std::uint64_t width,
+    bool exact, bool double_buffered) {
+    const auto buffers = exact && !double_buffered ? UINT64_C(1) : UINT64_C(2);
+    return prefill_checked_mul(prefill_checked_add(prefill_checked_mul(buffers,rows),1U),width);
+}
+inline bool http_mtp_prompt_tap_double(bool gsq) {
+    const char* pipe=std::getenv("STRIX_PREFILL_PIPE");
+    return pipe && (std::strtoul(pipe,nullptr,0)&1U) && !qpf2k::suppressed(qpf2k::Item::pipe,gsq);
+}
 // Geometry bounds for owners built by the MTP bridge/window factory. The primary
 // stack and shared tiled arenas are excluded. No option budget is an allocation.
 inline HttpServingMemory http_mtp_memory(const Options& o, const ModelContract& model,
@@ -45,7 +58,9 @@ inline HttpServingMemory http_mtp_memory(const Options& o, const ModelContract& 
     slot=add(slot,qsa_mtp_pool_bytes(o,model,qpf2k::has_gsq_gate(manifest)));
     // Prompt tap may be double buffered. Charge both independently of the
     // environment so inspection and startup have the same safe bound.
-    slot=add(slot,add(mul(mul(2U,o.known_prefix_prefill_rows),width),width));
+    // STRIX_SERVE_SLOT_EXACT=1: charge the tap buffers the prompt really allocates.
+    slot=add(slot,http_mtp_prompt_tap_bytes(o.known_prefix_prefill_rows,width,strix::serve::slot_exact(),
+        http_mtp_prompt_tap_double(qpf2k::has_gsq_gate(manifest))));
     const bool subset=!o.mtp.draft_vocab.empty() || o.mtp.draft_context_vocab;
     const auto subset_row=subset ? mul(model.hidden_size/32U,o.mtp.draft_q4?18U:34U) : 0U;
     slot=add(slot,mul(model.vocab_size,add(subset_row,77U)));

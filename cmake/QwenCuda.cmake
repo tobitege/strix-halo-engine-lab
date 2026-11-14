@@ -14,17 +14,18 @@ add_library(strix_qwen_cuda STATIC
     src/cuda/qwen_gdn.cu src/cuda/qwen_qsa.cu src/cuda/qwen_moe.cu
     src/cuda/qwen_plemtp.cu src/cuda/qwen_mtp_draft.cu src/cuda/qwen_transcode.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda)
+# Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
+include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
+target_link_libraries(strix_qwen_cuda PUBLIC strix_device)
 target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
-add_library(strix_qwen_handoff STATIC src/cuda/qwen_handoff.cpp src/bp_codec.cpp
-    src/serve/json.cpp src/model_content_hash.cpp src/model_runtime_binding.cpp)
-target_include_directories(strix_qwen_handoff PUBLIC include src/cuda)
-target_link_libraries(strix_qwen_handoff PUBLIC Threads::Threads)
-if(WIN32)
-    target_link_libraries(strix_qwen_handoff PUBLIC ws2_32)
-endif()
+# Handoff library and the serving front end of the node (OpenAI/Anthropic API, SSE, GGUF BPE tokenizer, Qwen chat
+# template) for the RTX engine: strix_qwen_handoff and strix_serve_win, with the libraries they call linked by name.
+include(${CMAKE_CURRENT_LIST_DIR}/StrixServeStandalone.cmake)
+strix_add_standalone_serve(strix_serve_win strix_qwen_handoff)
+include(${CMAKE_CURRENT_LIST_DIR}/StrixBuildInfo.cmake)  # generated/strix/build_info.hpp for src/preflight.cpp
 add_executable(strix-cuda-qwen-prefill-service apps/cuda_qwen_prefill_service_main.cu)
 target_link_libraries(strix-cuda-qwen-prefill-service PRIVATE strix_qwen_cuda strix_qwen_handoff)
 add_executable(qwen_prefill_e2e tests/cuda/qwen_prefill_e2e.cu)
@@ -41,12 +42,6 @@ add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
-# Serving front end of the node (OpenAI/Anthropic API, SSE, GGUF BPE tokenizer, Qwen chat template) for the RTX engine.
-add_library(strix_serve_win STATIC
-    src/serve/json_constraint.cpp src/serve/constraint_selection.cpp src/serve/bpe_tokenizer.cpp
-    src/serve/chat_template.cpp src/serve/deepseek_chat.cpp src/serve/engine.cpp src/serve/api.cpp src/serve/request_fields.cpp src/serve/health.cpp src/serve/http_server.cpp)
-target_include_directories(strix_serve_win PUBLIC include PRIVATE src/serve)
-target_link_libraries(strix_serve_win PUBLIC strix_qwen_handoff)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
 if(MSVC)

@@ -35,6 +35,7 @@ public:
         (void)hipFree(ws_.base);
         for (auto& [k, p] : experts_) (void)hipFree(p);
     }
+    bool publishes() const override { return true; }
     void forward(const MoeLayerWeights& w, const CallCtx& c, const float* x, const std::uint32_t* ids, const float* wts,
                  float* y) override {
         const auto R = static_cast<unsigned>(c.rows.size());
@@ -48,6 +49,7 @@ public:
         v.shared = slices(w.shared);
         v.out = y;
         v.ws = ws_;
+        v.publish = c.publish;
         if (w.i4.on()) {  // stored routed INT4: W4A16 for every row regime
             for (unsigned m = 0; m < 3; ++m) {
                 v.i4.wq[m] = w.i4.wq[m];

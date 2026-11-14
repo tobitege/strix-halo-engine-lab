@@ -1,6 +1,6 @@
 #pragma once
-// Host-only parsing shared by the transport opener and its tests. Spellings are
-// an app contract: callers select their existing dialect rather than add aliases.
+// Host-only parsing shared by the transport opener and its tests. Every pair binary accepts the same spellings:
+// usb4auto / usb4-auto (host path), usb4gpu / usb4-gpu (GPU-direct streams), usb4:dev,... and tcp-listen/tcp-connect.
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -10,13 +10,12 @@
 namespace strix::dist {
 enum class TransportKind { tcp_listen, tcp_connect, usb4_host, usb4_auto, usb4_gpu };
 struct TransportSpellings {
-    std::string_view host = "usb4auto", gpu = "usb4gpu", host_alias = {};
-    bool tcp = true, devices = false;
-    bool usb_suffix = true; // the existing kind:rest apps ignored USB4 rest
+    std::string_view host = "usb4auto", gpu = "usb4gpu", host_alias = "usb4-auto";
+    bool tcp = true, devices = true;
+    bool usb_suffix = true; // kind:rest ignores the USB4 rest
+    std::string_view gpu_alias = "usb4-gpu";
 };
-inline constexpr TransportSpellings compact_transport{"usb4auto", "usb4gpu", {}, true, true};
-inline constexpr TransportSpellings hyphen_transport{"usb4-auto", "usb4gpu"};
-inline constexpr TransportSpellings prefill_transport{"usb4-auto", "usb4-gpu"};
+inline constexpr TransportSpellings pair_transport{};
 struct TransportSpec {
     TransportKind kind;
     std::string host;
@@ -37,7 +36,8 @@ inline TransportSpec parse_transport(const std::string& spec, TransportSpellings
         throw std::invalid_argument("unknown transport " + spec);
     if ((!spellings.host.empty() && kind == spellings.host) || (!spellings.host_alias.empty() && kind == spellings.host_alias))
         return {TransportKind::usb4_auto, {}, 0, {}};
-    if (!spellings.gpu.empty() && kind == spellings.gpu) return {TransportKind::usb4_gpu, {}, 0, {}};
+    if ((!spellings.gpu.empty() && kind == spellings.gpu) || (!spellings.gpu_alias.empty() && kind == spellings.gpu_alias))
+        return {TransportKind::usb4_gpu, {}, 0, {}};
     if (spellings.devices && kind == "usb4") {
         TransportSpec result{TransportKind::usb4_host, {}, 0, {}};
         for (std::size_t begin = 0; begin < rest.size();) {
@@ -52,11 +52,15 @@ inline TransportSpec parse_transport(const std::string& spec, TransportSpellings
 }
 // Route identity after opening: a requested GPU transport is still the ordinary
 // host route unless a live device exchange was negotiated. Never infer this from
-// the request or the human-readable transport receipt.
+// the request or the human-readable transport receipt. A USB4 route is named by the caller's canonical names
+// whichever accepted spelling was requested, so a route key never depends on the spelling.
 inline std::string negotiated_transport(const std::string& requested, bool direct_live,
-                                        TransportSpellings spellings) {
-    if (parse_transport(requested, spellings).kind == TransportKind::usb4_gpu)
-        return std::string(direct_live ? spellings.gpu : spellings.host);
-    return requested;
+                                        std::string_view host_name = pair_transport.host,
+                                        std::string_view gpu_name = pair_transport.gpu) {
+    switch (parse_transport(requested, pair_transport).kind) {
+    case TransportKind::usb4_gpu: return std::string(direct_live ? gpu_name : host_name);
+    case TransportKind::usb4_auto: return std::string(host_name);
+    default: return requested;
+    }
 }
 } // namespace strix::dist

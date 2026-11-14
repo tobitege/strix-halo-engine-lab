@@ -14,6 +14,7 @@
 // unless a declared arithmetic deviation is approved. Implementations are installed with Engine::set_*() before load() or between
 // calls; the engine owns weights and state, seams own only their scratch.
 #include "glm/spec/glm_spec_merge.hpp"
+#include "strix/pair/producer_publish.hpp"
 
 #include <array>
 #include <cstddef>
@@ -182,6 +183,9 @@ struct CallCtx {
     hipStream_t stream = nullptr;
     bool decode = true;                 // false: prefill chunk
     const SpecRows* spec = nullptr;     // non-null: speculative verify rows; checkpoints go to spec->row_flag[r]
+    // Set by the engine when y is the exchange's TX slot (Exchange::producer_slot): the seam's last kernel publishes
+    // the partial itself. Only passed to a seam whose publishes() is true.
+    strix::pair::ProducerPublish publish{};
 };
 
 // ---------------------------------------------------------------- seams
@@ -194,6 +198,8 @@ public:
     virtual void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) = 0;
     // Speculative verify calls with the windows of several slots (SpecRows::seg); false: one slot per verify call.
     virtual bool supports_multi_slot_verify() const { return false; }
+    // True when kda() / dsa() honour CallCtx::publish (y is the exchange TX slot; the partial is published by the seam).
+    virtual bool publishes() const { return false; }
 };
 // FFN of one MoE layer: x = normed [R][4096]; route ids [R][8] ascending + weights [R][8] (computed by the engine,
 // R5/R14) -> y = sum over the row's experts in ascending id of fmaf(w, expert(x)) + shared(x), this rank's partial.
@@ -210,6 +216,8 @@ public:
         return 0;
     }
     virtual void warm(const MoeLayerWeights& w) { (void)w; }
+    // True when forward() honours CallCtx::publish (the partial is published by the seam's last kernel).
+    virtual bool publishes() const { return false; }
 };
 // TP reduction: p [R][4096] in place -> p0 + p1 (rank order) on both ranks; head argmax merge. world = 1: identity.
 class Exchange {
@@ -233,6 +241,14 @@ public:
                                 unsigned* /*flag*/, unsigned /*rows*/, hipStream_t /*s*/) {
         return false;
     }
+    // Producer publication (strix/pair/producer_publish.hpp): the TX slot of the next reduction of `rows` rows and what
+    // its producer needs to publish it. A seam that returns a slot accepts it as `part` in fused_boundary_rows (the
+    // message is then already written and published: nothing is copied). nullptr data = not provided.
+    struct ProducerSlot {
+        float* data = nullptr;
+        strix::pair::ProducerPublish publish{};
+    };
+    virtual ProducerSlot producer_slot(unsigned /*rows*/, hipStream_t /*s*/) { return {}; }
     // Row-aware hook: existing seams retain the single-flag contract.
     virtual bool fused_boundary_rows(const float* part, const float* X, const float* mix, float* Xout,
                                      unsigned* flags, unsigned rows, unsigned flag_stride, hipStream_t s) {
@@ -327,6 +343,10 @@ struct Profile {
     double kda = 0, dsa = 0, moe = 0, dense = 0;
     std::uint64_t calls = 0;
 };
+
+// Decode producer publication (STRIX_GLM_XB_PUBLISH): -1 = the environment (default), 0 / 1 = forced for the process.
+// Rank-local and bit-identical, so it may change between steps (in-process A/B).
+void set_decode_producer_publish(int mode);
 
 class Engine {
 public:

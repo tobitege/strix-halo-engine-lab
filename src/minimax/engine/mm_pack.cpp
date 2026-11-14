@@ -80,6 +80,8 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
                 throw std::runtime_error("duplicate tensor across safetensors shards: " + entry.name);
         }
     }
+    for (std::size_t f = 0; f < fds_.size(); ++f)
+        sources_.push_back(std::make_unique<strix::core::FileWeightSource>(fds_[f], direct_[f] != 0));
     void* p = nullptr;
     if (posix_memalign(&p, kAlign, kBounce) != 0) throw std::runtime_error("bounce buffer");
     bounce_ = static_cast<std::uint8_t*>(p);

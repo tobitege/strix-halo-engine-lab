@@ -15,7 +15,18 @@ namespace strix {
 // per probability bin (the slot's bins, shrunk to the controller-wide bins), instead of the probability blended
 // with the slot's per-depth history (which, once seen, barely depends on the draft's own confidence).
 // calibrated_min_members gates calibration by the joint group's member count at plan time.
-struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;};
+// budget: plan() and choose() take each request's rows from the shared row budget (strix/serve/row_budget.hpp):
+// a cycle costs fixed + per-row + per-request milliseconds, so draft rows follow acceptance and shrink as the lanes
+// of a cycle grow. The serving default (STRIX_SERVE_ROW_BUDGET=0 turns it off); also the rule name "budget".
+// Scheduling only, as every other rule.
+struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;
+    bool budget=false;};
+// The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
+// baseline mode) restores the fixed rows-per-request table.
+[[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
+// Most decoding requests the budget plans for (STRIX_SERVE_ROW_BUDGET_MAX_LANES, default 6, 0..8). Above it every
+// request gets the fixed table's two rows: measured, the budget wins at 2 to 6 requests and loses at 8.
+[[nodiscard]] std::uint32_t mtp_serve_row_budget_max_lanes() noexcept;
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.
 class MtpBatchWindowController {
@@ -29,7 +40,7 @@ public:
     using Rule=MtpBatchPlanRule;
     // Unset: calibrated-c3, or production under baseline. Explicit rules win over that default.
     [[nodiscard]] static Rule rule_from_env(bool baseline=false);
-    // "calibrated-c3", "calibrated", "pooled", "cap4", "cap2"; production/0/unknown = production.
+    // "calibrated-c3", "calibrated", "pooled", "cap4", "cap2", "budget"; production/0/unknown = production.
     [[nodiscard]] static Rule parse_rule(std::string_view text);
     // Measurement: the rule may change between admissions (in-process A/B); histories and costs are kept.
     void set_rule(Rule rule) noexcept {rule_=rule;}
@@ -47,6 +58,11 @@ public:
     // The last plan(): its expected tokens and ms (target estimate + draft estimate), and whether it was a probe.
     struct PlanInfo {double expected=0.0, ms=0.0; bool probe=false;};
     [[nodiscard]] const PlanInfo& last_plan() const noexcept {return last_;}
+    // Budget rule cost model: a cycle costs fixed + row x physical rows + lane x lanes ms. Priors 28 + 6 x rows
+    // + 6 x lanes (one lane: 34 + 6 x rows; STRIX_SERVE_ROW_COST=fixed,row,lane pins them); once the measured
+    // topologies identify the three terms, their least-squares fit.
+    struct BudgetCost {double fixed_ms=28.0,row_ms=6.0,lane_ms=6.0; bool fitted=false;};
+    [[nodiscard]] BudgetCost budget_cost() const;
     void resize_slots(std::size_t slots) {history_.resize(slots);}
     void reset(std::uint32_t slot) {history_.at(slot)={};}
     // Before paying for drafts: rows 0 means no draft; otherwise draft rows-1.
@@ -76,6 +92,8 @@ private:
     [[nodiscard]] static std::size_t calibration_bin(double p);
     [[nodiscard]] PlanInfo estimate(std::span<const Request>,std::span<const std::uint32_t> rows,bool prior) const;
     [[nodiscard]] std::vector<std::uint32_t> search(std::span<const Request>,std::uint32_t,bool prior,
+        PlanInfo* info=nullptr) const;
+    [[nodiscard]] std::vector<std::uint32_t> budget_rows(std::span<const Request>,std::uint32_t,bool prior,
         PlanInfo* info=nullptr) const;
 };
 } // namespace strix

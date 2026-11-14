@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/serial_session.hpp"
 #include <cstdlib>
@@ -17,7 +18,7 @@ struct OutputLogitsSnapshot {
     void capture(const std::optional<ModelContentIdentity>& row) { digest=row; }
 };
 inline bool prompt_terminal_digest_enabled() {
-    static const bool enabled=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
     return enabled;
 }
 inline std::optional<ModelContentIdentity> raw_fp32_logits_digest(std::span<const float> row) {

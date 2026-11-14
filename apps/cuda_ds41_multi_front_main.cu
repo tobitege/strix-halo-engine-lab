@@ -21,6 +21,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "strix/device/cuda_enumerator.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -313,6 +314,9 @@ Gathered gather(const pipe::StepMsg& no_stream, const float* stream, std::size_t
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     CudaPrefillOptions o;

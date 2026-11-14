@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_host_forward.hpp"
 
@@ -16,6 +17,10 @@
 //   strix-deepseek41-lockstep MODEL.gguf --layers 4 --prompt-ids 0,671,... [--generate G] [--logits OUT.f32] [--verbose]
 // The fed sequence is the prompt followed by the device's greedy tokens; --logits writes the device logits per step.
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::string model, prompt, logits_path;
     std::uint32_t layers = 4, generate = 8;
     bool verbose = false;

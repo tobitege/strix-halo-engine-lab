@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
@@ -107,7 +108,7 @@ struct HipKnownPromptBackend::Impl {
         }
         guard->require_original();
         // STRIX_PREFILL_TIMING=1: host milliseconds of the block's logits download on stderr.
-        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        static const bool timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         if (timing)
             std::fprintf(stderr, "teacher block %llu rows: download %.1f ms\n", static_cast<unsigned long long>(rows),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_start).count());
@@ -169,7 +170,7 @@ struct HipKnownPromptBackend::Impl {
             // Allocate host return storage before any model-state consumption.
             std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
             // STRIX_PREFILL_TIMING=1: host milliseconds of the hand-offs and the block (stderr).
-            static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+            static const bool timing=strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
             auto mark=std::chrono::steady_clock::now();
             const auto lap=[&](const char* name) {
                 if(!timing) return;
@@ -229,7 +230,7 @@ struct HipKnownPromptBackend::Impl {
                 validate_serial_decode_engine_logits(logits, vocab_size);
                 // STRIX_PREFILL_LOGITS_DIGEST=1: FNV-1a 64 of the terminal row's FP32 logit bytes (stderr), for
                 // bitwise comparisons of prefill variants.
-                static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
+                static const bool digest=strix::envcfg::flag("STRIX_PREFILL_LOGITS_DIGEST", false);
                 if(digest) {
                     std::uint64_t hash=14695981039346656037ULL;
                     for(const auto byte:std::as_bytes(std::span<const float>(logits))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
@@ -372,9 +373,12 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
             if (self.failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
             self.started = true;
             self.guard->require_original();
-            const auto rows = self.window->logical_rows();
+            // A partial member runs the first tokens.size() rows of its tiled owner, as execute_rows_partial does alone.
+            const auto rows = member.partial ? static_cast<std::uint32_t>(member.tokens.size()) : self.window->logical_rows();
             const auto policy = self.window->output_policy();
             validate_known_window_output_policy(policy);
+            if (member.partial && (rows < 16U || rows % 8U || rows > self.window->logical_rows()))
+                throw std::invalid_argument("known prompt group partial block needs 16..T rows in multiples of 8");
             if (!self.window->supports_tiled_prefill() || self.all_rows_sink || policy == KnownWindowOutputPolicy::all_rows ||
                 (member.logits && policy == KnownWindowOutputPolicy::state_only))
                 throw std::invalid_argument("known prompt group members are terminal-row or state-only tiled blocks");

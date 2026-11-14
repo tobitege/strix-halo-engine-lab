@@ -22,6 +22,7 @@
 // Failure: an error or a deadline (no completion within `timeout`) poisons the exchange, releases the stream
 // waiting on the flag (with a value that marks the failure) and makes every later call throw.
 
+#include "strix/dist/exchange_direction.hpp"
 #include "strix/linux_gpu_queue.hpp"
 
 #include <hip/hip_runtime.h>
@@ -42,6 +43,9 @@ class Transport;
 struct DeviceExchangeStats {
     std::uint64_t exchanges = 0;
     std::uint64_t bytes = 0;
+    // Payload bytes this rank put on / took off the rings (a symmetric exchange counts in both, a one-way
+    // transfer in one), and the one-way transfers among `exchanges`.
+    std::uint64_t bytes_tx = 0, bytes_rx = 0, one_way = 0;
     double producer_wait = 0.0;  // progress thread: waiting for the producer copy before SUBMIT (seconds)
     double completion_wait = 0.0; // from the last SUBMIT until RX and TX are complete
     double eagain_retries = 0.0;
@@ -82,6 +86,14 @@ public:
     // exchanges). Empty if the engine has none.
     [[nodiscard]] virtual std::string diagnose(std::size_t) { return {}; }
     virtual void use_rings(unsigned) {}
+    // One-way transfer: the next start() moves bytes in one direction only. The sending rank calls
+    // use_direction(send) and the receiving rank use_direction(receive) before the same exchange; the sender posts no
+    // receive and the receiver no transmit, so nothing travels in the unused direction. The receiver's GPU checks the
+    // same in-band identity and checksum, and the sender's operation completes only against the receive the peer
+    // posted (the rings' flow control). A one-way transfer posts no early receive. start() takes `local` on the
+    // sender (ignored on the receiver), finish() takes `remote` on the receiver (ignored on the sender). False: this
+    // exchange has no one-way form; the caller keeps the symmetric exchange.
+    [[nodiscard]] virtual bool use_direction(ExchangeDirection) { return false; }
     // The expected size and ring count (as use_rings) of the exchange after the next start(): its receive is posted
     // early, before this exchange's TX, so the peer never transmits into an empty receive ring. A wrong guess costs one
     // internal exchange of the guessed geometry, made the same way by both ranks (the hints are the same calls).

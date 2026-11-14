@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/q6p_registry.hpp"
 
 #include <atomic>
@@ -70,7 +71,7 @@ bool registered(const void* original_address) noexcept {
 std::uint64_t hits() noexcept { return registry().hits.load(std::memory_order_relaxed); }
 
 bool kernels_enabled() noexcept {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_Q6P"); return !v || v[0] != '0'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_Q6P", true);
     return enabled;
 }
 

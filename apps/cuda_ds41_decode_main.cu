@@ -30,6 +30,7 @@
 //   rows from position 0 (every row compared with --ref: fed, argmax, logits FNV), then --steps greedy R1 steps.
 // --stops K1,K2,..: after the greedy steps, --stop-steps steps (default 16) that stop after layer K (FRONT prefixes:
 //   the stream comes out, no head); the sequence's later layers fall behind (timing only).
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_file_reader.hpp"
@@ -288,6 +289,9 @@ bool read_boundary(std::FILE* f, Boundary& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     CudaPrefillOptions o;

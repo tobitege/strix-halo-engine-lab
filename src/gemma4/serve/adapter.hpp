@@ -3,11 +3,11 @@
 #include "chat.hpp"
 #include "tokenizer.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/serve/tokenizer.hpp"
 
 namespace strix::gemma4::serve {
 
-// Family-side seam for a future GenerationEngine implementation. GenerationJob
-// and GenerationQueue remain shared. No executor or HTTP endpoint is installed.
+// Family rendering and tokenization over the shared generation contract.
 struct PreparedPrompt {
     std::string rendered;
     std::vector<std::uint32_t> ids, stop_ids;
@@ -25,11 +25,9 @@ private:
 
 // The shared API uses {name, arguments} internally and creates wire IDs itself.
 [[nodiscard]] strix::serve::AssistantOutput shared_output(const Output& output);
+[[nodiscard]] Json shared_calls(const Json& calls);
 
-// Integration must provide a polymorphic tokenizer seam to ApiService (which
-// currently accepts concrete BpeTokenizer), and request-local parser state for
-// reasoning channels. An engine implements GenerationEngine::generate and
-// consumes PreparedPrompt::job through the existing queue. Budget continuation
-// is an explicit second job; advertise no engine budget capability until wired.
+// Delegates the Unicode/space/byte-fallback tokenizer without reinterpreting assets.
+[[nodiscard]] std::shared_ptr<const strix::serve::ApiTokenizer> api_tokenizer(std::shared_ptr<const Tokenizer>);
 
 } // namespace strix::gemma4::serve

@@ -24,7 +24,7 @@ inline constexpr std::size_t iu4_scale_bytes(unsigned K, unsigned N) { return st
 // block (after the input transform). Two K64 groups (j 0-1, j 2-3): wave max, s = max / 7 (1 when 0), q = clamp(RNE(x /
 // s), -7, 7); even lanes store the (even, odd) byte of row_q, lane 0 the two FP32 scales of row_s. The bits of the
 // library quantiser (quantise_wmma_iu4_activations) on the same FP16 rows.
-__device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* row_q, float* row_s, unsigned begin, unsigned lane) {
+template<class Store> __device__ __forceinline__ void iu4_quant128_store(const float (&v)[4], unsigned begin, unsigned lane, Store store) {
 #pragma unroll
     for (unsigned g = 0; g < 2U; ++g) {
         float amax = fmaxf(fabsf(v[2U * g]), fabsf(v[2U * g + 1U]));
@@ -37,10 +37,50 @@ __device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* 
             const int qv = max(-7, min(7, static_cast<int>(nearbyintf(v[j] / scale))));
             const int odd = __shfl_xor(qv, 1);
             if (!(lane & 1U))
-                row_q[(begin + lane + 32U * j) / 2U] =
-                    static_cast<std::uint8_t>((static_cast<unsigned>(qv) & 15U) | ((static_cast<unsigned>(odd) & 15U) << 4U));
+                store.byte((begin + lane + 32U * j) / 2U,
+                    static_cast<std::uint8_t>((static_cast<unsigned>(qv) & 15U) | ((static_cast<unsigned>(odd) & 15U) << 4U)));
         }
-        if (lane == 0U) row_s[begin / 64U + g] = scale;
+        if (lane == 0U) store.scale(begin / 64U + g, scale);
+    }
+}
+
+struct IU4RowStore {
+    std::uint8_t* q; float* s;
+    __device__ void byte(unsigned i, std::uint8_t v) const { q[i] = v; }
+    __device__ void scale(unsigned i, float v) const { s[i] = v; }
+};
+__device__ __forceinline__ void iu4_quant128(const float (&v)[4], std::uint8_t* q, float* s, unsigned begin, unsigned lane) {
+    iu4_quant128_store(v, begin, lane, IU4RowStore{q, s});
+}
+
+// Two-plane ("A8") twin of iu4_quant128: plane 1 is exactly iu4_quant128 (q, s); plane 2 holds the remainder
+// r = v - q s (|r| <= s / 2) as q2 = clamp(RNE(r / s2), -7, 7) with s2 = s / 14, so v ~ q s + q2 s2 with a step of
+// s / 14 (about 7.7 bits). Two IU4 GEMMs over the two planes add up to the W4A8 product; plane 1 alone is W4A4.
+__device__ __forceinline__ void iu4_quant128_planes(const float (&v)[4], std::uint8_t* q, float* s, std::uint8_t* q2, float* s2,
+                                                    unsigned begin, unsigned lane) {
+#pragma unroll
+    for (unsigned g = 0; g < 2U; ++g) {
+        float amax = fmaxf(fabsf(v[2U * g]), fabsf(v[2U * g + 1U]));
+#pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2) amax = fmaxf(amax, __shfl_xor(amax, delta));
+        const float scale = amax == 0.0F ? 1.0F : amax / 7.0F;
+        const float fine = scale / 14.0F;
+#pragma unroll
+        for (unsigned jj = 0; jj < 2U; ++jj) {
+            const unsigned j = 2U * g + jj;
+            const int qv = max(-7, min(7, static_cast<int>(nearbyintf(v[j] / scale))));
+            const int rv = max(-7, min(7, static_cast<int>(nearbyintf((v[j] - static_cast<float>(qv) * scale) / fine))));
+            const int odd = __shfl_xor(qv, 1), rodd = __shfl_xor(rv, 1);
+            if (!(lane & 1U)) {
+                const unsigned at = (begin + lane + 32U * j) / 2U;
+                q[at] = static_cast<std::uint8_t>((static_cast<unsigned>(qv) & 15U) | ((static_cast<unsigned>(odd) & 15U) << 4U));
+                q2[at] = static_cast<std::uint8_t>((static_cast<unsigned>(rv) & 15U) | ((static_cast<unsigned>(rodd) & 15U) << 4U));
+            }
+        }
+        if (lane == 0U) {
+            s[begin / 64U + g] = scale;
+            s2[begin / 64U + g] = fine;
+        }
     }
 }
 

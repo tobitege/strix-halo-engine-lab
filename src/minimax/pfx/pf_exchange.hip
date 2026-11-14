@@ -1,6 +1,7 @@
 // MiniMax M3.1 TP2 prefill exchange module: the engine (see pf_exchange.hpp).
 #include "pf_exchange.hpp"
 #include "minimax/xfer/minimax_xfer_device.hpp"
+#include "strix/env_flags.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -45,11 +46,6 @@ __global__ __launch_bounds__(kCopyThreads) void copy_publish_kernel(std::byte* d
     xfer::mmx_publish(target, gridDim.x);
 }
 
-std::uint64_t env_u64(const char* name, std::uint64_t fallback) {
-    const char* v = std::getenv(name);
-    return v != nullptr && *v != '\0' ? std::stoull(v) : fallback;
-}
-
 void pin(std::thread& t, int cpu) {
     if (cpu < 0) return;
     cpu_set_t set;
@@ -71,9 +67,10 @@ std::string describe(const Header& h) {
 }  // namespace
 
 void Options::from_env() {
-    depth = static_cast<unsigned>(env_u64("STRIX_MM_PFX_DEPTH", depth));
-    chunk = static_cast<std::size_t>(env_u64("STRIX_MM_PFX_CHUNK", chunk));
+    depth = static_cast<unsigned>(strix::env_number<std::uint64_t>("STRIX_MM_PFX_DEPTH", depth));
+    chunk = static_cast<std::size_t>(strix::env_number<std::uint64_t>("STRIX_MM_PFX_CHUNK", chunk));
     if (const char* v = std::getenv("STRIX_MM_PFX_CRC"); v != nullptr && v[0] == '0') crc = false;
+    joined = strix::envcfg::flag("STRIX_MM_PFX_JOINED", joined);
     if (const char* v = std::getenv("STRIX_MM_PFX_PROGRESS_CPU"); v != nullptr && *v != '\0') progress_cpu = std::atoi(v);
     if (const char* v = std::getenv("STRIX_MM_PFX_CRC_CPUS"); v != nullptr && *v != '\0') {
         std::stringstream in(v);
@@ -84,17 +81,21 @@ void Options::from_env() {
         crc_tx_cpu = std::stoi(a);
         crc_rx_cpu = std::stoi(b);
     }
-    timeout = std::chrono::milliseconds(env_u64("STRIX_MM_PFX_TIMEOUT_MS", static_cast<std::uint64_t>(timeout.count())));
+    timeout = std::chrono::milliseconds(strix::env_number<std::uint64_t>("STRIX_MM_PFX_TIMEOUT_MS", static_cast<std::uint64_t>(timeout.count())));
 }
 
-Exchanger::Exchanger(dist::Transport& borrowed, Options options) : transport_(&borrowed), options_(options) {
+Exchanger::Exchanger(dist::Transport& borrowed, Options options)
+    : transport_(&borrowed), options_(options),
+      frame_(options.chunk ? (options.capacity + options.chunk - 1) / options.chunk : 1) {
     if (options_.rank > 1) throw std::invalid_argument("mmpfx: rank must be 0 or 1");
     if (options_.capacity == 0) throw std::invalid_argument("mmpfx: capacity");
     if (options_.depth < 2 || options_.depth > 16) throw std::invalid_argument("mmpfx: depth must be 2..16");
     if (options_.chunk < (std::size_t{64} << 10) || options_.chunk > (std::size_t{64} << 20) || options_.chunk % 64 != 0)
         throw std::invalid_argument("mmpfx: chunk must be a multiple of 64 in [64 KiB, 64 MiB]");
-    stride_ = (options_.capacity + 4095) & ~std::size_t{4095};
     max_chunks_ = (options_.capacity + options_.chunk - 1) / options_.chunk;
+    // The joined form writes its record (identity, CRC list) behind the payload of the slot.
+    const std::size_t tail = options_.joined ? xport::FramedExchange<Header>::tail_bytes(max_chunks_) : 0;
+    stride_ = (options_.capacity + tail + 4095) & ~std::size_t{4095};
     const std::size_t total = stride_ * options_.depth;
     const unsigned flags = hipHostMallocMapped | hipHostMallocCoherent;
     if (options_.tx_uncached) {
@@ -187,6 +188,12 @@ bool Exchanger::set_tx_uncached(bool on) {
 
 void* Exchanger::tx() {
     const std::uint64_t s = next_ + 1;
+    if (s > retired_ + options_.depth) throw std::logic_error("mmpfx: tx() of a sequence whose slot is still in use (retire() of s - depth missing)");
+    return tx_dev_ + (tx_slot(s) - tx_host_);
+}
+
+void* Exchanger::tx(unsigned ahead) {
+    const std::uint64_t s = next_ + 1 + ahead;
     if (s > retired_ + options_.depth) throw std::logic_error("mmpfx: tx() of a sequence whose slot is still in use (retire() of s - depth missing)");
     return tx_dev_ + (tx_slot(s) - tx_host_);
 }
@@ -387,47 +394,52 @@ void Exchanger::process(const Job& job) {
     const std::size_t count = (job.bytes + options_.chunk - 1) / options_.chunk;
     if (options_.crc) post_lane(tx_lane_, tx, job.bytes, count);  // the TX slot is complete: every chunk is ready
     const Header mine = PrefillTraits::header(options_, job.sequence, job.bytes, job.tag);
-    Header peer;
+    const auto kind = static_cast<std::uint32_t>(job.tag.kind);
+    const auto wire = [&](std::span<const std::byte> out, std::span<std::byte> in) {
+        peer_wait_.measure(kind, [&] { transport_->exchange(out, in); });
+    };
+    const auto landed = [&](std::size_t chunks) {
+        if (options_.crc) rx_lane_.ready.store(chunks, std::memory_order_release);
+    };
+    const auto tx_crcs = [&] { wait_lane(tx_lane_, deadline); return static_cast<const std::uint32_t*>(tx_lane_.crcs.data()); };
+    const auto differs = [&](const Header& peer) {
+        fail("mmpfx: peer header differs: mine " + describe(mine) + " / peer " + describe(peer));
+    };
+    xport::FrameResult<Header> peer;
     try {
-        // The ranks agree on the identity and the size before any payload moves (a mismatch cannot desynchronise the
-        // streams' part sizes).
-        peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
-            transport_->exchange(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&mine), sizeof(mine)),
-                                 std::span<std::byte>(reinterpret_cast<std::byte*>(&peer), sizeof(peer)));
-        });
-        if (peer.magic != kHeaderMagic || !same_identity(mine, peer))
-            fail("mmpfx: peer header differs: mine " + describe(mine) + " / peer " + describe(peer));
-        if (options_.crc) post_lane(rx_lane_, rx, job.bytes, 0);
-        for (std::size_t k = 0; k < count; ++k) {
-            const std::size_t off = k * options_.chunk, n = std::min(options_.chunk, job.bytes - off);
-            peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
-                transport_->exchange(std::span<const std::byte>(tx + off, n), std::span<std::byte>(rx + off, n));
-            });
-            if (options_.crc) rx_lane_.ready.store(k + 1, std::memory_order_release);
+        if (!negotiated_) {
+            // Once per connection, before the first exchange: both ranks offer their forms and use the common ones.
+            // mine.chunk = the wire chunk size | the CRC bit: the two values that fix every later part size.
+            if (options_.joined)
+                forms_ = xport::negotiate_frame_forms(wire, xport::frame_rendezvous | xport::frame_joined, mine.chunk);
+            negotiated_ = true;
+        }
+        if ((forms_ & xport::frame_joined) != 0) {
+            if (options_.crc) post_lane(rx_lane_, rx, job.bytes, 0);
+            peer = frame_.joined(wire, mine, kTrailerMagic, tx, rx, job.bytes, options_.chunk, options_.crc, landed, tx_crcs);
+        } else {
+            // The ranks agree on the identity and the size before any payload moves (a mismatch cannot desynchronise
+            // the streams' part sizes).
+            peer = frame_.rendezvous(wire, mine, kTrailerMagic, tx, rx, job.bytes, options_.chunk, options_.crc,
+                [&](const Header& theirs) {
+                    if (theirs.magic != kHeaderMagic || !same_identity(mine, theirs)) differs(theirs);
+                    if (options_.crc) post_lane(rx_lane_, rx, job.bytes, 0);
+                }, landed, tx_crcs);
         }
     } catch (const std::exception& e) {
         if (failed_.load()) throw;
         fail(std::string("mmpfx: transport: ") + e.what());
     }
-    const auto t2 = Clock::now();
+    if (peer.first.magic != peer.first_magic || !same_identity(mine, peer.first)) differs(peer.first);
+    const auto t2 = peer.landed;
     if (options_.crc) {
-        // Trailer: the identity again + this rank's per-chunk TX CRCs; the peer's list must equal our RX CRCs.
-        wait_lane(tx_lane_, deadline);
-        std::vector<std::byte> out(sizeof(Header) + count * 4), in(out.size());
-        PrefillTraits::trailer(out.data(), mine, tx_lane_.crcs.data(), count);
-        try {
-            peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] { transport_->exchange(out, in); });
-        } catch (const std::exception& e) {
-            if (failed_.load()) throw;
-            fail(std::string("mmpfx: transport (trailer): ") + e.what());
-        }
-        Header pt;
-        std::memcpy(&pt, in.data(), sizeof(pt));
-        if (pt.magic != kTrailerMagic || !same_identity(mine, pt)) fail("mmpfx: peer trailer differs: " + describe(pt));
+        // The identity again + the peer's per-chunk TX CRCs: the list must equal our RX CRCs.
+        if (peer.trailer.magic != kTrailerMagic || !same_identity(mine, peer.trailer))
+            fail("mmpfx: peer trailer differs: " + describe(peer.trailer));
         wait_lane(rx_lane_, deadline);
-        if (std::memcmp(in.data() + sizeof(Header), rx_lane_.crcs.data(), count * 4) != 0) {
+        if (std::memcmp(peer.crcs, rx_lane_.crcs.data(), count * 4) != 0) {
             std::size_t k = 0;
-            while (k < count && std::memcmp(in.data() + sizeof(Header) + k * 4, &rx_lane_.crcs[k], 4) == 0) ++k;
+            while (k < count && std::memcmp(peer.crcs + k * 4, &rx_lane_.crcs[k], 4) == 0) ++k;
             fail("mmpfx: payload CRC mismatch at sequence " + std::to_string(job.sequence) + " chunk " + std::to_string(k) + " of " +
                  std::to_string(count));
         }

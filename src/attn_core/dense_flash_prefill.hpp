@@ -38,14 +38,14 @@
 //                                                   visited 16-key tile; masked keys are multiplied by zero)
 //   const uint16_t* value_t(const Args&, kv_head, d) kOp V^T row: element pos = V[pos][d]; 16-B aligned at pos%16==0
 //   unsigned* failure(const Args&)                  bit 1 nonfinite output, bit 4 operand query overflow
-// The denominator sums the operand-rounded p (what PV accumulates), as tile::online_step.
+// The denominator sums the operand-rounded p (what PV accumulates) in key order across both half-waves.
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 
-#include "flash_tile.hpp"
+#include "flash_core.hpp"
 
 namespace strix::attn_core::dense {
 
@@ -190,21 +190,25 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 m = other > m ? other : m;
             }
             const bool present = mine || __shfl_xor(int(mine), 16, 32) != 0;
-            const float alpha = present ? __builtin_amdgcn_exp2f(maximum - m) : 1.0F;
-            float own[8];
-#pragma unroll
-            for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[i] - m) : 0.0F;
+            // The online update is spelled out, not routed through online_step (flash_core.hpp): identical
+            // math through the shared step adds 4-24 B of scratch per kernel on gfx1151 (remarks, R1-7).
             Frag pa;
-            float sum = 0.0F;
+            const float alpha = present ? __builtin_amdgcn_exp2f(maximum - m) : 1.0F;
+            {
+                float own[8];
 #pragma unroll
-            for (unsigned j = 0; j < 16; ++j) {
-                const float other = __shfl_xor(own[j % 8U], 16, 32);
-                const std::uint16_t p = tile::to_operand<O>(j / 8U == hw ? own[j % 8U] : other);
-                sum += tile::operand_value<O>(p);
-                pa[j] = p;
+                for (unsigned i = 0; i < 8; ++i) own[i] = present ? __builtin_amdgcn_exp2f(sc[i] - m) : 0.0F;
+                float sum = 0.0F;
+#pragma unroll
+                for (unsigned j = 0; j < 16; ++j) {
+                    const float other = __shfl_xor(own[j % 8U], 16, 32);
+                    const std::uint16_t p = tile::to_operand<O>(j / 8U == hw ? own[j % 8U] : other);
+                    sum += tile::operand_value<O>(p);
+                    pa[j] = p;
+                }
+                denominator = denominator * alpha + sum;
+                maximum = m;
             }
-            denominator = denominator * alpha + sum;
-            maximum = m;
             float scale[8];
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) scale[e] = __shfl(alpha, int(2U * e + hw), 32);

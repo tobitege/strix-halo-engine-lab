@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -104,9 +105,22 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
                                const std::vector<std::vector<std::uint32_t>>& prompts, std::uint32_t max_tokens,
                                const std::vector<std::uint32_t>& stops, const std::vector<std::uint32_t>& followup,
                                const std::function<void()>& clear, const std::function<std::uint64_t()>& hits,
-                               const std::function<void(const std::string&)>& out) {
-    unsigned equal = 0, total = 0;
+                               const std::function<void(const std::string&)>& out, bool expect_reply) {
+    unsigned equal = 0, total = 0, reply_hits = 0, reply_cases = 0;
     std::uint64_t warm_hits = 0;
+    // expect_reply: the server runs with the reply-end store on (plain decode): a follow-up turn (previous prompt +
+    // previous reply + new ids) must restore at the END OF THE REPLY, i.e. hit_tokens beyond the first prompt and
+    // kind reply_end, and its tokens must still equal the cache-cleared run (the comparison below).
+    auto reply_hit = [&](const SelftestStream& turn2, std::size_t prompt1) {
+        ++reply_cases;
+        std::string v;
+        for (const auto& [k, x] : turn2.stats.engine_extra)
+            if (k == "prefix_cache") v = x;
+        const auto at = v.find("\"hit_tokens\":");
+        const std::uint64_t hit = at == std::string::npos ? 0 : std::strtoull(v.c_str() + at + 13, nullptr, 10);
+        if (v.find("\"kind\":\"reply_end\"") != std::string::npos && hit > prompt1) ++reply_hits;
+        else out("prefix selftest reply-end MISS: " + (v.empty() ? std::string("-") : v));
+    };
     auto run = [&](const std::vector<std::uint32_t>& p) {
         double wall = 0;
         return selftest_batch(queue, {p}, {0}, max_tokens, stops, wall).at(0);
@@ -149,6 +163,7 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
             clear();
             const auto cold = run(next[i]);
             compare(second[i], cold);
+            if (expect_reply && first[i].tokens.size() >= 2 && first[i].error.empty()) reply_hit(second[i], prompts[i].size());
             // PC3 timing: the turn-2 request served from the cache vs the same request with the cache cleared.
             const auto& w = second[i].stats;
             auto cache = [](const strix::serve::GenerationStats& s) {
@@ -164,7 +179,8 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
         }
     }
     out("prefix selftest: " + std::to_string(equal) + "/" + std::to_string(total) + " EQUAL, hits " + std::to_string(warm_hits));
-    return total != 0 && equal == total && warm_hits >= 2 * prompts.size();
+    if (expect_reply) out("prefix selftest reply-end: " + std::to_string(reply_hits) + "/" + std::to_string(reply_cases) + " restored at the reply end");
+    return total != 0 && equal == total && warm_hits >= 2 * prompts.size() && (!expect_reply || (reply_cases != 0 && reply_hits == reply_cases));
 }
 
 // The decode stall: the longest gap between two consecutive tokens of one stream that overlaps a prefill call of

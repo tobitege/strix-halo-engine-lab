@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_serial_graph.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
@@ -15,9 +16,7 @@
 
 namespace strix {
 namespace {
-void check(hipError_t result, const char* operation) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 void graph_position_prepare(const ExecutionDispatchContext& context, void*) {
     if (context.op != SerialOp::position_prepare || !hip_graph_position())
         throw std::invalid_argument("graph position bookkeeping requires device-input scope");
@@ -48,7 +47,7 @@ public:
                 throw std::invalid_argument("graph logits output is undersized");
             hipLaunchKernelGGL(validate_graph_logits, dim3((vocabulary_ - 1U) / 256U + 1U), dim3(256),
                 0, hip_execution_stream(), reinterpret_cast<const float*>(output.address), vocabulary_, hip_graph_status());
-            check(hipGetLastError(), "graph logits finite validation");
+            hip_check(hipGetLastError(), "graph logits finite validation");
         }
     }
     void dispatch_runtime_step(const ExecutionDispatchContext& context) override { direct_.dispatch_runtime_step(context); }
@@ -76,7 +75,7 @@ struct HipSerialGraph::Impl {
     std::uint32_t status = 0, history_count = 0;
     std::vector<std::uint32_t> order;
     const ExecutionRuntimeResources& current() const {
-        int active = -1; check(hipGetDevice(&active), "graph active device");
+        int active = -1; hip_check(hipGetDevice(&active), "graph active device");
         if (active != device) throw std::invalid_argument("graph device changed");
         const auto& resources = owner->current();
         const auto assessment = assess_compiled_serial_graph_replay(compiled, capture, resources, scope.arguments, 0);
@@ -114,16 +113,16 @@ struct HipSerialGraph::Impl {
             throw std::invalid_argument("graph host bookkeeping bindings changed");
         if (history_count) std::memcpy(previous.data(), reinterpret_cast<const void*>(ngram.address), history_count * 4ULL);
         pending = true;
-        check(hipMemcpyAsync(reinterpret_cast<void*>(scope.arguments.memory.arena_base), input.data(), input.size(),
+        hip_check(hipMemcpyAsync(reinterpret_cast<void*>(scope.arguments.memory.arena_base), input.data(), input.size(),
             hipMemcpyHostToDevice, stream), "graph input upload");
-        if (history_count) check(hipMemcpyAsync(reinterpret_cast<void*>(scope.ngram_input.arena_base), previous.data(),
+        if (history_count) hip_check(hipMemcpyAsync(reinterpret_cast<void*>(scope.ngram_input.arena_base), previous.data(),
             history_count * 4ULL, hipMemcpyHostToDevice, stream), "graph history upload");
-        check(hipGraphLaunch(executable, stream), "whole serial graph replay");
-        check(hipMemcpyAsync(&status, reinterpret_cast<void*>(scope.status.arena_base), 4, hipMemcpyDeviceToHost, stream),
+        hip_check(hipGraphLaunch(executable, stream), "whole serial graph replay");
+        hip_check(hipMemcpyAsync(&status, reinterpret_cast<void*>(scope.status.arena_base), 4, hipMemcpyDeviceToHost, stream),
             "graph completion status");
-        if (history_count) check(hipMemcpyAsync(next.data(), reinterpret_cast<void*>(scope.ngram_output.arena_base),
+        if (history_count) hip_check(hipMemcpyAsync(next.data(), reinterpret_cast<void*>(scope.ngram_output.arena_base),
             history_count * 4ULL, hipMemcpyDeviceToHost, stream), "graph next history");
-        check(hipStreamSynchronize(stream), "graph replay completion");
+        hip_check(hipStreamSynchronize(stream), "graph replay completion");
         pending = false;
         if (status != 0) throw std::runtime_error("whole graph device validation failed");
         (void)current();
@@ -154,7 +153,7 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
     if (!position || position->implementation_identity != graph_position_identity || position->function != &graph_position_prepare)
         throw std::invalid_argument("whole graph catalog has a host position consumer");
     p.launches = compile_launch_plan(p.compiled, p.launchers);
-    check(hipGetDevice(&p.device), "graph device");
+    hip_check(hipGetDevice(&p.device), "graph device");
     struct Range { std::uintptr_t base; std::uint64_t bytes; };
     const auto valid_range = [](Range range) {
         if (!range.base || !range.bytes || range.bytes > std::numeric_limits<std::uintptr_t>::max() - range.base)
@@ -166,11 +165,11 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
     const auto device_binding = [&](Range range) {
         valid_range(range);
         hipPointerAttribute_t attributes{};
-        check(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(range.base)), "graph resource device identity");
+        hip_check(hipPointerGetAttributes(&attributes, reinterpret_cast<const void*>(range.base)), "graph resource device identity");
         if (attributes.type != hipMemoryTypeDevice || attributes.isManaged || attributes.device != p.device)
             throw std::invalid_argument("whole graph requires local owned device allocations");
         hipDeviceptr_t allocation_base{}; std::size_t allocation_bytes = 0;
-        check(hipMemGetAddressRange(&allocation_base, &allocation_bytes,
+        hip_check(hipMemGetAddressRange(&allocation_base, &allocation_bytes,
             reinterpret_cast<hipDeviceptr_t>(range.base)), "graph resource native extent");
         const auto base = reinterpret_cast<std::uintptr_t>(allocation_base);
         if (range.base < base || range.base - base > allocation_bytes || range.bytes > allocation_bytes - (range.base - base))
@@ -199,16 +198,16 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
         for (const auto range : writable)
             if (overlaps(read_only, range)) throw std::invalid_argument("graph weights alias writable resources");
     }
-    hipDeviceProp_t device_properties{}; check(hipGetDeviceProperties(&device_properties, p.device), "graph device properties");
+    hipDeviceProp_t device_properties{}; hip_check(hipGetDeviceProperties(&device_properties, p.device), "graph device properties");
     const auto* override_arch = std::getenv("HSA_OVERRIDE_GFX_VERSION");
     if (std::string(device_properties.gcnArchName).substr(0, 7) != "gfx1151" || (override_arch && *override_arch))
         throw std::invalid_argument("whole graph requires actual gfx1151 without architecture override");
-    check(hipStreamCreateWithFlags(&p.stream, hipStreamNonBlocking), "graph stream create");
-    check(hipMalloc(&p.auxiliary, 128), "graph auxiliary allocation");
+    hip_check(hipStreamCreateWithFlags(&p.stream, hipStreamNonBlocking), "graph stream create");
+    hip_check(hipMalloc(&p.auxiliary, 128), "graph auxiliary allocation");
     hipDeviceptr_t actual_base{}; std::size_t actual_bytes = 0;
-    check(hipMemGetAddressRange(&actual_base, &actual_bytes, reinterpret_cast<hipDeviceptr_t>(p.auxiliary)), "graph auxiliary extent");
+    hip_check(hipMemGetAddressRange(&actual_base, &actual_bytes, reinterpret_cast<hipDeviceptr_t>(p.auxiliary)), "graph auxiliary extent");
     hipDeviceptr_t scratch_base{}; std::size_t scratch_bytes = 0;
-    check(hipMemGetAddressRange(&scratch_base, &scratch_bytes,
+    hip_check(hipMemGetAddressRange(&scratch_base, &scratch_bytes,
         reinterpret_cast<hipDeviceptr_t>(resources.scratch->arena_base)), "graph retained scratch extent");
     const auto scratch_start = reinterpret_cast<std::uintptr_t>(scratch_base);
     if (resources.scratch->arena_base < scratch_start || resources.scratch->arena_base - scratch_start > scratch_bytes ||
@@ -237,13 +236,13 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
     request.state.generations.fill(1);
     CaptureDispatcher dispatcher(p.launches, p.scope.vocabulary_size);
     try {
-        check(hipStreamBeginCapture(p.stream, hipStreamCaptureModeThreadLocal), "serial graph capture begin"); p.capturing = true;
+        hip_check(hipStreamBeginCapture(p.stream, hipStreamCaptureModeThreadLocal), "serial graph capture begin"); p.capturing = true;
         { HipLaunchScope scope(p.scope);
           p.order = execute_compiled_serial_eager(p.compiled, resources, request, dispatcher).completion_order; }
-        check(hipStreamEndCapture(p.stream, &p.graph), "serial graph capture end"); p.capturing = false;
-        std::size_t nodes = 0; check(hipGraphGetNodes(p.graph, nullptr, &nodes), "serial graph node inventory");
+        hip_check(hipStreamEndCapture(p.stream, &p.graph), "serial graph capture end"); p.capturing = false;
+        std::size_t nodes = 0; hip_check(hipGraphGetNodes(p.graph, nullptr, &nodes), "serial graph node inventory");
         if (!nodes || p.order.size() != p.compiled.execution.steps.size()) throw std::runtime_error("whole graph capture has missing work");
-        check(hipGraphInstantiate(&p.executable, p.graph, nullptr, nullptr, 0), "serial graph instantiate");
+        hip_check(hipGraphInstantiate(&p.executable, p.graph, nullptr, nullptr, 0), "serial graph instantiate");
     } catch (...) {
         p.failed = true;
         if (p.capturing) { hipGraph_t invalid = nullptr; const auto result = hipStreamEndCapture(p.stream, &invalid);

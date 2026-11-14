@@ -187,6 +187,27 @@ HostStream::HostStream(const ModelConfig& config) : impl_(std::make_shared<Impl>
     }
 }
 HostStream::~HostStream() = default;
+std::uint64_t HostStream::retained_bytes() const {
+    if (impl_->busy) throw std::invalid_argument("cannot size an in-flight host stream");
+    std::uint64_t total=sizeof(HostStream)+sizeof(Impl);
+    const auto add=[&](std::size_t count,std::size_t width) {
+        if(count>(UINT64_MAX-total)/width) throw std::overflow_error("host retained size overflow");
+        total+=std::uint64_t(count)*width;
+    };
+    add(impl_->config.layer.capacity(),sizeof(impl_->config.layer[0]));
+    add(impl_->cache.capacity(),sizeof(Cache));
+    for(const auto& cache:impl_->cache) {
+        add(cache.k.capacity(),sizeof(float));add(cache.v.capacity(),sizeof(float));
+        add(cache.tags.capacity(),sizeof(std::uint64_t));
+    }
+    return total;
+}
+std::unique_ptr<HostStream> HostStream::snapshot() const {
+    if (impl_->busy) throw std::invalid_argument("cannot snapshot an in-flight host stream");
+    auto copy = std::make_unique<HostStream>(impl_->config);
+    copy->impl_ = std::make_shared<Impl>(*impl_);
+    return copy;
+}
 std::unique_ptr<KvTxn> HostStream::begin() {
     if (impl_->busy) throw std::runtime_error("stream already has an unpublished KV transaction");
     auto txn = std::make_unique<Impl::Txn>(impl_);

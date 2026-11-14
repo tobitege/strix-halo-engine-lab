@@ -51,7 +51,7 @@ private:
     bool previous_;
 };
 inline int retry_mtp_bundle_serial(const std::exception& error,const std::function<int()>& run) {
-    std::cerr << "YaRN MTP bundle setup unavailable; using serial decode: " << error.what() << '\n';
+    std::cerr << "MTP bundle setup unavailable; using serial decode: " << error.what() << '\n';
     YarnBundleSerialRetry retry;
     return run();
 }
@@ -245,7 +245,7 @@ inline std::filesystem::path ensure_mtp_bundle_golden(const std::filesystem::pat
         std::filesystem::remove(temp,ignored);
         throw;
     }
-    std::cerr << "YaRN MTP calibration cached: " << final.string() << '\n';
+    std::cerr << "MTP calibration cached: " << final.string() << '\n';
     return final;
 }
 } // namespace strix::decode_cli

@@ -65,6 +65,8 @@ class DeviceTarget final : public Target {
     // Borrow for a prefill backend accepting device residency. This target
     // owns every view and must outlive that borrower; never read on the host.
     [[nodiscard]] const HostWeights& borrow_device_weights() const;
+    // No graph/FAST/chunk-streaming/private allocation modes are admitted.
+    [[nodiscard]] std::optional<memory::Work> cache_work_bound() const;
 
   private:
     struct Impl;

@@ -1,120 +1,129 @@
 #include "minimax/serve/minimax_api.hpp"
-#include "strix/serve/request_fields.hpp"
-#include "strix/serve/session_api.hpp"
-
 #include "minimax/serve/minimax_chat.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
-#include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/request_fields.hpp"
+#include "strix/serve/token_memo.hpp"
 
 #include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
 #include <cstdio>
-#include <ctime>
-#include <optional>
 #include <stdexcept>
-#include <thread>
 #include <utility>
 
 namespace strix::minimax::serve {
-namespace {
-
 namespace sv = strix::serve;
-void send_json(sv::HttpResponseWriter& w, int status, const sv::Json& body) { w.send(status, "application/json", body.dump()); }
-void send_error(sv::HttpResponseWriter& w, int status, const std::string& message, const std::string& param = {}) {
-    sv::Json e = sv::Json::object();
-    e.set("message", sv::Json(message));
-    e.set("type", sv::Json(status == 400 ? "invalid_request_error" : "server_error"));
-    if (!param.empty()) e.set("param", sv::Json(param));
-    sv::Json b = sv::Json::object();
-    b.set("error", std::move(e));
-    send_json(w, status, b);
-}
-
-// Generation fields, checked with the shared front-end checks (strix/serve/request_fields.hpp) so the contract is the
-// Qwen/DeepSeek one. This server decodes greedy only and executes no constraints, logit transforms or scoring: those
-// fields are refused with a 400 naming them unless their value is neutral, as are stop strings, n / best_of other than
-// 1, suffix and echo. A positive temperature runs greedy and the reply says so (timings.sampling_note, the shared
-// server's note text). Returns the sampling note ("" when nothing was ignored).
-std::string check_fields(const sv::Json& body) {
-    sv::refuse_unexecuted(body, false, false);
-    const auto set = [&](const char* key) -> const sv::Json* { const auto* v = body.find(key); return v && !v->is_null() ? v : nullptr; };
-    const auto refuse = [](const std::string& param, const std::string& what) {
-        throw sv::RequestFieldError(param, what + " is not supported by this server");
-    };
-    const auto real = [&](const char* key, double low, double high, bool open_low, bool open_high, double absent) {
-        const auto* v = set(key);
-        return v ? sv::finite_number(*v, key, low, high, open_low, open_high) : absent;
-    };
-    const double temperature = real("temperature", 0, 2, false, false, 0);
-    const double top_p = real("top_p", 0, 1, true, false, 1);
-    const double min_p = real("min_p", 0, 1, false, true, 0);
-    const std::uint64_t top_k = set("top_k") ? sv::unsigned_integer(*set("top_k"), "top_k", UINT32_MAX) : 0;
-    if (const auto* v = set("seed")) (void)sv::unsigned_integer(*v, "seed", INT64_MAX);
-    for (const char* key : {"n", "best_of"})
-        if (const auto* v = set(key); v && (!v->is_number() || sv::exact_integer(v->number_source()) != std::optional<std::uint64_t>{1}))
-            throw sv::RequestFieldError(key, std::string("only ") + key + " = 1 is supported");
-    if (const auto* v = set("stop")) {
-        bool empty = v->is_string() && v->as_string().empty();
-        if (v->is_array()) {
-            empty = true;
-            for (const auto& s : v->as_array()) empty = empty && s.is_string() && s.as_string().empty();
-        }
-        if (!empty) refuse("stop", "stop strings");
+namespace {
+class DelegatedTokenizer final : public sv::ApiTokenizer {
+public:
+    explicit DelegatedTokenizer(std::shared_ptr<const MinimaxTokenizer> tokenizer) : tokenizer_(std::move(tokenizer)) {}
+    std::vector<std::uint32_t> encode(std::string_view text, bool special) const override { return tokenizer_->encode(text,special); }
+    std::string decode(std::span<const std::uint32_t> ids, bool skip) const override { return tokenizer_->decode(ids,skip); }
+    std::string token_bytes(std::uint32_t id) const override { return tokenizer_->token_bytes(id); }
+    std::size_t vocab_size() const override { return tokenizer_->vocab_size(); }
+    std::uint32_t find(std::string_view text) const override { return tokenizer_->token_id(text); }
+    TokenType type(std::uint32_t id) const override {
+        if (id >= tokenizer_->vocab_size() || tokenizer_->token_text(id).empty()) return TokenType::unknown;
+        return tokenizer_->is_special(id) ? TokenType::control : tokenizer_->is_added(id) ? TokenType::user_defined : TokenType::normal;
     }
-    if (const auto* v = set("suffix"); v && !(v->is_string() && v->as_string().empty())) refuse("suffix", "suffix");
-    if (const auto* v = set("echo"); v && !(v->is_bool() && !v->as_bool())) refuse("echo", "echo");
-    if (temperature > 0.0) return "temperature ignored: this engine decodes greedy (exact)";
-    if (top_p != 1.0 || min_p != 0.0 || top_k != 0U) return "filters ignored at temperature 0 (greedy)";
-    return {};
-}
-
-// max_completion_tokens (preferred) or max_tokens: a positive integer read exactly from its JSON spelling; a value above
-// the context is clamped to it (the engine ends a generation at its context limit anyway), never wrapped. A server
-// without a known context (0) clamps to the largest count a job holds.
-std::uint32_t requested_max_tokens(const sv::Json& body, std::uint32_t fallback, std::uint64_t context) {
-    for (const char* key : {"max_completion_tokens", "max_tokens"})
-        if (const auto* v = body.find(key); v && !v->is_null()) {
-            const auto requested = sv::unsigned_integer(*v, key, UINT64_MAX);
-            if (requested < 1U) throw sv::RequestFieldError(key, std::string(key) + " must be a positive integer");
-            const auto limit = context ? std::min<std::uint64_t>(context, UINT32_MAX) : std::uint64_t{UINT32_MAX};
-            return static_cast<std::uint32_t>(std::min(requested, limit));
-        }
-    return fallback;
-}
-
-// A boolean request option: absent or null = false; any other non-boolean is a 400.
-bool option(const sv::Json& body, const char* key) {
-    const auto* v = body.find(key);
-    if (!v || v->is_null()) return false;
-    if (!v->is_bool()) throw std::invalid_argument(std::string(key) + " must be a boolean");
-    return v->as_bool();
-}
-
-// Generated text split as the template writes reasoning back: <mm:think> ... </mm:think> then the answer.
-void split_reasoning(const std::string& text, std::string& reasoning, std::string& content) {
-    static const std::string open = "<mm:think>", close = "</mm:think>";
-    const auto c = text.find(close);
-    if (c == std::string::npos) {
-        content = text;
-        return;
+    std::uint32_t eos_token() const override { return tokenizer_->eos_id(); }
+private:
+    std::shared_ptr<const MinimaxTokenizer> tokenizer_;
+};
+class CallbackTokenizer final : public sv::ApiTokenizer {
+public:
+    explicit CallbackTokenizer(strix::minimax::serve::ApiTokenizer tokenizer) : tokenizer_(std::move(tokenizer)) {}
+    std::vector<std::uint32_t> encode(std::string_view text, bool special) const override {
+        if (special && tokenizer_.encode) return tokenizer_.encode(text);
+        if (tokenizer_.delegated) return tokenizer_.delegated->encode(text,special);
+        throw std::invalid_argument("tokenizer does not expose encoding with this special-token policy");
     }
-    auto o = text.find(open);
-    const std::size_t r0 = o == std::string::npos || o > c ? 0 : o + open.size();
-    reasoning = text.substr(r0, c - r0);
-    content = text.substr(c + close.size());
-    while (!content.empty() && (content.front() == '\n' || content.front() == ' ')) content.erase(content.begin());
+    std::string decode(std::span<const std::uint32_t> ids, bool skip) const override {
+        if (skip && tokenizer_.decode) return tokenizer_.decode(ids);
+        if (tokenizer_.delegated) return tokenizer_.delegated->decode(ids,skip);
+        if (!tokenizer_.decode) throw std::invalid_argument("tokenizer does not expose decoding");
+        return tokenizer_.decode(ids);
+    }
+    std::string token_bytes(std::uint32_t id) const override {
+        if (!tokenizer_.stream_bytes) throw std::invalid_argument("tokenizer does not expose stream bytes");
+        return tokenizer_.stream_bytes(id);
+    }
+    std::size_t vocab_size() const override { return metadata().vocab_size(); }
+    std::uint32_t find(std::string_view text) const override { return metadata().find(text); }
+    TokenType type(std::uint32_t id) const override { return metadata().type(id); }
+    std::uint32_t eos_token() const override { return tokenizer_.eos_id; }
+private:
+    const sv::ApiTokenizer& metadata() const {
+        if (!tokenizer_.delegated) throw std::invalid_argument("tokenizer does not expose vocabulary metadata");
+        return *tokenizer_.delegated;
+    }
+    strix::minimax::serve::ApiTokenizer tokenizer_;
+};
+sv::AssistantOutput parse_output(const std::string& text) {
+    sv::AssistantOutput out;
+    out.tool_calls = sv::Json::array();
+    const auto close = text.find("</mm:think>");
+    if (close == std::string::npos) { out.content=text; return out; }
+    const auto open=text.find("<mm:think>");
+    const auto begin=open==std::string::npos || open>close ? 0 : open+10;
+    out.reasoning=text.substr(begin,close-begin);
+    out.content=text.substr(close+11);
+    while (!out.content.empty() && (out.content.front()=='\n' || out.content.front()==' ')) out.content.erase(out.content.begin());
+    return out;
 }
-
-}  // namespace
+void validate(const sv::HttpRequest& request, const sv::Json& body) {
+    if (request.path!="/v1/chat/completions" && request.path!="/v1/completions" &&
+        request.path!="/v1/messages" && request.path!="/v1/responses") return;
+    sv::refuse_unexecuted(body,false,false);
+    const auto refuse=[](const std::string& key) { throw sv::RequestFieldError(key,key+" is not supported by this server"); };
+    for (const char* key : {"ngram_draft","draft_depth_max","tool_draft","ngram_peers","thinking_budget","thinking_policy","max_thinking_tokens","state_cache"})
+        if (const auto* v=body.find(key); v && !v->is_null()) refuse(key);
+    if (const auto* strix=body.find("strix"); strix && strix->is_object())
+        for (const auto& [key,value]:strix->as_object()) if (!value.is_null()) refuse("strix."+key);
+    if (const auto* thinking=body.find("thinking"); thinking && !thinking->is_null()) {
+        if (!thinking->is_object()) refuse("thinking");
+        for (const auto& [key,value]:thinking->as_object()) if (key!="type" && !value.is_null()) refuse("thinking."+key);
+        if (const auto* type=thinking->find("type"); type && !type->is_null() &&
+            (!type->is_string() || (type->as_string()!="enabled" && type->as_string()!="disabled"))) refuse("thinking.type");
+    }
+    if (request.path=="/v1/responses")
+        if (const auto* reasoning=body.find("reasoning"); reasoning && reasoning->is_object())
+            for (const auto& [key,value]:reasoning->as_object())
+                if (key!="effort" && key!="summary" && key!="generate_summary" && !value.is_null()) refuse("reasoning."+key);
+    for (const char* key : {"n","best_of"})
+        if (const auto* v=body.find(key); v && !v->is_null() && (!v->is_number() || sv::exact_integer(v->number_source())!=std::optional<std::uint64_t>{1}))
+            throw sv::RequestFieldError(key,std::string("only ")+key+" = 1 is supported");
+    for (const char* key : {"stop","stop_sequences"}) if (const auto* v=body.find(key); v && !v->is_null()) {
+        bool empty=v->is_string() && v->as_string().empty();
+        if (v->is_array()) { empty=true; for (const auto& part:v->as_array()) empty=empty && part.is_string() && part.as_string().empty(); }
+        if (!empty) throw sv::RequestFieldError(key,"stop strings is not supported by this server");
+    }
+    if (const auto* v=body.find("suffix"); v && !v->is_null() && !(v->is_string() && v->as_string().empty())) refuse("suffix");
+    if (const auto* v=body.find("echo"); v && !v->is_null() && !(v->is_bool() && !v->as_bool())) refuse("echo");
+    if (request.path=="/v1/completions") {
+        const auto* prompt=body.find("prompt");
+        if (!prompt || !prompt->is_string()) throw std::invalid_argument("prompt (string) required");
+        for (const char* key : {"messages","tools","tool_choice","chat_template_kwargs","reasoning_effort"})
+            if (const auto* value=body.find(key); value && !value->is_null()) refuse(key);
+    }
+    if (const auto* kw=body.find("chat_template_kwargs"); kw && kw->is_object())
+        for (const auto& [key,value]:kw->as_object()) if (key!="thinking_mode" && key!="reasoning_effort" && !value.is_null()) refuse("chat_template_kwargs."+key);
+    if (const auto* thinking=body.find("thinking"); thinking && !thinking->is_null() && request.path!="/v1/messages") refuse("thinking");
+    if (const auto* enable=body.find("enable_thinking"); enable && !enable->is_null()) refuse("enable_thinking");
+}
+} // namespace
 
 ApiTokenizer api_tokenizer(std::shared_ptr<const MinimaxTokenizer> tokenizer) {
+    if (!tokenizer) throw std::invalid_argument("API tokenizer is required");
     ApiTokenizer t;
-    t.eos_id = tokenizer->eos_id();
-    t.encode = [tokenizer](std::string_view text) { return tokenizer->encode(text, true); };
-    t.decode = [tokenizer](std::span<const std::uint32_t> ids) { return tokenizer->decode(ids, true); };
-    t.stream_bytes = [tokenizer](std::uint32_t id) { return tokenizer->is_special(id) ? std::string() : tokenizer->token_bytes(id); };
+    t.eos_id=tokenizer->eos_id();
+    // Chat turns resend their history: the memo encodes only the new tail, with the ids of a full encode.
+    t.encode=[tokenizer,memo=std::make_shared<sv::TokenMemo>(),lookahead=tokenizer->mark_lookahead()](std::string_view text) {
+        if (!sv::TokenMemo::enabled_by_default()) return tokenizer->encode(text,true);
+        return memo->encode(1U,lookahead,text,[&](std::string_view tail,std::vector<sv::EncodeMark>& marks) {
+            return tokenizer->encode_marked(tail,true,marks); });
+    };
+    t.decode=[tokenizer](std::span<const std::uint32_t> ids) { return tokenizer->decode(ids,true); };
+    t.stream_bytes=[tokenizer](std::uint32_t id) { return tokenizer->is_special(id) ? std::string() : tokenizer->token_bytes(id); };
+    t.delegated=std::make_shared<DelegatedTokenizer>(std::move(tokenizer));
     return t;
 }
 
@@ -156,324 +165,107 @@ sv::Json reply_timings(const sv::GenerationStats& st, const RequestExtra& x) {
     timings.set("dspark_reason", sv::Json(x.dspark_reason));
     timings.set("dspark_context", sv::Json(x.context));
     timings.set("sampling", sv::Json("greedy"));
+    if (x.resident_reported) {
+        timings.set("cached_tokens", sv::Json(static_cast<std::int64_t>(st.cached_tokens)));
+        timings.set("prefill_tokens_computed", sv::Json(static_cast<std::int64_t>(x.prefill_computed)));
+        timings.set("cache_reply_extended", sv::Json(x.reply_extended));
+    }
     return timings;
 }
 
-MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, MinimaxApiOptions options, Observer& observer)
-    : tok_(std::move(tokenizer)), queue_(queue), options_(std::move(options)), observer_(observer) {}
-
-void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std::vector<std::uint32_t> prompt, const sv::Json& body,
-                          bool chat, const std::string& inbound_id) {
-    const std::string sampling_note = check_fields(body);
-    const std::uint32_t max_tokens = requested_max_tokens(body, options_.default_max_tokens, options_.context_tokens);
-    const auto timings = [&](const sv::GenerationStats& st, const std::optional<RequestExtra>& x) {
-        auto t = reply_timings(st, x.value_or(RequestExtra{}));
-        if (!sampling_note.empty()) t.set("sampling_note", sv::Json(sampling_note));
-        return t;
+MinimaxApi::MinimaxApi(ApiTokenizer tokenizer, sv::GenerationQueue& queue, MinimaxApiOptions options, Observer& observer) {
+    auto shared_options=std::make_shared<MinimaxApiOptions>(std::move(options));
+    sv::ApiConfig config;
+    config.model_id=shared_options->model_id;
+    config.default_max_tokens=shared_options->default_max_tokens;
+    config.deployment=shared_options->deployment;
+    config.default_thinking=false;
+    config.sessions_enabled=shared_options->session_enabled;
+    config.compact_chat_envelope=true;
+    config.timed_completion_envelope=true;
+    config.exact_max_tokens=true;
+    config.minimal_metadata=true;
+    config.status_slots=shared_options->http_slots;
+    config.explicit_thinking_only=true;
+    config.tokenize_text_field=true;
+    config.session_error_envelope=true;
+    config.stream_receipts=false;
+    config.sse_keepalive_seconds=0;
+    config.sse_progress_seconds=0;
+    config.observe_expiry_seconds=0;
+    config.stop_tokens.push_back(tokenizer.eos_id);
+    config.chat_extension_fields={"chat_template_kwargs","reasoning_effort","session"};
+    config.validate_request=[tokenizer](const sv::HttpRequest& request,const sv::Json& body) {
+        validate(request,body);
+        if (request.path=="/detokenize") return; // vocabulary metadata is checked by the shared operation
+        if (!tokenizer.encode) throw std::invalid_argument("tokenizer does not expose encoding");
+        if (request.path=="/tokenize") return;
+        const auto* stream=body.find("stream");
+        if (stream && stream->is_bool() && stream->as_bool()) {
+            if (!tokenizer.stream_bytes) throw std::invalid_argument("tokenizer does not expose stream bytes");
+        } else if (!tokenizer.decode) throw std::invalid_argument("tokenizer does not expose decoding");
     };
-    const bool stream = option(body, "stream");
-    const bool want_ids = option(body, "return_token_ids");
-    bool usage_option = false;
-    if (const auto* so = body.find("stream_options"); so && so->is_object()) usage_option = option(*so, "include_usage");
-    const bool include_usage = stream && usage_option;
-    const std::string id = std::string(chat ? "chatcmpl-" : "cmpl-") + std::to_string(next_id_++);
-    const auto created = static_cast<std::int64_t>(std::time(nullptr));
-    // a generation request that reaches submission echoes its completion id when it has no accepted inbound id (that
-    // one is already in the response head, see handle)
-    if (inbound_id.empty()) w.add_response_header("X-Request-Id", id);
-    sv::GenerationJob job;
-    job.prompt = std::move(prompt);
-    if (options_.session_enabled) if (const auto* v = body.find("session")) {
-        if (!v->is_string()) { w.send(400,"application/json",sv::session_error("invalid_request","session must be a string").dump()); return; }
-        const auto& session_id = v->as_string();
-        try { (void)sv::session_command("POST", "/v1/sessions/" + session_id + "/park", ""); }
-        catch (const sv::SessionApiError&) { w.send(400,"application/json",sv::session_error("invalid_request","invalid session id").dump()); return; }
-        job.session = session_id;
-    }
-    job.max_tokens = max_tokens;
-    job.stop_tokens.push_back(tok_.eos_id);  // not = {eos}: gcc 14 -O3 reports a false -Warray-bounds on the one-element list
-    const bool named_session = !job.session.empty();
-    const std::size_t prompt_tokens = job.prompt.size();
-    auto ticket = queue_.submit(std::move(job));
-    // Armed instrumentation is decided once per request, by the queue at submission (GenerationTicket::observed: the
-    // process-wide flag, one relaxed load); a refused request has no ticket and reads the flag itself. An observed
-    // request gets exactly one ring record, written below once the ticket has finished and the delivery is known.
-    std::optional<RequestRecord> rec;
-    if (ticket ? ticket->observed() : observe_armed()) {
-        rec.emplace();
-        rec->request_id = inbound_id;
-        rec->completion_id = id;
-        rec->route = chat ? "chat.completions" : "completions";
-        rec->time = created;
-        rec->stream = stream;
-        rec->prompt_tokens = prompt_tokens;
-    }
-    if (!ticket) {
-        if (rec) {
-            rec->status = "refused";
-            rec->error = "queue full";
-            observer_.record(std::move(*rec));
+    config.prepare_chat=[tokenizer](const sv::Json& body) {
+        const auto* messages=body.find("messages");
+        if (!messages || !messages->is_array() || !messages->size()) throw std::invalid_argument("messages required");
+        MinimaxChatOptions chat;
+        if (const auto* kw=body.find("chat_template_kwargs"); kw && kw->is_object()) {
+            if (const auto* v=kw->find("thinking_mode"); v && v->is_string()) chat.thinking_mode=v->as_string();
+            if (const auto* v=kw->find("reasoning_effort"); v && v->is_string()) chat.reasoning_effort=v->as_string();
         }
-        return send_error(w, 503, "queue full");
-    }
-    // Waits for the ticket's end (every path does, so the engine's statistics are final when recorded); a cancelled
-    // ticket wakes wait() at once, so the loop sleeps instead of spinning until the engine finishes it.
-    std::vector<std::uint32_t> ids, all_ids;
-    bool delivered = true;  // every byte of the reply reached the client's socket
-    auto drain = [&](auto&& on_token) {  // on_token(id) for every id but the stop token
-        for (bool done = false; !done;) {
-            const auto fresh = ticket->wait(std::chrono::milliseconds(100), done);
-            for (const auto t : fresh) {
-                if (want_ids) all_ids.push_back(t);
-                if (t == tok_.eos_id) continue;
-                ids.push_back(t);
-                on_token(t);
-            }
-            if (stream && w.client_gone()) {
-                delivered = false;
-                ticket->cancel();
-            }
-            if (!done && fresh.empty() && ticket->cancelled()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (const auto* v=body.find("reasoning_effort"); v && v->is_string()) chat.reasoning_effort=v->as_string();
+        if (const auto* t=body.find("enable_thinking"); t && t->is_bool()) chat.thinking_mode=t->as_bool() ? "enabled" : "disabled";
+        const auto* choice=body.find("tool_choice");
+        const auto* type=choice && choice->is_object() ? choice->find("type") : choice;
+        const bool off=type && type->is_string() && type->as_string()=="none";
+        const auto* tools=body.find("tools");
+        sv::ApiChatPrompt prompt;
+        try { prompt.tokens=tokenizer.encode(render_minimax_chat(*messages,tools && tools->is_array() && !off ? tools : nullptr,chat)); }
+        catch (const MinimaxChatError& error) { throw std::invalid_argument(error.what()); }
+        return prompt;
+    };
+    // Requests execute the existing fixed greedy policy. Shared validation and
+    // notes retain the requested filter/seed data without changing planner input.
+    config.prepare_job=[](const sv::HttpRequest&,const sv::Json&,sv::GenerationJob& job) { job.sampling={}; };
+    config.output_parser=[](const std::string& text,bool,const sv::Json&) { return parse_output(text); };
+    config.tools_off_marker="]<]minimax[>[<tool_call>"; // tool_choice "none": a call block is withheld, not sent as text
+    config.terminal_data=[shared_options](const sv::GenerationTicket& ticket) {
+        const auto extra=shared_options->take_extra ? shared_options->take_extra(ticket) : std::nullopt;
+        sv::ApiTerminalData data;
+        data.timings=reply_timings(ticket.stats(),extra.value_or(RequestExtra{}));
+        if (extra && ticket.stats().generated_tokens>=2) data.max_gap_ms=extra->max_gap_ms;
+        return data;
+    };
+    config.request_finished=[&observer](const sv::ApiRequestObservation& event) {
+        if (!event.observed) return;
+        RequestRecord record;
+        record.request_id=event.request_id; record.completion_id=event.completion_id; record.route=event.route;
+        record.time=event.time; record.stream=event.stream; record.prompt_tokens=event.prompt_tokens;
+        const auto& stats=event.stats;
+        record.cached_tokens=stats.cached_tokens; record.output_tokens=stats.generated_tokens;
+        record.queue_ms=stats.queue_ms; record.prefill_ms=stats.prefill_ms; record.decode_ms=stats.decode_ms;
+        record.imported_tokens=stats.imported_tokens;
+        record.first_token_ms=stats.generated_tokens ? stats.first_token_ms.value_or(-1.0) : -1.0;
+        record.max_gap_ms=event.terminal.max_gap_ms.value_or(-1.0);
+        record.draft=stats.proposed>0; record.cycles=stats.cycles; record.proposed=stats.proposed; record.accepted=stats.accepted;
+        record.stop_reason=event.error.empty() ? stats.finish : std::string(); record.error=event.error;
+        record.status=event.refused ? "refused" : !event.error.empty() ? "error" : !event.delivered || stats.finish=="cancelled" ? "cancelled" : "done";
+        observer.record(std::move(record));
+    };
+    config.status_data=[&observer](const sv::QueueSnapshot& snapshot,bool stopping,bool detail) { return observer.status(snapshot,stopping,detail); };
+    config.metrics_data=[&observer,shared_options](const sv::QueueSnapshot& snapshot) {
+        return observer.metrics(snapshot,shared_options->legacy_metrics ? shared_options->legacy_metrics(snapshot) : legacy_metric_lines(snapshot));
+    };
+    config.route_data=[shared_options](const sv::HttpRequest& request)->std::optional<sv::Json> {
+        if (request.path=="/admin/sched" && shared_options->admin_sched) {
+            try { return shared_options->admin_sched(request); }
+            catch (const std::exception& error) { throw sv::ApiRouteError(400,error.what()); }
         }
+        return std::nullopt;
     };
-    // The scheduler's measurements of the finished ticket, taken once on every path (nothing is left in its table).
-    auto take_extra = [&]() -> std::optional<RequestExtra> {
-        return options_.take_extra ? options_.take_extra(*ticket) : std::nullopt;
-    };
-    // The single end of a request: the engine's final statistics, the delivery outcome, one record.
-    auto finish_record = [&](const sv::GenerationStats& st, const std::string& err, const std::optional<RequestExtra>& x) {
-        if (!rec) return;
-        // the engine's longest emission gap, when the scheduler measured one (two or more tokens)
-        if (x && st.generated_tokens >= 2) rec->max_gap_ms = x->max_gap_ms;
-        rec->cached_tokens = st.cached_tokens;
-        rec->output_tokens = st.generated_tokens;
-        rec->queue_ms = st.queue_ms;
-        rec->prefill_ms = st.prefill_ms;
-        rec->decode_ms = st.decode_ms;
-        rec->imported_tokens = st.imported_tokens;
-        rec->first_token_ms = st.generated_tokens > 0 ? st.first_token_ms.value_or(-1.0) : -1.0;
-        rec->draft = st.proposed > 0;
-        rec->cycles = st.cycles;
-        rec->proposed = st.proposed;
-        rec->accepted = st.accepted;
-        rec->stop_reason = err.empty() ? st.finish : std::string();
-        rec->error = err;
-        rec->status = !err.empty() ? "error" : (!delivered || st.finish == "cancelled") ? "cancelled" : "done";
-        observer_.record(std::move(*rec));
-    };
-    auto chunk = [&](const std::string& delta, const char* finish) {
-        sv::Json choice = sv::Json::object();
-        choice.set("index", sv::Json(0));
-        if (chat) {
-            sv::Json d = sv::Json::object();
-            if (!delta.empty()) d.set("content", sv::Json(delta));
-            choice.set("delta", std::move(d));
-        } else {
-            choice.set("text", sv::Json(delta));
-        }
-        choice.set("finish_reason", finish ? sv::Json(finish) : sv::Json());
-        sv::Json c = sv::Json::object();
-        c.set("id", sv::Json(id));
-        c.set("object", sv::Json(chat ? "chat.completion.chunk" : "text_completion"));
-        c.set("created", sv::Json(created));
-        c.set("model", sv::Json(options_.model_id));
-        sv::Json arr = sv::Json::array();
-        arr.as_array().push_back(std::move(choice));
-        c.set("choices", std::move(arr));
-        return c;
-    };
-    auto event = [](const sv::Json& c) { return "data: " + c.dump() + "\n\n"; };
-    auto usage_json = [&](const sv::GenerationStats& st) {
-        sv::Json usage = sv::Json::object();
-        usage.set("prompt_tokens", sv::Json(static_cast<std::int64_t>(prompt_tokens)));
-        usage.set("completion_tokens", sv::Json(static_cast<std::int64_t>(st.generated_tokens)));
-        usage.set("total_tokens", sv::Json(static_cast<std::int64_t>(prompt_tokens + st.generated_tokens)));
-        sv::Json details = sv::Json::object();
-        details.set("cached_tokens", sv::Json(static_cast<std::int64_t>(st.cached_tokens)));
-        usage.set("prompt_tokens_details", std::move(details));
-        return usage;
-    };
-    auto finish_reason = [](const sv::GenerationStats& st) {
-        return st.finish == "stop" ? "stop" : st.finish == "cancelled" ? "stop" : "length";
-    };
-
-    if (stream) {
-        if (!w.begin_stream(200, "text/event-stream", {{"Cache-Control", "no-cache"}})) {
-            ticket->cancel();
-            delivered = false;
-            drain([](std::uint32_t) {});
-            finish_record(ticket->stats(), ticket->error(), take_extra());
-            return;
-        }
-        sv::Utf8StreamDecoder utf8;
-        auto write = [&](const std::string& data) {
-            if (delivered && !w.write(data)) {
-                delivered = false;
-                ticket->cancel();
-            }
-        };
-        drain([&](std::uint32_t t) {
-            const std::string text = utf8.push(tok_.stream_bytes(t));
-            if (!text.empty()) write(event(chunk(text, nullptr)));
-        });
-        const auto st = ticket->stats();
-        const std::string err = ticket->error();
-        const auto x = take_extra();
-        const std::string tail = utf8.flush();
-        if (!tail.empty()) write(event(chunk(tail, nullptr)));
-        if (!err.empty()) {  // the headers are out: the error travels as an event
-            sv::Json e = sv::Json::object();
-            e.set("message", sv::Json(err));
-            e.set("type", sv::Json("server_error"));
-            sv::Json b = sv::Json::object();
-            b.set("error", std::move(e));
-            if (named_session) { const auto failure = sv::session_failure(err); write(event(sv::session_error(failure.code,err))); }
-            else write(event(b));
-        }
-        auto last = chunk("", finish_reason(st));
-        last.set("timings", timings(st, x));
-        if (want_ids) last.set("strix", reply_extension(all_ids));
-        write(event(last));
-        if (include_usage) {
-            sv::Json u = sv::Json::object();
-            u.set("id", sv::Json(id));
-            u.set("object", sv::Json(chat ? "chat.completion.chunk" : "text_completion"));
-            u.set("created", sv::Json(created));
-            u.set("model", sv::Json(options_.model_id));
-            u.set("choices", sv::Json::array());
-            u.set("usage", usage_json(st));
-            if (want_ids) u.set("strix", reply_extension(all_ids));
-            write(event(u));
-        }
-        write("data: [DONE]\n\n");
-        // The reply is delivered when every event through [DONE] was written. The chunked-encoding terminator is
-        // framing after the complete reply (a client may close once it has read [DONE]); it is skipped after a failed
-        // write, so nothing is written once the client is gone.
-        if (delivered) w.end_stream();
-        finish_record(st, err, x);
-        return;
-    }
-
-    drain([](std::uint32_t) {});
-    const auto st = ticket->stats();
-    const std::string err = ticket->error();
-    const auto x = take_extra();
-    if (!err.empty()) {
-        if (named_session) { const auto failure = sv::session_failure(err); w.send(failure.status,"application/json",sv::session_error(failure.code,err).dump()); }
-        else send_error(w, 400, err);
-        finish_record(st, err, x);
-        return;
-    }
-    const std::string text = tok_.decode(ids);
-    sv::Json choice = sv::Json::object();
-    choice.set("index", sv::Json(0));
-    if (chat) {
-        std::string reasoning, content;
-        split_reasoning(text, reasoning, content);
-        sv::Json m = sv::Json::object();
-        m.set("role", sv::Json("assistant"));
-        m.set("content", sv::Json(content));
-        if (!reasoning.empty()) m.set("reasoning_content", sv::Json(reasoning));
-        choice.set("message", std::move(m));
-    } else {
-        choice.set("text", sv::Json(text));
-    }
-    choice.set("finish_reason", sv::Json(finish_reason(st)));
-    sv::Json out = sv::Json::object();
-    out.set("id", sv::Json(id));
-    out.set("object", sv::Json(chat ? "chat.completion" : "text_completion"));
-    out.set("created", sv::Json(created));
-    out.set("model", sv::Json(options_.model_id));
-    sv::Json arr = sv::Json::array();
-    arr.as_array().push_back(std::move(choice));
-    out.set("choices", std::move(arr));
-    out.set("usage", usage_json(st));
-    out.set("timings", timings(st, x));
-    if (want_ids) out.set("strix", reply_extension(all_ids));
-    send_json(w, 200, out);
-    finish_record(st, err, x);  // a non-streamed reply is one send(): its delivery is not observable here
+    service_=std::make_unique<sv::ApiService>(std::move(config),sv::ApiTokenizerBinding(std::make_shared<CallbackTokenizer>(std::move(tokenizer))),queue,shared_options->context_tokens,false);
 }
 
-void MinimaxApi::handle(const sv::HttpRequest& req, sv::HttpResponseWriter& w) {
-    // An accepted inbound id is echoed on every response (the writer's response head carries it, whatever sends the
-    // response); generation requests always echo one (see generate).
-    std::string inbound = req.header("x-request-id");
-    if (!valid_request_id(inbound)) inbound.clear();
-    if (!inbound.empty()) w.add_response_header("X-Request-Id", inbound);
-    try {
-        if (req.method == "GET" && req.path == "/health") {
-            sv::Json b = sv::Json::object();
-            b.set("status", sv::Json(queue_.draining() ? "draining" : "ok"));
-            sv::deployment_health(b, options_.deployment);
-            return send_json(w, queue_.draining() ? 503 : 200, b);
-        }
-        if (req.method == "GET" && req.path == "/v1/models") {
-            sv::Json m = sv::Json::object();
-            m.set("id", sv::Json(options_.model_id));
-            m.set("object", sv::Json("model"));
-            m.set("context_length", sv::Json(static_cast<std::int64_t>(options_.context_tokens)));
-            sv::Json arr = sv::Json::array();
-            arr.as_array().push_back(std::move(m));
-            sv::Json b = sv::Json::object();
-            b.set("object", sv::Json("list"));
-            b.set("data", std::move(arr));
-            return send_json(w, 200, b);
-        }
-        // The first GET /metrics or GET /api/status?detail=1 arms the instrumentation (one-way).
-        if (req.method == "GET" && req.path == "/metrics") {
-            observe_arm();
-            const auto q = queue_.snapshot();  // one snapshot for the legacy lines and the strix_* families
-            const std::string legacy = options_.legacy_metrics ? options_.legacy_metrics(q) : legacy_metric_lines(q);
-            return w.send(200, "text/plain; version=0.0.4", observer_.metrics(q, legacy));
-        }
-        if (req.method == "GET" && req.path == "/api/status") {
-            const bool detail = query_flag(req.query, "detail");
-            if (detail) observe_arm();
-            auto status = observer_.status(queue_.snapshot(), queue_.stopping(), detail);
-            sv::deployment_status(status, options_.deployment, queue_, options_.http_slots);
-            return send_json(w, 200, status);
-        }
-        if (sv::handle_deployment_route(req, w, queue_, options_.deployment)) return;
-        if (options_.admin_sched && req.path == "/admin/sched") return send_json(w, 200, options_.admin_sched(req));
-        if (req.method != "POST") return send_error(w, 404, "no route " + req.method + " " + req.path);
-        const sv::Json body = sv::parse_request_json(req.body);
-        if (req.path == "/tokenize") {
-            const auto* text = body.find("text");
-            if (!text || !text->is_string()) return send_error(w, 400, "text required");
-            sv::Json arr = sv::Json::array();
-            for (auto t : tok_.encode(text->as_string())) arr.as_array().push_back(sv::Json(static_cast<std::int64_t>(t)));
-            sv::Json b = sv::Json::object();
-            b.set("tokens", std::move(arr));
-            return send_json(w, 200, b);
-        }
-        if (req.path == "/v1/chat/completions") {
-            const auto* messages = body.find("messages");
-            if (!messages || !messages->is_array() || messages->as_array().empty()) return send_error(w, 400, "messages required");
-            MinimaxChatOptions o;
-            if (const auto* kw = body.find("chat_template_kwargs"); kw && kw->is_object()) {
-                if (const auto* v = kw->find("thinking_mode"); v && v->is_string()) o.thinking_mode = v->as_string();
-                if (const auto* v = kw->find("reasoning_effort"); v && v->is_string()) o.reasoning_effort = v->as_string();
-            }
-            if (const auto* v = body.find("reasoning_effort"); v && v->is_string()) o.reasoning_effort = v->as_string();
-            // tool_choice "none" (string or {"type":"none"}): the tools are not offered, as in the shared server.
-            const auto* choice = body.find("tool_choice");
-            const auto* choice_type = choice && choice->is_object() ? choice->find("type") : choice;
-            const bool tools_off = choice_type && choice_type->is_string() && choice_type->as_string() == "none";
-            const auto* tools = body.find("tools");
-            const std::string text = render_minimax_chat(*messages, tools && tools->is_array() && !tools_off ? tools : nullptr, o);
-            return generate(req, w, tok_.encode(text), body, true, inbound);
-        }
-        if (req.path == "/v1/completions") {
-            const auto* p = body.find("prompt");
-            if (!p || !p->is_string()) return send_error(w, 400, "prompt (string) required");
-            return generate(req, w, tok_.encode(p->as_string()), body, false, inbound);
-        }
-        return send_error(w, 404, "no route " + req.path);
-    } catch (const sv::RequestFieldError& e) {
-        return send_error(w, 400, e.what(), e.param);
-    } catch (const std::exception& e) {
-        return send_error(w, 400, e.what());
-    }
-}
+void MinimaxApi::handle(const sv::HttpRequest& request, sv::HttpResponseWriter& response) { service_->handle(request,response); }
 
-}  // namespace strix::minimax::serve
+} // namespace strix::minimax::serve

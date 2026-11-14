@@ -1,6 +1,7 @@
 #include "strix/ds41_native_fp8.hpp"
 #include "strix/ds41_trellis.hpp"
 #include "strix/deepseek41_session_cache.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/ds41_attention.hpp"
@@ -10,65 +11,38 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #if defined(_WIN32)
-#include <io.h>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #else
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/file.h>
-#include <cerrno>
-#include <unistd.h>
 extern char **environ;
 #endif
 
 namespace strix::deepseek41 {
 namespace {
+namespace io = ::strix::session::checkpoint_io;
 [[noreturn]] void fail(const std::string &s) { throw std::runtime_error("ds41 session cache: " + s); }
 // Persistent lock inodes must never be unlinked during cleanup. Separate rank files
 // allow peers on one host to rendezvous while holding their transaction locks.
+// Family adapter preserves the ordered two-inode transaction, without host IO.
 class DiskLock {
-#if defined(_WIN32)
-    HANDLE handle_ = INVALID_HANDLE_VALUE;
-#else
-    int fd_ = -1;
-#endif
+    std::unique_ptr<io::DirectoryLock> lock_;
 public:
     void acquire(const std::filesystem::path& dir, unsigned rank) {
         if (dir.empty()) return;
-        const auto path = dir / (".session-rank" + std::to_string(rank) + ".lock");
-#if defined(_WIN32)
-        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        OVERLAPPED ov{};
-        if (handle_ == INVALID_HANDLE_VALUE || !LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov))
-            fail("disk transaction lock");
-#else
-        fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        if (fd_ < 0) fail("disk transaction lock open");
-        int rc;
-        do { rc = ::flock(fd_, LOCK_EX); } while (rc < 0 && errno == EINTR);
-        if (rc < 0) fail("disk transaction flock");
-#endif
+        try { lock_ = std::make_unique<io::DirectoryLock>(dir, io::LockMode::blocking,
+            ".session-rank" + std::to_string(rank) + ".lock"); }
+        catch (const std::exception& e) { fail(std::string("disk transaction lock: ") + e.what()); }
     }
     DiskLock() = default;
     DiskLock(const DiskLock&) = delete;
-    ~DiskLock() {
-#if defined(_WIN32)
-        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
-#else
-        if (fd_ >= 0) { ::flock(fd_, LOCK_UN); ::close(fd_); }
-#endif
-    }
     void transaction(const std::filesystem::path& dir, unsigned rank, const SessionExchange& exchange) {
         // Acquire rank 0 before rank 1 across all pairs, including shared directories.
         for (unsigned turn = 0; turn < 2; ++turn) {
@@ -177,55 +151,46 @@ void validate(const SessionCheckpoint &c) {
     }
 }
 SessionBytes read(const std::filesystem::path &p, std::uint64_t max) {
-    const auto n = std::filesystem::file_size(p);
-    if (n > max)
-        fail("file exceeds byte budget");
-    std::ifstream f(p, std::ios::binary);
-    SessionBytes b(static_cast<std::size_t>(n));
-    if (!f.read(reinterpret_cast<char *>(b.data()), static_cast<std::streamsize>(n)))
-        fail("short read: " + p.string());
-    if (f.peek() != std::char_traits<char>::eof())
-        fail("file grew during read");
+    SessionBytes b;
+    try {
+        io::read(p, 0, max, [&](std::uint64_t n) {
+            b.resize(static_cast<std::size_t>(n));
+            return std::as_writable_bytes(std::span(b));
+        }, io::DirectIo::buffered);
+    } catch (const io::Error& e) {
+        throw io::Error(e.operation, (std::string("ds41 session cache: ") + e.what()).c_str());
+    }
     return b;
 }
 void durable(const std::filesystem::path &p, std::span<const std::uint8_t> b) {
-    const auto tmp = std::filesystem::path(p.string() + ".tmp." + session_generation());
-#if defined(_WIN32)
-    FILE *f = nullptr;
-    if (fopen_s(&f, tmp.string().c_str(), "wb") != 0)
-        fail("open temporary");
-#else
-    FILE *f = std::fopen(tmp.c_str(), "wb");
-    if (!f)
-        fail("open temporary");
-#endif
-    const bool written = std::fwrite(b.data(), 1, b.size(), f) == b.size() && std::fflush(f) == 0;
-#if defined(_WIN32)
-    const bool synced = written && _commit(_fileno(f)) == 0;
-#else
-    const bool synced = written && ::fsync(::fileno(f)) == 0;
-#endif
-    const bool closed = std::fclose(f) == 0;
-    if (!synced || !closed) {
-        std::filesystem::remove(tmp);
-        fail("write/fsync failed");
+    try { io::atomic_write(p, std::as_bytes(b)); }
+    catch (const io::Error& e) {
+        throw io::Error(e.operation, (std::string("ds41 session cache: ") + e.what()).c_str());
     }
-#if defined(_WIN32)
-    if (!MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        std::filesystem::remove(tmp);
-        fail("atomic replace failed");
-    }
-#else
-    try { std::filesystem::rename(tmp, p); }
-    catch (...) { std::filesystem::remove(tmp); throw; }
-    const int fd = ::open(p.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0)
-        fail("open directory for fsync");
-    const int rc = ::fsync(fd);
-    ::close(fd);
-    if (rc)
-        fail("directory fsync failed");
-#endif
+}
+// Only exact family-owned filenames qualify for accounting/cleanup. A symlink
+// is never a family payload. Historical and shared-core temporary names coexist.
+std::string disk_owner(const std::string& name, unsigned rank) {
+    const auto dot = name.find('.');
+    if (dot == std::string::npos) return {};
+    const auto id = name.substr(0, dot);
+    const auto tail = ".rank" + std::to_string(rank);
+    auto rest = name.substr(dot);
+    try {
+        validate_session_id(id);
+        if (!rest.starts_with(tail + ".group")) {
+            const auto end = rest.find(tail + ".state");
+            if (end == std::string::npos || end < 2) return {};
+            validate_session_id(rest.substr(1, end - 1));
+            rest.erase(0, end);
+        }
+        const auto stem = rest.starts_with(tail + ".group") ? tail + ".group" : tail + ".state";
+        rest.erase(0, stem.size());
+        if (rest.empty()) return id;
+        if (!rest.starts_with(".tmp.") && !rest.starts_with(".tmp-")) return {};
+        validate_session_id(rest.substr(5));
+        return id;
+    } catch (const std::exception&) { return {}; }
 }
 std::string identity(const std::filesystem::path &p) {
     std::string s = std::filesystem::canonical(p).string() + ":" + std::to_string(std::filesystem::file_size(p)) + ":" +
@@ -761,13 +726,11 @@ void PrefixCache::Sessions::capture(const SessionCheckpoint &c, const SessionExc
 }
 void PrefixCache::Sessions::remove_disk(const std::string& id, const std::filesystem::path& keep) {
     validate_session_id(id);
-    if (keep.empty()) std::filesystem::remove(manifest(id));
     for (const auto& e : std::filesystem::directory_iterator(dir_)) {
+        if (e.is_symlink() || !e.is_regular_file()) continue;
         const auto n = e.path().filename().string();
-        const auto rank = ".rank" + std::to_string(rank_);
-        if (n.starts_with(id + ".") && e.path() != keep &&
-            (n.ends_with(rank + ".state") || n.find(rank + ".state.tmp.") != std::string::npos ||
-             n.find(rank + ".group.tmp.") != std::string::npos)) std::filesystem::remove(e.path());
+        if (disk_owner(n, rank_) == id && e.path() != keep &&
+            (keep.empty() || e.path() != manifest(id))) std::filesystem::remove(e.path());
     }
 }
 void PrefixCache::Sessions::reserve_disk(const std::string& id, std::uint64_t bytes, const SessionExchange& exchange) {
@@ -788,7 +751,7 @@ void PrefixCache::Sessions::reserve_disk(const std::string& id, std::uint64_t by
                 auto oldest = std::filesystem::file_time_type::max();
                 for (const auto& e : std::filesystem::directory_iterator(dir_)) {
                     const auto n = e.path().filename().string(), tail = std::string(".rank0.group");
-                    if (!n.ends_with(tail)) continue;
+                    if (e.is_symlink() || !e.is_regular_file() || !n.ends_with(tail)) continue;
                     const auto candidate = n.substr(0, n.size() - tail.size());
                     if (candidate == id) continue;
                     validate_session_id(candidate);
@@ -816,25 +779,53 @@ void PrefixCache::Sessions::checkpoint(const std::string &id, const SessionExcha
     lock.transaction(dir_, rank_, exchange);
     reserve_disk(id, i->second.bytes.size() + (4U << 20U), exchange);
     bool ok = true;
+    std::exception_ptr io_failure;
+    SessionBytes previous_group;
+    bool had_group = false;
     try {
+        if (std::filesystem::is_symlink(path) || std::filesystem::is_symlink(manifest(id)))
+            fail("refusing symlink publication");
+        had_group = std::filesystem::exists(manifest(id));
+        if (had_group) previous_group = read(manifest(id), 4U << 20U);
         if (std::filesystem::exists(path)) {
             if (read(path, budget_) != i->second.bytes)
                 fail("generation already exists with different bytes");
         } else
             durable(path, i->second.bytes);
     } catch (...) {
-        ok = false;
+        ok = false; io_failure = std::current_exception();
     }
-    agree(ok, exchange, "rank write/fsync");
+    try { agree(ok, exchange, "rank write/fsync"); }
+    catch (...) { if (io_failure) std::rethrow_exception(io_failure); throw; }
     const auto mine = describe(c, i->second.bytes), peer = exchange(mine);
     const auto g = group(mine, peer, compat_, rank_);
     ok = true;
     try {
         durable(manifest(id), g);
     } catch (...) {
-        ok = false;
+        ok = false; io_failure = std::current_exception();
     }
-    agree(ok, exchange, "group manifest publication");
+    try { agree(ok, exchange, "group manifest publication"); }
+    catch (...) {
+        const auto publication_failure = io_failure ? io_failure : std::current_exception();
+        // A peer may already have replaced its manifest. Restore exact prior
+        // bytes on BOTH ranks while the ordered locks remain held. This is a
+        // recovery attempt, not a guarantee under persistent storage failures.
+        std::exception_ptr rollback_failure;
+        try {
+            if (had_group) durable(manifest(id), previous_group);
+            else {
+                std::filesystem::remove(manifest(id));
+                io::sync_directory(dir_);
+            }
+        } catch (const io::Error& e) {
+            rollback_failure = std::make_exception_ptr(io::Error(e.operation,
+                (std::string("ds41 session cache: group manifest rollback; durable commit uncertain: ") + e.what()).c_str()));
+        } catch (...) { rollback_failure = std::current_exception(); }
+        try { agree(!rollback_failure, exchange, "group manifest rollback; durable commit uncertain"); }
+        catch (...) { if (rollback_failure) std::rethrow_exception(rollback_failure); throw; }
+        std::rethrow_exception(publication_failure);
+    }
     i->second.used = ++clock_;
     dirty_.erase(id);
     ok = true;
@@ -968,9 +959,11 @@ std::uint64_t PrefixCache::Sessions::disk_bytes() const {
     std::uint64_t bytes = 0;
     if (!dir_.empty()) for (const auto &e : std::filesystem::directory_iterator(dir_)) {
         const auto name = e.path().filename().string();
-        const auto rank = ".rank" + std::to_string(rank_);
-        if (e.is_regular_file() && (name.ends_with(rank + ".state") || name.ends_with(rank + ".group") ||
-            name.find(rank + ".state.tmp.") != std::string::npos || name.find(rank + ".group.tmp.") != std::string::npos)) bytes += e.file_size();
+        if (!e.is_symlink() && e.is_regular_file() && !disk_owner(name, rank_).empty()) {
+            const auto n = e.file_size();
+            if (n > UINT64_MAX - bytes) fail("disk byte budget overflow");
+            bytes += n;
+        }
     }
     return bytes;
 }

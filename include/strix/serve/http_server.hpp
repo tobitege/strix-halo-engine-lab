@@ -70,6 +70,10 @@ public:
     // Binds and listens (throws on failure); serve() then accepts until stop().
     void listen();
     void serve();
+    // Idempotent and safe concurrently with serve()/other stop() calls. Stops
+    // admission and interrupts socket waits without changing request deadlines.
+    // Join the caller-owned serve thread before destruction. The destructor
+    // drains all connection handlers; their captured objects must outlive it.
     void stop();
     [[nodiscard]] std::uint16_t port() const noexcept;
     [[nodiscard]] unsigned active_connections() const noexcept;

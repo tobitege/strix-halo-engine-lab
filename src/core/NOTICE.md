@@ -16,3 +16,15 @@ library's strix_trellis so it never collides with an external strix-trellis
 archive linked by the same engine). Local extensions: the integer operand
 (integer_operand.hpp, integer_math.hpp, integer_mainloop.inc) for DS41 GGUF
 blocks, W4A16 streaming decode and the activation quantiser.
+
+Shared trellis codec
+
+trellis_format.hpp and trellis_codec.hpp are the one EXL3 trellis weight codec
+of this repository. They gather, without changing their arithmetic, the ring,
+codebook and reader primitives adopted from the strix-trellis library that were
+previously kept in trellis_device.hpp, trellis_optimized.hpp and
+packed_decoder.hpp here and as copies in src/moe_core/exl3_trellis.hpp and
+src/gemma4/exl3/device.hip (whose notices/ directory is retained). Apache
+License 2.0 applies as above. The EXL3 format is defined by exllamav3 (MIT
+License) and QTIP is described by Tseng et al. (NeurIPS 2024); no code from
+either project is included.

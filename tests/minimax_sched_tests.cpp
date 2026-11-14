@@ -55,6 +55,8 @@ namespace ms = strix::minimax::serve;
 struct WireTrace : Trace {
     int socket = -1;
     unsigned delay_ms = 0;
+    unsigned pair_rank = 0;
+    unsigned rank() const { return pair_rank; }
     strix::minimax::engine::PfProgress prefill_progress(bool frozen = false) const {
         strix::minimax::engine::PfProgress p;
         p.id = frozen ? parked : active;
@@ -366,7 +368,7 @@ int main() {
             if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) throw std::runtime_error("socketpair");
             const auto rank = [&](unsigned r) {
                 WireTrace engine;
-                engine.socket = sockets[r]; engine.active = 42; engine.parent = 41;
+                engine.socket = sockets[r]; engine.pair_rank = r; engine.active = 42; engine.parent = 41;
                 engine.open = opcode != 11 && opcode != 12; engine.parked = 41;
                 ms::Control out;
                 if (r == 0) { out.command = opcode; out.task_id = id; out.layers = 1; out.parent_task_id = opcode == 10 ? 999U : 0U; out.bank = opcode == 10 || opcode == 5 ? 1U : 0U; }
@@ -388,7 +390,7 @@ int main() {
         int sockets[2]{};
         if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) throw std::runtime_error("socketpair");
         WireTrace lead, follower;
-        lead.socket = sockets[0]; follower.socket = sockets[1]; follower.delay_ms = 100;
+        lead.socket = sockets[0]; follower.socket = sockets[1]; follower.pair_rank = 1; follower.delay_ms = 100;
         ms::Control completion;
         completion.command = static_cast<unsigned>(ms::Command::check); completion.task_id = 42;
         auto peer = std::async(std::launch::async, [&] { return ms::exchange(follower, ms::Control{}); });

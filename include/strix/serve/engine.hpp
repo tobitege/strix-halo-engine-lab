@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/serve/chat_template.hpp"
 
 #include "strix/serve/short_first.hpp"
 
@@ -18,6 +19,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace strix::session {
+class EmbedTable;
+}
 
 namespace strix::serve {
 
@@ -72,6 +77,12 @@ struct ConstraintVerdict {
     // (transforms, argmax, scores) and, on MTP windows, the whole row (readback + mask + select).
     std::uint64_t profile_rows = 0, profile_window_rows = 0, profile_known_rows = 0;
     double profile_mask_ms = 0, profile_select_ms = 0, profile_window_row_ms = 0;
+    // Mask-ahead: rows whose mask came from the host worker (mask_ms then holds only the wait), and every
+    // mask the worker walked with its own time (off the selection thread; includes masks no row needed).
+    std::uint64_t profile_ahead_rows = 0, profile_ahead_masks = 0;
+    // Rows decided by ranked membership (maximum refused, a next-best logit admitted): no mask walk.
+    std::uint64_t profile_ranked_rows = 0;
+    double profile_ahead_ms = 0;
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it
@@ -118,6 +129,43 @@ struct GenerationProgress {
 // step with the newly verified tokens (stop tokens included); returning false stops generation.
 enum class CacheRetention : std::uint8_t { server_policy, retain, no_store };
 
+// Internal typed family data, never populated from a public session identifier.
+// Admission must validate the concrete type before acquiring model state.
+struct GenerationContext { virtual ~GenerationContext() = default; };
+
+// Optional family presentation. Producers run on the SAME execution owner;
+// the shared HTTP drain consumes deltas. No family callback writes HTTP bytes.
+class GenerationOutput {
+public:
+    struct Delta { std::string content, reasoning; Json tool_calls = {}; };
+    void publish(Delta delta) {
+        if (delta.content.empty() && delta.reasoning.empty() && !delta.tool_calls.size()) return;
+        std::lock_guard lock(mutex_); deltas_.push_back(std::move(delta));
+    }
+    std::vector<Delta> drain() {
+        std::lock_guard lock(mutex_); std::vector<Delta> out; out.swap(deltas_); return out;
+    }
+    // Optional owner-side parser, called at token-piece boundaries before the
+    // ticket wakes its HTTP drain. Capture family context weakly: it owns this
+    // presentation, while completed tickets may outlive the execution context.
+    std::function<bool(std::span<const std::uint32_t>)> consume_tokens = {};
+    // Written before ticket completion and read only after it.
+    AssistantOutput parsed;
+    Json receipt;
+private:
+    std::mutex mutex_;
+    std::vector<Delta> deltas_;
+};
+
+// The rest of a prompt that is still being tokenized (GenerationJob::prompt_tail). `prompt` must hold exactly the
+// first prompt.size() ids; take() appends every further id that is final and returns true once the prompt is complete.
+// wait: block until at least one more id is final or the prompt is complete. Ids never change once appended.
+class PromptTail {
+public:
+    virtual ~PromptTail() = default;
+    virtual bool take(std::vector<std::uint32_t>& prompt, bool wait) = 0;
+};
+
 struct GenerationJob {
     std::function<void()> on_admitted; // optional: session preflight passed, before execution
     std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
@@ -125,6 +173,11 @@ struct GenerationJob {
     CacheRetention cache_retention = CacheRetention::server_policy;
     std::string session_id;
     std::vector<std::uint32_t> prompt;
+    // Optional early admission: the prompt is still being tokenized. `prompt` holds the ids final so far (the first
+    // chunk at least) and the session runtime appends the rest from here; it runs prefill only on ids it holds and
+    // never treats the prompt as complete before the stream is. Queue selection sees the current size. Null: the
+    // prompt is complete (every existing caller).
+    std::shared_ptr<PromptTail> prompt_tail;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
     std::uint32_t stable_prefix = 0;
@@ -153,6 +206,11 @@ struct GenerationJob {
     std::uint64_t observed_period = 0;  // set by submit: observe_period() then
     [[nodiscard]] bool observation_complete() const noexcept { return observed && observe_period() == observed_period; }
     std::string session; // empty: ordinary scheduler, unchanged numerical route
+    std::shared_ptr<GenerationContext> family_context;
+    std::shared_ptr<GenerationOutput> output = {};
+    std::function<bool()> client_gone = {}; // connection lifetime guarded by the shared frontend
+    // Resolves the virtual ids of prompt (strix/session/embed_rows.hpp); null: the prompt holds none.
+    std::shared_ptr<const session::EmbedTable> embeds = {};
 };
 
 struct GenerationStats {
@@ -179,6 +237,9 @@ struct GenerationStats {
     std::string sampling = "greedy";
     // Engine receipts added to the response's "strix" object: (member name, JSON value text). Empty: none.
     std::vector<std::pair<std::string, std::string>> engine_extra;
+    // Steady-clock nanoseconds of the job's execution span, stamped by the queue when the job finishes (0: not
+    // stamped). The power receipt of a request is taken over this span, not over the time its response is rendered.
+    std::int64_t exec_begin_ns = 0, exec_end_ns = 0;
 };
 
 // A request-local failure preserves its terminal receipt without poisoning the engine.
@@ -211,8 +272,12 @@ public:
     // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
     std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
     // Wait without consuming tokens until session admission or completion.
+    // Ends the current (or next) wait() without tokens: an engine that hands output to the HTTP thread by another
+    // path (Gemma4's batched deltas) wakes it instead of the HTTP thread polling.
+    void wake();
     bool wait_admission(std::chrono::milliseconds timeout);
     void admit();
+    [[nodiscard]] std::shared_ptr<GenerationOutput> output() const { return output_; }
     [[nodiscard]] GenerationProgress progress() const;
     [[nodiscard]] GenerationStats stats() const;
     [[nodiscard]] std::string error() const;
@@ -233,11 +298,13 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::vector<std::uint32_t> pending_;
+    std::shared_ptr<GenerationOutput> output_;
     GenerationProgress progress_;
     GenerationStats stats_;
     std::string error_;
     bool admitted_ = false;
     bool done_ = false;
+    bool woken_ = false;
     std::atomic<bool> cancelled_{false};
     bool observed_ = false;
     std::uint64_t submitted_queue_position_ = 0;
@@ -303,23 +370,50 @@ struct QueueSnapshot {
 
 // FIFO is the default; MiniMax short-first also gives cancellation precedence.
 enum class QueueSelection { fifo, short_first };
+// Serial generate() measures TTFT from entry, unlike native batched producers.
+enum class QueueCompletion { taken, serial };
 
 // Generation jobs executed on the thread that calls run() or take().
 class GenerationQueue {
 public:
 #ifdef STRIX_SERVE_QUEUE_TEST
     inline static std::chrono::steady_clock::time_point (*test_now)() = std::chrono::steady_clock::now;
+#endif
+    // Stable layout across production owners and instrumented replay queues.
+    // Only test builds update these counters; ordinary queue operations keep
+    // their existing fast path. Shared archives must agree on member offsets.
     struct Work { unsigned take_locks = 0, cancel_visits = 0, selection_visits = 0, lookahead_locks = 0, lookahead_visits = 0; };
     mutable Work work;
-#endif
     explicit GenerationQueue(std::size_t max_queued = 64) : max_queued_(max_queued) {}
     // Install before starting the owner. HTTP wakeups share the existing idle wait.
     void set_idle_control(std::function<void()> control) { idle_control_ = std::move(control); }
     void wake_control();
+    // Wait without reserving/removing a candidate. Timed owners use this for
+    // idle protocol deadlines and bounded control work. A blocked FIFO head
+    // must pass generation_ready=false to avoid waking repeatedly on itself.
+    // Control callbacks retain take()'s outside-the-lock dispatch semantics.
+    void wait_for_work_until(std::chrono::steady_clock::time_point deadline,
+                             bool generation_ready = true) {
+        std::function<void()> control;
+        {
+            std::unique_lock lock(mutex_);
+            ready_.wait_until(lock, deadline, [&] {
+                return stopping_ || control_pending_ || (generation_ready && !entries_.empty());
+            });
+            if (control_pending_ && !stopping_) {
+                control_pending_ = false;
+                control = idle_control_;
+            }
+        }
+        if (control) control();
+    }
     // nullptr when the queue is full or shut down.
     std::shared_ptr<GenerationTicket> submit(GenerationJob job);
     // Runs jobs until shutdown(); `observe` (optional) sees every finished job's stats.
     void run(GenerationEngine& engine, const std::function<void(const GenerationStats&)>& observe = {});
+    // One FIFO entry, including cancelled work, with run()'s idle-control wake
+    // boundary. No cancellation sweep or completion occurs during reservation.
+    std::optional<TakenJob> take_serial(bool wait);
     // Batching engines, which decode several jobs at once and take new ones between steps instead of
     // run(): chooses a job with the requested policy (FIFO by default), waiting when `wait`.
     // nullopt when none is queued; cancelled entries are finished here. Selection preserves
@@ -332,9 +426,22 @@ public:
         const std::function<bool(std::chrono::steady_clock::time_point)>& reorder = {},
         const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible = {},
         const std::function<void()>& overtake_blocked = {});
+    // When supplied, blocked is written under the SAME lock as the failed
+    // selection: true only for an observed inadmissible head, false for an
+    // exhausted/empty observation. Pass !blocked to wait_for_work_until; a later
+    // submission must not be reclassified by a separate has_queued_work read.
+    std::optional<TakenJob> take(bool wait, QueueSelection selection,
+        const std::function<bool(const GenerationJob&)>& eligible,
+        const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
+        const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
+        const std::function<void()>& overtake_blocked, bool* blocked);
     // Explicit QueueSelection calls process only the initial batch; retry nullopt until stopping.
     // The bool/default API retains upstream FIFO/DeepSeek cancellation and wait semantics.
     [[nodiscard]] bool has_queued_work() const;
+    // Idle owner loops: block until work is queued, the queue stops, or the deadline passes, instead of polling with
+    // a short sleep. A control wake (wake_control) does not end the wait: take(false) never clears it, so waking on it
+    // would spin. Returns has_queued_work() at return.
+    bool wait_work_until(std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
@@ -343,7 +450,8 @@ public:
     // before the lock plus a few additions under it (no allocation, no syscall). A runner's timed region that encloses
     // the call therefore sees at most that constant, on top of the totals update it already contained.
     void finish(TakenJob& job, GenerationStats stats, std::string error = {},
-        const std::function<void(const GenerationStats&)>& observe = {});
+        const std::function<void(const GenerationStats&)>& observe = {},
+        QueueCompletion protocol = QueueCompletion::taken);
     [[nodiscard]] bool stopping() const;
     // Close admission atomically with submit, preserving all accepted work and the owner loop.
     // Returns true only on the first call.
@@ -361,13 +469,14 @@ private:
         const std::function<bool(const GenerationJob&)>& eligible = {},
         const std::function<bool(std::chrono::steady_clock::time_point)>& reorder = {},
         const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible = {},
-        const std::function<void()>& overtake_blocked = {});
+        const std::function<void()>& overtake_blocked = {},
+        bool* blocked = nullptr);
     static bool still_observed(GenerationTicket& ticket) noexcept;
     static ObserveDelta observe_delta(const GenerationStats& stats, const std::string& error) noexcept;
     void observe_locked(const ObserveDelta& d) noexcept;
     struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; std::uint32_t overtakes = 0; };
     mutable std::mutex mutex_;
-    std::condition_variable ready_;
+    mutable std::condition_variable ready_;  // mutable: wait_work_until is const
     std::deque<Entry> entries_;
     std::size_t max_queued_;
     bool stopping_ = false;

@@ -43,6 +43,18 @@ __global__ void dsa_rows_kernel(const std::uint32_t* slot, const std::uint64_t* 
     tpos[r] = static_cast<unsigned>(pos[r]);
 }
 
+// The partial was not written by one publishing launch: one thread raises the TX flag after its producers.
+__global__ void publish_partial_kernel(strix::pair::ProducerPublish t) {
+    if (threadIdx.x == 0) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        __hip_atomic_store(t.flag, t.sequence, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+void publish_partial(const strix::pair::ProducerPublish& t, hipStream_t s) {
+    publish_partial_kernel<<<1, 32, 0, s>>>(t);
+    if (hipGetLastError() != hipSuccess) throw std::runtime_error("fast attention: publish launch");
+}
+
 class FastAttn final : public AttnPath {
 public:
     FastAttn(unsigned kda_heads, unsigned mla_heads, std::uint64_t cap)
@@ -91,7 +103,41 @@ public:
             (void)hipFree(p);
     }
 
+    bool publishes() const override { return true; }
     void kda(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y) override {
+        pub_begin(c, y);
+        kda_run(w, st, c, x, y);
+        pub_end(c);
+    }
+    void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) override {
+        pub_begin(c, y);
+        dsa_run(w, st, c, x, y);
+        pub_end(c);
+    }
+
+private:
+    // Producer publication (CallCtx::publish): the o projection that writes the whole partial in one launch publishes
+    // it in-kernel; any other form (row groups, prepared o_proj) is followed by one publish launch.
+    strix::pair::ProducerPublish pub_{};
+    const float* pub_y_ = nullptr;
+    unsigned pub_rows_ = 0;
+    bool pub_done_ = false;
+    void pub_begin(const CallCtx& c, const float* y) {
+        pub_ = c.publish;
+        pub_y_ = y;
+        pub_rows_ = static_cast<unsigned>(c.rows.size());
+        pub_done_ = false;
+    }
+    const strix::pair::ProducerPublish* pub_for(const float* y, unsigned n) {
+        if (!pub_.on() || pub_done_ || y != pub_y_ || n != pub_rows_) return nullptr;
+        pub_done_ = true;
+        return &pub_;
+    }
+    void pub_end(const CallCtx& c) {
+        if (pub_.on() && !pub_done_) publish_partial(pub_, c.stream);
+        pub_ = {};
+    }
+    void kda_run(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y) {
         if (w.heads != Hk_) throw std::invalid_argument("fast attention: KDA heads");
         const std::size_t SZ = static_cast<std::size_t>(Hk_) * kKdaDim * kKdaDim, CZ = static_cast<std::size_t>(3) * C_ * 3;
         const D::KdaDev kd{Hk_, w.conv, w.A_log, w.dt_bias, w.o_norm};
@@ -127,9 +173,13 @@ public:
         }
     }
 
+
+public:
     bool supports_multi_slot_verify() const override { return true; }
 
-    void dsa(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) override {
+private:
+
+    void dsa_run(const DsaLayerWeights& w, DsaState& st, const CallCtx& c, const float* x, float* y) {
         if (w.heads != Hm_ || st.cap != cap_) throw std::invalid_argument("fast attention: DSA heads / capacity");
         if (st.shard != nullptr && (c.rows.size() != 1 || c.spec != nullptr || Hm_ != 32))
             throw std::invalid_argument("kvshard: single-row TP2 plain decode required");
@@ -183,7 +233,7 @@ public:
             if (st.shard) st.shard->attention(st, c, d, tok_, ntok_, q_, w.kv_b, mw_, o_);
             else F::mla_attention(d, tok_, ntok_, q_, w.kv_b, Hm_, mw_, o_, c.stream, static_cast<unsigned>(std::min<std::uint64_t>(t_vis, 1U << 30)));
             if (dumping) dump_decode(st, c);
-            if (raw(w.o)) TB::dsa_o(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, kHidden, tb_ws_, c.stream);
+            if (raw(w.o)) TB::dsa_o(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y + r0 * kHidden, n));
             else c.lin->run(w.o, o_, y + r0 * kHidden, n, c.stream);
         }
     }
@@ -290,7 +340,7 @@ private:
         }
     }
     void kda_o(const KdaLayerWeights& w, float* y, unsigned n, const CallCtx& c) {
-        if (raw(w.o)) TB::kda_o(mat(w.o), ky_, C_, n, y, kHidden, tb_ws_, c.stream);
+        if (raw(w.o)) TB::kda_o(mat(w.o), ky_, C_, n, y, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y, n));
         else c.lin->run(w.o, ky_, y, n, c.stream);
     }
 

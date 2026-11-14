@@ -101,7 +101,7 @@ inline bool reorder_prompts(Sched sched, bool enabled, bool head_protected) {
     return sched == Sched::interleave && enabled && head_protected;
 }
 
-enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13, session = 14 };
+enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13, session = 14, state = 15, input = 16 };
 
 // A follower only replays the lead's payload. No policy, cancellation ticket or clock is consulted.
 template<class Control, class Engine, class Runner, class Receive>
@@ -125,7 +125,13 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
             c.bank != (c.parent_task_id != 0 ? 1U : 0U))
             throw std::runtime_error("control channel: begin bank / parent mismatch");
         const auto prompt = receive(c.plen);
-        run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0, c.task_id, c.parent_task_id, c.slot_generation, c.pstart);
+        // A runner without resident-prefix support still replays every whole prefill.
+        if constexpr (requires { run.prefill_begin(c.pslot, prompt, true, c.task_id, c.parent_task_id, c.slot_generation, c.pstart); })
+            run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0, c.task_id, c.parent_task_id, c.slot_generation, c.pstart);
+        else {
+            if (c.pstart != 0) throw std::runtime_error("control channel: resident prefill unsupported by this runner");
+            run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0, c.task_id, c.parent_task_id, c.slot_generation);
+        }
         break;
     }
     case Command::unit: {
@@ -151,6 +157,12 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
         if (c.dslots > std::size(c.dslot)) throw std::runtime_error("control channel: draft count");
         if (run.dd == nullptr) throw std::runtime_error("control channel: draft without a drafter");
         for (std::uint32_t i = 0; i < c.dslots; ++i) (void)run.draft(c.dslot[i], c.danchor[i], c.dpos[i]);
+        break;
+    case Command::input:
+        if(c.rows==0 || c.rows>std::size(c.row) || c.append || c.dslots!=c.rows)
+            throw std::runtime_error("control channel: input shape");
+        if constexpr(requires {run.input_control(c);})run.input_control(c);
+        else throw std::runtime_error("control channel: native input OFF");
         break;
     case Command::step:
         if (c.rows > std::size(c.row)) throw std::runtime_error("control channel: step count");

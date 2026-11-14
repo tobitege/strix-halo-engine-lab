@@ -418,6 +418,51 @@ void check_chunked(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top
                    const std::string& label);
 void check_q8_nan_payloads();
 
+// Rows narrower than the 8 group classes of a wave pair (hidden 32 = one group, inter 64 = two): some waves own no group.
+// Gate/up alone (a down of 32 outputs is not a valid view), per-form default and every product on the shared core against
+// the kernels of the engine, bit for bit; the policy names and the rejection of an unknown one.
+void check_narrow_gate_up() {
+    using namespace strix::ds41;
+    const auto e = synthetic_experts(WeightFormat::q8_0, WeightFormat::q8_0, 1, 32, 64, 45);
+    const DeviceExperts x(e);
+    const std::uint32_t rows = 37, top_k = 1, batch_rows = 16;
+    const auto ids = routing(rows, top_k, e.experts, 0.0, 12);
+    RouteBuffers rb(rows, top_k, e.experts, batch_rows);
+    rb.ids.upload(ids);
+    enqueue_build_prefill_routes(rb.ids.data, rows, top_k, e.experts, 1, batch_rows, rb.b, nullptr);
+    const auto view = prefill_routes_view(rb.b, rows, top_k, e.experts, batch_rows);
+    Inputs in(rows, top_k, e.hidden, 23);
+    struct Got { std::vector<float> gate, up, deltas; std::vector<std::int8_t> codes; std::vector<std::int32_t> sums; };
+    const auto run_arm = [&](const char* policy) {
+        set_pf_core(policy);
+        PrefillRun run(rows, rows, 128, e.inter, true);
+        run.gate.fill_pattern(); run.up.fill_pattern(); run.act_codes.fill_pattern(); run.act_deltas.fill_pattern(); run.act_sums.fill_pattern();
+        PrefillGateUpView gu;
+        gu.gate = x.gate.data; gu.up = x.up.data; gu.expert_stride_bytes = e.gate_row() * e.inter; gu.row_bytes = e.gate_row();
+        gu.hidden = e.hidden; gu.inter = e.inter; gu.routes = view; gu.codes = in.codes.data; gu.deltas = in.deltas.data;
+        gu.gate_out = run.gate.data; gu.up_out = run.up.data;
+        gu.act_codes = run.act_codes.data; gu.act_deltas = run.act_deltas.data; gu.act_sums = run.act_sums.data;
+        enqueue_prefill_gate_up(e.gate_up, gu, nullptr);
+        check(hipDeviceSynchronize(), "narrow gate/up");
+        return Got{run.gate.download(), run.up.download(), run.act_deltas.download(), run.act_codes.download(), run.act_sums.download()};
+    };
+    const auto priv = run_arm("0");
+    std::size_t bad = 0;
+    for (const char* policy : {static_cast<const char*>(nullptr), "moe", "1"}) {
+        const auto got = run_arm(policy);
+        bad += bit_mismatches(got.gate, priv.gate) + bit_mismatches(got.up, priv.up) + bit_mismatches(got.codes, priv.codes) +
+               bit_mismatches(got.deltas, priv.deltas) + bit_mismatches(got.sums, priv.sums);
+    }
+    bool rejected = false;
+    try { set_pf_core("mo"); } catch (const std::invalid_argument&) { rejected = true; }
+    try { set_pf_core(""); rejected = false; } catch (const std::invalid_argument&) {}
+    set_pf_core(-1);
+    expect(bad == 0U && rejected, "narrow Q8_0 gate/up h32 i64: " + std::to_string(bad) + " differ, unknown policy " +
+        (rejected ? "rejected" : "ACCEPTED"));
+    std::cout << "synthetic Q8_0 narrow gate/up h32 i64: default / moe / 1 against the engine kernels "
+              << (bad == 0U ? "bit-exact" : "MISMATCH") << ", unknown and empty policy " << (rejected ? "rejected" : "ACCEPTED") << "\n";
+}
+
 void test_synthetic() {
     {
         const auto e = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 16, 1024, 512, 5);
@@ -453,6 +498,38 @@ void test_synthetic() {
         check_case(x, 45, 1, 1, 32, 0.0, 7, "synthetic Q8_0 shared h5120");
         check_case(x, 37, 1, 1, 16, 0.0, 8, "synthetic Q8_0 shared h5120");
     }
+    {
+        // narrow rows: gate/up of 4 groups, down of 2 (width 64, 128 outputs); per-form default (the shared core for
+        // these Q8_0 forms), the engine kernels and every product on the shared core, each against the decode windows
+        const auto e = synthetic_experts(WeightFormat::q8_0, WeightFormat::q8_0, 1, 128, 64, 55);
+        const DeviceExperts x(e);
+        for (const char* policy : {static_cast<const char*>(nullptr), "0", "1"}) {
+            strix::ds41::set_pf_core(policy);
+            const std::string name = std::string("synthetic Q8_0 narrow h128 i64 PF_CORE=") + (policy ? policy : "unset");
+            check_case(x, 37, 1, 1, 16, 0.0, 13, name);
+            check_case(x, 45, 1, 1, 32, 0.0, 14, name);
+        }
+        strix::ds41::set_pf_core(-1);
+    }
+    {
+        // IQ2_XXS gate/up width that is not a multiple of 1024 (the shared core loads whole chunks): the per-form default
+        // keeps the engine kernels; default and PF_CORE=0, partial route batches included, against the decode windows
+        const auto e = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 8, 1280, 512, 75);
+        const DeviceExperts x(e);
+        for (const char* policy : {static_cast<const char*>(nullptr), "0"}) {
+            strix::ds41::set_pf_core(policy);
+            const std::string name = std::string("synthetic IQ2_XXS/Q2_K h1280 i512 PF_CORE=") + (policy ? policy : "unset");
+            expect(!strix::ds41::prefill_gate_up_on_core(WeightFormat::iq2_xxs, 1280U, 16U), name + ": gate/up routed to the shared core");
+            check_case(x, 37, 6, 4, 16, 0.3, 71, name);
+            check_case(x, 9, 6, 4, 16, 0.0, 72, name);
+        }
+        strix::ds41::set_pf_core(nullptr);
+        expect(strix::ds41::prefill_gate_up_on_core(WeightFormat::iq2_xxs, 1024U, 16U) ==
+                   strix::ds41::prefill_down_on_core(WeightFormat::q2_k, 512U, 16U),
+               "IQ2_XXS h1024 gate/up and Q2_K down: per-form default routes differ");
+        strix::ds41::set_pf_core(-1);
+    }
+    check_narrow_gate_up();
     check_q8_nan_payloads();
 }
 
@@ -876,6 +953,8 @@ void bench_router(const RouterWeights& rw, const std::string& label) {
 
 // Rank-shaped expert calls of the pair prefill (one piece of T rows routed top-k over all experts; this rank owns experts
 // [0, owned)), split kernels only (batches of 16). Arms (STRIX_DS41_BENCH_ARMS = "name:VAR=V,VAR=-;name2:..."; '-' unsets)
+// (default: the engine kernels, PF_CORE=0, against the per-form default route; the v1 / v2 split kernels are explicit
+// arms, "v1:STRIX_DS41_PF_CORE=0,STRIX_DS41_PREFILL_MOE_V2=0;v2:STRIX_DS41_PF_CORE=0,STRIX_DS41_PREFILL_MOE_V2=-")
 // alternate within each repetition, every arm's outputs (A8 codes, deltas, sums, raw down vectors) compared bitwise with
 // the first arm's. STRIX_DS41_BENCH_T (comma list), STRIX_DS41_BENCH_REPS, STRIX_DS41_BENCH_SKEW.
 std::vector<std::string> split_on(const std::string& s, char c) {
@@ -890,7 +969,9 @@ std::vector<std::string> split_on(const std::string& s, char c) {
 struct Arm { std::string name; std::vector<std::pair<std::string, std::string>> env; };
 void apply_arm(const Arm& a) {
     for (const auto& [k, v] : a.env) {
-        if (v == "-") unsetenv(k.c_str());
+        // resolved once per run in the library: the arms go through the harness override
+        if (k == "STRIX_DS41_PF_CORE") strix::ds41::set_pf_core(v == "-" ? nullptr : v.c_str());
+        else if (v == "-") unsetenv(k.c_str());
         else setenv(k.c_str(), v.c_str(), 1);
     }
 }
@@ -899,7 +980,8 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
     const auto& e = x.e;
     std::vector<Arm> arms;
     const char* arms_env = std::getenv("STRIX_DS41_BENCH_ARMS");
-    for (const auto& spec : split_on(arms_env && *arms_env ? arms_env : "v1:STRIX_DS41_PREFILL_MOE_V2=0;v2:STRIX_DS41_PREFILL_MOE_V2=-", ';')) {
+    const bool default_arms = !(arms_env && *arms_env);
+    for (const auto& spec : split_on(arms_env && *arms_env ? arms_env : "family:STRIX_DS41_PF_CORE=0;core:STRIX_DS41_PF_CORE=-", ';')) {
         Arm a;
         const auto colon = spec.find(':');
         a.name = spec.substr(0, colon);
@@ -950,12 +1032,25 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
         std::vector<std::int8_t> ref_codes;
         std::vector<float> ref_deltas, ref_raw;
         std::vector<std::int32_t> ref_sums;
+        bool ref_gu_core = false, ref_dn_core = false;
         for (unsigned rep = 0; rep < reps + 1U; ++rep)
             for (std::size_t a = 0; a < arms.size(); ++a) {
                 apply_arm(arms[(a + rep) % arms.size()]);
                 const std::size_t arm = (a + rep) % arms.size();
                 const char* r2 = std::getenv("STRIX_DS41_PREFILL_MOE_R2"); // 32-row routes for the R2 arms
                 if (rep == 0U) { run.raw.fill_pattern(); run.act_codes.fill_pattern(); }
+                if (rep == 0U) {
+                    // the route each arm really takes: the default arms are the engine kernels against the shared core
+                    const bool gu_core = prefill_gate_up_on_core(e.gate_up, e.hidden, r2 && std::strcmp(r2, "1") == 0 ? 32U : batch_rows);
+                    const bool dn_core = prefill_down_on_core(e.down, e.inter, r2 && std::strcmp(r2, "1") == 0 ? 32U : batch_rows);
+                    if (a == 0U) { ref_gu_core = gu_core; ref_dn_core = dn_core; }
+                    if (default_arms) expect(a == 0U ? !gu_core && !dn_core : gu_core || dn_core,
+                        label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": the default arms do not compare two routes");
+                    std::cout << "RANK-ROUTE " << label << " T=" << rows << " arm " << arms[arm].name << ": gate/up "
+                              << (gu_core ? "shared core" : "engine kernels") << ", down " << (dn_core ? "shared core" : "engine kernels")
+                              << (a != 0U && gu_core == ref_gu_core && dn_core == ref_dn_core ? " (SAME ROUTE as arm " + arms[0].name + ")" : "") << '
+';
+                }
                 hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
                 enqueue_prefill(x, in, r2 && std::strcmp(r2, "1") == 0 ? view32 : view, run, false, ev);
                 check(hipEventSynchronize(ev[2]), "sync");
@@ -972,8 +1067,16 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
                     const auto bad = bit_mismatches(codes, ref_codes) + bit_mismatches(deltas, ref_deltas) + bit_mismatches(sums, ref_sums) +
                         bit_mismatches(raw, ref_raw);
                     expect(bad == 0U, label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": outputs differ from arm " + arms[0].name);
+                    const auto fnv = [](const auto& v) {
+                        std::uint64_t h = 1469598103934665603ULL;
+                        const auto* p = reinterpret_cast<const unsigned char*>(v.data());
+                        for (std::size_t i = 0; i < v.size() * sizeof(v[0]); ++i) h = (h ^ p[i]) * 1099511628211ULL;
+                        return h;
+                    };
                     std::cout << "RANK-CHECK " << label << " T=" << rows << " arm " << arms[arm].name << " vs " << arms[0].name << ": "
-                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)\n";
+                              << (bad == 0U ? "bit-identical" : "MISMATCH " + std::to_string(bad)) << " (A8 codes/deltas/sums, raw)" << std::hex
+                              << " fnv codes " << fnv(codes) << " group sums " << fnv(sums) << " deltas " << fnv(deltas) << " raw " << fnv(raw)
+                              << std::dec << '\n';
                 }
             }
         const double ops_gu = 2.0 * static_cast<double>(entries) * 2.0 * e.inter * e.hidden;

@@ -58,6 +58,7 @@ struct MinimaxTraits {
     static constexpr std::uint32_t kHeadLayer = 60; // standalone argmax helper's historical tag
     static constexpr const char* kEnvironment = "STRIX_MMX_";
     static constexpr bool kCrc = true, kCrcDeferred = true;
+    static constexpr unsigned kFoldRows = 0;  // xport row fold of the decode all-reduce sum (STRIX_MMX_FOLD=rows)
     [[nodiscard]] static constexpr int memory_kind(std::string_view value) {
         return value == "host" ? 0 : value == "device" ? 1 : value == "uncached" ? 2 : -1;
     }

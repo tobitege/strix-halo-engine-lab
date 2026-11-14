@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_integer_projection_runtime.hpp"
 #include "strix/hip_launch_context.hpp"
 #include <hip/hip_runtime.h>
@@ -9,7 +10,7 @@
 namespace strix::integer_projection {
 namespace {
 void require(bool ok,const char* message){if(!ok)throw std::invalid_argument(message);}
-void check(hipError_t e,const char* message){if(e!=hipSuccess)throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
+using strix::hip_check;
 hipStream_t native_stream(hipStream_t stream) noexcept {return stream==hipStreamLegacy?nullptr:stream;}
 std::uint64_t unique_generation(){
     static std::atomic<std::uint64_t> next{0x4950520000000000ULL};auto current=next.load();
@@ -20,24 +21,24 @@ std::uint64_t add(std::uint64_t a,std::uint64_t b){if(b>UINT64_MAX-a)throw std::
 void target(const DeviceIdentity& d,hipStream_t stream){
     const auto* override_arch=std::getenv("HSA_OVERRIDE_GFX_VERSION");require(!override_arch||!*override_arch,"integer runtime rejects architecture override");
     require(d.index>=0&&d.instance_generation&&d.architecture=="gfx1151","integer runtime requires explicit gfx1151 instance");
-    int current=-1;check(hipGetDevice(&current),"integer runtime current device");require(current==d.index,"integer runtime device changed");
+    int current=-1;hip_check(hipGetDevice(&current),"integer runtime current device");require(current==d.index,"integer runtime device changed");
     // HIP's legacy/default stream is a sentinel tied to the current device,
     // not an allocated stream handle. Some runtimes dereference that sentinel.
     hipDevice_t owner=current;
     if(stream!=nullptr&&stream!=hipStreamLegacy)
-        check(hipStreamGetDevice(stream,&owner),"integer runtime stream device");
+        hip_check(hipStreamGetDevice(stream,&owner),"integer runtime stream device");
     require(owner==d.index,"integer runtime stream device mismatch");
-    hipDeviceProp_t props{};check(hipGetDeviceProperties(&props,current),"integer runtime device properties");
+    hipDeviceProp_t props{};hip_check(hipGetDeviceProperties(&props,current),"integer runtime device properties");
     std::string architecture=props.gcnArchName;require(architecture.substr(0,architecture.find(':'))==d.architecture,"integer runtime target architecture mismatch");
 }
 AllocationBinding native_allocation(const DeviceIdentity& d,std::uintptr_t address,std::uint64_t generation,std::uint64_t identity){
-    hipPointerAttribute_t attr{};check(hipPointerGetAttributes(&attr,reinterpret_cast<const void*>(address)),"integer runtime pointer attributes");
+    hipPointerAttribute_t attr{};hip_check(hipPointerGetAttributes(&attr,reinterpret_cast<const void*>(address)),"integer runtime pointer attributes");
     require(attr.type==hipMemoryTypeDevice&&!attr.isManaged&&attr.device==d.index,"integer runtime owner factory requires device-local allocation");
-    hipDeviceptr_t base=nullptr;std::size_t bytes=0;check(hipMemGetAddressRange(&base,&bytes,reinterpret_cast<hipDeviceptr_t>(address)),"integer runtime allocation extent");
+    hipDeviceptr_t base=nullptr;std::size_t bytes=0;hip_check(hipMemGetAddressRange(&base,&bytes,reinterpret_cast<hipDeviceptr_t>(address)),"integer runtime allocation extent");
     return {reinterpret_cast<std::uintptr_t>(base),bytes,identity,generation,d,1};
 }
 void physical_extent(const AllocationBinding& binding,bool registered){
-    hipPointerAttribute_t attr{};check(hipPointerGetAttributes(&attr,reinterpret_cast<const void*>(binding.base)),"integer runtime source attributes");
+    hipPointerAttribute_t attr{};hip_check(hipPointerGetAttributes(&attr,reinterpret_cast<const void*>(binding.base)),"integer runtime source attributes");
     if(registered){require(attr.type==hipMemoryTypeHost&&!attr.isManaged&&attr.devicePointer,"integer runtime registered mapping is not GPU visible");return;}
     const auto actual=native_allocation(binding.device,binding.base,binding.generation,binding.identity);
     require(actual.base==binding.base&&actual.bytes==binding.bytes,"integer runtime owning device allocation extent changed");
@@ -46,7 +47,7 @@ struct Owned final:AllocationPin {
     AllocationBinding binding;
     hipStream_t stream=nullptr;
     explicit Owned(const DeviceIdentity& device,std::uint64_t bytes,hipStream_t on_stream):stream(on_stream){
-        void* p=nullptr;check(hipMalloc(&p,static_cast<std::size_t>(bytes)),"integer runtime allocation");
+        void* p=nullptr;hip_check(hipMalloc(&p,static_cast<std::size_t>(bytes)),"integer runtime allocation");
         try{const auto id=unique_generation();binding=native_allocation(device,reinterpret_cast<std::uintptr_t>(p),id,id);}
         catch(...){(void)hipFree(p);throw;}
     }
@@ -157,7 +158,7 @@ RuntimeOutcome HipIntegerProjectionRuntimeBundle::execute(const ExecutionDispatc
         const auto* scope=current_hip_launch_context();
         require(scope?(!scope->graph_capture&&scope->stream==impl_->stream):(impl_->stream==hipStreamLegacy),
             "integer runtime requires matching eager stream scope or explicit legacy stream");
-        hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(native_stream(impl_->stream),&capture),"integer runtime capture query");
+        hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;hip_check(hipStreamIsCapturing(native_stream(impl_->stream),&capture),"integer runtime capture query");
         require(capture==hipStreamCaptureStatusNone,"blocking integer runtime cannot execute during graph capture");
         impl_->snapshot=impl_->plan.validate_dispatch(context,impl_->owners);impl_->live();impl_->allocate();impl_->live();
         require(impl_->next_operation&&impl_->plan.accounting().tile_count<=UINT64_MAX-impl_->next_operation,"integer runtime operation generations exhausted");
@@ -165,8 +166,8 @@ RuntimeOutcome HipIntegerProjectionRuntimeBundle::execute(const ExecutionDispatc
         const auto& config=impl_->plan.config();
         hipLaunchKernelGGL(widen_input,dim3(config.hidden_size/128U+static_cast<unsigned>(config.hidden_size%128U!=0)),dim3(128),0,native_stream(impl_->stream),
             reinterpret_cast<const void*>(impl_->plan.input().address),pointer<double>(impl_->buffers[index(BufferRole::input_f64)]),config.hidden_size,config.input==RuntimeInput::bf16);
-        check(hipGetLastError(),"integer runtime source widening");
-        check(hipMemsetAsync(pointer<unsigned>(impl_->conversion_status),0,4,native_stream(impl_->stream)),"integer runtime conversion status clear");
+        hip_check(hipGetLastError(),"integer runtime source widening");
+        hip_check(hipMemsetAsync(pointer<unsigned>(impl_->conversion_status),0,4,native_stream(impl_->stream)),"integer runtime conversion status clear");
         for(std::uint32_t first=0;first<config.vocabulary_size;){
             const auto tile=impl_->plan.tile(first,impl_->next_operation++);const auto columns=static_cast<unsigned>(tile.request().shape.columns);
             impl_->live();HipProjectionInputs inputs;
@@ -176,23 +177,23 @@ RuntimeOutcome HipIntegerProjectionRuntimeBundle::execute(const ExecutionDispatc
             hipLaunchKernelGGL(repack_weights,dim3(static_cast<unsigned>((groups+127U)/128U)),dim3(128),0,native_stream(impl_->stream),
                 reinterpret_cast<const unsigned char*>(impl_->plan.checkpoint().address),pointer<unsigned char>(impl_->buffers[index(BufferRole::packed_weights)]),
                 pointer<double>(impl_->buffers[index(BufferRole::weight_scales_f64)]),config.hidden_size,first,columns,config.weights==WeightEncoding::iq4_xs);
-            check(hipGetLastError(),"integer runtime original checkpoint repack");
+            hip_check(hipGetLastError(),"integer runtime original checkpoint repack");
             inputs.producer_ready=HipProjectionReadyEvent::record(config.device,impl_->stream,inputs.pins,impl_->stream_owner);
             const auto outcome=impl_->launcher.execute(tile,inputs);
             require(outcome.status==HipProjectionStatus::complete,"integer runtime shared projection rejected tile");
             validate_completed_output(tile,inputs.buffers,outcome.evidence);impl_->live();
             hipLaunchKernelGGL(convert_logits,dim3((columns+127U)/128U),dim3(128),0,native_stream(impl_->stream),
                 pointer<const double>(impl_->buffers[index(BufferRole::destination_f64)]),pointer<float>(impl_->staged_logits),first,columns,pointer<unsigned>(impl_->conversion_status));
-            check(hipGetLastError(),"integer runtime explicit FP32 conversion");
-            check(hipMemcpyAsync(&impl_->host_status,pointer<unsigned>(impl_->conversion_status),4,hipMemcpyDeviceToHost,native_stream(impl_->stream)),"integer runtime conversion status readback");
-            check(hipStreamSynchronize(native_stream(impl_->stream)),"integer runtime tile conversion completion");impl_->live();
+            hip_check(hipGetLastError(),"integer runtime explicit FP32 conversion");
+            hip_check(hipMemcpyAsync(&impl_->host_status,pointer<unsigned>(impl_->conversion_status),4,hipMemcpyDeviceToHost,native_stream(impl_->stream)),"integer runtime conversion status readback");
+            hip_check(hipStreamSynchronize(native_stream(impl_->stream)),"integer runtime tile conversion completion");impl_->live();
             require(impl_->host_status==0,"integer runtime logits cannot be represented as finite FP32");
             ++result.completed_tiles;first+=columns;
         }
         (void)impl_->plan.validate_dispatch(context,impl_->owners);impl_->live();commit_started=true;
-        check(hipMemcpyAsync(reinterpret_cast<void*>(impl_->plan.output().address),pointer<const float>(impl_->staged_logits),
+        hip_check(hipMemcpyAsync(reinterpret_cast<void*>(impl_->plan.output().address),pointer<const float>(impl_->staged_logits),
             static_cast<std::size_t>(impl_->plan.accounting().staged_logits_bytes),hipMemcpyDeviceToDevice,native_stream(impl_->stream)),"integer runtime whole logits commit");
-        check(hipStreamSynchronize(native_stream(impl_->stream)),"integer runtime logits commit completion");impl_->live();
+        hip_check(hipStreamSynchronize(native_stream(impl_->stream)),"integer runtime logits commit completion");impl_->live();
         (void)impl_->plan.validate_dispatch(context,impl_->owners);
         result.actual_internal_bytes=impl_->internal_bytes;result.actual_retained_bytes=add(impl_->internal_bytes,add(impl_->snapshot.arena.bytes,impl_->snapshot.weights.bytes));
         result.output_committed=true;result.stream_quiescent=true;impl_->retire();return result;

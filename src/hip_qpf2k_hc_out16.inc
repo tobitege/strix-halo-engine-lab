@@ -72,6 +72,31 @@ __global__ __launch_bounds__(128) void qpf2k_hc_out16_kernel(HyperWideRows rows,
                 }
             }
         }
+        if constexpr (Recompute) {
+            // Every stream load and inverse read is issued before the first pinned multiply. The pinned operations are
+            // ordering points: loads interleaved with them were each waited for alone (one memory latency per value).
+            unsigned raw[2][2][8];
+            float inverse[2][8];
+#pragma unroll
+            for (unsigned t = 0; t < 2U; ++t)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    const unsigned at = t * 16U + 2U * e + lane / 16U;
+                    inverse[t][e] = qpf2k_hc_padded_inverse(as, Pitch, at, s);
+                    const auto* input = wide_row(rows.recompute_input, rows.recompute_stride, min(row0 + at, rows.count - 1U));
+#pragma unroll
+                    for (unsigned c = 0; c < 2U; ++c) raw[t][c][e] = input[s * hidden + feature0 + c * 16U];
+                }
+#pragma unroll
+            for (unsigned t = 0; t < 2U; ++t)
+#pragma unroll
+                for (unsigned c = 0; c < 2U; ++c)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e) {
+                        const float nv = qpf2k_mul(qpf2k_mul(inverse[t][e], __uint_as_float(raw[t][c][e] << 16U)), norm_weight[c]);
+                        mixed[t][c][e] += nv * sigmoid(acc[t][c][e]);
+                    }
+        } else
 #pragma unroll
         for (unsigned t = 0; t < 2U; ++t)
 #pragma unroll

@@ -38,7 +38,7 @@ la predicción satura el tamaño y no permite admitir con un cálculo reducido.
 
 MiniMax permite reutilizar prefijos residentes para peticiones sin sesión mediante
 `STRIX_MM_SERVE_PREFIX=1` en ambos rangos; sigue desactivado por defecto y en baseline.
-Solo reutiliza grupos completos de prefill (`--max-rows` por `STRIX_MM_PF_GROUP`,
+Solo reutiliza bloques alineados a 2 chunks de prefill (`--max-rows` x 2,
 8192 tokens por defecto), nunca filas producidas por decode. Ambos rangos deben usar
 la misma configuración. Las peticiones anidadas y los contextos DSpark hacen prefill
 completo; las operaciones de sesión invalidan el registro. Se informa de los tokens

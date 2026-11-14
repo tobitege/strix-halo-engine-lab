@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_token_sampling.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdio>
@@ -32,7 +33,7 @@ struct SampleTimingTotals {
 SampleTimingTotals& sample_timing_totals() { static SampleTimingTotals totals; return totals; }
 } // namespace
 bool sample_timing_enabled() noexcept {
-    static const bool on = [] { const char* v = std::getenv("STRIX_SAMPLE_TIMING"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_SAMPLE_TIMING", false);
     return on;
 }
 void record_sample_timing(SampleTimingKind kind,std::uint32_t rows,double readback_seconds,double decide_seconds,

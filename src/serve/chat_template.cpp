@@ -267,4 +267,69 @@ AssistantOutput parse_assistant_output(const std::string& text, bool thinking, c
     return out;
 }
 
+bool tool_choice_is_none(const Json& body) {
+    const auto* choice = body.find("tool_choice");
+    const auto* type = choice && choice->is_object() ? choice->find("type") : choice;
+    return type && type->is_string() && type->as_string() == "none";
+}
+
+std::optional<Json> messages_with_no_tools_hint(const Json& messages, std::string_view hint) {
+    if (!messages.is_array() || messages.size() == 0U || hint.empty()) return std::nullopt;
+    const auto role_of = [](const Json& message) -> std::string {
+        const auto* role = message.is_object() ? message.find("role") : nullptr;
+        return role && role->is_string() ? role->as_string() : std::string{};
+    };
+    bool tool_history = false;
+    for (const auto& message : messages.as_array()) {
+        if (role_of(message) == "tool") tool_history = true;
+        if (const auto* calls = message.is_object() ? message.find("tool_calls") : nullptr; calls && calls->is_array() && calls->size() > 0U)
+            tool_history = true;
+    }
+    if (!tool_history) return std::nullopt;
+    const auto& last = messages.as_array().back();
+    const auto role = role_of(last);
+    if (role != "user" && role != "tool") return std::nullopt;
+    Json out = Json::array();
+    for (std::size_t i = 0; i + 1U < messages.size(); ++i) out.push(messages.as_array()[i]);
+    Json closing = last;
+    const auto* content = last.find("content");
+    if (role == "user" && content && content->is_string()) {
+        closing.set("content", Json(content->as_string() + (content->as_string().empty() ? "" : "\n\n") + std::string(hint)));
+        out.push(std::move(closing));
+    } else if (role == "user" && content && content->is_array()) {
+        Json parts = *content;
+        Json part = Json::object(); part.set("type", Json("text")); part.set("text", Json("\n\n" + std::string(hint)));
+        parts.push(std::move(part));
+        closing.set("content", std::move(parts));
+        out.push(std::move(closing));
+    } else {
+        out.push(std::move(closing));
+        Json added = Json::object(); added.set("role", Json("user")); added.set("content", Json(std::string(hint)));
+        out.push(std::move(added));
+    }
+    return out;
+}
+
+void withhold_tool_calls(AssistantOutput& output, std::string_view marker) {
+    bool withheld = output.unfinished_call || (output.tool_calls.is_array() && output.tool_calls.size() > 0U);
+    std::string names;
+    if (output.tool_calls.is_array()) for (const auto& call : output.tool_calls.as_array())
+        if (const auto* name = call.is_object() ? call.find("name") : nullptr; name && name->is_string() && !name->as_string().empty())
+            names += (names.empty() ? "" : ", ") + name->as_string();
+    if (!marker.empty()) if (const auto at = output.content.find(marker); at != std::string::npos) {
+        output.content.erase(at);
+        withheld = true;
+    }
+    output.tool_calls = Json::array();
+    output.call_complete.clear();
+    output.unfinished_call = false;
+    output.withheld.clear();
+    if (!withheld) return;
+    const auto last = output.content.find_last_not_of(" \t\r\n");
+    output.content.erase(last == std::string::npos ? 0U : last + 1U);
+    output.withheld = std::string(output.content.empty() ? "" : "\n\n") + "[tool call" + (names.empty() ? "" : " to " + names) +
+        " withheld: tool_choice is \"none\"]";
+    output.content += output.withheld;
+}
+
 }  // namespace strix::serve

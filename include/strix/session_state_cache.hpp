@@ -12,6 +12,10 @@ struct SessionCompatibility {
     ModelContentIdentity model, executable;
     std::string numerical_config; // canonical, length-framed effective settings and plan
     bool mtp = false;
+    // Appended fields preserve historical Qwen aggregate initialization and digest bytes.
+    std::string family = "qwen";
+    std::uint64_t format_version = 1;
+    std::string record = {}; // complete family compatibility record, never just its hash
     [[nodiscard]] ModelContentIdentity digest() const;
 };
 struct SessionSuffixPlan { bool tiled = false; std::uint64_t serial_rows = 0; };
@@ -24,18 +28,49 @@ struct SessionSuffixPlan { bool tiled = false; std::uint64_t serial_rows = 0; };
     if (inputs < align || inputs - align < block_rows) return {false, inputs};
     return {true, align};
 }
+// Optional semantics remain Qwen's. The explicit integer conversion is a read-only
+// compatibility accessor for the existing MiniMax administrative summary consumer.
+struct SessionPending : std::optional<std::uint32_t> {
+    SessionPending() = default;
+    using std::optional<std::uint32_t>::optional;
+    SessionPending& operator=(std::uint32_t p) { emplace(p); return *this; }
+    SessionPending& operator=(std::nullopt_t) { reset(); return *this; }
+    SessionPending& operator=(const std::optional<std::uint32_t>& p) {
+        std::optional<std::uint32_t>::operator=(p); return *this;
+    }
+    SessionPending(const std::optional<std::uint32_t>& p) : std::optional<std::uint32_t>(p) {}
+    explicit operator std::uint64_t() const { return value(); }
+};
 struct SessionFrontier {
     std::uint64_t consumed = 0, emitted = 0, accepted = 0, predictor = 0;
-    std::optional<std::uint32_t> pending;
+    SessionPending pending;
     std::string sampling = "greedy";
-    std::vector<std::uint32_t> tokens; // consumed inputs only; pending is separate
+    std::vector<std::uint32_t> tokens; // complete consumed inputs, including raw thinking; pending separate
+    std::uint64_t drafter = 0, control = 0, selection = 0, rng_draws = 0;
+    bool drafter_ready = false;
+    std::string lineage;
 };
-struct SessionSection { std::string name; PrefixCacheBuffer payload; };
+struct SessionSection {
+    std::string name;
+    PrefixCacheBuffer payload;
+    bool replicated = true;
+    std::vector<std::uint8_t> bytes; // legacy vector storage alternative; never duplicates payload
+    std::optional<std::uint32_t> rank; // absent: inherits the envelope rank
+    SessionSection() = default;
+    SessionSection(std::string n, PrefixCacheBuffer p) : name(std::move(n)), payload(std::move(p)) {}
+    SessionSection(std::string n, bool r, std::vector<std::uint8_t> b)
+        : name(std::move(n)), replicated(r), bytes(std::move(b)) {}
+};
 struct SessionCheckpoint {
     SessionCompatibility compatibility;
     SessionFrontier frontier;
-    std::vector<SessionSection> sections; // rank 0, replicated (single node)
+    std::vector<SessionSection> sections;
+    std::string id = {}, generation = {}; // defaulted: existing aggregate initialisers stay valid
+    std::uint32_t rank = 0, world = 1;
 };
+// Shape checks independent of a family's stronger codec/restore validation. No live
+// StateSnapshot or erased device owner belongs in this durable envelope.
+void validate_session_envelope(const SessionCheckpoint&);
 // Opportunistic named lookup: incompatible/corrupt envelopes are misses, never mutate a live slot.
 [[nodiscard]] std::optional<SessionCheckpoint> lookup_session_checkpoint(PrefixStateCache&, const std::string&,
     const SessionCompatibility&);

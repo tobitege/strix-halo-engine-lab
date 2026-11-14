@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include <cstdlib>
@@ -17,7 +18,7 @@ constexpr unsigned hidden=2560,inter=640,experts=512,slots=11,routed=10,waves=8;
 template<bool Q4> constexpr unsigned block_bytes=Q4?18U:34U;
 template<bool Q4> constexpr unsigned gate_row_bytes=hidden/32U*block_bytes<Q4>;
 template<bool Q4> constexpr unsigned down_row_bytes=inter/32U*block_bytes<Q4>;
-void check(hipError_t e,const char* m) {if(e!=hipSuccess) throw std::runtime_error(std::string(m)+": "+hipGetErrorString(e));}
+using strix::hip_check;
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
     for(unsigned d=16;d;d>>=1U) v+=strix::qwen_dpp::xor32(v, d);
@@ -261,7 +262,7 @@ void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* o
     if(!q8 || !output || !stream || !elements || elements%32U) throw std::invalid_argument("MTP Q8 dequantize views are invalid");
     hipLaunchKernelGGL(mtp_dequantize_q8,dim3(static_cast<unsigned>((elements+255U)/256U)),dim3(256),0,static_cast<hipStream_t>(stream),
         static_cast<const unsigned char*>(q8),elements,output);
-    check(hipGetLastError(),"MTP Q8 dequantize launch");
+    hip_check(hipGetLastError(),"MTP Q8 dequantize launch");
 }
 void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream,
     std::shared_ptr<const void> source_owner,std::uint64_t generation,ModelContentIdentity content) {
@@ -279,10 +280,10 @@ void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* strea
         return;
     }
     const auto blocks=elements/32U;void* q4=nullptr;
-    check(hipMalloc(&q4,blocks*18U),"MTP draft Q4 copy");
+    hip_check(hipMalloc(&q4,blocks*18U),"MTP draft Q4 copy");
     hipLaunchKernelGGL(mtp_q8_to_q4,dim3(static_cast<unsigned>((blocks+255U)/256U)),dim3(256),0,static_cast<hipStream_t>(stream),
         static_cast<const unsigned char*>(q8),blocks,static_cast<unsigned char*>(q4));
-    check(hipGetLastError(),"MTP draft Q4 conversion launch");
+    hip_check(hipGetLastError(),"MTP draft Q4 conversion launch");
     c.copies.push_back({q8,q4,elements,generation,content,std::move(source_owner)});
 }
 const void* hip_mtp_draft_q4(const void* q8) noexcept {
@@ -305,7 +306,7 @@ void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* 
         else if(input_bf16) start(mtp_draft_q8_gemv<true,false,true>,q4);
         else if(output_bf16) start(mtp_draft_q8_gemv<false,true,true>,q4);
         else start(mtp_draft_q8_gemv<false,false,true>,q4);
-        check(hipGetLastError(),"MTP draft Q4 GEMV launch");
+        hip_check(hipGetLastError(),"MTP draft Q4 GEMV launch");
         return;
     }
     const auto* w=static_cast<const unsigned char*>(q8);
@@ -313,7 +314,7 @@ void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* 
     else if(input_bf16) start(mtp_draft_q8_gemv<true,false>,w);
     else if(output_bf16) start(mtp_draft_q8_gemv<false,true>,w);
     else start(mtp_draft_q8_gemv<false,false>,w);
-    check(hipGetLastError(),"MTP draft Q8 GEMV launch");
+    hip_check(hipGetLastError(),"MTP draft Q8 GEMV launch");
 }
 void launch_hip_mtp_draft_q8_gemv_rows(const HipMtpDraftGemvRows& rows,std::uint32_t count,bool input_bf16,std::uint32_t width,
     bool output_bf16,void* stream) {
@@ -355,7 +356,7 @@ void launch_hip_mtp_draft_q8_gemv_rows(const HipMtpDraftGemvRows& rows,std::uint
         }
     };
     if(all_q4) by_count.template operator()<true>(); else by_count.template operator()<false>();
-    check(hipGetLastError(),"MTP draft batch GEMV launch");
+    hip_check(hipGetLastError(),"MTP draft batch GEMV launch");
 }
 void launch_hip_mtp_fast_moe_rows(std::span<const HipMtpFastMoeViews> views,void* stream) {
     if(views.empty() || views.size()>hip_mtp_draft_batch_rows || !stream) throw std::invalid_argument("MTP fast MoE batch size is invalid");
@@ -375,12 +376,12 @@ void launch_hip_mtp_fast_moe_rows(std::span<const HipMtpFastMoeViews> views,void
     if(!all_q4) throw std::invalid_argument("MTP fast MoE batch needs the registered Q4 copies");
     const auto s=static_cast<hipStream_t>(stream);const auto n=static_cast<unsigned>(views.size());
     hipLaunchKernelGGL(mtp_fast_gate_up_rows<true>,dim3((inter+waves)/waves,slots,n),dim3(256),0,s,q4);
-    check(hipGetLastError(),"MTP fast Q4 gate/up batch launch");
+    hip_check(hipGetLastError(),"MTP fast Q4 gate/up batch launch");
     const unsigned down_waves=fast_down_waves();
     if(down_waves==32U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down_rows<true,32U>),dim3(hidden/32U,1,n),dim3(1024),0,s,q4);
     else if(down_waves==16U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down_rows<true,16U>),dim3(hidden/16U,1,n),dim3(512),0,s,q4);
     else hipLaunchKernelGGL(mtp_fast_down_rows<true>,dim3(hidden/waves,1,n),dim3(256),0,s,q4);
-    check(hipGetLastError(),"MTP fast Q4 down batch launch");
+    hip_check(hipGetLastError(),"MTP fast Q4 down batch launch");
 }
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     if(!v.input || !v.routes || !v.route_weights || !v.gate || !v.up || !v.down || !v.shared_gate || !v.shared_up ||
@@ -393,17 +394,17 @@ void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     q4.shared_gate=hip_mtp_draft_q4(v.shared_gate);q4.shared_up=hip_mtp_draft_q4(v.shared_up);q4.shared_down=hip_mtp_draft_q4(v.shared_down);
     if(q4.gate && q4.up && q4.down && q4.shared_gate && q4.shared_up && q4.shared_down) {
         hipLaunchKernelGGL(mtp_fast_gate_up<true>,dim3((inter+waves)/waves,slots),dim3(256),0,s,q4);
-        check(hipGetLastError(),"MTP fast Q4 gate/up launch");
+        hip_check(hipGetLastError(),"MTP fast Q4 gate/up launch");
         const unsigned down_waves=fast_down_waves();
         if(down_waves==32U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,32U>),dim3(hidden/32U),dim3(1024),0,s,q4);
         else if(down_waves==16U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,16U>),dim3(hidden/16U),dim3(512),0,s,q4);
         else hipLaunchKernelGGL(mtp_fast_down<true>,dim3(hidden/waves),dim3(256),0,s,q4);
-        check(hipGetLastError(),"MTP fast Q4 down launch");
+        hip_check(hipGetLastError(),"MTP fast Q4 down launch");
         return;
     }
     hipLaunchKernelGGL(mtp_fast_gate_up<false>,dim3((inter+waves)/waves,slots),dim3(256),0,s,v);
-    check(hipGetLastError(),"MTP fast gate/up launch");
+    hip_check(hipGetLastError(),"MTP fast gate/up launch");
     hipLaunchKernelGGL(mtp_fast_down<false>,dim3(hidden/waves),dim3(256),0,s,v);
-    check(hipGetLastError(),"MTP fast down launch");
+    hip_check(hipGetLastError(),"MTP fast down launch");
 }
 } // namespace strix

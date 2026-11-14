@@ -1,5 +1,6 @@
 #pragma once
 #include "staging.hpp"
+#include "row_fold.hpp"
 // Shared TP2 staging/progress engine; engine-specific wire ABI lives in Traits.
 #include "strix/dist/communicator.hpp"
 
@@ -71,6 +72,9 @@ struct ChannelOptions {
     unsigned idle_spin_us = 3000;        // progress thread: spin this long without a job before sleeping
     bool small_spin = false;            // shared opt-in ordered small-message progress
     std::chrono::milliseconds timeout{120000};
+    // Exchange row fold (row_fold.hpp): largest message a fold may be requested for; 0 = no fold slots are allocated
+    // and fold_next() is refused. The fold slots are host-coherent like the default RX slots.
+    std::size_t fold_capacity = 0;
     // Reads the STRIX_GLMX_* variables over these values.
     void from_env();
 };
@@ -144,6 +148,18 @@ public:
     [[nodiscard]] RxView recv_view();
     // The local payload of the exchange recv() just returned (its TX slot), for consumers of (part0, part1).
     [[nodiscard]] const void* last_local() const noexcept { return last_local_; }
+    // Exchange row fold. fold_next(op): the next send()'s exchange is folded by the progress thread before its RX flag
+    // is published: fold slot = op(rank 0's partial, rank 1's partial) over the message bytes. last_folded(): the fold
+    // slot (device pointer) of the exchange recv() / recv_view() just returned, or nullptr if it was not folded. The
+    // slot has the lifetime of the RX slot; a consumer reads it only after the RX flag (stream wait or in-kernel wait).
+    [[nodiscard]] bool can_fold(std::size_t bytes) const noexcept {
+        return fx_host_ != nullptr && bytes != 0 && bytes <= options_.fold_capacity && bytes % sizeof(float) == 0;
+    }
+    void fold_next(RowFold op) {
+        if (op != RowFold::none && fx_host_ == nullptr) throw std::logic_error("xport: fold_next() without fold slots");
+        fold_next_ = op;
+    }
+    [[nodiscard]] const void* last_folded() const noexcept { return last_folded_; }
     // CPU: waits until every posted exchange is complete, then check(). Between steps / requests only.
     void drain();
     // Throws with the cause if an exchange failed (the stream was released with garbage).
@@ -161,7 +177,9 @@ private:
         bool seal = false;  // host-only 0-byte message carrying the last deferred CRC (drain())
         const std::byte* direct_tx = nullptr;
         std::byte* direct_rx = nullptr;
+        RowFold fold = RowFold::none;
     };
+    struct RxTrace { std::uint64_t sequence, kind, bytes, tx_seen_ns, wire_done_ns, rx_published_ns; };
     class CrcWorker;
     static constexpr std::size_t kQueue = 256;
     void init();
@@ -199,6 +217,18 @@ private:
     std::byte seal_tx_[64 + 64] = {}, seal_rx_[64 + 64] = {};
     std::unique_ptr<CrcWorker> crc_worker_;
     const void* last_local_ = nullptr;
+    // row fold: slots (host-coherent), caller-side request state
+    std::byte* fx_host_ = nullptr;
+    std::byte* fx_dev_ = nullptr;
+    std::size_t fx_stride_ = 0;
+    RowFold fold_next_ = RowFold::none;
+    std::vector<std::uint8_t> folded_;  // per slot: the exchange in it was folded (caller only)
+    const void* last_folded_ = nullptr;
+    // <ENV>RX_TRACE=<path>: the progress thread records per exchange when it saw the producer, when the wire call
+    // returned and when it published the RX flag (CLOCK_MONOTONIC ns); written to <path>.<rank> by the destructor.
+    std::string rx_trace_path_;
+    std::vector<RxTrace> rx_trace_;
+    std::uint64_t folds_ = 0;  // progress thread only
     Job jobs_[kQueue];
     std::atomic<std::uint64_t> posted_{0}, done_{0};
     std::atomic<bool> stop_{false}, failed_{false}, sleeping_{false};

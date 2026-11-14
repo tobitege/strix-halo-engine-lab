@@ -1377,7 +1377,12 @@ int main(int argc, char** argv) {
                 failed||racy||!n_success||!n_pre||!rejected||!admitted||!unproven_success||!cert_pre||!cert_merge ? "FAIL/UNQUALIFIED" : "PASS");
             return failed||racy||!n_success||!n_pre||!rejected||!admitted||!unproven_success||!cert_pre||!cert_merge ? 1 : 0;
         }
-        if (mode == "xor64" || mode == "xor64bench") {
+        if (mode == "xor64" || mode == "xor64bench" || mode == "da16issue" || mode == "da16issuebench") {
+            // da16issue / da16issuebench: the same comparisons and timing with XOR rows on and the uniform DA16 activation
+            // issue (STRIX_QPF2K_MOE_DA16_ISSUE) off vs on; the DA16 image is poisoned before every compared run, and the
+            // bench also reports the down phase alone (DA16 phase events).
+            const bool issue_mode = mode == "da16issue" || mode == "da16issuebench";
+            const auto item = [issue_mode](int on) { if (issue_mode) { kr::set_prefill_xor64(1); kr::set_prefill_da16_issue(on); } else kr::set_prefill_xor64(on); };
             // MoE XOR rows (STRIX_QPF2K_MOE_XOR64): default chain (form 3, ROUTE 14, DA16 1, HDR 1) with the item off vs on.
             // xor64 [specs...]: every written view and the CSR words byte-identical, and the on run must take tune 88 exactly
             // when the off run takes tune 80 with >= 3072 rows (synthetic Q4_K/Q5_K x Q5_1/Q8_0 at T 2048..4864 with skew,
@@ -1390,8 +1395,8 @@ int main(int argc, char** argv) {
                 return fl;
             };
             kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1); kr::set_prefill_hdr(1);
-            const auto reset = [] { kr::set_prefill_xor64(-1); kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1); };
-            if (mode == "xor64bench") {
+            const auto reset = [] { kr::set_prefill_da16_issue(-1); kr::set_prefill_xor64(-1); kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1); };
+            if (mode == "xor64bench" || mode == "da16issuebench") {
                 if (argc < 5) throw std::invalid_argument("xor64bench <reps> <layer spec> <rows>");
                 const int reps = std::atoi(argv[2]);
                 if (reps <= 0) throw std::invalid_argument("xor64bench: reps must be positive");
@@ -1400,12 +1405,17 @@ int main(int argc, char** argv) {
                 Case c{"xor64bench", 512U, rows, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
                     nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
                 c.gguf = fl[0].c_str();
+                if (issue_mode && std::getenv("BENCH_FULL128") && std::getenv("BENCH_FULL128")[0] == '1') { c.crafted = true; c.full128 = true; }
                 Fixture f(c);
                 hipEvent_t e0, e1;
                 check(hipEventCreate(&e0), "event"); check(hipEventCreate(&e1), "event");
                 unsigned tune_on = 0;
+                std::array<hipEvent_t, 3> phases{};
+                for (auto& e : phases) check(hipEventCreate(&e), "event");
+                if (issue_mode) kr::prefill_test_da16_events(&phases);
+                std::vector<double> down[2], proj[2];
                 const auto timed = [&](int on) {
-                    kr::set_prefill_xor64(on);
+                    item(on);
                     check(hipEventRecord(e0, f.stream), "record");
                     f.enqueue(3, rows);
                     check(hipEventRecord(e1, f.stream), "record");
@@ -1413,14 +1423,23 @@ int main(int argc, char** argv) {
                     if (!kr::prefill_da16_ran()) throw std::runtime_error("xor64bench: the DA16 path did not run");
                     if (on) tune_on = kr::prefill_last_tune();
                     float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+                    if (issue_mode) { float d = 0.0F; check(hipEventElapsedTime(&d, phases[1], phases[2]), "down elapsed"); down[on ? 1 : 0].push_back(d); check(hipEventElapsedTime(&d, phases[0], phases[1]), "gate/up elapsed"); proj[on ? 1 : 0].push_back(d); }
                     return static_cast<double>(ms);
                 };
                 timed(0); timed(1);
+                down[0].clear(); down[1].clear(); proj[0].clear(); proj[1].clear();
                 std::vector<double> a, b;
                 for (int r = 0; r < reps; ++r) { a.push_back(timed(0)); b.push_back(timed(1)); b.push_back(timed(1)); a.push_back(timed(0)); }
                 const auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
                 std::printf("xor64bench rows %u reps %d: off %.4f ms, on %.4f ms (tune %u), delta %.4f ms (%+.2f %%)\n",
                     rows, reps, med(a), med(b), tune_on, med(b) - med(a), 100.0 * (med(b) - med(a)) / med(a));
+                if (issue_mode) {
+                    kr::prefill_test_da16_events(nullptr);
+                    std::printf("da16issuebench rows %u gate/up phase: masked %.4f ms, uniform %.4f ms; down min: masked %.4f ms, uniform %.4f ms\n",
+                        rows, med(proj[0]), med(proj[1]), *std::min_element(down[0].begin(), down[0].end()), *std::min_element(down[1].begin(), down[1].end()));
+                    std::printf("da16issuebench rows %u down phase: masked %.4f ms, uniform %.4f ms, delta %.4f ms (%+.2f %%)\n",
+                        rows, med(down[0]), med(down[1]), med(down[1]) - med(down[0]), 100.0 * (med(down[1]) - med(down[0])) / med(down[0]));
+                }
                 reset();
                 return 0;
             }
@@ -1433,13 +1452,14 @@ int main(int argc, char** argv) {
                     kr::set_prefill_hdr(hdr);
                     unsigned tune = 0; bool produced = false;
                     const auto run = [&](int on) {
-                        kr::set_prefill_xor64(on);
+                        item(on);
                         check(hipMemcpy(f.weights.base, routes.data(), routes.size(), hipMemcpyHostToDevice), "xor64 routes");
                         if (cert == 2) { const float one_plus = std::nextafter(1.0F, 2.0F); check(hipMemcpy(f.weights.base, &one_plus, 4U, hipMemcpyHostToDevice), "xor64 unproven route"); }
                         const unsigned zero = 0U; check(hipMemcpy(f.admission.base, &zero, 4U, hipMemcpyHostToDevice), "xor64 admission reset");
                         f.view.unsafe = cert ? static_cast<unsigned*>(f.admission.base) : nullptr;
                         for (const auto* b : f.written()) b->poison(f.stream);
                         f.csr.poison(f.stream);
+                        if (issue_mode) kr::prefill_test_poison_da16(f.stream, rows);
                         f.enqueue(3, rows);
                         produced = kr::prefill_certificate_produced();
                         check(hipStreamSynchronize(f.stream), "xor64 run");
@@ -1456,7 +1476,7 @@ int main(int argc, char** argv) {
                     const unsigned tune_off = tune; const bool produced_off = produced;
                     if (run(0) != base) { ++failed; std::printf("  RACY base %s rows %u\n", tag.c_str(), rows); continue; }
                     const auto got = run(1);
-                    const unsigned want = tune_off == 80U && rows >= 3072U ? 88U : tune_off;
+                    const unsigned want = !issue_mode && tune_off == 80U && rows >= 3072U ? 88U : tune_off;
                     ++cases;
                     if (tune != want) { ++failed; std::printf("  TUNE %s rows %u: off %u on %u (want %u)\n", tag.c_str(), rows, tune_off, tune, want); }
                     if (produced != produced_off || (cert && !produced)) { ++failed; std::printf("  CERTIFICATE %s rows %u: off %d on %d\n", tag.c_str(), rows, produced_off ? 1 : 0, produced ? 1 : 0); }
@@ -1472,7 +1492,12 @@ int main(int argc, char** argv) {
                 f.view.unsafe = nullptr;
             };
             static std::vector<std::string> keep7; keep7.reserve(128);
+            // BENCH_IDENT (da16issue only, for short tickets): "real" = only the real layers, "gd" (e.g. 127, 138) = only that
+            // synthetic gate/down type pair; BENCH_IDENT_ROWS = one row count for the real layers.
+            const std::string ident = issue_mode && std::getenv("BENCH_IDENT") ? std::getenv("BENCH_IDENT") : "";
+            const unsigned ident_rows = issue_mode && std::getenv("BENCH_IDENT_ROWS") ? static_cast<unsigned>(std::atoi(std::getenv("BENCH_IDENT_ROWS"))) : 0U;
             for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                if (!ident.empty() && ident != std::to_string(g) + std::to_string(d)) continue;
                 keep7.push_back("xor64 E512 T4864 g" + std::to_string(g) + " d" + std::to_string(d));
                 Fixture f({keep7.back().c_str(), 512U, 4864U, g, d, 4U, false, true, false, 0U, 1.5});
                 for (unsigned rows : {4864U, 3072U, 2048U}) cmp(f, rows, keep7.back());
@@ -1485,18 +1510,19 @@ int main(int argc, char** argv) {
                 cmp(fn, 3072U, keep7.back());
             }
             for (int a = 2; a < argc; ++a) {
+                if (!ident.empty() && ident != "real") break;
                 const auto fl = parse(argv[a]);
                 keep7.push_back("xor64 REAL " + fl[1]);
                 Case c{keep7.back().c_str(), 512U, 8192U, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
                     nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
                 c.gguf = fl[0].c_str();
                 Fixture f(c);
-                for (unsigned rows : {8192U, 4864U, 4096U, 3072U, 2048U}) cmp(f, rows, keep7.back());
+                for (unsigned rows : {8192U, 4864U, 4096U, 3072U, 2048U}) if (!ident_rows || rows == ident_rows) cmp(f, rows, keep7.back());
             }
             reset();
-            std::printf("xor64: %u comparisons (%u took tune 88, %u certified, %u of them unproven), %u differ/racy/wrong tune/certificate -> %s\n",
-                cases, switched, certified, unproven, failed, failed || !cases || !switched || !certified ? "FAIL" : "PASS");
-            return failed || !cases || !switched || !certified ? 1 : 0;
+            std::printf("%s: %u comparisons (%u took tune 88, %u certified, %u of them unproven), %u differ/racy/wrong tune/certificate -> %s\n",
+                issue_mode ? "da16issue" : "xor64", cases, switched, certified, unproven, failed, failed || !cases || (!issue_mode && !switched) || !certified ? "FAIL" : "PASS");
+            return failed || !cases || (!issue_mode && !switched) || !certified ? 1 : 0;
         }
         if (mode == "tile64" || mode == "tile64time") {
             // MoE TILE64 (STRIX_QPF2K_MOE_TILE64): default chain (form 3, ROUTE 14, DA16 1) with today's DA16 tile vs the 64x64

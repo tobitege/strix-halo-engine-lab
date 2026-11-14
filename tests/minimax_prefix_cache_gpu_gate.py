@@ -2,7 +2,10 @@
 """MiniMax serve prefix-reuse exactness gate.
 
 Prefix KV reuse (opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks) lets a request that shares a leading token prefix
-with a free slot's resident cache skip aligned groups of completed prefill rows. Decode rows are excluded.
+with a free slot's resident cache skip whole prefill chunks (the alignment is one --max-rows chunk) of completed
+prefill rows. Decode rows are excluded. A second opt-in, STRIX_MM_SERVE_CONVERSATION=1 on both ranks, also keeps the
+rows a finished reply consumed and restarts a follow-up turn at that frontier (any row, not chunk aligned); that mode
+is not bitwise equal to a cold prefill by design and is gated by the `conv-capture` / `conv-compare` pair below.
 This gate compares complete emitted token IDs; logits and state digests require separate device gates. It checks
 and that reuse actually fired (a silently skipped reuse would "pass" a plain token comparison).
 
@@ -30,7 +33,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-CHUNK = 8192  # conservative default: --max-rows (4096) times STRIX_MM_PF_GROUP (2).
+CHUNK = 4096  # the default --max-rows: one prefill chunk is the reuse alignment (pass --alignment for another --max-rows).
 
 
 def require(value, message):
@@ -149,6 +152,78 @@ def compare(args):
     return 0 if verdict == "EXACT" else 1
 
 
+def conv_capture(args):
+    """A multi-turn conversation: turn t sends the previous prompt + the previous reply text + a user turn, serially,
+    and records per turn the generated ids and how many prompt tokens were reused (metrics delta)."""
+    require(args.turns >= 2 and args.generate > 0, "need >= 2 turns and a positive generate count")
+    prompt = Path(args.prompt).read_text()
+    turns = []
+    for t in range(args.turns):
+        tokens = tokenize(args.port, prompt)
+        reply = post(args.port, "/v1/completions", dict(prompt=prompt, max_tokens=args.generate, temperature=0,
+                                                         stream=False, return_token_ids=True))
+        require("error" not in reply, f"server error: {reply.get('error')}")
+        ids = [int(i) for i in ((reply.get("strix") or {}).get("token_ids") or [])]
+        require(ids, "NO-REFERENCE: reply carries no strix.token_ids")
+        text = reply["choices"][0].get("text", "")
+        timings = reply.get("timings") or {}
+        require(type(timings.get("cache_reply_extended")) is bool and "cached_tokens" in timings,
+                "NO-REFERENCE: missing per-request resident diagnostics")
+        turns.append(dict(prompt_tokens=len(tokens), prompt_sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
+                          ids=ids, reused=int(timings["cached_tokens"]), reply_extended=timings["cache_reply_extended"]))
+        prompt = prompt + text + args.user_text  # the next turn extends the transcript by the reply and a user turn
+    record = dict(turns=turns, generate=args.generate, alignment=args.alignment)
+    Path(args.out).write_text(json.dumps(record, indent=2))
+    print("captured: " + " ".join(f"t{i + 1}:|P|={x['prompt_tokens']} reused={x['reused']}" for i, x in enumerate(turns)) + f" -> {args.out}")
+    return record
+
+
+def conv_compare_records(on, off):
+    """Conversation mode ON (reply-extended restart) against OFF. Returns (verdict, reasons).
+    EXACT: every turn's ids equal. DIVERGED: reuse fired and ids differ (expected possible: the restart is mid-chunk and
+    decode rows seed the cache, so this is a measured drift, reported with the first differing position).
+    NO-REFERENCE: evidence missing, prompts differ across arms, or reuse did not fire as required."""
+    if any(k not in on or k not in off for k in ("turns", "generate", "alignment")) or len(on["turns"]) != len(off["turns"]):
+        return "NO-REFERENCE", ["captures lack turns or differ in turn count"]
+    if on["generate"] != off["generate"] or on["alignment"] != off["alignment"] or len(on["turns"]) < 2:
+        return "NO-REFERENCE", ["unmatched capture settings"]
+    for i, (a, b) in enumerate(zip(on["turns"], off["turns"]), 1):
+        if any(type(t.get("reply_extended")) is not bool or type(t.get("reused")) is not int for t in (a, b)):
+            return "NO-REFERENCE", [f"turn {i}: missing per-request resident diagnostics"]
+        if a["prompt_sha256"] != b["prompt_sha256"] or a["prompt_tokens"] != b["prompt_tokens"]:
+            return "NO-REFERENCE", [f"turn {i}: prompts differ across arms (an earlier turn's reply diverged, or settings differ)"]
+        if not a["ids"] or not b["ids"]:
+            return "NO-REFERENCE", [f"turn {i}: empty output"]
+    reasons = []
+    if on["turns"][0]["reused"] != 0 or off["turns"][0]["reused"] != 0:
+        return "NO-REFERENCE", ["turn 1 reused tokens; restart an idle pair for each arm"]
+    eligible = 0
+    for i, (a, b) in enumerate(zip(on["turns"][1:], off["turns"][1:]), 2):
+        previous = on["turns"][i - 2]["prompt_tokens"]
+        reply_rows = len(on["turns"][i - 2]["ids"]) - 1
+        if reply_rows > 0:
+            eligible += 1
+            if not a["reply_extended"] or not previous < a["reused"] <= previous + reply_rows or a["reused"] >= a["prompt_tokens"]:
+                reasons.append(f"turn {i}: ON did not reuse a consumed reply frontier beyond prompt {previous}")
+        if b["reply_extended"] or b["reused"] % on["alignment"] or b["reused"] > previous:
+            reasons.append(f"turn {i}: OFF arm reused {b['reused']} (not chunk aligned or above ON): conversation mode was on")
+    if not eligible:
+        reasons.append("no eligible multi-token reply")
+    if reasons:
+        return "NO-REFERENCE", reasons
+    for i, (a, b) in enumerate(zip(on["turns"], off["turns"]), 1):
+        if a["ids"] != b["ids"]:
+            at = next((k for k, (x, y) in enumerate(zip(a["ids"], b["ids"])) if x != y), min(len(a["ids"]), len(b["ids"])))
+            return "DIVERGED", [f"turn {i}: first differing generated token at index {at} of {len(a['ids'])}"]
+    return "EXACT", [f"{len(on['turns'])} turns, identical ids; ON reused " + ",".join(str(t["reused"]) for t in on["turns"])]
+
+
+def conv_compare(args):
+    verdict, reasons = conv_compare_records(json.loads(Path(args.on).read_text()), json.loads(Path(args.off).read_text()))
+    print(f"{verdict}: " + "; ".join(reasons))
+    return 0 if verdict == "EXACT" else 1
+
+
 def self_test():
     base = dict(prefix_len=9000, tokens_a=9000, tokens_b=9003, generate=3, alignment=8192,
                 prompt_sha256="a" * 64, ids_a=[5, 6, 7], ids_b=[8, 9, 10])
@@ -163,6 +238,22 @@ def self_test():
     require(compare_records(on, dict(off, alignment=4096))[0] == "NO-REFERENCE", "different alignments cannot pass")
     missing = dict(off); del missing["reused_b"]
     require(compare_records(on, missing)[0] == "NO-REFERENCE", "missing OFF evidence cannot pass")
+    turn = lambda n, ids, reused, sha: dict(prompt_tokens=n, prompt_sha256=sha * 64, ids=ids, reused=reused, reply_extended=reused > 0)
+    conv_on = dict(generate=3, alignment=4096, turns=[turn(300, [1, 2, 3], 0, "a"), turn(309, [4, 5, 6], 302, "b"),
+                                                       turn(318, [7, 8, 9], 311, "c")])
+    conv_off = dict(conv_on, turns=[turn(300, [1, 2, 3], 0, "a"), turn(309, [4, 5, 6], 0, "b"), turn(318, [7, 8, 9], 0, "c")])
+    require(conv_compare_records(conv_on, conv_off)[0] == "EXACT", "self-test: conversation arms match")
+    drift = json.loads(json.dumps(conv_on)); drift["turns"][2]["ids"] = [7, 8, 0]
+    require(conv_compare_records(drift, conv_off)[0] == "DIVERGED", "self-test: drift is reported, not hidden")
+    cold = json.loads(json.dumps(conv_on)); cold["turns"][1]["reused"] = 0
+    require(conv_compare_records(cold, conv_off)[0] == "NO-REFERENCE", "self-test: a conversation arm that never reused proves nothing")
+    other = json.loads(json.dumps(conv_off)); other["turns"][1]["prompt_sha256"] = "d" * 64
+    require(conv_compare_records(conv_on, other)[0] == "NO-REFERENCE", "self-test: different transcripts cannot pass")
+    aligned = dict(generate=3, alignment=4096, turns=[turn(4096, [1, 2, 3], 0, "a"), turn(4105, [4, 5, 6], 4096, "b")])
+    aligned["turns"][1]["reply_extended"] = False
+    require(conv_compare_records(aligned, aligned)[0] == "NO-REFERENCE", "aligned prompt-only reuse cannot certify reply reuse")
+    missing_reply = json.loads(json.dumps(conv_on)); del missing_reply["turns"][1]["reply_extended"]
+    require(conv_compare_records(missing_reply, conv_off)[0] == "NO-REFERENCE", "missing reply indicator cannot pass")
     print("PASS minimax prefix-cache gate self-test (comparison logic, CPU only)")
     return 0
 
@@ -176,12 +267,23 @@ def main():
     cap.add_argument("--out", required=True)
     cap.add_argument("--generate", type=int, default=32, help="tokens to generate per request (greedy)")
     cap.add_argument("--alignment", type=int, default=CHUNK,
-                     help="--max-rows times STRIX_MM_PF_GROUP on both ranks (default 8192)")
+                     help="--max-rows of both ranks, one prefill chunk (default 4096)")
     cap.add_argument("--suffix-text", default="\n\nIn one word, the main theme above is:",
                      help="distinct text appended to A to form B (must append at a clean token boundary)")
     cmp = sub.add_parser("compare", help="compare an ON and an OFF capture")
     cmp.add_argument("--on", required=True)
     cmp.add_argument("--off", required=True)
+    cc = sub.add_parser("conv-capture", help="drive a running pair through a multi-turn conversation and record one arm")
+    cc.add_argument("--port", type=int, required=True)
+    cc.add_argument("--prompt", required=True, help="text file for turn 1")
+    cc.add_argument("--out", required=True)
+    cc.add_argument("--turns", type=int, default=3)
+    cc.add_argument("--generate", type=int, default=32)
+    cc.add_argument("--alignment", type=int, default=CHUNK, help="--max-rows of both ranks (default 4096)")
+    cc.add_argument("--user-text", default="\n\nContinue.")
+    cv = sub.add_parser("conv-compare", help="compare a conversation-mode ON and an OFF capture")
+    cv.add_argument("--on", required=True)
+    cv.add_argument("--off", required=True)
     sub.add_parser("self-test", help="check the comparison logic without a server")
     args = parser.parse_args()
     if args.cmd == "capture":
@@ -189,6 +291,11 @@ def main():
         return 0
     if args.cmd == "compare":
         return compare(args)
+    if args.cmd == "conv-capture":
+        conv_capture(args)
+        return 0
+    if args.cmd == "conv-compare":
+        return conv_compare(args)
     return self_test()
 
 

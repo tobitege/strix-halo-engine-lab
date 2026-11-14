@@ -19,20 +19,18 @@ struct OneSplitPrefill : Traits {
     static __device__ __forceinline__ Half16 as_half16(const std::uint32_t (&f)[8]) {
         return FragmentCore::as_half16(f);
     }
-    static __device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
-        return Traits::template WeightDecode<3>::codebook_value(state);
-    }
+    // Traits may set kScalarWeightDecode = true to keep the scalar codebook conversion per coefficient.
+    static constexpr bool kScalarWeightDecode = requires { requires Traits::kScalarWeightDecode; };
     static __device__ __forceinline__ float codebook_mul1_v2(std::uint32_t state) {
         return Traits::template WeightDecode<3>::codebook_value_v2(state);
     }
 // CTA = 4 waves = 8 tile columns = 128 outputs x MT row tiles of 16. Wave w owns tiles 2p, 2p + 1 (p = 4 bx + w):
 // lanes 0-15 decode column lane of tile 2p, lanes 16-31 column lane - 16 of tile 2p + 1; v_permlanex16 hands each
 // half the other's column so both B fragments (lane = column, k = 0..15) are complete without LDS.
-// V2 (core v2, same bits): codebook_mul1_v2, global-address-space loads and the k loop unrolled by 2 (no ln -> lc
-// register rotation). PF (core v3 = V2 with PF 4): the trellis words of k-tile t + PF are loaded while tile t is
-// computed (a register ring of PF tiles, compile-time slots), so more weight bytes are in flight (k12: the weight
-// stream was serialized with the WMMAs). Only load timing changes.
-template <int Bits, int MT, int K, int N, bool V2, int PF = 1>
+// codebook_mul1_v2 and global-address-space loads. PF: the trellis words of k-tile t + PF are loaded while tile t is
+// computed (a register ring of PF tiles, compile-time slots), so more weight bytes are in flight; PF 1 unrolls the k
+// loop by 2 instead. Only load timing changes with PF; all PF values give the same bits.
+template <int Bits, int MT, int K, int N, int PF>
 static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, unsigned by) {
     using NW = Norm<Bits>;
     constexpr int tiles_n = N / 16, tiles_k = K / 16;
@@ -58,23 +56,22 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
         const int row = first_row + 16 * m + c;
         const _Float16* p = it.x + (static_cast<std::size_t>(first_row / 16 + m) * static_cast<std::size_t>(tiles_k)) * 256 +
                             static_cast<std::size_t>(c) * 16;
-        // V2: rows past the group read row tile 0 of this CTA instead of zeros (no branch). A WMMA output row depends
+        // Rows past the group read row tile 0 of this CTA instead of zeros (no branch). A WMMA output row depends
         // only on its own A row and those rows are never stored, so every stored value keeps its bits.
-        xr[m] = row < rows ? p : V2 ? it.x + static_cast<std::size_t>(first_row / 16) * static_cast<std::size_t>(tiles_k) * 256 : nullptr;
+        xr[m] = row < rows ? p : it.x + static_cast<std::size_t>(first_row / 16) * static_cast<std::size_t>(tiles_k) * 256;
     }
     Float8 acc0[MT] = {}, acc1[MT] = {};
-    static_assert(PF == 1 || V2, "prefetch ring only on the v2 path");
     static_assert(tiles_k % (2 * PF) == 0, "k loop unrolled by 2 (PF 1) or by PF");
     auto tword = [&](int tile, int i) -> std::uint32_t {
         const std::uint32_t* kb = it.trellis + static_cast<std::size_t>(tile) * k_stride;  // uniform
-        return V2 ? ((Glob<std::uint32_t>)kb)[loff[i]] : kb[loff[i]];
+        return ((Glob<std::uint32_t>)kb)[loff[i]];
     };
     std::uint32_t ring[PF][NW::kNL];
 #pragma unroll
     for (int q = 0; q < PF; ++q)
 #pragma unroll
         for (int i = 0; i < NW::kNL; ++i) ring[q][i] = tword(q, i);
-    constexpr int kUnroll = V2 && PF == 1 ? 2 : 1;
+    constexpr int kUnroll = PF == 1 ? 2 : 1;
 #pragma unroll kUnroll
     for (int tk0 = 0; tk0 < tiles_k; tk0 += PF) {
 #pragma unroll
@@ -91,16 +88,22 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
 #pragma unroll
         for (int i = 0; i < NW::kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(lc[i], lc[i + 1], sh);
         std::uint32_t mine[8];
+        if constexpr (!kScalarWeightDecode) {
+            // The shared codec's packed pair decode (full-rate integer hash, one packed FP16 FMA per two coefficients):
+            // the same FP16 bits as the scalar codebook below for all 65,536 states, with fewer and faster operations.
+            Traits::template WeightDecode<Bits>::Fragment::template decode16<typename Traits::template WeightDecode<Bits>::Codebook>(nrm, mine);
+        } else {
 #pragma unroll
-        for (int r = 0; r < 16; r += 2) {
-            std::uint16_t v[2];
+            for (int r = 0; r < 16; r += 2) {
+                std::uint16_t v[2];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int rr = r + i;
-                const std::uint32_t state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
-                v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(V2 ? codebook_mul1_v2(state) : codebook_mul1(state)));
+                for (int i = 0; i < 2; ++i) {
+                    const int rr = r + i;
+                    const std::uint32_t state = __builtin_amdgcn_alignbit(nrm[NW::g(rr) - 1], nrm[NW::g(rr)], NW::shift(rr)) & 65535U;
+                    v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(codebook_mul1_v2(state)));
+                }
+                mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
             }
-            mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
         }
         std::uint32_t other[8], f0[8], f1[8];
 #pragma unroll
@@ -117,14 +120,7 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
 #pragma unroll
             for (int i = 0; i < G; ++i) {
                 const int m = g + i;
-                if constexpr (V2) {
-                    a[i] = *((Glob<Half16>)__builtin_assume_aligned(xr[m] + static_cast<std::size_t>(tile_k) * 256, 32));
-                } else if (xr[m] != nullptr) {  // 32 bytes, 32-byte aligned (512-byte tiles, 256-byte aligned regions)
-                    const auto* src = static_cast<const _Float16*>(__builtin_assume_aligned(xr[m] + static_cast<std::size_t>(tile_k) * 256, 32));
-                    __builtin_memcpy(&a[i], src, sizeof(Half16));
-                } else {
-                    a[i] = Half16{};
-                }
+                a[i] = *((Glob<Half16>)__builtin_assume_aligned(xr[m] + static_cast<std::size_t>(tile_k) * 256, 32));
             }
 #pragma unroll
             for (int i = 0; i < G; ++i) {

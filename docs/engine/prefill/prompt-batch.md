@@ -11,6 +11,9 @@ tiled block, the next blocks of the other running prompts join it, oldest first,
 budget: the rows of the T-row block owner, or `STRIX_PROMPT_BATCH_ROWS` when it is smaller. With
 `STRIX_PROMPT_BATCH_ROWS` above T, setup builds one more tiled owner of that many rows (its own arena) that only runs
 groups. A group of two or more blocks runs as one segmented prefill; a lone block or serial rows run alone. The
+merged ladder head of a prompt shorter than T (a partial block: the first rows of the prompt's T owner, a multiple
+of 128) is a block like the others and joins a group as one segment (`STRIX_PROMPT_BATCH_PARTIAL=0`: it runs alone,
+as it did before; the first and largest unit of every prompt below T rows was then never grouped). The
 decode cycle of the requests past their prompt follows each prompt step as before (prefill and decode are not fused).
 
 Group size by load (`STRIX_PROMPT_BATCH_AUTO`, default on; `=0` off): a group takes at most 4 blocks, so the first
@@ -52,6 +55,8 @@ to the prompt receipt next to the state digest).
 | `STRIX_PROMPT_BATCH_AUTO=0` | Always fill the row budget (default: at most 4 blocks per group unless requests wait for a slot) |
 | `STRIX_PROMPT_BATCH_AUTO_QUEUE=N` | Queued requests that count as backlog for the load rule (default 1) |
 | `STRIX_PROMPT_BATCH_ROWS=N` | Row budget of a group; above T, a dedicated group owner of N rows (multiple of 8, up to 8192) |
+| `STRIX_PROMPT_BATCH_PARTIAL=0` | Partial blocks of the T owner run alone (default: they join groups as segments) |
+| `STRIX_PROMPT_BATCH_LOG=1` / `2` | One stderr line per group; `2` also one line per prompt unit that found no group, with the reason |
 | `STRIX_PROMPT_BATCH_SHARED=list` | Families run once for all segments (default `hc,router,moe,elementwise`) |
 
 Receipts: each request's tiled prompt receipt counts `grouped_blocks`; the cohort receipt adds `prompt_batch`

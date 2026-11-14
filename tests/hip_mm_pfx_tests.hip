@@ -53,6 +53,7 @@ private:
 
 // Hang diagnosis: live exchangers register here; a watchdog prints their state every 5 s while a case runs.
 std::mutex g_live_mutex;
+bool g_joined = true;
 std::vector<const px::Exchanger*> g_live;
 void live(const px::Exchanger* x, bool add) {
     std::lock_guard<std::mutex> g(g_live_mutex);
@@ -84,16 +85,17 @@ __global__ void consume_kernel(std::byte* peer_out, std::byte* local_out, const 
     }
 }
 
-// Flips one byte of the `nth` exchange() call's outgoing data (0 = the first call).
+// Flips one byte of the `nth` exchange() call's outgoing data (0 = the first call): the middle byte, or the byte
+// `back` bytes before the end.
 class Corrupting final : public sd::Transport {
 public:
-    Corrupting(sd::Transport& t, int nth) : t_(t), nth_(nth) {}
+    Corrupting(sd::Transport& t, int nth, std::size_t back = 0) : t_(t), nth_(nth), back_(back) {}
     void send(std::span<const std::byte> m) override { t_.send(m); }
     void receive(std::span<std::byte> m) override { t_.receive(m); }
     void exchange(std::span<const std::byte> o, std::span<std::byte> i) override {
         if (calls_++ == nth_) {
             std::vector<std::byte> copy(o.begin(), o.end());
-            copy[copy.size() / 2] ^= std::byte{0x10};
+            copy[back_ != 0 ? copy.size() - back_ : copy.size() / 2] ^= std::byte{0x10};
             t_.exchange(copy, i);
             return;
         }
@@ -103,6 +105,7 @@ public:
 
 private:
     sd::Transport& t_;
+    std::size_t back_ = 0;
     int nth_, calls_ = 0;
 };
 
@@ -134,6 +137,7 @@ std::size_t run_rank(std::uint32_t rank, sd::Transport& t, const Case& c, std::s
     o.chunk = c.chunk;
     o.stream = s;
     o.tx_uncached = c.uncached;
+    o.joined = g_joined;
     o.timeout = std::chrono::milliseconds(10000);
     std::size_t bad = 0;
     std::byte* src = nullptr;
@@ -264,7 +268,8 @@ bool run_case(const Case& c) {
 
 // A failure case: rank `who` corrupts its `nth` exchange call (or uses another layer tag when nth < 0); every rank that
 // must detect it has to throw with `expect` in the message, and its stream must be released (no hang).
-bool run_failure(const std::string& name, int nth, const std::string& expect0, const std::string& expect1, bool uncached = false) {
+bool run_failure(const std::string& name, int nth, const std::string& expect0, const std::string& expect1, bool uncached = false,
+                 bool joined = false, std::size_t back = 0) {
     auto [t0, t1] = sd::memory_pair();
     const std::size_t b = 3 * (std::size_t{1} << 20) + 4096;
     std::string err[2];
@@ -276,11 +281,12 @@ bool run_failure(const std::string& name, int nth, const std::string& expect0, c
         ok(hipMalloc(&src, b), "src");
         ok(hipMalloc(&out, 2 * b), "out");
         try {
-            Corrupting ct(t, rank == 0 && nth >= 0 ? nth : -1);
+            Corrupting ct(t, rank == 0 && nth >= 0 ? nth : -1, back);
             px::Options o;
             o.rank = rank;
             o.capacity = b;
-            o.chunk = std::size_t{1} << 20;  // call indices below (header 0, chunks 1..4, trailer 5) assume 1 MiB chunks
+            o.chunk = std::size_t{1} << 20;  // call indices below (header or hello 0, chunks 1..4, trailer 5) assume 1 MiB chunks
+            o.joined = joined;
             o.stream = s;
             o.tx_uncached = uncached;
             o.timeout = std::chrono::milliseconds(10000);
@@ -316,7 +322,8 @@ bool run_failure(const std::string& name, int nth, const std::string& expect0, c
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    g_joined = !(argc > 1 && std::string(argv[1]) == "legacy");  // the transfer cases in the original wire form
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::atomic<bool> quit{false};
     std::thread watchdog([&] {
@@ -392,6 +399,14 @@ int main() {
         all &= run_failure("corrupt payload chunk 0", 1, "", "payload CRC mismatch");
         all &= run_failure("corrupt payload chunk 3 (last)", 4, "", "payload CRC mismatch");
         all &= run_failure("header mismatch (layer tag)", -1, "peer header differs", "peer header differs");
+        // Joined form: hello (call 0), chunks 0..3 (calls 1..4); the last call carries payload, the 64-byte identity
+        // record and the 16-byte CRC list. 40 bytes before the end of the record = its `bytes` field.
+        all &= run_failure("joined corrupt payload chunk 0", 1, "", "payload CRC mismatch", false, true);
+        all &= run_failure("joined corrupt payload chunk 3 (last)", 4, "", "payload CRC mismatch", false, true);
+        all &= run_failure("joined corrupt identity record", 4, "", "peer header differs", false, true, 16 + 40);
+        all &= run_failure("joined corrupt CRC list", 4, "", "payload CRC mismatch", false, true, 1);
+        all &= run_failure("joined header mismatch (layer tag)", -1, "peer header differs", "peer header differs", false, true);
+        all &= run_failure("joined uncached corrupt identity record", 4, "", "peer header differs", true, true, 16 + 40);
         std::printf("%s\n", all ? "ALL PASS" : "SOME FAILED");
         return all ? 0 : 1;
     } catch (const std::exception& e) {

@@ -194,8 +194,11 @@ struct FakeEng {
         return tok(h[s]);
     }
     bool refuse_prefix = false, fail_prefix_restore = false;
+    std::uint64_t snapshot_bound = sizeof(std::uint64_t), snapshot_copies = 0;
+    std::uint64_t prefix_state_bound(std::uint64_t) const { return snapshot_bound; }
     bool prefix_store_allowed() const { return !refuse_prefix; }
     std::vector<std::uint8_t> state_bytes_upto(std::uint32_t s, std::uint64_t p) {
+        ++snapshot_copies;
         if (frontier.at(s) != p) throw std::runtime_error("fake snapshot frontier");
         std::vector<std::uint8_t> bytes(sizeof(std::uint64_t));
         std::memcpy(bytes.data(), &h.at(s), bytes.size());
@@ -479,6 +482,7 @@ struct PairRun {
     gs::SelftestResult result;
     std::string lead_error, follow_error, driver_error;
     gs::LeadStats stats;
+    std::uint64_t follower_snapshot_copies = 0;
     std::vector<std::size_t> rows0, rows1;
     std::vector<std::string> log0, log1;
 };
@@ -486,7 +490,7 @@ struct PairRun {
 PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t tokens, std::uint32_t corrupt = 0,
                  gs::Hello h1 = hello_for(8, 4096, 2), bool mtp = false, unsigned chunk = 0, unsigned long_n = 0,
                  unsigned delay_us = 0, bool skip_basic = false, bool g2 = false, std::uint64_t* multi = nullptr,
-                 std::uint64_t import_min = 0, bool fail_import = false, bool fail_restore = false, std::uint8_t binding_salt = 0, bool prefix = false, bool refuse_prefix = false, std::uint64_t prefix_budget = 1ULL << 20) {
+                 std::uint64_t import_min = 0, bool fail_import = false, bool fail_restore = false, std::uint8_t binding_salt = 0, bool prefix = false, bool refuse_prefix = false, std::uint64_t prefix_budget = 1ULL << 20, bool reply_keep = false, bool refuse_reply = false, bool oversized = false) {
     PairRun out;
     Loopback lb;
     FakeEng e0(slots), e1(slots);
@@ -502,6 +506,7 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     gs::Hello h0 = hello_for(slots, 4096, 2);
     if (prefix) h0.prefix_cache_bytes = h1.prefix_cache_bytes = prefix_budget;
     e1.refuse_prefix = refuse_prefix;
+    if (oversized) e1.snapshot_bound = prefix_budget + 1;
     if (h1.slots == 8 && slots != 8) h1.slots = slots;
     std::thread follower([&] {
         try {
@@ -514,6 +519,7 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     sv::GenerationQueue queue(64);
     gs::LeadConfig lc;
     lc.prefix_cache_bytes = h0.prefix_cache_bytes;
+    lc.prefix_reply_store = reply_keep && !refuse_reply;
     lc.slots = slots;
     lc.capacity = 4096;
     lc.batch = batch;
@@ -549,7 +555,7 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
                 }
                 if (prefix) out.result.exact = gs::run_prefix_selftest(queue, prompts(n), tokens, gs::default_stop_ids(), {17, 23},
                     [&lead] { lead.clear_prefix_cache(); }, [&lead] { return lead.stats().prefix_hits; },
-                    [](const std::string& line) { std::printf("%s\n", line.c_str()); });
+                    [](const std::string& line) { std::printf("%s\n", line.c_str()); }, reply_keep && !mtp);
                 else out.result = gs::run_selftest(queue, prompts(n), tokens, gs::default_stop_ids(), slots, [](const std::string& l) {
                     std::printf("  %s\n", l.c_str());
                 }, hooks);
@@ -574,22 +580,40 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     out.rows1 = e1.step_rows;
     out.log0 = e0.log;
     out.log1 = e1.log;
+    out.follower_snapshot_copies = e1.snapshot_copies;
     if (multi) *multi = e0.multi_slot_verifies;
     return out;
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
+    // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
+    // from the shared queue with this selection; off keeps FIFO
+    {
+        CHECK(gs::LeadConfig{}.short_first);
+        for (const bool on : {true, false}) {
+            strix::serve::GenerationQueue q;
+            strix::serve::GenerationJob lng, shrt;
+            lng.prompt.resize(2000);
+            shrt.prompt.resize(10);
+            const auto tl = q.submit(std::move(lng));
+            const auto ts = q.submit(std::move(shrt));
+            auto first = q.take(false, on);
+            CHECK(first && first->ticket == (on ? ts : tl));
+        }
+    }
     // ---- prefix key semantics, byte LRU, full-token collision checks and admission parsing
     {
         auto entry = [](std::uint64_t id, std::vector<std::uint32_t> ids, bool mtp = false, std::uint64_t identity = 7) {
             gs::PrefixCache::Entry e;
-            e.id = id; e.ids = std::move(ids); e.hash = gs::prefix_hash(e.ids);
+            e.id = id; e.ids = std::move(ids);
             e.mtp = mtp; e.identity = identity; e.frontier = e.ids.size() - (mtp ? 1U : 0U);
             e.state.assign(16, 42);
             return e;
         };
+        const auto one = [](std::size_t key) { return strix::serve::ConversationKeep::charged_bytes(16, key); };
         gs::PrefixCache c(4096);
         CHECK(c.prepare(entry(1, {1, 2}))); c.commit(true);
         CHECK(c.prepare(entry(2, {1, 2, 3}))); c.commit(true);
@@ -600,23 +624,34 @@ int main() {
         CHECK(!c.find(p, true, 7) && !c.find(p, false, 8));
         CHECK(c.prepare(entry(3, {1, 2, 3}, true))); c.commit(true);
         CHECK(c.find(p, true, 7)->frontier == 2);  // A + y0 key; restore at |A|
-        auto collision = entry(4, {9, 9, 9});
-        collision.hash = gs::prefix_hash(std::span(p).first(3));
-        CHECK(c.prepare(std::move(collision))); c.commit(true);
-        CHECK(c.find(p, false, 7)->id == 2);  // matching hash alone is insufficient
-        const auto e = entry(5, {2, 3});
-        gs::PrefixCache lru(e.bytes() * 2);
+        CHECK(c.state(3) && c.state(3)->size() == 16 && !c.state(99));
+        // a weak hash makes every key collide: only the full token compare decides
+        gs::PrefixCache weak(4096, [](std::uint64_t, std::span<const std::uint32_t>) -> std::uint64_t { return 5; });
+        CHECK(weak.prepare(entry(1, {9, 9, 9}))); weak.commit(true);
+        CHECK(weak.prepare(entry(2, {1, 2, 3}))); weak.commit(true);
+        CHECK(weak.find(p, false, 7)->id == 2 && !weak.find(std::vector<std::uint32_t>{9, 9, 8, 1}, false, 7));
+        gs::PrefixCache lru(one(2) * 2);
         CHECK(lru.prepare(entry(1, {1, 2}))); lru.commit(true);
         CHECK(lru.prepare(entry(2, {2, 3}))); lru.commit(true);
         lru.touch(1);
-        CHECK(lru.prepare(entry(3, {3, 4}))); lru.commit(true);
-        CHECK(lru.get(1) && !lru.get(2) && lru.get(3) && lru.evictions == 1);
+        // A full grant refuses before staging; explicit paired pressure reclaim makes room.
+        CHECK(!lru.prepare(entry(3, {3, 4})));
+        CHECK(lru.oldest() == 2 && lru.erase(2));
+        CHECK(lru.prepare(entry(3, {3, 4})));
+        std::vector<std::uint64_t> victims;
+        CHECK(lru.victims(victims) && victims.empty() && lru.pending_fits());
+        for (const auto v : victims) CHECK(lru.erase(v));
+        lru.commit(true);
+        CHECK(lru.get(1) && !lru.get(2) && !lru.state(2) && lru.get(3) && lru.stats().evictions == 1);
         auto huge = entry(4, {4, 5}); huge.state.resize(4096);
-        CHECK(!lru.prepare(std::move(huge)) && lru.bytes() == e.bytes() * 2);
+        CHECK(!lru.prepare(std::move(huge)) && lru.bytes() == one(2) * 2);
+        lru.set_budget(one(2) * 3);
         CHECK(lru.prepare(entry(5, {5, 6}))); lru.commit(false);
         CHECK(!lru.get(5) && lru.get(1));
-        CHECK(lru.prepare(entry(6, {1, 2}))); lru.commit(true);
-        CHECK(!lru.get(1) && lru.get(6) && lru.get(3) && lru.bytes() == e.bytes() * 2);
+        CHECK(lru.prepare(entry(6, {1, 2})));
+        CHECK(lru.replacement_id() == 1 && lru.victims(victims) && victims == std::vector<std::uint64_t>{1});
+        CHECK(lru.erase(1)); lru.commit(true);
+        CHECK(!lru.get(1) && lru.get(6) && lru.get(3) && lru.bytes() == one(2) * 2);
         CHECK(gs::prefix_budget_bytes("0") == 0 && gs::prefix_budget_bytes("0.5") == (1ULL << 29));
         for (const auto* v : {"-1", "nan", "inf", "1x", "17179869184", "1e-20"})
             CHECK(throws_with([&] { (void)gs::prefix_budget_bytes(v); }, "--prefix-cache-gib"));
@@ -630,11 +665,11 @@ int main() {
         CHECK(gs::hello_mismatch(hello, peer).find("prefix_cache_bytes") != std::string::npos);
     }
     {
-        // A budget holding only one snapshot forces the lead to publish explicit eviction victims.
+        // A grant holding only one snapshot refuses new stores without a transient over-allocation.
         const auto r = run_pair(3, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
                                 nullptr, 0, false, false, 0, true, false, 256);
         CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty());
-        CHECK(r.stats.prefix_evictions > 0 && r.stats.prefix_bytes <= 256 && r.log0 == r.log1);
+        CHECK(r.stats.prefix_stores > 0 && r.stats.prefix_evictions == 0 && r.stats.prefix_bytes <= 256 && r.log0 == r.log1);
         // Native prefix caching must not replace the optional imported numerical identity.
         const auto imported = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
                                        nullptr, 1, false, false, 0, true);
@@ -648,7 +683,7 @@ int main() {
         FakeEng e0(1), e1(1);
         gs::PrefixCache k0(4096), k1(4096);
         gs::PrefixCache::Entry e;
-        e.id = 1; e.identity = 7; e.frontier = 2; e.ids = {11, 22}; e.hash = gs::prefix_hash(e.ids);
+        e.id = 1; e.identity = 7; e.frontier = 2; e.ids = {11, 22};
         e0.reset(0); (void)e0.prefill(0, e.ids, 0);
         e.state = e0.state_bytes_upto(0, 2);
         CHECK(k0.prepare(e)); k0.commit(true);
@@ -681,6 +716,25 @@ int main() {
         CHECK(f.lead_error.empty() && f.follow_error.empty() && f.driver_error.empty());
         CHECK(!f.result.exact && f.stats.prefix_hits == 0 && f.stats.prefix_stores == 0);
     }
+
+    // A prompt-only run must fail the reply gate even when prompt hits and output equality succeed.
+    for (const bool refuse_reply : {false, true}) {
+        auto r = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                          nullptr, 0, false, false, 0, true, false, 1ULL << 20, true, refuse_reply);
+        CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty());
+        CHECK(r.stats.prefix_hits > 0);
+        CHECK(r.result.exact == !refuse_reply);
+        CHECK(refuse_reply ? r.stats.prefix_hits_reply == 0 : r.stats.prefix_hits_reply > 0);
+    }
+
+    {
+        auto r = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                          nullptr, 0, false, false, 0, true, false, 1ULL << 20, false, false, true);
+        CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty());
+        CHECK(r.follower_snapshot_copies == 0 && r.stats.prefix_stores == 0 && !r.result.exact);
+    }
+
+    if (prefix_only) return failures ? 1 : 0;
 
     // ---- import commit votes: both ranks fail together on any rank's failure, binding or frontier mismatch
     {
@@ -909,6 +963,9 @@ int main() {
         b.identity_hash = 1;
         const auto m = gs::hello_mismatch(a, b);
         CHECK(m.find("slots") != std::string::npos && m.find("identity_hash") != std::string::npos);
+        gs::Hello c = a;
+        c.route_fingerprint = a.route_fingerprint + 1U;  // the peer resolved another numerical route
+        CHECK(gs::hello_mismatch(a, c).find("route_fingerprint") != std::string::npos);
         // RTX import settings: receiver on / 'DSA once', wire version and the attested model SHA must agree on every rank
         {
             auto i0 = a;

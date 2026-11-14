@@ -6,6 +6,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import contextlib
+import shutil
+import time
 
 exe = str(pathlib.Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory(prefix="ds41-compat-") as tmp:
@@ -69,3 +72,85 @@ with tempfile.TemporaryDirectory(prefix="ds41-disk-lock-") as tmp:
         assert p.wait(timeout=60) == 0, "shared-directory transaction failed"
     assert not list(root.rglob("*.state")) and not list(root.rglob("*.group")), "delete left published generations"
 print("PASS interprocess lock, concurrent quota/publication/replacement/delete")
+
+# Fresh processes exercise the actual durable Sessions path (plain and DSpark),
+# with entry-recorded byte hashes checked by the executable in each process.
+with tempfile.TemporaryDirectory(prefix="ds41-process-restart-") as tmp:
+    subprocess.run([exe, "--codec-write", tmp], check=True, timeout=30)
+    subprocess.run([exe, "--codec-read", tmp], check=True, timeout=30)
+print("PASS production Sessions write/read across fresh processes, both-rank payload/group bytes")
+
+@contextlib.contextmanager
+def lock_scratch():
+    scratch = tempfile.mkdtemp(prefix="ds41-ordered-lock-")
+    try:
+        yield scratch
+    except BaseException:
+        print(f"Retained failed lock fixture: {scratch}")
+        raise
+    else:
+        # All child processes and external handles are closed before teardown.
+        # Windows can briefly retain a pending directory deletion after exit.
+        for attempt in range(5):
+            try:
+                shutil.rmtree(scratch)
+                break
+            except OSError as error:
+                if os.name != "nt" or error.winerror not in (32, 145) or attempt == 4:
+                    raise
+                print(f"Retry Windows lock-fixture teardown: {error.winerror}")
+                time.sleep(0.05)
+
+# Both ranks keep independent persistent lock inodes, even when their payload
+# directories coincide. Exercise each old lock name as an external lock holder.
+for shared in (False, True):
+    for blocked_rank in range(2):
+        with lock_scratch() as tmp:
+            root = pathlib.Path(tmp)
+            paths = [root / ("shared" if shared else f"rank{r}") for r in range(2)]
+            for path in paths:
+                path.mkdir(exist_ok=True)
+            lock_path = paths[blocked_rank] / f".session-rank{blocked_rank}.lock"
+            with lock_path.open("a+b") as lock:
+                lock.write(b"0"); lock.flush(); lock.seek(0)
+                inode = lock_path.stat().st_ino
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                args = ["--disk-worker-shared" if shared else "--disk-worker", tmp]
+                processes = [subprocess.Popen([exe, *args, name]) for name in ("aa", "bb")]
+                try:
+                    try:
+                        time.sleep(0.25)
+                        assert all(p.poll() is None for p in processes), "ordered lock did not block paired writer"
+                        assert not list(root.rglob("*.state")), "payload published before both ordered locks"
+                    finally:
+                        if os.name == "nt":
+                            lock.seek(0); msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    for process in processes:
+                        assert process.wait(timeout=30) == 0, "concurrent paired writer refused/hung"
+                finally:
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill(); process.wait(timeout=5)
+                assert lock_path.stat().st_ino == inode, "cleanup replaced external lock inode"
+                deadline = time.monotonic() + 1.0
+                observed = []
+                while True:
+                    leftovers = [str(p.relative_to(root)) for p in root.rglob("*")
+                                 if p.suffix in (".state", ".group") or ".tmp" in p.name]
+                    if not leftovers:
+                        break
+                    observed.extend(leftovers)
+                    assert time.monotonic() < deadline, f"cleanup left publications/temporaries: {leftovers}"
+                    time.sleep(0.01)
+                if observed:
+                    print(f"Transient directory entries cleared within one second: {observed}")
+                for r in range(2):
+                    assert (paths[r] / f".session-rank{r}.lock").exists(), "cleanup unlinked a rank lock"
+print("PASS external legacy lock names on each rank, shared/separate directories, simultaneous paired writers, stable inodes")

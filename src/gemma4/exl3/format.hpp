@@ -11,6 +11,7 @@
 // All other target operations, KV and selection retain g4-v1 arithmetic.
 // Overflow/nonfinite at any conversion or transform is a hard failure.
 // WMMA uses the same transforms and a separately named prefill identity.
+#include "core/trellis_format.hpp"
 #include "gemma4/contracts/g4_types.hpp"
 #include "gemma4/prefill/prefill.hpp"
 #include <atomic>
@@ -106,23 +107,16 @@ STRIX_G4_HD inline bool geometry(LinearView w) {
 STRIX_G4_HD inline std::uint32_t word(const std::uint8_t* p) {
     return std::uint32_t(load16(p)) | (std::uint32_t(load16(p + 2)) << 16U);
 }
-STRIX_G4_HD inline unsigned stream_position(unsigned row, unsigned col) {
-    return ((col & 7U) << 5U) | ((row & 6U) << 2U) | (row & 1U) |
-           ((row & 8U) >> 2U) | ((col & 8U) >> 1U);
-}
+// Ring positions, state extraction and the mul1 constants are the shared format's (core/trellis_format.hpp).
+STRIX_G4_HD inline unsigned stream_position(unsigned row, unsigned col) { return core::trellis::Format::position(row, col); }
 STRIX_G4_HD inline unsigned state(const std::uint8_t* tile, unsigned k, unsigned position) {
-    const auto ring = 256U * k, end = (position + 1U) * k + ring, start = end - 16U;
-    const auto earlier = word(tile + ((start / 32U) % (ring / 32U)) * 4U);
-    const auto later = word(tile + (((end - 1U) / 32U) % (ring / 32U)) * 4U);
-    const auto pair = (std::uint64_t(earlier) << 32U) | later;
-    return unsigned(pair >> ((32U - (end & 31U)) & 31U)) & 65535U;
+    return core::trellis::Format::state_bytes(tile, int(k), position);
 }
 STRIX_G4_HD inline float codebook(unsigned s) {
-    const auto p = std::uint32_t(s) * 0x83dcd12dU;
-    const auto sum = (p & 255U) + ((p >> 8U) & 255U) + ((p >> 16U) & 255U) + (p >> 24U);
+    using Book = core::trellis::Mul1Constants;
     // Both operations are exact in FP32, so this also models the half FMA
     // with one final RNE conversion, without relying on host half support.
-    const float value = float(1024U + sum) * fp16_value(0x1eeeU) + fp16_value(0xc931U);
+    const float value = float(1024U + Book::state_sum(s)) * fp16_value(Book::kScale) + fp16_value(Book::kBias);
     std::uint16_t half = 0;
     (void)prefill::half_bits(value, half);
     return fp16_value(half);

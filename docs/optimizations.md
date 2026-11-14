@@ -18,17 +18,19 @@ that it is bit-changing and qualification is in progress. On other routes, inclu
 HTTP and MTP, the row stays `pending` with the same reason as an explicit request's
 decline, keeps FP32 route storage and is not exported or stamped as applied. If no
 provisional or unqualified row runs, the qualification stamp is `qualified`.
-Attention budget, FP16 recurrent chunks and output head remain pending: builtin paths continue,
-with one notice per row and declared targets in `profile.pending`. The FP16 recurrent chunk row
-(`STRIX_QPF2K_GDN_FP16_CHUNK`, [chunked GDN prefill](#qwen-gdn-chunk)) is runnable but awaits fidelity qualification.
+The FP16 recurrent chunk row (`STRIX_QPF2K_GDN_FP16_CHUNK=1`, [chunked GDN prefill](#qwen-gdn-chunk)) and the attention
+budget row (`STRIX_QPF2K_QSA_BUDGET=1536`) are provisional in the same way: fast exports them without `--allow-pending`
+and the stamp lists every applied provisional row (`qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk`).
+Single-node screen of the three rows together, plain CLI, 8K prompts: pooled KL 0.0040, top-1 agreement 97.5 %,
+NLL change -0.039 on 7 held-out prompts (1,792 teacher-forced rows); prefill 8K / 32K / 128K +7.2 / +7.9 / +7.9 %.
+The output head row remains pending: its builtin path continues, with one notice and its declared target in `profile.pending`.
 `quality` runs default settings with one notice because no quality pack exists.
 
 Explicit environment variables and lever options override the profile, including
 explicit off. `--allow-pending` / `STRIX_QWEN_PROFILE_ALLOW_PENDING=1` applies only
 runnable genuinely pending rows for benchmarks and stamps `unqualified: <rows>`.
 When combined with provisional rows, this follows the qualification-in-progress
-stamp, separated by `; `. Of the three pending rows only the FP16 recurrent chunk row is runnable,
-so with this flag fast also exports `STRIX_QPF2K_GDN_FP16_CHUNK=1` and stamps `unqualified: gdn_fp16_chunk`. The existing
+stamp, separated by `; `. No pending row of the table is runnable today, so this flag does not change fast's resolution. The existing
 `--prefill-moe-route-bf16` contract is preserved. On YaRN, profile rows refused by
 rotary admission stay pending with their reason and are not exported or stamped
 as applied; selection alone cannot cause that refusal. Required assets remain
@@ -471,7 +473,6 @@ disables only stage batching; HC mask values select folds. Use explicit tiling t
 | `STRIX_QPF2K_DENSE` | `1` | `STRIX_QPF2K_DENSE=0` | [Register-blocked dense projections](#qwen-dense) |
 | `STRIX_QPF2K_GDN` | `1` | `STRIX_QPF2K_GDN=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | `1` | `STRIX_QPF2K_GDN_GATES_BATCH=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
-| `STRIX_QPF2K_GDN_CORE16` | `1` | `STRIX_QPF2K_GDN_CORE16=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_QSA` | `1` | `STRIX_QPF2K_QSA=0` | [QSA stages and stage batching](#qwen-qsa) |
 | `STRIX_QPF2K_QSA_MASK` | `0x2257` | `STRIX_QPF2K_QSA_MASK=0` | [QSA stages and stage batching](#qwen-qsa) |
 | `STRIX_QPF2K_HC` | `1` | `STRIX_QPF2K_HC=0` | [HC folds, output v3 and band 16](#qwen-hc) |
@@ -529,23 +530,24 @@ Reuses dense projection tiles across prompt rows while preserving the operand im
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults), [dense selector](../src/hip_dense_f16_tiled.hpp)
 - **WMMA register banks:** form 4 issues its WMMAs with A and B pinned to VGPR banks other than the accumulators' (STRIX_QPF2K_WMMA_PIN). It is an independent switch read once per process, not one of the QPF2K resolver defaults: on unless set to `0`, and `=0` only restores the compiler's register assignment (route selection is unchanged). Register assignment only: the same instructions on the same values. The accumulator bank is chosen by the compiler; `tools/check_wmma_banks.py` checks each build (distinct banks, tied and disjoint D, zero scratch, at most 192 VGPRs).
+- **GDN input vector epilogue:** `STRIX_QPF2K_GDN_VEC_EPILOGUE` defaults ON (only `0` disables it), read once per process; eligible aligned outputs retain the same per-element BF16 rounding and use 16-byte stores through the shared tiled epilogue. `=0` restores the scalar kernels; unpinned scratch-A keeps scalar stores.
 
 <a id="qwen-gdn"></a>
 
 ### GDN recurrence, gates batching and core16
 
-**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN=1; STRIX_QPF2K_GDN_PARTS=55; STRIX_QPF2K_GDN_GATES_BATCH=1; STRIX_QPF2K_GDN_CORE16=1`. **Default:** auto.
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN=1; STRIX_QPF2K_GDN_PARTS=55; STRIX_QPF2K_GDN_GATES_BATCH=1`. **Default:** auto.
 
-Uses the exact recurrence forms, batches gates and feeds eligible dense output directly from FP16 core rows.
+Uses the exact recurrence forms, batches gates and feeds eligible dense output directly from FP16 core rows through the tiled kPre projection path.
 
 - **Preconditions:** Eligible GDN prefill rows and supported lane/column shapes. Core16 additionally needs dense FP16 (not dense G64), tiled rows in multiples of 32, output site enabled, at least 2048 rows by default, value width 6144, head dimension 128, uniform core/output strides and a supported dense output site; graph capture declines it. The FP16 core consumer must be admitted before the producer drops FP32 rows.
-- **Automatic selection:** The initializer enables GDN, gates batching and core16; the GDN reader defaults PARTS to 55. Shape, check-mode and consumer guards retain the older forms.
+- **Automatic selection:** The initializer enables GDN and gates batching; eligible layouts use the core16 output path automatically; the GDN reader defaults PARTS to 55. Shape, check-mode and consumer guards retain the older forms.
 - **Core launch:** Cores default to plain launches on the caller's stream instead of the cooperative queue: on Linux 7.4, an eviction/restore of the process queues while a cooperative core ran could leave it waiting forever and hang prefill. Arrival tickets form value-head pairs in arrival order, so pairing does not depend on physical dispatch order. The two halves still exchange norm sums through a pair-local wait; tickets do not establish deadlock freedom under arbitrary preemption/restore. A single-workgroup core containing both halves, with no inter-block wait, is the follow-up.
 - **Launch policy:** `STRIX_QPF2K_GDN_COOP_LAUNCH=0` (or unset) selects plain; `=1` is the cooperative OFF arm. Both retain the historical cooperative-support, per-block occupancy and whole-grid capacity admission, so the policy changes only the launch call, not variant selection. Both retain ticket pairing. The value is read once per process; use a fresh process for each arm. `--print-effective-config` reports the requested environment value and effective `plain` / `cooperative` policy under `gdn_core_launch`.
 - **Fallback notice:** Ineligible forms fall back without a general decline line. Check modes retain FP32 core rows. Diagnostic output is QPF2K GDN check: ... differ ... or GDN prefill check: ... differ ....
 - **Exactness evidence:** STRIX_QPF2K_GDN_CHECK=1 and STRIX_GDN_PREFILL_CHECK=1 compare written bytes; require zero differences. Whole-engine receipts and operand-identity checks cover the qualified special-value/NaN order.
-- **Launch-change validation:** Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4 with the cooperative launch); terminal-logits fnv64 and tokens equal to the previous build at 16K and 32K in both launch arms; `STRIX_QPF2K_GDN_CHECK=1` differ 0 in both launch arms; 32K prefill unchanged (ABBA, +-0.0 %). These results describe the measured scope, not arbitrary preemption/restore safety. In fresh processes, `STRIX_QPF2K_GDN_CHECK=1` compares q/k, gates, FP32 core rows, conv history and recurrent state against production from identical inputs; require `differ 0` in both launch arms. It excludes CORE16. Coverage beyond the measured scope includes 8-row and Chunk-16 dispatch, four-column, plain/pipe/lean and witness routes, NaN-triggered fallback, and separate same-profile CORE16 output/logit/state checks.
-- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 or STRIX_QPF2K_GDN_CORE16=0 (one at a time); STRIX_QPF2K_GDN_CHUNK16=0 keeps the 8-row core ([Chunk-16 core](#qwen-gdn-chunk16))
+- **Launch-change validation:** Linux 7.4, 16K YaRN prompt: 0 hangs in 8 runs (3 in 4 with the cooperative launch); terminal-logits fnv64 and tokens equal to the previous build at 16K and 32K in both launch arms; `STRIX_QPF2K_GDN_CHECK=1` differ 0 in both launch arms; 32K prefill unchanged (ABBA, +-0.0 %). These results describe the measured scope, not arbitrary preemption/restore safety. In fresh processes, `STRIX_QPF2K_GDN_CHECK=1` compares q/k, gates, FP32 core rows, conv history and recurrent state against production from identical inputs; require `differ 0` in both launch arms. It excludes the core16 output projection. Coverage beyond the measured scope includes 8-row and Chunk-16 dispatch, four-column, plain/pipe/lean and witness routes, NaN-triggered fallback, and separate same-profile core16 output/logit/state checks.
+- **Off switch:** STRIX_QPF2K_GDN=0; independently STRIX_QPF2K_GDN_GATES_BATCH=0 (one at a time); STRIX_QPF2K_GDN_CHUNK16=0 keeps the 8-row core ([Chunk-16 core](#qwen-gdn-chunk16))
 - **Measured gain:** -
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults)
 
@@ -570,7 +572,7 @@ The decay-NaN dispatch block pairs of the fused GDN core run 16-row chunks with 
 ### Chunked GDN prefill on FP16 WMMA (FAST)
 
 **Engine:** `qwen`. **Control:** `STRIX_QPF2K_GDN_FP16_CHUNK=1` or `--gdn-fp16-chunk 1`. **Default:** OFF (profile `fast`
-row `gdn_fp16_chunk`, pending qualification).
+row `gdn_fp16_chunk`, provisional: applied by `--profile fast`, qualification in progress).
 
 Replaces conv, recurrence and gated norm of the GDN prefill row route with identity `qwen-gdn-fp16-chunk rev 2`
 ([contract](engine/kernels/gdn-fp16-chunk.md)): 32-row chunks in WY form, FP16 WMMA operands with FP32 accumulation,
@@ -937,6 +939,23 @@ When a chunk averages fewer than 96 assignments per expert (fewer than 4,915 row
 - **Measured gain:** routed call −2.6 % to −8.2 % at 3,072 to 4,864 rows (512 experts, top-10, real layers, ABBA); +1 % to +5 % at 1,024 to 2,048 rows (hence the threshold); no change at 8,192-row chunks.
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-moe-da16-issue"></a>
+
+### Uniform DA16 activation issue (expert down)
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_DA16_ISSUE`. **Default:** automatic (on for the XOR-row tune 88).
+
+The expert down kernel keeps two register stages of global loads in flight while the WMMA step runs. Each thread used to skip its two activation-image loads when its part lay past the end of the batch, which put the loads of every fetch in an exec-masked region behind a skip branch. With the item on, every thread issues both loads through the pointer the kernel already clamps to the first row of the batch, so a fetch is one straight block. Rows past the batch stage a copy of the first row instead of zeros; no store and no certificate check reads them. The barrier, the global loads, the K pipeline and the issue policy (`GroupedF16Issue`, `GroupedF16ActivationIssue`) live in the shared grouped F16 support, so another grouped body adopts the policy instead of copying the scheduler.
+
+- **Preconditions:** DA16 expert down entries (base, certificate, BF16 route, one-byte route). The LDS-epilogue tier kernels, the tile-64 remainder and the P1 item keep the masked issue.
+- **Automatic selection:** Unset selects the uniform issue for tune 88 (64-assignment batches with XOR rows: 3,072 to 4,914 rows per chunk for 512 experts, top-10) and the masked issue for tunes 80 and 82. `=1` selects it for every tune, `=0` for none.
+- **Fallback notice:** The masked kernels are the previous kernels with unchanged machine code.
+- **Exactness evidence:** Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word; header reuse on and off; certificate off, armed and unproven; DA16 image poisoned before each run) identical with the item on and off on a real layer at 4,096 and 8,192 rows and on synthetic Q4_K/Q5_K x Q5_1/Q8_0 layers; 8K and 32K terminal FP32 logits and generated tokens identical with `=0`, unset and `=1`.
+- **Off switch:** STRIX_QPF2K_MOE_DA16_ISSUE=0
+- **Measured gain:** down phase -0.7 % at 3,072 rows, -1.2 % at 4,096 and -1.5 % at 4,864 (routed call -0.26 % to -0.39 %; real layer, ABBA, 30 repetitions). No repeatable change at 2,048 rows (tune 80) or at 6,144 and 8,192 rows (tune 82), so 8K and longer prompts in 8,192-row chunks are unaffected.
+- **Not adopted:** making the wait before each stage exact as well (ordered prologue fetches plus a branch-free tail fetch; no `vmcnt(0)` left in the K loop) measured +1.1 % on the down phase at 8,192 rows and +2.2 % with full batches, and nothing beyond the uniform loads at 4,096 rows.
+- **Implementation / evidence:** [shared scheduler](../src/moe_core/grouped_f16.hpp), [down body](../src/moe_core/hip_moe_da16_down_body.inc)
+
 <a id="qwen-qsa-union-merge"></a>
 
 ### QSA attend-union merge
@@ -1173,6 +1192,38 @@ A headless tiled block already stops after its last state-writing step, the last
 - **Off switch:** STRIX_QSA_CACHE_ONLY=0
 - **Measured gain:** 262K YaRN serial prefill, 2 runs per arm alternating: 191.04 / 193.21 s on vs 194.76 / 200.17 s off (means 192.1 vs 197.5 s; adjacent pairs -1.6 to -7.0 s); 32K: neutral on the current T16384 route (one headless block; +0.04 / +0.07 s mean in two runs per order), -0.41 s on the earlier T8192 route (three headless blocks)
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [prefill runtime](../src/known_prefix_prefill_runtime.cpp)
+
+<a id="qwen-prefill-final-cone"></a>
+
+### Final-block cone: final hyper mix on the trailing rows only
+
+**Engine:** `qwen`. **Control:** `STRIX_PREFILL_FINAL_CONE`. **Default:** 1.
+
+The final block of a prompt keeps its head, and the head runs only on the logit rows (the last row). The final hyper mix before it feeds nothing else, so it now runs on the trailing rows only, through the same full-T entry and therefore with the same per-row arithmetic. The last layer's MoE and MLP injection are not coned: the MTP predictor builds one cache row from the tap of every prompt row.
+
+- **Preconditions:** A tiled prefill block that keeps its head (the final block), whole 8-row tiles and more than STRIX_PREFILL_FINAL_CONE_ROWS rows (default 128; the HIP hyper-mix entry needs at least 16). The MTP predictor reads the tap (last MLP injection) of every prompt row, so the last layer's MoE and injection still run on all rows; only the final mix, read by the head alone, is coned. =2 (opt-in, host-test evidence only) also cones every other trailing step that touches no session state and has no step observer.
+- **Automatic selection:** On when unset; `=0`, `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile run every row; `--print-effective-config` reports it under `long_context_items`. Persistent state is unchanged, so the value stays out of the prefix/session cache namespace.
+- **Fallback notice:** Headless blocks, blocks of at most `STRIX_PREFILL_FINAL_CONE_ROWS` rows, blocks with a row tail and telemetry runs execute every row. `STRIX_PREFILL_TIMING=1` prints the coned steps and rows.
+- **Exactness evidence:** Exact: plain default command, same binary on/off: prefill logits byte-identical with the token at 8K (five arms) and, at 32K, the full logits of the prefill and of 48 MTP decode steps byte-identical with the tokens. A first form that ran the final mix through the 8-row tile entry was rejected: its prefill logits differed (up to 0.0044) because the full-T entry uses the FP16-output route.
+- **Off switch:** STRIX_PREFILL_FINAL_CONE=0
+- **Measured gain:** 8K single node, three alternating off/on pairs: 4,764.0 / 4,752.7 / 4,727.8 ms off vs 4,707.7 / 4,717.4 / 4,677.9 ms on (means 4,748.2 vs 4,701.0 ms, -1.0 %; adjacent pairs -56 / -35 / -50 ms); 32K with 48 decode steps, one pair: 21.11 s off vs 21.00 s on (within run noise)
+- **Implementation / evidence:** [prefill runtime](../src/known_prefix_prefill_runtime.cpp)
+
+<a id="host-wait-policy"></a>
+
+### Blocking host wait (shared host wait policy)
+
+**Engine:** `qwen`. **Control:** `STRIX_HOST_WAIT`. **Default:** block (Qwen decode app); other engines keep the runtime schedule unless they select one.
+
+How a host thread waits for the device is one shared policy: `runtime` (no device flag), `spin`, `yield` or `block`. An engine names its choice once after the device bind and `STRIX_HOST_WAIT` overrides it. The Qwen decode app selects `block`; the DeepSeek expert server's `--busy-poll` selects `spin` through the same call.
+
+- **Preconditions:** Any HIP binary that calls the shared policy after the device bind (strix::device::set_host_wait). The HIP runtime's own schedule busy-waits on device completion, which keeps one host core at 100 % for the whole prefill.
+- **Automatic selection:** Each engine's choice; `STRIX_HOST_WAIT=runtime|spin|yield|block` overrides it and any other text is refused at start. The value stays out of the prefix/session cache namespace. The receipt line `host wait: <policy> (engine|STRIX_HOST_WAIT)` is printed at start.
+- **Fallback notice:** Engines that do not call the policy keep the runtime schedule.
+- **Exactness evidence:** Exact: the policy only changes how the host thread waits for the device. Prefill logits and tokens byte-identical between spin, block and the runtime schedule at 8K and between spin and block at 32K.
+- **Off switch:** STRIX_HOST_WAIT=runtime (or spin)
+- **Measured gain:** Host CPU time, not speed. 8K: host user CPU 2.3 s (block) vs 5.8-6.1 s (spin / runtime schedule), busiest thread 61-68 % vs 97-98 %; request 1,730 / 1,762 / 1,729 tok/s block vs 1,723 / 1,738 / 1,770 spin (three pairs, no ordered difference). 32K, two pairs: 18.90 / 18.84 s block vs 19.00 / 18.89 s spin, host user CPU 11.5 / 10.7 s vs 19.4 / 18.9 s. Power: the device power sensor (0.5 s samples) does not separate the arms (32K 135 / 137 W block vs 138 / 136 W spin; 8K 113-122 W both), so no watt saving is claimed.
+- **Implementation / evidence:** [device gate](../include/strix/device/hip_gate.hpp), [HIP side](../src/device/hip_gate.cpp)
 
 <a id="qwen-qsa-score-rows64"></a>
 
@@ -1573,10 +1624,10 @@ Group shared-expert SwiGLU pairs.
 
 Splits expert work across the pair, retains expert slots, builds integer routes faster, pairs eligible F16 projections and batches attention segments.
 
-- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152; segment batching does not combine with BATCH_ROWS16=1.
-- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS declines itself when STRIX_DS41_BATCH_ROWS16=1. Shape guards keep supported older paths.
+- **Preconditions:** Two ranks and supported expert geometry; TP down width 1152.
+- **Automatic selection:** Each is on unless disabled; BATCH_SEGMENTS also covers STRIX_DS41_BATCH_ROWS16=1 (two launches per kernel for 9 to 16 request segments). Shape guards keep supported older paths.
 - **Fallback notice:** Routine operator eligibility has no general decline log. Invalid expert-TP geometry fails validation; do not treat a transport change as the same numerical identity.
-- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms.
+- **Exactness evidence:** The published two-node gates compare both ranks with the reference: prefill logits, decode token IDs, verify rows and batch rows. Keep the same Q2 experts, dense overlay and trellis packs in both arms. The newly enabled BATCH_ROWS16 segment path still needs server-level qualification of actual 9–16-row steps with mixed segment lengths and complete token/logit/state comparisons against BATCH_SEGMENTS=0; launch-splitting kernel coverage does not establish this gate. Per-rank token-stream checksums are diagnostic only and omit row/slot identity and step boundaries; equality is not proof of identical outputs.
 - **Off switch:** Set one of STRIX_DS41_EXPERT_TP, STRIX_DS41_EXPERT_SLOTS, STRIX_DS41_ROUTES_FAST, STRIX_DS41_F16_PAIR, STRIX_DS41_TP_DOWN or STRIX_DS41_BATCH_SEGMENTS to 0 per comparison.
 - **Measured gain:** Batch segments N8 +9%; TP down R6 -3%, N8 +1.6%
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
@@ -2651,8 +2702,9 @@ tokens with the tokens still resident in a free slot starts in that slot and pre
 each slot's resident token ids, picks the free slot with the longest match, rounds it down to whole chunks, and the
 prefill command carries the first position (`pstart`) to the follower. Reuse preserves prefill boundaries: a
 prefill tiles its rows from the chunk's first row, so a suffix opening inside a chunk does not reproduce the bits of a
-full prefill. Alignment is conservatively `--max-rows` times `STRIX_MM_PF_GROUP` (default 4096 x 2 = 8192 tokens),
-including when grouping is disabled. Only completed prefill rows are reusable; generated rows never extend the record.
+full prefill. Alignment is conservatively `--max-rows` times 2 chunks (default 4096 x 2 = 8192 tokens; narrower than
+the default prefill group of 4 chunks, which changes the schedule but not the chunk bits), including when grouping is
+disabled. Only completed prefill rows are reusable; generated rows never extend the record.
 The KV rows are the slot's own cache, so the reuse lasts until
 another request takes the slot. Reused tokens are reported as `cached_tokens`, in `strix_prompt_tokens_cached_total`
 and as `capabilities.prefix_cache` in `/api/status`.
@@ -2755,19 +2807,7 @@ per draft instead of a full-vocabulary scan and host exchange per step.
 
 ### v4 MoE prefill core
 
-**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_CORE`. **Default:** v4.
-
-Use v4 register/layout scheduling.
-
-- **Preconditions:** Supported prefill expert shapes and quantized weights.
-- **Automatic selection:** Resolver supplies v4 only when unset; explicit values win. Shape/core dispatch determines actual use.
-- **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
-- **Exactness evidence:** Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
-- **Off switch:** STRIX_MMX_PREFILL_CORE=lib
-- **Measured gain:** Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib
-- **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
-
-<a id="mm-pf-msa-batch"></a>
+The v4 core path is the only MiniMax MoE prefill path.
 
 ### MSA prefill batching
 
@@ -2878,6 +2918,64 @@ Two neighbouring CTAs of the 128-row MT8 PIPE launch split the 128 output column
 - **Off switch:** STRIX_MMX_PREFILL_PIPE_PAIR=0
 - **Measured gain:** MoE call, real weights and routes of one layer, 10 A B B A blocks, five runs: 4096 rows -0.9 to -1.5 % (e.g. 50.19 -> 49.43 ms; one noisy run -0.1 %), 2048 rows -0.6 to -1.0 %; 1024 rows mixed (-1.1 to +0.7 %), so it stays unpaired. Two Strix Halo nodes over 2x USB4, in-process A B A B A B A: 8K TTFT mean 14.14 -> 14.04 s (-0.7 %); 32K fresh process per arm (A B A, B A B): TTFT 63.70 -> 63.48 s (-0.3 %, within noise), MoE GPU time 22.86 -> 22.90 s (neutral).
 - **Implementation / evidence:** [kernel](../src/minimax/moe/mmx_prefill_core.hpp), [dispatch](../src/minimax/moe/mmx_prefill.hip), [resolver](../src/minimax/engine/mm_defaults.cpp), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
+<a id="mm-pf-dense-band"></a>
+
+### Prefill dense tall PIPE bands (opt-in)
+
+**Engine:** `minimax`. **Control:** `STRIX_MMX_PREFILL_DENSE_BAND`. **Default:** 0 (off).
+
+Dense prefill linears (attention q/k/v and o_proj) under PIPE can run tall bands instead of MT8 PIPE CTAs: one CTA
+of 4 or 8 waves owns 32 output columns over 4 or 8 full 128-row tiles, decodes each weight tile once per band
+(each wave decodes 16 / W states of the two tiles) and shares the decoded B fragments through a double-buffered
+LDS stage, one barrier per k tile. Rows beyond the last full band keep the PIPE tiles and the tail.
+
+- **Preconditions:** v4 prefill core with PIPE (the default); dense calls only. Values 0, 4 or 8.
+- **Exactness evidence:** Same operands, WMMA chain and split partials per output as the PIPE kernel. Bench `test_prefill_dense`: band 0 / 4 / 8 byte-identical, T 1024, 1700 and 4096. TP2 8K and 32K state, token and result anchors equal, ranks agree.
+- **Off switch:** `STRIX_MMX_PREFILL_DENSE_BAND=0` (default)
+- **Measured gain:** None that clears noise, so it stays opt-in. Kernel bench at T4096 (band vs PIPE, interleaved): band 4 q -0.9 %, o -3.9 %, q+k+v -1.3 %, k+v +5.7 %; band 8 is slower (+2.3 to +13.6 %). TP2 32K TTFT, band 4 vs PIPE: -1.05 % (band first) and -0.57 % (PIPE first), mean -0.8 %, below the ±3 % single-run spread; band 8 +0.6 % (one pair). Default flip needs more pairs.
+- **Implementation / evidence:** [kernel](../src/moe_core/grouped_core.hpp), [dispatch](../src/minimax/moe/mmx_prefill.hip), [bench tests](../tests/hip_mmx_moe_bench.hip)
+
+<a id="core-iu4-wscale-defer"></a>
+
+### IU4 tiled core: weight scale converted at the LDS store
+
+**Engine:** `minimax` (shared `src/core/tiled_core.hpp`; GLM INT4 uses the same core). **Control:** none. **Default:** on.
+
+The grouped and dense IU4 tiled core converted the F16 weight scale to FP32 inside `fetch()`, right after it issued
+the next stage's loads, so every wave waited for those loads (`s_waitcnt vmcnt`) before the stage's WMMA. The
+scale now stays F16 in registers until `store()` writes it to LDS after the WMMA.
+
+- **Preconditions:** IU4 tiled core plans (FAST_I4 MoE, the INT4 chain, GLM INT4).
+- **Exactness evidence:** F16 to FP32 conversion is exact; same FP32 value at the same LDS slot. gfx1151 ISA: the wait is gone, VGPR -1, no spills, occupancy unchanged. Grouped microbench output bitwise across plans.
+- **Off switch:** None (code motion only).
+- **Measured gain:** Grouped IU4 microbench (MiniMax shapes, A B B A): plan 2 gate K6144 N1536 -6.8 % (T4096) / -5.9 % (T8192), down K1536 N6144 -4.9 % / -4.2 %; dense plan 2 -2 to -5 %. TP2 32K TTFT (unfused MoE path, both orders) -0.8 % and -1.5 % against an older binary without the change (that binary also lacks other later commits, so this is an upper bound).
+- **Implementation / evidence:** [core](../src/core/tiled_core.hpp)
+
+<a id="core-load-cohort-schedule"></a>
+
+### Tiled core: the load schedule is a contract trait
+
+**Engine:** `minimax`, `glm` (shared `src/core/tiled_core.hpp`; every non-integer tiled-core plan). **Control:** none. **Default:** on.
+
+The order in which the tiled core issues a stage's raw loads, publishes them to LDS and synchronises the CTA was
+written inline in the kernel body. It is now a schedule type named by the contract (`Contract::Schedule`, default
+`pipeline::CtaStageAhead<>` in `src/core/load_cohort.hpp`): the schedule states which load cohorts are issued ahead
+of the stage's matrix work and how many stages and LDS buffers that keeps live, and the kernel orders its issue,
+publish and barrier accordingly. Loads are grouped in two cohorts (activations with their row scales, weights with
+their column scales) selected at compile time, so a schedule adds no branch to the kernel.
+
+The default schedule is the one the core already ran: the next stage's loads are issued before the current stage's
+matrix work and first read by the LDS store after it. On gfx1151 the 128x128 IU4 plan issues 8 loads after the
+barrier, runs its 64 matrix operations and the K64 scale flush with LDS waits only, then stores with one staggered
+`s_waitcnt vmcnt` per store and one barrier per stage, in both the GLM and the MiniMax chain kernels. A separate
+activation/weight readiness split therefore has nothing left to hide and is not built.
+
+- **Preconditions:** none; code motion behind a compile-time trait.
+- **Exactness evidence:** gfx1151 assembly of the tiled-core library unit is instruction-identical before and after (392 kernels). `strix-hip-iu4-load-cohort-tests` pins the I32 group sums and FP32 outputs of gate/up (K 6144, N 1536) and down (K 1536, N 6144) for four groups of 1, 127, 128 and 129 rows, pins LDS bytes, scratch and a VGPR ceiling of the three library instantiations, and requires the same output bits when the weights or all loads are issued late.
+- **Off switch:** None (no behaviour change).
+- **Measured gain:** none claimed. Routed replay of the fixture (4,096 token rows x top-8 over 288 groups, gate/up + down, 41 interleaved rounds): 24.06 / 23.78 ms before, 23.91 ms after. The same kernel with the weights issued late is +7.3 % slower, with every load issued late +9.1 %: that is what the existing overlap is worth, and it was already in place.
+- **Implementation / evidence:** [schedule](../src/core/load_cohort.hpp), [core](../src/core/tiled_core.hpp), [fixture](../tests/hip_iu4_load_cohort_tests.hip)
 
 <a id="mm-pf-gather-tok"></a>
 
@@ -3202,6 +3300,20 @@ The pair prefill exchange sends each message as a run of synchronous transport c
 - **Measured gain:** TTFT 1,024 tokens 2.469 -> 2.423 s (414.8 -> 422.6 tok/s, -1.9 %), 4,096 tokens 9.168 -> 9.025 s (446.8 -> 453.9 tok/s, -1.5 %), 8,192 tokens 13.817 / 13.874 -> 13.874 s (592.9 / 590.5 -> 590.5 tok/s, unchanged)
 - **Implementation / evidence:** [exchange options](../src/minimax/pfx/pf_exchange.hpp), [exchange tests](../tests/hip_mm_pfx_tests.hip)
 
+<a id="mm-pfx-joined"></a>
+
+### Prefill exchange joined frame
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PFX_JOINED` (both ranks the same). **Default:** 1.
+
+A prefill exchange message used to be three rendezvous: a header exchange, the chunk exchanges, then a CRC-list exchange. The joined frame carries the identity record behind the last chunk, and with CRC and two or more chunks the CRC list as well, so a message of N chunks is N transport exchanges instead of N + 2 (a one-chunk message with CRC keeps its CRC-list exchange: N + 1). The framing lives in the shared transport code (`src/xport/framed_exchange.hpp`), which also serializes the original form byte for byte; the two ranks agree on the form once, in a hello at the first message, and the joined form is used only when both offer it. Payload bytes, chunk cuts, per-chunk CRCs and validation before consumption are unchanged.
+
+- **Preconditions:** Pair (two-rank) MiniMax prefill; both ranks run the same value (with 0 there is no hello, so a mixed pair fails at the first message instead of exchanging garbage).
+- **Exactness evidence:** Host tests compare the original form against a frozen copy of the previous serializer byte for byte and check the joined form's identity, CRC list and mismatch detection; device exchange tests pass in both forms.
+- **Off switch:** STRIX_MM_PFX_JOINED=0
+- **Measured gain:** Two fewer transport exchanges per message (26 -> 24 for a 4K-token message of 24 chunks); the per-partial trailer no longer allocates two vectors.
+- **Implementation / evidence:** [framed exchange](../src/xport/framed_exchange.hpp), [exchange options](../src/minimax/pfx/pf_exchange.hpp), [framing tests](../tests/xport_minimax_pfx_tests.cpp), [exchange tests](../tests/hip_mm_pfx_tests.hip)
+
 <a id="mm-pf-idx-tile"></a>
 
 ### MSA prefill index query tiles
@@ -3347,6 +3459,33 @@ Use the host-path decode exchange module, load the prefill exchange module, and 
 - **Off switch:** STRIX_MM_XFER=off; STRIX_MM_PFX=off; STRIX_MM_PF_INTERLEAVE=off (one at a time)
 - **Measured gain:** Interleaving: 8K TTFT 40.0 -> 35.4 s; 1K inert
 
+### Prefill group width
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_GROUP` (2..8), `STRIX_MM_PFX_DEPTH`. **Default:** group 4, exchange depth 4 (shared policy `include/strix/pair/prefill_group.hpp`).
+
+Interleave up to 8 forward chunks (`--max-rows` 4096 each) of one prompt as one layer-major group, so per-layer work that does not depend on the rows (the FAST_I4 layer-slot conversion) runs once per group: at the default a 32K prompt converts each MoE layer twice instead of four times; `STRIX_MM_PF_GROUP=8 STRIX_MM_PFX_DEPTH=8` makes it once.
+
+- **Preconditions:** The width is clamped to the prompt's chunk count (an 8K prompt is a group of 2 as before) and to the prefill exchange depth; each extra chunk of width costs four `--max-rows` x hidden FP32 row buffers per rank (0.8 GiB at width 4, 2.4 GiB at width 8) and one TX / RX exchange slot.
+- **Automatic selection:** Unset = 4. An explicit narrower `STRIX_MM_PFX_DEPTH` lowers the default width with a notice; an explicit `STRIX_MM_PF_GROUP` above the depth is an error.
+- **Fallback notice:** `mm rank N: prefill group width W (STRIX_MM_PFX_DEPTH)` when the depth narrows the default.
+- **Exactness evidence:** 32K FAST_I4 chain, group 4 vs 2: identical state / final-rows / result hashes, ranks agree, same tokens; prefix-cache reuse alignment stays 2 chunks.
+- **Off switch:** STRIX_MM_PF_GROUP=2 (previous default)
+- **Measured gain:** MiniMax M3.1 FAST_I4 32K TTFT, TP2 USB4, ABAB both orders: group 4 vs 2: 55.0 / 54.5 s -> 52.2 / 51.7 s (-5.1 %); group 8 vs 2: 55.5 / 55.2 s -> 52.5 / 51.4 s (-6.1 %, not distinguishable from 4, hence the default 4); 8K unchanged by construction; decode unchanged (46.1-46.5 ms/token at 32K ctx in all arms).
+
+<a id="mm-pf-moe-group"></a>
+### Prefill group-wide EXL3 MoE call
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MOE_GROUP` (0 = automatic, 1 = one call per chunk, 2..8 chunks per call). **Default:** automatic (shared policy `include/strix/pair/prefill_group.hpp`): calls of half the group for a prefill group of 8 chunks, one call per chunk otherwise.
+
+Run the EXL3 MoE of a layer once for several chunks of the prefill group, so an expert's weights are decoded once for those chunks' rows. The plan merges an expert's rows per K-split class of their own chunk (the split count follows the rows an expert holds in a chunk), so every row keeps its per-chunk arithmetic.
+
+- **Preconditions:** Device-planned EXL3 MoE layers (not the FAST_I4 chain layers); every chunk of a call at least 97 rows; outputs written in place into the exchange TX slots or per-member partials. A call of W chunks needs its own workspace (3.94 GiB at 2 x 4096 rows, 6.40 GiB at 4 x 4096 rows per rank), allocated at start-up only when the width can exceed 1.
+- **Automatic selection:** A call sends all its chunks' partials at once; another sub-group's compute must cover those transfers. Unset: width 4 for `STRIX_MM_PF_GROUP=8` on prompts of 8 chunks, 1 at the default group 4 and for shorter prompts.
+- **Fallback notice:** `mm rank N: prefill MoE sub-group width up to W (workspace X GiB)` when enabled; spans that do not qualify run one call per chunk silently (same bits).
+- **Exactness evidence:** Device test `test_prefill_group` (group call vs one call per chunk, 7 chunk layouts, bitwise); 8K and 32K pair runs: identical state / final-rows / result hashes in every arm, ranks agree.
+- **Off switch:** STRIX_MM_PF_MOE_GROUP=1
+- **Measured gain:** Kernel (whole MoE call, real weights and routes repeated per chunk): 2 chunks -4..-9 %, 4 chunks -13 %. MiniMax M3.1 FAST_I4 TTFT, TP2 USB4: 32K group 8 with calls of 4 chunks vs the default group 4, both orders: 49.20 -> 48.99 s, 49.25 -> 48.75 s (-0.4 %, -1.0 %); 32K group 4 with calls of 2 chunks: neutral (49.35 / 49.28 -> 49.36 / 49.15 s); 8K with one call for both chunks: +13..23 % (12.28 / 12.96 -> 15.14 / 14.60 s), which is why the automatic width keeps one call per chunk there.
+
 <a id="mm-gu4"></a>
 
 ### Scalar gu4 expert addressing
@@ -3376,6 +3515,23 @@ producer overwrites it, so the copies overlap compute. Compute and scratch stay 
 - **Off switch:** `STRIX_MM_PF_ASYNC_START=0` (global); `STRIX_MM_PF_LATE_SRC_FENCE=0` for the late fence; `STRIX_MM_BASELINE=1` unless explicitly overridden.
 - **Measured gain:** Balanced 7940-token prefill (4096+3844): -2.3 to -2.6 % in both measurement orders. Unbalanced shapes (4096+443) measured neutral and take the ordinary path through the row gate.
 - **Implementation / evidence:** [grouped prefill](minimax-grouped-prefill.md)
+
+<a id="minimax-fast-i4-chain"></a>
+
+### FAST_I4 INT4 MoE chain per chunk
+
+**Engine:** `minimax`. **Control:** `STRIX_MOE_I4_CHAIN`, `STRIX_MOE_I4_CHAIN_GSAVE`. **Default:** ON with draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) scope `all`.
+
+The INT4 MoE prefill quantises the gate/up input once, runs gate/up as one paired grouped GEMM whose epilogue applies
+SwiGLU and the down input transform, then the down GEMM and the ordered combine. It runs once per 4096-row pipeline
+chunk, so chunk c's MoE overlaps the TP2 exchange of chunk c-1.
+
+- **Preconditions:** Draft FAST_I4 (`STRIX_MMX_MODEL_FORMAT=fast_i4`) with `STRIX_MMX_FAST_I4_SCOPE=all`; FAST_I4 itself is a lossy opt-in identity whose quality gates are pending.
+- **Exactness evidence:** Same bits as the unfused INT4 calls. 8K and 32K state, final-row and token anchors equal; ranks agree in every run.
+- **Off switch:** `STRIX_MOE_I4_CHAIN=0` (unfused calls, same bits)
+- **Measured gain:** 8K prefill 12.12 s vs 12.34 s unfused and 12.76 s vs 12.98 s (-1.7 %, both orders). 32K 55.23 s vs 55.74 s unfused (-0.9 %, mean of six n9 pairs, three in each order: -0.6 % S-first, -1.2 % X-first; single runs vary ±3 %). Gate/up keeps the free plan choice via FP32 gate save to global scratch (`STRIX_MOE_I4_CHAIN_GSAVE`, default on); the register save forced plan 1 (BM64) and cost +1.2 % at 32K. Chain GEMMs reach 31 % (8K) / 32 % (32K) of the iu4 WMMA peak.
+- **Plan policy:** one host decision for every engine (`moe_i4::chain_plan` / `launch_chain` in [moe_i4_chain.hpp](../src/core/moe_i4_chain.hpp), policy in [moe_i4_chain_plan.hpp](../src/core/moe_i4_chain_plan.hpp)): the down runs the call's plan; gate/up shares it when the engine lends gate scratch, else it stays on 64-row tiles with its own tile list. MiniMax lends the scratch by default; GLM lends it only with `STRIX_GLM_I4_CHAIN_GSAVE=1` (its register form is faster, see [toggles](toggles.md)).
+- **Implementation / evidence:** [draft FAST_I4](minimax-grouped-prefill.md#draft-fast_i4)
 
 ## GLM
 
@@ -3731,6 +3887,22 @@ Fuse exchange reduction and its dependent boundary work.
 - **Measured gain:** Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise
 - **Implementation / evidence:** [29-item resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-xfer-producer-publish"></a>
+
+### Producer exchange publish (GLM decode)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_XB_PUBLISH`. **Default:** 1.
+
+The kernel that stores the last bytes of a rank's exchanged partial (the attention output projection and the MoE down kernel) writes it straight into the exchange TX slot and raises the TX flag itself, through the shared helper `include/strix/pair/producer_publish.hpp`. The copy-and-publish launch between the producer and the post-exchange kernel is gone, and the latency-bound exchange starts at the end of the producer instead of one launch later (about 8 us per exchange in a kernel trace, 90 exchanges per token).
+
+- **Preconditions:** Pair decode and speculative verify rows on the Xfer exchange with the fused boundary (`STRIX_GLM_BOUNDARY`), fast attention and fast MoE seams. Dense FFN layers and prefill keep the copy.
+- **Automatic selection:** Unset resolves to 1. Seams that do not publish, or exchanges without a producer slot, keep the copy path.
+- **Fallback notice:** None; an output projection that does not write the whole partial in one launch is followed by one publish launch.
+- **Exactness evidence:** In-process A B A over the switch, 1K prompt: tokens, last logits and state digests identical in every run; fresh-process arms at 8K (plain and speculative): identical token digests.
+- **Off switch:** STRIX_GLM_XB_PUBLISH=0
+- **Measured gain:** GLM-5.3 TP2 USB4 plain decode, 1K, in-process A B A: 39.06 / 39.05 -> 38.42 ms/token (-1.6 %); MoE producer alone 39.05 / 39.04 -> 38.74 (-0.8 %). Fresh processes at 8K: plain 40.01 / 39.75 -> 39.33 ms/token (-1.4 %), speculative default 23.05 / 23.51 -> 22.84 ms/token (-1.9 %).
+- **Implementation / evidence:** [shared helper](../include/strix/pair/producer_publish.hpp), [exchange slot](../src/glm/xfer/glm_xfer_exchange.hpp)
+
 <a id="glm-moe-fast"></a>
 
 ### Fast raw-expert MoE
@@ -3813,12 +3985,12 @@ Grouped expert work in exact chunked prefill; calls of 128 rows or more run rout
 
 Register-blocked exact prefill linear: LDS-decoded weights reused over 64 rows, activations read with scalar loads, four outputs x eight rows per lane (X3; X2 = LDS activations over 32 rows with next-stage register prefetch).
 
-- **Preconditions:** Exact chunked prefill linears; auto takes the X3 core with eight rows per wave for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1, 2, 3 or 4 force X, X2, X3 (four rows per wave) or X3 (eight) for every call.
+- **Preconditions:** Exact chunked prefill linears; auto takes the X3 core with eight rows per wave for calls of at least 64 rows (32 when the FAST WMMA identity is selected; STRIX_GLM_PF_EXACT_X_MIN_ROWS overrides, 2048 restores the former floor) and the TM16 path below. The floor is one host-only policy (glm_pf_dense_policy.hpp) shared by the launcher, the rank CLI and the server; the server resolves its decode-first prefill chunk (--prefill-chunk, default 512 tokens = two 256-row calls on the pair) with it, grows the default chunk up to 1024 tokens when that keeps the large-call core, and prints effective serve-prefill-chunk=... with the reason whenever chunked calls decline it. 1, 2, 3 or 4 force X, X2, X3 (four rows per wave) or X3 (eight) for every call.
 - **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 0.
 - **Fallback notice:** Below the row threshold the TM16 path runs; invalid values fail. No silent numerical-identity substitution.
 - **Exactness evidence:** Bitwise: X/X2/X3 keep the TM path's DOT2 chains, fold and split order (X3 reads the wave-uniform activation pairs with scalar loads; LDS holds only decoded weights); dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
 - **Off switch:** STRIX_GLM_PF_EXACT_X=2 (previous X2 core) or 0
-- **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks
+- **Measured gain:** X3: 8K TTFT 21.42 -> 18.37 s (-14.3 %) vs STRIX_GLM_PF_EXACT_X=2 in the same run (two pairs, MoE v10 in both arms); X2 earlier: 8K 29.59 -> 27.93 s (-5.6 %) vs X=0; logits bitwise on both ranks. Row floor 2048 -> 64 (32 with FAST WMMA), pair, fresh process per arm: 1,024-token prompt exact 2.429 -> 2.055 s (-15.4 %), logits, state and tokens identical on both ranks; served 8,192-token prompt admitted while another request decodes, FAST profile: time to first token about 22.6 -> 18.56 s (362 -> 441 tok/s), every chunk call on the WMMA core (6,496 launches, none bypassed) and the same 16 tokens as the request served alone (before, the first token differed); background stream 2.03 -> 2.71 tok/s during the prefill, longest stall 1.64 -> 1.23 s. The 8K whole-prompt route is unchanged (8.93 s, same logits)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
 
 <a id="glm-pf-obar-v5"></a>
@@ -3879,7 +4051,7 @@ the v2 chain (k ascending from +0, fmaf), so the result has the same bits as v2.
 
 ### Prefill dense rows v3 (grouped projections)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS`. **Default:** 3.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS=3`. **Default:** superseded by v4 (`STRIX_GLM_PF_DENSE_ROWS=3` selects it).
 
 Up to three dense-row projections of the same input (KDA f_a / g_a / b, indexer wk / gate / weights_proj) run in one
 launch with a 128-row x 64-column tile, so x is read once per tile for all of them. Each output keeps the v2 chain
@@ -3887,12 +4059,28 @@ launch with a 128-row x 64-column tile, so x is read once per tile for all of th
 parity and keep the v2 tile.
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Unset resolves to 3; the engine default provides it; the resolver reports it. Explicit values win; values other than 1, 2 and 3 are rejected.
+- **Automatic selection:** None since v4 became the default; `STRIX_GLM_PF_DENSE_ROWS=3` selects it. Values other than 1, 2, 3 and 4 are rejected.
 - **Fallback notice:** None.
 - **Exactness evidence:** Device test v3 == v2 bitwise over every tile and the grouped production shapes (417 checks, 0 failures); logits bitwise equal on both ranks at 8K across v3 / v2 / v1.
 - **Off switch:** STRIX_GLM_PF_DENSE_ROWS=2 (v2) or 1 (v1)
 - **Measured gain:** TTFT at 8,192 tokens at parity with v2 within noise (14.29 vs 14.33 s; a second pair run 14.80 vs 14.72 s, medians of two runs; 14.49 s with v1). Grouped calls at 8192 rows: KDA 9.33 -> 6.77 ms, indexer 8.98 -> 6.62 ms; at 4096 rows 4.17 -> 2.89 ms and 4.14 -> 2.83 ms
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
+
+<a id="glm-pf-dense-rows-v4"></a>
+
+### Prefill dense rows v4 (shared pipelined FMA-rows core)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_DENSE_ROWS`, `STRIX_GLM_PF_DENSE_FORM`. **Default:** 4.
+
+The exact dense-row projections (router, KDA, indexer) run on the shared FMA-rows core (`src/core/fma_rows.hpp`): the same ascending fmaf chain per (row, output), with the global loads of the next step issued right after the barrier and held in registers while the wave runs the current FMAs from LDS, and one barrier per stage instead of two. The core picks the physical form per shape from measurements. From 4096 rows, chains of up to 128 inputs keep the activation tile resident in LDS and walk 16 column blocks per work group, and long chains use a 64-row tile (three projections per work group for grouped calls). Below 4096 rows it uses a 128-row tile (16-input stages for short chains), or a 64-row tile when the call has fewer work groups than compute units.
+
+- **Preconditions:** Exact chunked prefill; chains of at most 4096 inputs (longer chains keep the version 3 route). The opt-in `STRIX_GLM_PF_AUX_DENSE=1` lane only runs with `STRIX_GLM_PF_DENSE_ROWS=3`.
+- **Automatic selection:** Unset resolves to 4; the engine default provides it; the resolver reports it. Explicit values win. The form is automatic (rows, chain length, group size); `STRIX_GLM_PF_DENSE_FORM=1..7` forces one form where the shape admits it (1 / 2 = 128- / 64-row tile, 3 = three projections per work group, 4 / 5 / 6 = resident activations with 16 / 8 / 4 column blocks, 7 = 128-row tile with 16-input stages), 0 or unset = automatic.
+- **Fallback notice:** None.
+- **Exactness evidence:** Device test strix-hip-fma-rows-tests: every form byte-identical to v3 over ragged groups, row and column tails, F16 / BF16 / F32 weights, weight row offsets and the production shapes, guard rows untouched (388 + 424 checks on a second node with the final selection, 0 failures); two-node FAST run at 8,192 tokens: logits and state hashes equal to version 3. Exact two-node run at 8,192 tokens (one arm per run, order v3 / v4 / v4 / v3, first run discarded as a cold start): logits, state and token hashes equal in every run; prefill 12.68 and 12.69 s with v4 against 12.81 s with v3 (646 against 640 tokens/s; 3.76 / 3.88 against 3.90 / 3.98 million GPU clock cycles per token on the two nodes)
+- **Off switch:** STRIX_GLM_PF_DENSE_ROWS=3
+- **Measured gain:** Kernel fixture (one node, interleaved whole-call medians, outputs byte-identical to v3): KDA f_a + g_a + b (4096 inputs, 320 outputs) 3.17 -> 2.56 ms at 4096 rows and 7.04 -> 5.00 ms at 8192 rows; KDA f_b (128 inputs, 8192 outputs, 4096 rows) 4.09 -> 1.71 ms, g_b (4096 outputs) 2.18 -> 0.96 ms; router (4096 inputs, 288 outputs, 4096 rows) 3.03 -> 2.74 ms, at 8192 rows 6.76 -> 4.88 ms; f_b at 8192 rows 12.87 -> 3.14 ms; grouped call at 1024 rows 0.56 -> 0.37 ms and at 256 rows 0.38 -> 0.15 ms. End to end: the two-node FAST run at 8,192 tokens gives the same logits and state hashes with version 4 (that path only runs the router and indexer projections here, so no TTFT change is claimed); the exact-mode end-to-end run is pending, which is why the default stays 3
+- **Implementation / evidence:** [shared core](../src/core/fma_rows.hpp), [adapter](../src/glm/prefill/glm_prefill.hip), [device test](../tests/hip_fma_rows_tests.hip)
 
 <a id="glm-pf-dense-rows-v2"></a>
 
@@ -4212,7 +4400,127 @@ exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select ot
 - **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
 - **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
-- **Implementation / evidence:** [core](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
+- **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
+
+<a id="glm-pf-wmma-live-fragments"></a>
+
+### Folded F16 WMMA core: skip row fragments that hold no row
+
+**Engine:** `glm` (shared core `moe_core::folded_f16`). **Control:** `STRIX_GLM_PF_WMMA_LIVE_FRAG`. **Default:** on wherever the FAST WMMA prefill cores run.
+
+The folded F16 core (FP16 trellis weights x FP16 rows, K in 64-wide stages, one LDS stage, H128 epilogue) now lives once in
+`src/moe_core/grouped_f16.hpp` with decode, fold, input and output traits; GLM binds its trellis decode and policies.
+A ragged tile runs on the smallest row class that covers it (64 rows for 33-64, 128 rows for 65-128), so up to three
+16-row fragments per wave hold no row. Their WMMA chains computed values that were never stored. The core now counts
+the live fragments once per tile (wave-uniform) and skips the chains of the dead ones. Full tiles keep the branch-free
+loop; only a wave with a dead fragment takes the predicated loop.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` (FAST prefill). Applies to routed MoE groups, the shared expert's last slice and the last tile of a dense call.
+- **Exactness evidence:** Bitwise to the glm-pf-wmma-x identity: live fragments keep every operand and the order of their chain; skipped accumulators stay +0 and are never stored. `hip_glm_pf_wmma_tests`: the form with all fragments computed equals the default on every buffer for group sizes 1-64, the 64/65/127/128/129/192/193/255/256/257/1100 edges, uniform classes of 33-112 rows per expert and lognormal routing (MoE 828 checks, dense 480 checks). Pair 8K: logits, state and token hashes equal the previous binary.
+- **Off switch:** `STRIX_GLM_PF_WMMA_LIVE_FRAG=0` (computes every fragment, same bits)
+- **Measured gain:** Whole MoE call on one node, every expert holding the same number of rows, skip vs all fragments: 33 rows 18.91 vs 21.23 ms (-11 %), 48: -11 %, 65: 29.03 vs 35.48 ms (-18 %), 80: -21 %, 96: -10 %, 112: -4 %. Lognormal routing: 2048 rows 26.80 vs 27.51 ms (-2.6 %), 4096 rows 48.62 vs 50.10 ms (-3.0 %); full tiles are unchanged (all-fragments form equals the previous binary within run noise).
+- **Resources:** no kernel gains a register spill; the 128-row gate/up kernel uses 238 VGPR (239 before), occupancy and LDS bytes are unchanged.
+- **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [test](../tests/hip_glm_pf_wmma_tests.hip)
+
+<a id="glm-pf-kda-wmma"></a>
+
+### FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_WMMA`. **Default:** on in FAST prefill (`STRIX_GLM_PF_WMMA=1`); off in exact mode.
+
+The five plain FP16 projections of a KDA layer in the chunked prefill (f_a, g_a and b of the layer input in one
+grouped call, then f_b and g_b) run on the shared dense FP16 WMMA core (`src/core/f16_dense_tall.hpp`, GLM adapter
+`src/glm/prefill/glm_pf_kda_wmma.hpp`) instead of the exact FP32 fma chains of `dense_rows`. One work-group covers
+128 rows x 256 outputs: each wave converts its 16 rows to FP16 in registers (the only in-loop VALU work, 16
+conversions per 16 WMMAs) and reads the weight fragments from LDS, where the work-group stages each 64-wide k stage
+once. Kernels: 194 / 224 VGPRs, no spills, 36,864 bytes of LDS, occupancy 6. The router and the indexer projections
+stay on the exact kernels: they select experts and tokens, where a flip is not a rounding error.
+
+- **Preconditions:** FP16 weights, every width a multiple of 16, input width a multiple of 128; other shapes keep the exact kernels.
+- **Exactness:** FAST identity (FP16-rounded activations, WMMA FP32 accumulation); kernel gate: against the FP64 value of the contract rel-L2 <= 8.0e-7, against the exact chains rel-L2 <= 2.3e-4 (297 checks); teacher-forced 3 x 256 positions at 8K against FAST without it: KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change -0.006 / +0.001 / +0.002 (chat / code / json); the exact route, or 0 with FAST, keeps the previous bytes.
+- **Measured:** Pair FAST prefill 8K 9.25 -> 9.05 s (-2.1 %, 2 ABAB pairs: 9.258 / 9.245 vs 9.034 / 9.073); 32K 37.74 -> 37.13 s (-1.6 %; off 37.705 / 37.771, on 36.990 / 37.280 / 37.105; one run of each arm at 41-43 s discarded as a disturbed run); kernels at 4096 rows: f_a + g_a + b 3.06 -> 1.71 ms, f_b / g_b (8192 outputs) 4.06 -> 2.03 ms.
+- **Off switch:** `STRIX_GLM_PF_KDA_WMMA=0` (or exact mode). `=1` forces it; both ranks of a pair must resolve the same value (checked by the startup agreement).
+
+<a id="f16-dense-epilogue-tail"></a>
+
+### Dense FP16 core: store policy, sized remainder launch, idle-wave skip (f16-dense-epilogue-tail)
+
+**Engine:** shared core (`src/core/f16_dense_tall.hpp`); users: vision encoder linears, GLM FAST KDA projections.
+**Controls:** `STRIX_F16_DENSE_TAIL`, `STRIX_VISION_GEMM_EPILOGUE`. **Default:** both on (bit-identical to off).
+
+Three changes to the shared dense FP16 WMMA core, built once and adopted by both users:
+
+1. **Store policy.** The core takes a `Store` (default `RawStore`: `y[r][c] = sum`). An adapter's policy applies its
+   epilogue in the same store. The vision GEMM uses it to finish the linear in place ((high + low) * scale + bias,
+   + residual, non-finite report), so the separate sum and affine kernels are no longer launched. Same operations in
+   the same order, no FMA contraction: the bytes do not change.
+2. **Sized remainder launch.** Outputs beyond the 16-tile columns used to run in 4-tile columns with the full
+   36,864-byte LDS block. LDS is now `Storage<TC>` (2,304 bytes per column tile) and `plan(tiles, rows)` picks 1-, 2-
+   or 4-tile columns from the measured rule: remainder of 1-2 tiles -> 1-tile columns; up to 256 rows -> 2-tile
+   columns; above that 2-tile columns up to 5 tiles and 4-tile columns from 6. An 8-tile width is not offered: it
+   compiles to 256 VGPRs with 120+ spills.
+3. **Idle-wave skip.** A row wave with no live row keeps its staging and barrier duties. After the initial row-0
+   fragment load, it skips subsequent row loads and all WMMAs.
+
+| kernel | VGPRs | spills | occupancy | LDS bytes | WMMAs |
+|---|---|---|---|---|---|
+| 16-tile, before | 192 | 0 | 6 | 36,864 | 128 |
+| 4-tile, before | 224 | 0 | 6 | 36,864 | 32 |
+| 16-tile | 193 | 0 | 6 | 36,864 | 128 |
+| 4-tile | 249 | 0 | 5 | 9,216 | 32 |
+| 2-tile | 193 | 0 | 7 | 4,608 | 16 |
+| 1-tile | 153 | 0 | 9 | 2,304 | 8 |
+
+- **Preconditions:** none beyond the core's own (FP16 weights, widths multiples of 16).
+- **Exactness checks:** The core fixture compares 25 shapes and all 15 remainders, every column width and skip on/off, against an independent CPU reference using exactly representable bounded inputs, with live-write and padding checks. This does not establish general equivalence to the previous header. Vision tail linears compare all output bytes to a separately saved OFF arm: run `strix-vision-encoder-hip-tests --bench-save-reference linear-off.bin` with both switches OFF, then restart with the desired switches and run `--bench linear-off.bin`. Numeric-error reporting and large-tower repeatability are mandatory. The revised gates still require native execution. Earlier reported vision (6 towers) and GLM KDA (66 cases) before/after/OFF hashes are historical evidence, not results of these revised gates.
+- **Performance scope:** The tail heuristic is measured at input width 1024. Performance at other admitted widths remains unmeasured; this is not a numerical-divergence finding.
+- **Measured (kernel, input width 1024, ms per call):** 129 x 272: 0.0675 -> 0.0636; 129 x 16: 0.0147 -> 0.0091; 129 x 208: 0.0157 -> 0.0123; 1 x 16: 0.0141 -> 0.0065; 1024 x 48: 0.0219 -> 0.0201; shapes with no remainder (n = 1024) and 1024 x 208 are unchanged (+-1 %).
+- **Measured (forward):** 32-layer width-1024 encoder tower, 1,521 rows (every width a multiple of 256, so no remainder launch): median 110.85 / 110.89 -> 110.83 / 110.66 ms (2 ABAB pairs, parity; mean GPU clock 1.12 GHz in both arms, about 124 M GPU clocks per forward). The fused epilogue removes the sum and affine launches without a measurable time change at this size; the store mode is selected once per wave (a per-element mode test cost 5 % of this forward).
+- **Off switch:** `STRIX_F16_DENSE_TAIL=0` (4-tile remainder, no skip), `STRIX_VISION_GEMM_EPILOGUE=0` (GEMM + sum + affine kernels).
+
+<a id="glm-pf-attn-wmma"></a>
+
+### FAST fused MLA/DSA attention core (glm-pf-attn-wmma)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_ATTN_WMMA`. **Default:** on in FAST prefill (`STRIX_GLM_PF_WMMA=1`); off in exact mode.
+
+The prefill MLA/DSA attention (scores, softmax, o-bar over each row's DSA top-k list) runs as one flash kernel on the
+shared sparse core (`src/attn_core/sparse_flash_wmma.hpp`, helpers in `src/attn_core/flash_tile.hpp`) instead of the
+exact scores / softmax / o-bar kernels: one work-group per row, 8 waves = 2 head tiles x 4 latent quarters, bf16
+WMMA for both products, FP32 online softmax (exp2, operand-rounded probabilities in the sum), no score matrix in
+memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA version measured slower and was removed).
+`STRIX_GLM_PF_ATTN_WMMA_T=32` selects 32-key blocks (default 16).
+
+- **Preconditions:** 32 MLA heads per rank (TP2); other head counts keep the exact kernels.
+- **Automatic selection:** follows the FAST prefill switch: unset means on with `STRIX_GLM_PF_WMMA=1` (including `strix-glm5-rank --profile fast`) and off without it, so exact mode keeps its bytes.
+- **Fallback notice:** each rank prints `prefill identity glm-pf-attn-wmma FAST (... T 16, calls N)` only when the fused core ran. Two ranks: the switch is part of the startup agreement (bit 14); modes without the decode handshake refuse it.
+- **Exactness evidence:** FAST identity. Synthetic: fused vs FP64 row/head rel-L2 mean 1.8e-3, worst 2.7e-3 (GLM shape and MiniMax MSA shape, hip_attn_core_sparse_tests); layer bench o-bar / MLA output vs exact rel-L2 1.9e-3 (cos 0.999998). Pair 8K, exact mode: logits equal the anchors on both ranks (`032dde66` / `4c0cb0a3`); FAST with `STRIX_GLM_PF_ATTN_WMMA=0` equals the previous FAST logits (`6f8f5af9` / `07df33f4`). Pair, against FAST without the core: prefill-logits KL 7.8e-4 nats (8K) and below 1e-5 (32K), 8 same-context decode steps mean KL 1.3e-3 (max 6.6e-3), top-1 8/8, greedy equal over 8 tokens. Teacher-forced 3 prompts x 256 positions: pending.
+- **Off switch:** STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)
+- **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
+- **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
+
+<a id="mm-pf-msa-flash"></a>
+
+### FAST key-split MSA attention core (mm-pf-msa-flash)
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_FLASH` (0 | 1 | 2), `STRIX_MM_PF_MSA_FLASH_LAYERS`. **Default:** off (opt-in FAST identity); when on, layers 40-59.
+
+The prefill MSA attention of a (row, KV group) - 16 query heads over the row's selected 128-key blocks - runs as one
+flash kernel on the shared key-split core (`src/attn_core/sparse_flash_keysplit.hpp`) instead of the exact in-block
+kernel (mode 10): one work-group = 4 waves, each wave owns every fourth 16-key tile and runs a complete flash step on
+it (bf16 WMMA QK straight from the key rows, FP32 online softmax inside the wave, bf16 WMMA PV from a wave-private
+transposed value tile), with no barrier in the key loop; the four per-wave states are merged once per row. Selection,
+block lists and the K/V caches are the exact path's. Value 1 rounds queries and probabilities to bf16 (16 WMMA per
+tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding 2^-17 instead of 2^-9).
+
+- **Preconditions:** prefill windows of more than 8 rows with the in-block MSA mode active (`STRIX_MM_PF_MSA_REWORK` not 0); other windows keep the exact kernel.
+- **Automatic selection:** per layer when enabled: layers 40-59 use the flash core, the others the exact kernel. `STRIX_MM_PF_MSA_FLASH_LAYERS` (layer-set grammar, e.g. `30-59`) changes the layers. Unset, every layer keeps the exact kernel, so exact mode keeps its bytes. It is not a default of the FAST_I4 format: there the same layer set changes the output more than the gate allows (see evidence).
+- **Why per layer:** the kernel is accurate (see evidence), but any non-identical attention output changes the top-16 block selection of some later rows, and that divergence grows with the number of layers downstream. On 8K prompts the full depth fails the FAST gate with either operand form, layers 20-59 fail, layers 40-59 pass with both forms on the EXL3 format. With the FAST_I4 format the INT4 MoE layers (38-59) amplify the same change: layers 40-59, 50-59 and 55-59 all fail against the FAST_I4 run.
+- **Fallback notice:** each rank prints `prefill identity mm-pf-msa-flash FAST (..., N-term operands, L layers)` when it is on.
+- **Exactness evidence:** FAST identity. Device unit (flash vs exact in-block kernel, same caches and selections, dense rows, dense/sparse boundary, sparse rows, masked last block, single-tile rows): row/head rel-L2 max 2.4e-3 (value 1), 4.2e-6 (value 2); all-equal scores 1e-7; one dominant key 8.6e-3 / 1.3e-5. Pair 8K chat prose / code / data, last 256 rows each, both ranks, against the exact run (pooled KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01): value 2 on layer 59 only KL 0.00000, top-1 100 %; layers 40-59 KL 0.0013, top-1 99.7 %, dNLL -0.003 (pass; value 1 on the same layers: KL 0.0012, top-1 99.7 %, dNLL +0.0004, pass); layers 20-59 KL 0.110 (fail); all layers KL 0.589 (value 2) / 0.697 (value 1) (fail). FAST_I4 format, value 1, against the FAST_I4 run: layers 40-59 KL 0.079, top-1 92.7 % (fail); layers 50-59 KL 0.046, top-1 94.5 %, dNLL +0.039 (fail); layers 55-59 KL 0.011, top-1 96.6 %, dNLL +0.013 (fail on dNLL); against the exact run the 40-59 arm is KL 0.084, top-1 92.1 % where FAST_I4 alone is KL 0.099, top-1 90.6 % (same 8K prompts).
+- **Off switch:** STRIX_MM_PF_MSA_FLASH=0 (or exact mode)
+- **Measured gain:** Device unit, 4,096 rows at the 8K position, whole prefill attention call (prep + index + selection + attend), all layers on the flash core: 33.9 -> 16.6 ms (value 1), 23.0 ms (value 2). Pair, FAST_I4 format, layers 40-59, one fresh process per arm, both orders (state hashes repeat per arm): 8K TTFT 12.289 / 12.281 s -> 11.703 / 11.637 s (value 1, -5.0 %), 11.865 / 11.819 s (value 2, -3.6 %); 32K 49.867 / 49.927 s -> 46.270 / 47.440 s (value 1, -6.1 %). Resources (gfx1151): value 1 206 VGPR, 5 waves per SIMD, 25,088 B LDS; value 2 219 VGPR, 4 waves, 29,184 B; no spills, no barrier in the key loop.
+- **Implementation / evidence:** [core](../src/attn_core/sparse_flash_keysplit.hpp), [softmax step](../src/attn_core/online_softmax.hpp), [MiniMax policy](../src/minimax/attn/msa_flash_policy.hpp), [launch](../src/minimax/attn/msa_fused.hip), [test](../src/minimax/attn/msa_fused_tests.hip)
 
 <a id="glm-serve-g2"></a>
 
@@ -4351,7 +4659,8 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 | `MLA_GEMM` | 3, 2, 1 | 3 |
 | `SCORES` | 7, 6, 5, 4, 3, 2 | 7 |
 | `KDA_SCAN` | 5, 3, 1 | 5 |
-| `DENSE_ROWS` | 3, 2, 1 | 3 |
+| `DENSE_ROWS` | 4, 3, 2, 1 | 4 |
+| `DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (physical form of `DENSE_ROWS=4`; 0 = automatic per shape) | 0 |
 
 - **Preconditions:** Any set value, empty included, must be in the allowed list.
 - **Fallback notice:** None; an unknown or empty value throws `ENV='v' is not a known variant (allowed: ...; unset = D)`.
@@ -4359,6 +4668,65 @@ The load admits the first prefill memory plan that fits, in this order: full scr
 - **Off switch:** Set the variable to an older allowed value.
 - **Measured gain:** Not stated here.
 - **Implementation / evidence:** [variants](../src/glm/prefill/glm_pf_variants.hpp)
+
+<a id="glm-idx-wmma"></a>
+
+### Indexer scores on WMMA: exact selection by default, FAST modes opt-in (glm-idx-wmma)
+
+**Engine:** `glm`. **Control:** `STRIX_IDX_WMMA`. **Default:** ON (`exact`, same selected pools as the exact kernels); `=0` runs the exact v3 kernel alone; `=f16` / `=1` / `bf16` are opt-in FAST identities.
+
+The prefill DSA indexer scores (per row: ReLU of the 32 head dots times the head weight, summed over heads, for every
+pooled key) run on the shared indexer score core (`src/attn_core/index_score_wmma.hpp`, tile helpers in
+`src/attn_core/wmma_types.hpp` / `wmma_frag.hpp`) instead of the exact v3 kernel: 128 query vectors per work-group
+in registers, 128-key tiles in a swizzled LDS tile, 16x16x16 WMMA with FP32 accumulation, head-sum epilogue in
+registers. Both operands (FP32 queries and pooled keys) are rounded to the operand type: `STRIX_IDX_WMMA=f16` (the
+measured setting: faster and closer) or `=1` / `bf16`. The top-k selection kernels are unchanged.
+`STRIX_IDX_WMMA_AUDIT=1` rescores every call with the exact kernel and prints the per-row top-512 recall
+(diagnostic, synchronous, slow).
+
+**Exact mode (default).** The scores come from the FP16 WMMA kernel; a second kernel (`idx_refine_rows_kernel`) then
+brackets the cut-off of each row (the 512th largest key, three histogram passes), bounds the row's score error by
+`delta = sum_h |w_h| * f16_dot_error(|q_h|, max_p |k_p|) / sqrt(128)` (operand rounding 2^-11 per operand plus an
+accumulation allowance, `src/attn_core/index_score_band.hpp`) and recomputes every pool within `2 delta` of the
+cut-off with the dot and head chains of the exact v3 kernel. By the band rule the unchanged selection and window-merge
+kernels then return the pool lists of the exact path, ties included. With several pool windows the retained
+candidates are rescored through their pool ids; when the pools are staged one window at a time, a row that still
+has windows to come rescores everything at or above the cut-off band, so the keys it retains are exact values. A row
+whose bound is not finite (operand outside the FP16 range, non-finite input) rescores all of its pools. The key
+buffer holds WMMA values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA=0`.
+
+- **Preconditions:** prefill indexer rows with more pools than the always-kept set (shorter rows keep the exact path); the `--tf` scoring path does not use it.
+- **Automatic selection:** exact mode always, unless `STRIX_IDX_WMMA` is set. The FAST modes are opt-in.
+- **Fallback notice:** exact mode: none (same identity, agreement value 0 like `STRIX_IDX_WMMA=0`). FAST modes: each rank prints `prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=...)`; two ranks: the mode is part of the startup agreement (config bits 15-16); modes without the decode handshake refuse it. GLM takes 0, 1, bf16, f16 or exact; other values fail closed.
+- **Exactness evidence:** FAST identity. Synthetic (strix-hip-idx-wmma-glm-tests): pool recall@512 f16 0.99988 / bf16 0.9991, score rel-L2 f16 1.9e-4 / bf16 1.5e-3. Pair 8K FAST prefill (PF_WMMA=1 config), f16: in-engine recall@512 0.99974 (min 0.9941), prefill-logits KL 0.00052, 64 same-context decode steps KL mean 0.0021 (max 0.036), top-1 100 %, greedy 64/64 ids identical; bf16: KL 0.0011, top-1 98.1 %, greedy diverges at step 51. FAST gate, `f16` against `STRIX_IDX_WMMA=0` inside the FAST prefill profile (four prompts of 8.2K to 9.3K tokens where the indexer acts, teacher-forced logits of the last 512 rows each, 2048 rows): pooled KL 0.0068 (per prompt 0.0186 / 0.0041 / 0.0008 / 0.0037), top-1 agreement 97.8 %, dNLL 0.0000; reference NLL 0.88 / 0.26 / 0.008 / 1.00 nats per token. It passes KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01, but `f16` stays opt-in: against the exact default it is not measurably faster (8K last repetition 8.542 / 8.532 s against 8.529 to 8.563 s), and its composition with the FAST profile against the exact engine has no receipt of its own. **Exact mode:** exact identity. Kernel test: token lists equal to the v3 path entry for entry at six shapes (single window, several windows, windows staged one at a time; 300 to 2048 rows, up to 30720 positions). Pair prefill 8K, exact profile: logits, state and decoded tokens equal on both ranks against `STRIX_IDX_WMMA=0`, and the teacher-forced logits of the last 512 rows are byte-identical on both ranks. Pair FAST-profile prefill at 8K, 20K and 32K: logits and state hashes equal on both ranks. In-engine audit (8K, 22 calls, 67.5K rows): top-512 recall 1.00000 on every row; 11.0 % of the scores are rescored.
+- **Off switch:** `STRIX_IDX_WMMA=0` (nothing from the core runs: the exact v3 kernel alone).
+- **Measured gain:** Kernel (gfx1151): 4096 x 2048 rows exact v3 2.05 ms -> f16 1.14 ms (1.80x), bf16 1.51 ms; 28672 x 2048 13.9 -> 8.3 ms (1.67x). Pair 8K FAST, f16, fresh process per arm, 2 ABAB pairs: 11.32 -> 11.13 s (-0.19 s, -1.7 %). 32K: 2 pairs -5.24 / +0.80 s, not resolved (arm spread larger than the effect). **Exact mode:** kernel (gfx1151): 4096 x 2048 rows 2.02 -> 1.70 ms (1.19x), 28672 x 2048 rows 13.70 -> 9.87 ms (1.39x; windows staged one at a time 13.76 -> 10.10 ms, 1.36x). Pair FAST-profile prefill 8K, three prefills per process, last repetition: 8.568 / 8.567 / 8.555 s with `=0`, 8.529 / 8.530 / 8.563 / 8.544 s by default (-0.02 s, -0.25 %). 32K, fresh process per cell: 35.80 to 36.75 s with `=0` (4 cells), 35.41 to 36.76 s by default (3 cells): not resolved, the cell spread is larger than the effect (the indexer is about 1.3 s of the 32K prefill).
+- **MiniMax:** the same core scores the MiniMax MSA prefill index; see [exact index selection through WMMA scores](#minimax-idx-wmma-exact) (default, exact) and its FAST modes.
+- **Implementation / evidence:** [core](../src/attn_core/index_score_wmma.hpp), [mode](../src/attn_core/index_score_mode.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [startup agreement](../apps/glm_rank_startup.hpp), [test](../tests/hip_idx_wmma_tests.hip)
+
+<a id="minimax-idx-wmma-exact"></a>
+
+### Exact index selection through WMMA scores (minimax-idx-wmma-exact)
+
+**Engine:** `minimax`. **Control:** `STRIX_IDX_WMMA`. **Default:** ON (`exact`); `STRIX_IDX_WMMA=0` runs the VALU index kernels.
+
+The MSA prefill index picks, per row and index head, the 15 best 128-position blocks before the newest one. The
+default path scores every block on the shared WMMA index core (`src/attn_core/index_score_wmma.hpp`) with the query
+split into a BF16 value plus the BF16 rounding of its FP32 residual (two WMMA terms per dot, the BF16 keys are the
+cache bits), which bounds the score error by `delta = 2^-13 * |q| * |k| * scale`. A second kernel then finds the
+cut-off of each selection and rescores only the blocks within `2 delta` of it with the arithmetic of the VALU kernel
+(same per-dot FMA order, same maximum). By the band rule in `src/attn_core/index_score_band.hpp` the unchanged
+selection kernel then returns exactly the set of the VALU path, ties included. The score buffer itself holds WMMA
+values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA=0`.
+
+- **Preconditions:** prefill rows with more than 16 blocks (shorter rows select every block and skip the index).
+- **Automatic selection:** always, unless `STRIX_IDX_WMMA` is set.
+- **Fallback notice:** none (same identity). `STRIX_IDX_WMMA_AUDIT=1` rescores every call with the VALU kernel and prints the per-row selection recall (diagnostic, synchronous, slow).
+- **Exactness evidence:** exact identity. Kernel test (strix-hip-idx-wmma-mm-tests): every (row, head) selection equals the VALU selection at 2K, 8K and 32K positions, score error at most 1.8e-5 against a bound of 2 delta. Pair prefill, in-engine audit over 2.2M (row, head, layer) selections on three 8K prompts: recall 1.00000, minimum 1.0000; state, final-row and result hashes equal to the `STRIX_IDX_WMMA=0` run on all three, and equal to the published 8K and 32K anchors in every timing cell.
+- **Off switch:** `STRIX_IDX_WMMA=0`.
+- **Measured gain:** index kernel (gfx1151, 4096 rows x 2 heads): at 8K positions 4.86 -> 1.66 ms (2.9x), at 32K positions 25.6 -> 5.45 ms (4.7x). Pair prefill TTFT 32K, fresh process per cell, 4 pairs in both orders: 57.66 -> 52.62 s (-5.04 s, -8.7 %; pairs -5.24 / -5.06 / -4.84 / -5.01). 8K: 6 pairs, median pair -0.07 s, not resolved (cell spread 12.8-15.9 s).
+- **FAST modes (opt-in, not qualified):** `STRIX_IDX_WMMA=bf16x2` (split query without the rescoring) and `=1` / `bf16` (rounded query) change a few selections (flip rate below 5e-6 and 6e-4) and fail the FAST gate on chat-wrapped prose / code / data at 8K: pooled KL 0.47 / 0.69 (limit 0.02), top-1 agreement 87.6 % / 85.9 % (limit 93 %). They stay switches for measurements only.
+- **Implementation / evidence:** [core](../src/attn_core/index_score_wmma.hpp), [band rule](../src/attn_core/index_score_band.hpp), [mode](../src/attn_core/index_score_mode.hpp), [MiniMax policy and rescoring kernel](../src/minimax/attn/msa_fused.hip), [test](../tests/hip_idx_wmma_tests.hip)
 
 ## Qwen RTX PRO standalone
 
@@ -4398,6 +4766,45 @@ by the IOMMU.
 - **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
 - **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within +/-1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
+
+<a id="platform-power-receipt"></a>
+
+### Shared power and energy receipt
+
+**Engine:** platform. **Control:** `STRIX_POWER_SAMPLER`. **Default:** ON when a power source is readable.
+
+One host sampler thread reads what the machine exposes without elevated rights (amdgpu hwmon power, clock and
+temperature; the powercap package energy counter when readable; cpufreq) and every engine reports the same block,
+`strix-power-receipt-v1`: `energy_j`, `avg_w`, `peak_w` and `tok_per_j` for prefill and decode, the median GPU
+clock, the maximum temperature, the sample count and the sources used. The energy is computed per domain
+(package, accelerator, system) and the receipt names what it covers (`coverage`) and whether the window is fully
+measured (`complete`, `covered_ms`); nothing is extended over a failed read or past the ring. See
+[engine/power-receipt.md](engine/power-receipt.md).
+
+- **Preconditions:** A readable source. A missing or unreadable source is reported as unavailable with the reason; the run continues.
+- **Automatic selection:** Started by the device gate and by the HTTP server; an engine adds nothing.
+- **Fallback notice:** `"available":false` with the reason per source in the receipt block; `"complete":false` with `covered_ms` when only part of the window was measured.
+- **Exactness evidence:** Host-only measurement: no device call, no arithmetic. Qwen 8K prefill, sampler on vs off: logits file and generated tokens byte-identical.
+- **Measured:** Measurement, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, sampler on/off interleaved (ABAB): 1,755.9 / 1,744.5 tok/s on vs 1,752.9 / 1,733.5 off (no slowdown), logits and tokens identical. First receipts: prefill 577-588 J, 123.5-125.4 W mean, 150-152 W peak, 13.9-14.2 tok/J, median GPU clock 2,512-2,524 MHz, 84-92 C; serial greedy decode 128 tokens: 544 J, 95.7 W mean, 0.235 tok/J, 2,873 MHz.
+- **Off switch:** `STRIX_POWER_SAMPLER=0`.
+
+<a id="platform-route-receipt"></a>
+
+### Shared route receipt
+
+**Engine:** platform. **Control:** `STRIX_ROUTE_RECEIPT`. **Default:** ON.
+
+One shared block, `strix-route-receipt-v1`, says which kernel family actually ran each product (launches and rows),
+which levers were requested and which took effect, and the reason code of every decline or bypass. The two ranks of
+a pair compare a fingerprint of the numerical levers at start-up and refuse to run on different routes. See
+[engine/route-receipt.md](engine/route-receipt.md).
+
+- **Preconditions:** None. Family lines exist where an engine has launch-site hooks (MiniMax MoE prefill per layer, GLM dense prefill); every engine reports its levers and the explicitly set switches.
+- **Automatic selection:** Armed by the device gate; the server adds the request window and the status view.
+- **Fallback notice:** A bypass line (product, wanted family, reason, calls, rows) in the block; a fingerprint that differs between the ranks is a start-up error.
+- **Exactness evidence:** Host-only counters: no device call, no arithmetic. Qwen 8K prefill, receipt on vs off: logits file and generated tokens byte-identical in all four runs.
+- **Measured:** Observability, not a speed lever. Qwen 8K real-text prefill, one node, default exact route, receipt on/off interleaved (ABAB): 1,768.7 / 1,772.0 tok/s on vs 1,771.1 / 1,769.2 off. Qwen has no launch-site hooks, so this workload does not qualify counter overhead on instrumented MiniMax or GLM paths; that native measurement remains open.
+- **Off switch:** `STRIX_ROUTE_RECEIPT=0` (counters and printed block; the rank comparison stays).
 
 <a id="qwen-moe-route-bf16"></a>
 
@@ -4450,16 +4857,37 @@ Weights, activations and route weights retain their existing arithmetic.
   covers both down formats, all three tunes, scalar/vector tails, top-k ten, padded tails, RNE ties, subnormals,
   infinities, NaNs, OFF byte equality and both merge/commit branches.
 
-## HC normalized recompute candidate
+## HC normalized recompute
 
-`STRIX_QPF2K_HC_RECOMPUTE_NORM=1` removes FP32 normalized image stores at
-eligible qpf2k HC sites, using the exact inverse already computed in the existing
-producer. Consumers reconstruct values through the same two pinned multiplies.
-Folds, prefetched projection, OUT16 and output3/lowband remain eligible; no launch
-is added. Numerical identity is unchanged. OFF: `=0`; restart. The default remains
-OFF until native equality and interleaved timing establish that ON is not slower.
-Unsupported sites retain the image. At T16384 the net reduction in materialized
-stores is 639.75 MiB/site; allocation reservations are unchanged. No speed claim.
+**Default ON with the WMMA HC output (OUT16).** At eligible qpf2k HC sites the folded inject + norm stores only the
+four stream inverses of each row. The projection and the output rebuild every normalized value with the same two
+pinned multiplies, so the FP32 normalized image (40 KB per row) is neither written nor read. Numerical identity is
+unchanged: every written byte is equal, and the logits are identical at 8K and 32K.
+
+Three parts make the route faster than the image:
+
+- **Full-width projection** (`STRIX_QPF2K_HC_PROJ_TILE`, default 64 rows per block; 32 and 16 selectable, 0 selects
+  the five-column-block form). One block owns 64 rows and all 320 low outputs, so each normalized value is formed
+  once instead of once per column block.
+- **Output epilogue.** The stream loads of a block are issued before the first pinned multiply. Interleaved with
+  the pinned multiplies, each load was waited for alone.
+- **Stream mirror.** Stream rows whose pitch is a multiple of 4096 bytes alias when a block reads many rows at the
+  same column, which is what both consumers do. For such rows the folded inject + norm also stores the stream row
+  into the unused first half of the row in the normalized workspace (pitch 42240 bytes), and the consumers read
+  that copy. Sites without the fold keep the image.
+
+Measured on one node, HC step of 8,192 rows (inject + norm, projection, output):
+
+| stream row pitch | image | recompute | change |
+|---|---|---|---|
+| 20480 bytes (the engine's rows, mirrored) | 8.29 ms | 7.19 ms | -13 % |
+| 20608 bytes (non-aliasing, no mirror) | 8.33 ms | 6.12 ms | -27 % |
+| 20480 bytes without the mirror | 8.28 ms | 10.49 ms | +27 % |
+
+End to end, same binary with the route off and on: 8K prefill -2.3 %, 32K prefill -2.1 %.
+
+OFF: `STRIX_QPF2K_HC_RECOMPUTE_NORM=0`; restart. `=1` also admits the route with the lane-chain output forms, which
+were not measured and therefore keep the image by default. Unsupported sites retain the image.
 See [admission, lifetime, resources and the native ticket](engine/prefill/hc-normalized-recompute.md).
 
 ## HC low-band layout

@@ -5,19 +5,53 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/http_server.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define MSG_NOSIGNAL 0
+#else
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <atomic>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <netinet/in.h>
 #include <regex>
 #include <set>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 
 namespace {
+#ifdef _WIN32
+using TestSocket = SOCKET;
+constexpr TestSocket invalid_socket = INVALID_SOCKET;
+void close_socket(TestSocket fd) { (void)::closesocket(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,int size) {
+    return ::setsockopt(fd,level,option,static_cast<const char*>(value),size);
+}
+struct SocketRuntime {
+    SocketRuntime() { WSADATA data{}; if (WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Winsock initialization failed"); }
+    ~SocketRuntime() { WSACleanup(); }
+};
+#else
+using TestSocket = int;
+constexpr TestSocket invalid_socket = -1;
+void close_socket(TestSocket fd) { (void)::close(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,socklen_t size) {
+    return ::setsockopt(fd,level,option,value,size);
+}
+struct SocketRuntime {};
+#endif
+[[maybe_unused]] void set_receive_timeout(TestSocket fd,unsigned seconds) {
+#ifdef _WIN32
+    const DWORD timeout=seconds*1000;
+#else
+    timeval timeout{};timeout.tv_sec=seconds;
+#endif
+    (void)socket_option(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+}
 using namespace strix::serve;
 int failures = 0;
 void check(bool ok, const std::string& what) {
@@ -82,13 +116,13 @@ const Json& at(const Json& json, std::string_view key) {
     throw std::runtime_error("missing key " + std::string(key) + " in " + json.dump());
 }
 struct Reply { int status = 0; std::string headers, body; };
-int connect_to(std::uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+TestSocket connect_to(std::uint16_t port) {
+    const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { ::close(fd); return -1; }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { close_socket(fd); return invalid_socket; }
     return fd;
 }
 std::string request_text(const std::string& method, const std::string& path, const std::string& body, const std::string& extra, bool close) {
@@ -114,8 +148,8 @@ Reply parse_reply(const std::string& raw) {
     return out;
 }
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body = {}, const std::string& extra = {}) {
-    const int fd = connect_to(port);
-    if (fd < 0) return {};
+    const TestSocket fd = connect_to(port);
+    if (fd == invalid_socket) return {};
     const auto request = request_text(method, path, body, extra, true);
     (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
     std::string raw;
@@ -125,14 +159,14 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         if (n <= 0) break;
         raw.append(buffer, static_cast<std::size_t>(n));
     }
-    ::close(fd);
+    close_socket(fd);
     return parse_reply(raw);
 }
 // Requests on one keep-alive connection (the server answers them on the same thread), Content-Length replies; the
 // last one closes the connection.
 std::vector<Reply> http_sequence(std::uint16_t port, const std::string& path, const std::string& body, const std::vector<std::string>& extras) {
-    const int fd = connect_to(port);
-    if (fd < 0) return {};
+    const TestSocket fd = connect_to(port);
+    if (fd == invalid_socket) return {};
     std::vector<Reply> out;
     std::string raw;
     char buffer[4096];
@@ -160,7 +194,7 @@ std::vector<Reply> http_sequence(std::uint16_t port, const std::string& path, co
         (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
         out.push_back(read_one());
     }
-    ::close(fd);
+    close_socket(fd);
     return out;
 }
 std::string header_value(const Reply& r, const std::string& name) {
@@ -275,6 +309,7 @@ double wait_armed(bool armed, double limit) {
 }  // namespace
 
 int main() try {
+    [[maybe_unused]] SocketRuntime sockets;
     const auto tokenizer = tiny_tokenizer();
     FixedEngine engine(tokenizer);
     GenerationQueue queue;

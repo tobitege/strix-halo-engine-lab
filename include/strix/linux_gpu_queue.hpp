@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/linux_direct_gpu_stream_uapi.h"
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -48,8 +49,13 @@ struct GpuQueueExpected {
     // (open, QUERY/QUEUE, IMPORT, ARM, STATS, STOP, RELEASE, RECOVER, group
     // reset), not around every PREPARE/SUBMIT/EVENT/RETIRE; EVENT is skipped
     // while no submitted operation is incomplete. Operation identity, fences and
-    // every EVENT field are checked exactly as before.
+    // every EVENT field are checked exactly as before. Between transitions the
+    // FD and pool identity are still re-verified: at most `identity_interval`
+    // after the last check (on the next hot operation), and before any hot
+    // ioctl error other than EAGAIN/EINTR is reported, so a replaced descriptor
+    // is named as such rather than as a driver failure.
     bool lean = false;
+    std::chrono::milliseconds identity_interval{100};
 };
 // EVENT reported SGU_FRAME_ERROR_TERMINAL: the peer's kernel-built terminal did
 // not match this operation (epoch, sequence, size, frame count or slot), or a

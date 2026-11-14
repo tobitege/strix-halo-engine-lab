@@ -1,6 +1,7 @@
 #include "strix/session_state_cache.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/unbuffered_file.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -12,13 +13,8 @@
 #include <system_error>
 #include <sys/stat.h>
 #ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
 extern char** environ;
 #else
-#include <io.h>
-#include <fcntl.h>
-#include <process.h>
 extern char** _environ;
 #endif
 
@@ -38,13 +34,14 @@ struct Reader {
     std::size_t at=0;
     std::span<const std::byte> take(std::uint64_t n) {
         require(n<=b.size()-at,"session checkpoint truncated or out of bounds");
-        auto r=b.subspan(at,static_cast<std::size_t>(n)); at+=static_cast<std::size_t>(n); return r;
+        return session::checkpoint_io::take(b,at,n);
     }
     std::uint64_t u64() { auto v=take(8); std::uint64_t x=0; for(unsigned i=0;i<8;++i) x|=std::uint64_t(std::to_integer<unsigned char>(v[i]))<<(8*i); return x; }
     ModelContentIdentity hash() { ModelContentIdentity h; auto s=take(32); std::memcpy(h.bytes.data(),s.data(),32); return h; }
     std::string str() { auto s=take(u64()); return {reinterpret_cast<const char*>(s.data()),s.size()}; }
 };
 void compat(Writer& w,const SessionCompatibility& c) {
+    require(c.family=="qwen" && c.format_version==1 && c.record.empty(),"session schema mismatch");
     require(c.model.valid() && c.executable.valid(),"session requires full model and executable hashes");
     w.str("strix-session-v1"); w.u64(SessionCompatibility::schema); w.hash(c.model); w.hash(c.executable);
     w.str(c.numerical_config); w.u64(c.mtp?1:0);
@@ -54,17 +51,30 @@ void frontier_valid(const SessionFrontier& f) {
     require(f.tokens.size()==f.consumed && f.accepted==f.consumed,"session frontier/history differs");
     require(f.predictor<=f.consumed,"session predictor beyond committed frontier");
 }
-#ifndef _WIN32
-void sync_directory(const std::filesystem::path& path) {
-    const int fd=::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    require(fd>=0,"session directory open failed");
-    const int result=::fsync(fd); ::close(fd);
-    require(result==0,"session directory fsync failed");
-}
-#endif
 double elapsed(Clock::time_point t) { return std::chrono::duration<double,std::milli>(Clock::now()-t).count(); }
 }
-ModelContentIdentity SessionCompatibility::digest() const { Writer w; compat(w,*this); return sha256_bytes(w.b); }
+void validate_session_envelope(const SessionCheckpoint& c) {
+    require(!c.compatibility.family.empty() && c.compatibility.format_version!=0,"session schema mismatch");
+    require(c.world!=0 && c.rank<c.world,"session unsupported rank geometry");
+    require(c.frontier.tokens.size()==c.frontier.consumed && c.frontier.accepted==c.frontier.consumed,
+        "session frontier/history differs");
+    require(c.frontier.predictor<=c.frontier.consumed && c.frontier.drafter<=c.frontier.consumed,
+        "session predictor beyond committed frontier");
+    std::set<std::string> names;
+    for(const auto& s:c.sections) {
+        require(!s.name.empty() && names.insert(s.name).second,"session duplicate/empty section");
+        require(!s.rank || *s.rank==c.rank,"session unsupported rank geometry");
+        require(s.payload.bytes<=SIZE_MAX && (!s.payload.bytes || s.payload.data),"session null or oversized section");
+        require(s.bytes.empty() || (!s.payload.data && !s.payload.bytes),"session duplicate section storage");
+    }
+}
+ModelContentIdentity SessionCompatibility::digest() const {
+    Writer w;
+    if(family=="qwen") compat(w,*this); // unchanged legacy Qwen identity bytes
+    else { w.str("strix-session-family-compatibility"); w.str(family); w.u64(format_version); w.str(record);
+        w.hash(model); w.hash(executable); w.str(numerical_config); w.u64(mtp?1:0); }
+    return sha256_bytes(w.b);
+}
 ModelContentIdentity session_cached_file_hash(const std::filesystem::path& path, std::optional<ModelContentIdentity> known_full_digest) {
     // Revalidate identity before and after the FULL content pass; never sample weights.
     static std::mutex mutex;
@@ -111,6 +121,8 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
             value.starts_with("STRIX_QPF2K_COMPACT_IMAGES=")) continue;
         // The last-layer cache-only QSA step writes the same persistent state as the full step.
         if (value.starts_with("STRIX_QSA_CACHE_ONLY=")) continue;
+        // The final-block cone skips rows nothing reads; the host wait policy only changes how the host waits.
+        if (value.starts_with("STRIX_PREFILL_FINAL_CONE=") || value.starts_with("STRIX_HOST_WAIT=")) continue;
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
         // Startup provenance of injected defaults (qpf2k::pre_injected_env); the values themselves stay bound.
         if (value.starts_with("STRIX_QPF2K_PRE_INJECTED=")) continue;
@@ -158,6 +170,11 @@ std::string session_family_numerical_config(std::string_view cli, const RotaryId
     return numerical_config(cli,rotary,true,replace);
 }
 PrefixCacheBuffer encode_session_checkpoint(const SessionCheckpoint& c,const PrefixCacheAllocator& alloc) {
+    validate_session_envelope(c);
+    require(c.compatibility.family=="qwen" && c.compatibility.format_version==1 && c.compatibility.record.empty() &&
+        c.rank==0 && c.world==1 && c.id.empty() && c.generation.empty(),"session unsupported legacy schema");
+    require(c.frontier.drafter==0 && c.frontier.control==0 && c.frontier.selection==0 && c.frontier.rng_draws==0 &&
+        !c.frontier.drafter_ready && c.frontier.lineage.empty(),"session unsupported legacy frontier");
     frontier_valid(c.frontier);
     require(c.compatibility.mtp || c.frontier.predictor==0,"target-only session has a predictor frontier");
     Writer w; compat(w,c.compatibility); w.hash(c.compatibility.digest());
@@ -168,6 +185,7 @@ PrefixCacheBuffer encode_session_checkpoint(const SessionCheckpoint& c,const Pre
     w.u64(c.sections.size());
     std::set<std::string> names;
     for(const auto& s:c.sections) {
+        require(s.bytes.empty() && s.replicated && (!s.rank || *s.rank==0),"session unsupported rank geometry");
         require(!s.name.empty() && names.insert(s.name).second,"session duplicate/empty section");
         require(s.payload.bytes<=std::numeric_limits<std::size_t>::max() &&
             (!s.payload.bytes || s.payload.data!=nullptr),"session null or oversized section");
@@ -192,6 +210,7 @@ SessionCheckpoint decode_checkpoint(const PrefixCacheBuffer& blob,const SessionC
     require(r.str()=="strix-session-v1" && r.u64()==SessionCompatibility::schema,"session schema mismatch");
     c.compatibility.model=r.hash(); c.compatibility.executable=r.hash();
     c.compatibility.numerical_config=r.str(); const auto mtp=r.u64(); require(mtp<=1,"session invalid MTP flag"); c.compatibility.mtp=mtp!=0;
+    require(expected.family=="qwen" && expected.format_version==1 && expected.record.empty(),"session schema mismatch");
     require(r.hash()==c.compatibility.digest() && c.compatibility.digest()==expected.digest(),"session compatibility mismatch");
     auto& f=c.frontier; f.consumed=r.u64(); f.emitted=r.u64(); f.accepted=r.u64(); f.predictor=r.u64();
     auto pending=r.u64(); require(pending<=std::uint64_t{UINT32_MAX}+1,"session invalid pending token");
@@ -211,7 +230,7 @@ SessionCheckpoint decode_checkpoint(const PrefixCacheBuffer& blob,const SessionC
         const auto offset=static_cast<std::size_t>(payload.data()-bytes.data());
         c.sections.push_back({std::move(name),{std::shared_ptr<std::byte>(blob.data,blob.data.get()+offset),n}});
     }
-    require(r.at==body.size(),"session trailing data"); return c;
+    require(r.at==body.size(),"session trailing data"); validate_session_envelope(c); return c;
 }
 }
 SessionCheckpoint decode_session_checkpoint(const PrefixCacheBuffer& blob,const SessionCompatibility& expected) {
@@ -226,120 +245,29 @@ std::optional<SessionCheckpoint> lookup_session_checkpoint(PrefixStateCache& sto
 }
 void publish_session_checkpoint(const std::filesystem::path& dir,const PrefixCacheBuffer& blob,SessionIoStats* stats) {
     const auto start=Clock::now();
-    require(blob.data && blob.bytes>=32,"session publication requires a complete envelope");
-#ifndef _WIN32
-    std::vector<std::filesystem::path> missing;
-    for(auto p=std::filesystem::absolute(dir);!std::filesystem::exists(p);p=p.parent_path())
-        missing.push_back(p);
-#endif
-    std::filesystem::create_directories(dir);
-#ifndef _WIN32
-    // Persist every newly-created ancestor's directory entry as well as the file itself.
-    for(auto it=missing.rbegin();it!=missing.rend();++it) sync_directory(it->parent_path());
-#endif
-    // Exclusive temp creation: concurrent publishers cannot truncate each other's temporary file.
-    static std::mutex mutex; static std::uint64_t sequence=0; std::lock_guard lock(mutex);
-#ifdef _WIN32
-    const auto pid=_getpid();
-#else
-    const auto pid=getpid();
-#endif
-    const auto tmp=dir/(".session-"+std::to_string(pid)+"-"+std::to_string(++sequence)+"-"+std::to_string(Clock::now().time_since_epoch().count())+".tmp");
-    const auto dest=dir/"session.bin";
-#ifndef _WIN32
-    if(state_file_io::unbuffered_io_enabled()) {
-        // Same bytes and the same exclusive temporary, written around the page cache.
-        state_file_io::SequentialWriter out(tmp,true,0600);
-        require(out.open(),"session cannot create temporary checkpoint");
-        try {
-            try { out.write(blob.data.get(),blob.bytes); }
-            catch(const std::exception&) { throw std::runtime_error("session checkpoint write failed"); }
-            try { out.finish(true); }
-            catch(const std::exception&) { throw std::runtime_error("session checkpoint fsync failed"); }
-            std::filesystem::rename(tmp,dest);
-            sync_directory(dir);
-        } catch(...) { std::error_code ec; std::filesystem::remove(tmp,ec); throw; }
-        if(stats) { stats->bytes=blob.bytes; stats->write_fsync_ms=elapsed(start); }
-        return;
-    }
-#endif
-#ifdef _WIN32
-    int fd=::_open(tmp.string().c_str(),_O_WRONLY|_O_CREAT|_O_EXCL|_O_BINARY,_S_IREAD|_S_IWRITE);
-#else
-    int fd=::open(tmp.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);
-#endif
-    require(fd>=0,"session cannot create temporary checkpoint");
-    try {
-        std::uint64_t at=0;
-        while(at<blob.bytes) {
-            const auto n=static_cast<unsigned>(std::min<std::uint64_t>(blob.bytes-at,1U<<26));
-#ifdef _WIN32
-            const auto done=::_write(fd,blob.data.get()+at,n);
-#else
-            const auto done=::write(fd,blob.data.get()+at,n);
-#endif
-            require(done>0,"session checkpoint write failed"); at+=static_cast<std::uint64_t>(done);
-        }
-#ifdef _WIN32
-        require(::_commit(fd)==0,"session checkpoint fsync failed"); ::_close(fd);
-#else
-        require(::fsync(fd)==0,"session checkpoint fsync failed"); ::close(fd);
-#endif
-        fd=-1;
-        std::filesystem::rename(tmp,dest);
-#ifndef _WIN32
-        sync_directory(dir);
-#endif
-    } catch(...) {
-        if(fd>=0) {
-#ifdef _WIN32
-            ::_close(fd);
-#else
-            ::close(fd);
-#endif
-        }
-        std::error_code ec; std::filesystem::remove(tmp,ec); throw;
-    }
+    require(blob.data && blob.bytes>=32 && blob.bytes<=SIZE_MAX,"session publication requires a complete envelope");
+    session::checkpoint_io::atomic_write(dir/"session.bin",blob.span(),
+        {true,session::checkpoint_io::DirectIo::automatic,0600,".session-"});
     if(stats) { stats->bytes=blob.bytes; stats->write_fsync_ms=elapsed(start); }
 }
 PrefixCacheBuffer read_session_checkpoint(const std::filesystem::path& dir,const SessionCompatibility& expected,
     const PrefixCacheAllocator& alloc,std::uint64_t max_bytes,SessionIoStats* stats,SessionCheckpoint* decoded) {
-    const auto start=Clock::now(); const auto path=dir/"session.bin";
-    if(state_file_io::unbuffered_io_enabled()) {
-        state_file_io::SequentialReader in(path); require(in.open(),"session checkpoint open failed");
-        const auto size=in.size(); require(size>=32 && size<=max_bytes,"session checkpoint size outside admission budget");
-        auto blob=alloc(size); require(blob.data && blob.bytes>=size,"session allocation failed");
-        blob.bytes=size;
-        // Streamed verification: the manifest root is hashed chunk by chunk as the bytes land
-        // (while the next chunk is read ahead), not in a second pass over the whole envelope.
-        const bool streamed=state_file_io::switch_enabled("STRIX_SESSION_CHUNKED");
-        std::optional<Sha256Fast> root; if(streamed) root.emplace();
-        const std::uint64_t body=size-32;
-        try {
-            for(std::uint64_t at=0;at<size;) {
-                const auto n=std::min<std::uint64_t>(size-at,state_file_io::chunk_bytes);
-                in.read(blob.data.get()+at,n);
-                if(root && at<body) root->update(std::span<const std::byte>(blob.data.get()+at,
-                    static_cast<std::size_t>(std::min(n,body-at))));
-                at+=n;
-            }
-        } catch(const std::exception&) { throw std::runtime_error("session checkpoint truncated during read"); }
-        require(!in.grew(),"session checkpoint grew during read");
-        std::optional<ModelContentIdentity> digest; if(root) digest=root->finalize();
-        auto checkpoint=decode_checkpoint(blob,expected,digest ? &*digest : nullptr); // complete validation before live writes
-        if(decoded) *decoded=std::move(checkpoint);
-        if(stats) { stats->bytes=blob.bytes; stats->read_verify_ms=elapsed(start); } return blob;
-    }
-    std::ifstream in(path,std::ios::binary|std::ios::ate); require(bool(in),"session checkpoint open failed");
-    const auto size=in.tellg(); require(size>=32 && static_cast<std::uint64_t>(size)<=max_bytes,"session checkpoint size outside admission budget");
-    auto blob=alloc(static_cast<std::uint64_t>(size)); require(blob.data && blob.bytes>=static_cast<std::uint64_t>(size),"session allocation failed");
-    blob.bytes=static_cast<std::uint64_t>(size); in.seekg(0);
-    in.read(reinterpret_cast<char*>(blob.data.get()),static_cast<std::streamsize>(size)); require(bool(in),"session checkpoint truncated during read");
-    require(in.peek()==std::ifstream::traits_type::eof(),"session checkpoint grew during read");
-    auto checkpoint=decode_session_checkpoint(blob,expected); // complete validation before live writes
+    const auto start=Clock::now(); PrefixCacheBuffer blob;
+    std::optional<Sha256Fast> root;
+    if(state_file_io::unbuffered_io_enabled() && state_file_io::switch_enabled("STRIX_SESSION_CHUNKED")) root.emplace();
+    session::checkpoint_io::read(dir/"session.bin",32,max_bytes,[&](std::uint64_t n) {
+        blob=alloc(n); require(blob.data && blob.bytes>=n,"session allocation failed");
+        blob.bytes=n; return blob.span();
+    },session::checkpoint_io::DirectIo::automatic,[&](std::span<const std::byte> chunk,std::uint64_t at) {
+        const auto body=blob.bytes-32;
+        if(root && at<body) root->update(chunk.first(static_cast<std::size_t>(std::min<std::uint64_t>(chunk.size(),body-at))));
+    });
+    std::optional<ModelContentIdentity> digest; if(root) digest=root->finalize();
+    auto checkpoint=decode_checkpoint(blob,expected,digest ? &*digest : nullptr);
     if(decoded) *decoded=std::move(checkpoint);
     if(stats) { stats->bytes=blob.bytes; stats->read_verify_ms=elapsed(start); } return blob;
 }
+
 void preflight_session_checkpoint(const std::filesystem::path& dir,const ModelContentIdentity& executable,
     std::string_view numerical_prefix,std::uint64_t max_bytes) {
     max_bytes = session_checkpoint_envelope_limit(max_bytes);

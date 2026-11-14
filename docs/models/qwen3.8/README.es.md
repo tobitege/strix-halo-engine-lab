@@ -33,8 +33,11 @@ Véase [prefill HTTP](../../engine/serving/serving.md#default-prompt-prefill). V
 [ruta automática y los interruptores de desactivación](../../getting-started/engine-reference.md#command-line).
 
 `prompt.ids` contiene el prompt como IDs de token del tokenizador del modelo; el motor imprime un recibo JSON con
-`generated_tokens` y los tiempos. Para las velocidades anteriores, añada las opciones especulativas (sidecar MTP, ventanas de verificación
-2/4/8, vocabulario de draft): el comando completo está en **[docs/getting-started/engine-reference.md → Línea de comandos](../../getting-started/engine-reference.md#command-line)**
+`generated_tokens` y los tiempos. El comando simple decodifica con especulación MTP exacta cuando el
+[bundle del drafter](../../engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) (JSON del bundle, sidecar
+destilado, vocabulario de draft) está junto al modelo; `--no-mtp` o `STRIX_MTP=0` dan decodificación simple con los
+mismos tokens, y sin bundle se decodifica de forma simple con un único aviso. Mismo binario, un nodo, simple (`--no-mtp`) frente al comando por defecto, tokens idénticos: 22,1 -> 73,3 tok/s tras un prompt de 1K (300 tokens; 81,3 tok/s en 1.200 tokens) y 16,9 -> 62,8 tok/s tras un prompt de 8K (300 tokens). El comando
+especulativo explícito (todas las opciones) está en **[docs/getting-started/engine-reference.md → Línea de comandos](../../getting-started/engine-reference.md#command-line)**
 y en [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). El servidor HTTP, los slots por batch (`--http-batch`) y la
 caché de prefijos están en [docs/engine/serving/serving.md](../../engine/serving/serving.md); varias peticiones en un proceso, en
 [docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (política automática por ciclo, activada por defecto: 8 peticiones, 69.3 tok/s agregados; 62.9 tok/s antes); el muestreo, en
@@ -78,9 +81,9 @@ Un solo interruptor selecciona un perfil de producto para Qwen (CLI, `--http-ser
   El recibo indica `qualification in progress: moe_route_bf16` y marca la fila como `provisional`; una línea de
   stderr informa del cambio de bits y del estado de la cualificación. En las demás rutas, incluidas HTTP y MTP,
   la fila queda `pending` con el motivo del rechazo, mantiene el almacenamiento FP32 y no se exporta ni se marca como aplicada.
-  El presupuesto de selección de atención, la recurrencia por fragmentos FP16 y la cabeza de salida FP16 siguen pendientes
-  y mantienen sus rutas internas, con un aviso cada una; la fila de la recurrencia por fragmentos FP16 ya es ejecutable
-  (`--allow-pending` la ejecuta, marcada `unqualified`).
+  El presupuesto de selección de atención (1536) y la recurrencia por fragmentos FP16 (`STRIX_QPF2K_GDN_FP16_CHUNK=1`)
+  también son filas provisionales y se aplican igual; la cabeza de salida FP16 sigue pendiente y mantiene su ruta
+  interna, con un aviso.
 - `quality`: no hay paquete de calidad para este modelo, así que ejecuta `default` y lo indica en el recibo.
 
 `--allow-pending` (o `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) ejecuta las opciones realmente pendientes cuyo código está
@@ -304,12 +307,19 @@ los pares más rápidos. A 262K (YaRN factor 2, ruta en serie, `--profile defaul
 intercalados) el prefill pasó de **191.2 a 185.7 s (−2.9 %, 1,371 → 1,412 tok/s)**, cada ejecución fast más rápida
 que cada ejecución default; el decode no cambia. Véase el [catálogo](../../optimizations.md#qwen-moe-route-bf16).
 
+**Poda de rutas MoE: conmutador opcional, desactivado por defecto, fuera de todos los perfiles.**
+`STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (o `--prefill-moe-route-prune cap9`) descarta el experto de menor peso de cada fila
+del prefill antes de construir el plan de rutas: alrededor de un 2 % menos de tiempo de prefill a 8,192 y 32,768
+tokens, dentro de la puerta FAST compuesta en ambas longitudes. `cap8` da un 4-5 % y sale de la puerta a 32,768 tokens.
+Cambia los logits y añade `+rp<spec>` a la identidad del prefill; para volver atrás, quite la variable y reinicie.
+Cifras y gramática: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+
 **GDN por bloques en WMMA FP16 en el prefill: candidato opcional (opt-in), pendiente de cualificación.**
 `STRIX_QPF2K_GDN_FP16_CHUNK=1` (o `--gdn-fp16-chunk 1`) ejecuta la convolución, la recurrencia y la norma con puerta de
 las capas GDN en bloques de 32 filas sobre WMMA FP16 con acumulación FP32 y estado FP32 (identidad
 `qwen-gdn-fp16-chunk rev 2`; la proyección de entrada escribe entonces sus valores, ya redondeados a BF16, como filas
-BF16). Cambia bits y está desactivado por defecto; `--profile fast` lo lista como pendiente hasta que supere la
-cualificación de fidelidad (`--allow-pending` lo ejecuta, marcado `unqualified`). Misma compilación, CLI simple, pares
+BF16). Cambia bits y está desactivado por defecto; `--profile fast` lo aplica como fila provisional
+(cualificación en curso; cribado a 8K junto con las demás filas de fast: KL 0.0040, top-1 97.5 %). Misma compilación, CLI simple, pares
 intercalados: 4K **2.42 → 2.36 s (−2.6 %)**, 32K **19.61 → 18.81 s (−4.1 %)**, 262K **177.9 → 170.0 s (−4.5 %, 1,471 → 1,539 tok/s; un par)**; los primeros tokens
 generados coinciden con la ruta exacta. Sin la variable o con `=0` se usa la ruta exacta. Véase el
 [catálogo](../../optimizations.md#qwen-gdn-chunk).

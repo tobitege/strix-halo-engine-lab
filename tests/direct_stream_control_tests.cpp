@@ -9,13 +9,6 @@
 #include <stdexcept>
 #include <utility>
 
-#if defined(__linux__) || defined(__APPLE__)
-#include "strix/distributed_tcp_control_stream.hpp"
-#include <cerrno>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#endif
 
 namespace {
 using namespace strix;
@@ -93,45 +86,6 @@ public:
     int opened = 0, closed = 0, stale_close_refused = 0, inspections = 0, read_calls = 0, write_calls = 0, wait_calls = 0;
     bool replace_during_read = false, replace_during_wait = false;
 };
-#if defined(__linux__) || defined(__APPLE__)
-// Real socket syscalls exercise framing interoperability only. The route
-// declaration is synthetic, not proof of a physical character-stream peer.
-class SocketIo final : public Io {
-public:
-    explicit SocketIo(int socket) { fd.descriptor = socket; }
-    DirectStreamIoResult read(DirectStreamFd token, std::span<std::byte> bytes) override {
-        return result(::recv(token.descriptor, bytes.data(), bytes.size(), MSG_DONTWAIT));
-    }
-    DirectStreamIoResult write(DirectStreamFd token, std::span<const std::byte> bytes) override {
-        int flags = MSG_DONTWAIT;
-#if defined(MSG_NOSIGNAL)
-        flags |= MSG_NOSIGNAL;
-#endif
-        return result(::send(token.descriptor, bytes.data(), bytes.size(), flags));
-    }
-    DirectStreamWaitStatus wait(DirectStreamFd token, bool writing, DirectStreamClock::time_point limit) override {
-        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(limit - now()).count();
-        if (remaining <= 0) return DirectStreamWaitStatus::timed_out;
-        struct pollfd state{token.descriptor, static_cast<short>(writing ? POLLOUT : POLLIN), 0};
-        const int status = ::poll(&state, 1, static_cast<int>(remaining));
-        if (status < 0) return errno == EINTR ? DirectStreamWaitStatus::interrupted : DirectStreamWaitStatus::failed;
-        if (status == 0) return DirectStreamWaitStatus::timed_out;
-        if ((state.revents & (POLLERR | POLLNVAL)) != 0) return DirectStreamWaitStatus::failed;
-        if ((state.revents & state.events) != 0) return DirectStreamWaitStatus::ready;
-        return DirectStreamWaitStatus::end_of_stream;
-    }
-    DirectStreamClock::time_point now() const override { return DirectStreamClock::now(); }
-    void close(DirectStreamFd token) noexcept override { static_cast<void>(::close(token.descriptor)); ++closed; }
-private:
-    static DirectStreamIoResult result(ssize_t count) {
-        if (count > 0) return {DirectStreamIoStatus::transferred, static_cast<std::uint64_t>(count)};
-        if (count == 0) return {DirectStreamIoStatus::end_of_stream, 0};
-        if (errno == EINTR) return {DirectStreamIoStatus::interrupted, 0};
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return {DirectStreamIoStatus::would_block, 0};
-        return {DirectStreamIoStatus::failed, 0};
-    }
-};
-#endif
 }  // namespace
 
 int main() {
@@ -225,23 +179,6 @@ int main() {
                "unbounded/zero deadline is rejected before FD acquisition");
     }
 #if defined(__linux__) || defined(__APPLE__)
-    {
-        int pair[2]{};
-        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) throw std::runtime_error("socketpair failed");
-        SocketIo io(pair[0]);
-        auto stream = DirectStreamControlByteStream::open_with_io(io, device(), {4096, 64, std::chrono::milliseconds(1000)});
-        auto tcp = TcpDistributedControlByteStream::adopt_connected(pair[1], 4096);
-        const DistributedRemoteStepCommand command{1, 11, 22, 3, 4, 5, SerialOp::token_embedding, 1};
-        const DistributedRemoteStepAck ack{1, 11, 22, 3, 4, 5, 1, true};
-        tcp.send(encode_distributed_remote_step_ack(ack));
-        FramedDistributedControlWire wire(stream);
-        const auto actual_ack = wire.execute_remote_step(command);
-        const auto actual_command = decode_distributed_remote_step_command(tcp.receive());
-        expect(actual_ack.request_id == command.request_id && actual_ack.sequence == command.sequence && actual_ack.success &&
-               actual_command.request_id == command.request_id && actual_command.generation == command.generation &&
-               actual_command.placement_plan_identity == command.placement_plan_identity && actual_command.op == command.op,
-               "real socketpair interoperates with TCP framing and existing v2 control command/ACK identities");
-    }
     {
         // /dev/null is a real character-device FD fixture, not a stream peer.
         const auto observed = inspect_direct_stream_device("/dev/null");

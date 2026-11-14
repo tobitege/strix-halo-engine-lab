@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_payload_geometry.hpp"
@@ -15,6 +16,7 @@
 #include <vector>
 #include "strix/hip_token_sampling_device.hpp"
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -53,7 +55,7 @@ bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) 
 }
 // STRIX_MTP_REQUEST_RESET=0 keeps the controllers' estimates across requests.
 bool mtp_request_reset() noexcept {
-    static const bool reset=[]{const char* v=std::getenv("STRIX_MTP_REQUEST_RESET");return !v || v[0]!='0';}();
+    static const bool reset=strix::envcfg::flag("STRIX_MTP_REQUEST_RESET", true);
     return reset;
 }
 // Cost-table device key: architecture, marketing name, compute units, memory size, clock, HIP runtime and driver.
@@ -70,7 +72,6 @@ bool hip_mtp_survival_controller() noexcept {
     return enabled;
 }
 namespace {
-double env_number(const char* name,double fallback) {const char* v=std::getenv(name);return v && *v?std::atof(v):fallback;}
 double clamped_logit(double p) {p=std::clamp(p,1e-6,1.0-1e-6);return std::log(p/(1.0-p));}
 double sigmoid(double z) {return 1.0/(1.0+std::exp(-std::clamp(z,-30.0,30.0)));}
 // P(draft k equals the target's greedy token | drafts 0..k-1 did): a logistic over the draft's own
@@ -105,7 +106,7 @@ struct SurvivalCalibrator {
 };
 }
 bool hip_mtp_full_chain_diagnostic() noexcept {
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_MTP_DIAG_FULL_CHAIN");return v && v[0]=='1';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_MTP_DIAG_FULL_CHAIN", false);
     return enabled;
 }
 struct HipMtpWindowVerifier::Impl {
@@ -195,6 +196,30 @@ struct HipMtpWindowVerifier::Impl {
         if(sampler && sampled_decided<selected.size()) selected.resize(sampled_decided);
     }
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
+    // Base session of the serial window being verified; reused so its lineage vector keeps capacity across cycles.
+    SerialSessionContext window_base;
+    // The previous owner's PLE commit runs on its own stream: wait for it before another owner's window runs.
+    void fence_previous_owner(const Owner* next) const {
+        if(last && last!=next && hipStreamSynchronize(static_cast<hipStream_t>(last->captures.front()->source_stream()))!=hipSuccess)
+            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+    }
+    // Commits the accepted prefix of a verified window and rolls the session back past the dropped rows.
+    // Prefix owners require one consumed input at row-zero failure, so at least one row is committed.
+    std::uint32_t commit_window_prefix(Owner* owner,SerialSessionContext& session,const SerialSessionContext& previous,
+                                       std::uint32_t rows,std::uint32_t n_keep) {
+        const auto committed=std::max(1U,n_keep);
+        owner->window->commit_prefix(committed);last=owner;
+        if(resources.qsa_committed_pool) resources.qsa_committed_pool->commit(false,previous.next_position+committed);
+        if(committed<rows) {
+            const auto dropped=rows-committed;
+            session.next_position-=dropped;session.committed_tokens-=dropped;
+            const auto& tail=session.arithmetic_lineage.intervals.back();
+            session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,tail.begin,
+                tail.begin+committed,tail.numerical_plan_identity,tail.reduction_plan_identity,tail.state_update_identity);
+            write_position_word(resources,session.next_position-1U);
+        }
+        return committed;
+    }
     // Survival controller (STRIX_MTP_CONTROLLER=survival). An option is an owner and its active rows: with
     // STRIX_MTP_ACTIVE_ROWS=1 the R4 owner also verifies 3 active rows and the R8 owner 6 (the rest are
     // padding outside the expert union and acceptance). Costs are separated: per option the cycle time
@@ -291,14 +316,14 @@ struct HipMtpWindowVerifier::Impl {
         // The survival controller prices options by measured time: never with a timing-independent schedule.
         survival=prefix && hip_mtp_survival_controller() && !timing_independent;
         if(survival) {
-            const bool active_rows=env_number("STRIX_MTP_ACTIVE_ROWS",0.0)!=0.0;
+            const bool active_rows=strix::env_number<double>("STRIX_MTP_ACTIVE_ROWS",0.0)!=0.0;
             for(auto& o:owners) {
                 if(active_rows && (o.rows==4U || o.rows==8U)) options.push_back({&o,o.rows==4U?3U:6U});
                 options.push_back({&o,o.rows});
             }
-            explore=env_number("STRIX_MTP_EXPLORE",0.0);
-            reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,env_number("STRIX_MTP_REPROBE",64.0)));
-            if(env_number("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
+            explore=strix::env_number<double>("STRIX_MTP_EXPLORE",0.0);
+            reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,strix::env_number<double>("STRIX_MTP_REPROBE",64.0)));
+            if(strix::env_number<double>("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
         }
         // Persisted costs: the default min-p controller with measured costs only (no depth/survival controller,
         // no timing-independent schedule, no diagnostics), per-request resets (the default), and every owner admitted
@@ -325,7 +350,7 @@ struct HipMtpWindowVerifier::Impl {
         for(std::size_t o=1;o<owners.size();++o) owners[o].window->share_deferred(*owners.front().window);
         // STRIX_WINDOW_ROUTE_LOG=1 (diagnostics, never timed): after each router step of a verify window, the
         // routed expert ids of every row ("route pos=P rows=R row=r layer=L ids=..." on stderr). Synchronizes.
-        if(env_number("STRIX_WINDOW_ROUTE_LOG",0.0)!=0.0) for(auto& o:owners) {
+        if(strix::env_number<double>("STRIX_WINDOW_ROUTE_LOG",0.0)!=0.0) for(auto& o:owners) {
             const auto top_k=static_cast<std::size_t>(target->model().num_experts_per_token);
             o.window->set_window_step_observer([rows=o.rows,top_k](std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
                 const auto first=row(0);
@@ -549,7 +574,7 @@ bool HipMtpWindowVerifier::robust_cost_model() const noexcept {return impl_->dep
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session) {
     // STRIX_WINDOW_SETUP_PREFLIGHT=0 leaves each owner's admission to its first window.
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_WINDOW_SETUP_PREFLIGHT");return !v || v[0]!='0';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_WINDOW_SETUP_PREFLIGHT", true);
     auto& i=*impl_;
     if(!enabled || i.busy || failed()) return;
     const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().effective_max_positions());
@@ -646,18 +671,13 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         members[a]={owner->window.get(),q.session,p.inputs,p.capture};
         if(q.transaction) {
             require(!sampler && q.verifier->policy_selection_admitted(),"MTP cohort policy route is not serial equivalent");
-            q.transaction->reset();
+            q.transaction->reset();q.transaction->expect(q.candidates);
             p.capture->set_transaction_selection(i.transaction_selection(*q.transaction,p.capture->source_stream(),q.candidates,q.rows,q.budget,q.eos));
         }
         if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
             q.rows,std::min(q.rows,q.budget),q.drafts,q.eos));
     }
-    for(auto& p:prepared) {
-        // The previous owner's PLE commit runs on its own stream.
-        if(p.impl->last && p.impl->last!=p.owner &&
-           hipStreamSynchronize(static_cast<hipStream_t>(p.impl->last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
-    }
+    for(const auto& p:prepared) p.impl->fence_previous_owner(p.owner);
     for(std::size_t a=0;a<requests.size();++a){prepared[a].previous=*requests[a].session;prepared[a].impl->busy=true;}
     bool attempted=false;
     try {
@@ -683,20 +703,9 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && k+1U<selected.size() && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
             const auto n_keep=q.transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):k+1U;
             if(q.transaction) k=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
-            // Prefix owners require one consumed input at row-zero failure.
-            // Never promote a ticket or emit an ID for that undecided row.
-            const auto committed=std::max(1U,n_keep);
+            // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(q.transaction)result.selection_failure=provisional->selection_prefix()->selection_failure;
-            p.owner->window->commit_prefix(committed);i.last=p.owner;
-            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,p.previous.next_position+committed);
-            if(committed<rows) {
-                const auto dropped=rows-committed;
-                session.next_position-=dropped;session.committed_tokens-=dropped;
-                const auto& last=session.arithmetic_lineage.intervals.back();
-                session.arithmetic_lineage=prepare_known_window_chunk_lineage(p.previous.arithmetic_lineage,last.begin,
-                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
-                write_position_word(i.resources,session.next_position-1U);
-            }
+            i.commit_window_prefix(p.owner,session,p.previous,rows,n_keep);
             if(n_keep)result.committed_rows=i.target->accept_verified_prefix(provisional,*q.initial,session,n_keep);
             result.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             result.accepted_candidates=k;result.accepted_window=n_keep==rows;
@@ -743,9 +752,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpWindowVerifier::prompt_rows(SerialSe
     capture->set_row_selection({});
     i.busy=true;bool attempted=false;
     try {
-        // The previous owner's PLE commit runs on its own stream.
-        if(i.last && i.last!=owner && hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+        i.fence_previous_owner(owner);
         const std::vector<std::uint32_t> inputs(tokens.begin(),tokens.end());
         auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},rows);
         attempted=true;
@@ -833,12 +840,7 @@ std::vector<std::vector<HipMtpTargetHiddenTicket>> HipMtpWindowVerifier::prompt_
         inputs[m].assign(q.tokens.begin(),q.tokens.end());
         members.push_back({x.owner->window.get(),q.session,inputs[m],x.capture});
     }
-    for(const auto& x:items) {
-        // The previous owner's PLE commit runs on its own stream.
-        if(x.impl->last && x.impl->last!=x.owner &&
-           hipStreamSynchronize(static_cast<hipStream_t>(x.impl->last->captures.front()->source_stream()))!=hipSuccess)
-            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
-    }
+    for(const auto& x:items) x.impl->fence_previous_owner(x.owner);
     for(auto& x:items) x.impl->busy=true;
     bool attempted=false;
     try {
@@ -964,7 +966,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     // Matched-position diagnostics: execute a physical owner, but commit only one
     // exact target row. Every arm therefore visits the same target frontiers.
     const bool diagnostic=hip_mtp_full_chain_diagnostic();
-    const auto diagnostic_rows=diagnostic?static_cast<std::uint32_t>(env_number("STRIX_MTP_DIAG_ROWS",1.0)):0U;
+    const auto diagnostic_rows=diagnostic?static_cast<std::uint32_t>(strix::env_number<double>("STRIX_MTP_DIAG_ROWS",1.0)):0U;
     require(!diagnostic || diagnostic_rows==1U || diagnostic_rows==2U || diagnostic_rows==4U || diagnostic_rows==8U,
         "MTP diagnostic rows must be 1, 2, 4 or 8");
     if(diagnostic && diagnostic_rows==1U) budget=std::min(budget,1U);
@@ -1032,7 +1034,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     };
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
     struct ClearSelection {std::shared_ptr<HipMtpTargetWindowCapture>& c;~ClearSelection(){if(c){c->set_row_selection({});c->set_transaction_selection({});}}} clear_selection{capture};
-    if(transaction) {require(!sampler && policy_selection_admitted(),"MTP policy route is not serial equivalent");transaction->reset();}
+    if(transaction) {require(!sampler && policy_selection_admitted(),"MTP policy route is not serial equivalent");transaction->reset();transaction->expect(candidates);}
     if(use_window) {
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
         require(!!capture,"MTP window capture pools are retained by previous batch readers");
@@ -1054,12 +1056,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     i.busy=true;bool attempted_target=false;
     try {
         if(use_window && i.prefix) {
-            // The previous owner's PLE commit runs on its own stream.
-            if(i.last && i.last!=owner && hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
-                throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+            i.fence_previous_owner(owner);
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
-            const auto previous=session;
+            auto& previous=i.window_base;previous=session;
             host_phase_mark("4 verify prologue");
             auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");
@@ -1077,22 +1077,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             const auto n_keep=transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):a+1U;
             if(transaction) a=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
             host_phase_mark("7a select/accept");
-            // Prefix owners require one consumed input at row-zero failure.
-            // Never promote a ticket or emit an ID for that undecided row.
-            const auto committed=std::max(1U,n_keep);
+            // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
-            owner->window->commit_prefix(committed);i.last=owner;
-            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,previous.next_position+committed);
-            host_phase_mark("7b commit prefix");
-            if(committed<rows) {
-                const auto dropped=rows-committed;
-                session.next_position-=dropped;session.committed_tokens-=dropped;
-                const auto& last=session.arithmetic_lineage.intervals.back();
-                session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,last.begin,
-                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
-                write_position_word(i.resources,session.next_position-1U);
-            }
-            host_phase_mark("7c lineage");
+            i.commit_window_prefix(owner,session,previous,rows,n_keep);
+            host_phase_mark("7b commit prefix+lineage");
             if(n_keep)out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
             host_phase_mark("7d accept prefix");
             out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);

@@ -36,10 +36,50 @@ reference run. Details and conditions: [DeepSeek standalone](models/deepseek-v4.
 [Qwen served from one RTX](models/qwen3.8/rtx-serve.md),
 [GLM on one RTX](models/glm-5.3/README.md#glm-rtx-results).
 
-## Pin the right GPU
+## Declare the GPU to use
 
-When the machine has more than one NVIDIA GPU, select the card by UUID, never by index (indices can differ between
-`nvidia-smi` and CUDA):
+The DeepSeek and Qwen CUDA binaries start only on a card you have declared. Each one reads a `strix-devices-v1` file
+before its first allocation, matches the cards by UUID (never by index) and refuses to start, with one line that lists
+every card and the reason, when the card is undeclared, marked `excluded`, matched by a deny policy, or when more than
+one declared card is eligible and none was selected. An undeclared card is an excluded card.
+
+```toml
+schema = "strix-devices-v1"
+
+[devices.main]                       # the table name is the device id
+vendor = "nvidia"
+uuid = "GPU-<uuid from nvidia-smi -L>"
+roles = ["replica", "prefill"]       # no roles = no work
+attach = { kind = "pcie", pcie_gen = 4, pcie_width = 16 }
+
+[devices.other]                      # a card these binaries must never use
+vendor = "nvidia"
+uuid = "GPU-<uuid>"
+excluded = true
+reason = "kept for the desktop"
+
+[device_policies.never-other]        # deny by name: still holds if the UUID changes
+name_contains = "<part of the card name>"
+excluded = true
+```
+
+Pass the file with `--devices FILE`, set `STRIX_DEVICES`, or save it as `%APPDATA%\strix\devices.toml`
+(`~/.config/strix/devices.toml` on Linux). With several eligible cards, choose one with `--device-id ID` or
+`STRIX_DEVICE`. The binary then restricts its own process to that card (it sets `CUDA_VISIBLE_DEVICES` to the UUID
+before CUDA starts and checks the result), so no thread can reach another card, and prints the card it bound:
+
+```
+device: id=main vendor=nvidia uuid=GPU-... pci=0000:01:00.0 name="..." arch=sm_120 ordinal=0 attach=pcie gen4 x16 roles=replica,prefill declared=devices.toml
+```
+
+`strix-cuda-qwen-serve` also reports it under `device` in `/api/status`.
+
+The AMD (HIP) binaries on a node call the same gate and accept the same flags, with the device identified by PCI
+address (`pci = "0000:c5:00.0"`, `vendor = "amd"`). Without a declaration, the node's single integrated GPU keeps
+working and the receipt says `declared=implicit`; a discrete or a second AMD device always needs the file.
+
+The GLM tools on this page do not read the declaration yet. For those, and for any other CUDA program, select the card
+by UUID in the shell:
 
 ```powershell
 nvidia-smi -L                      # lists each GPU with its UUID
@@ -47,7 +87,41 @@ $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
 $env:CUDA_VISIBLE_DEVICES = "GPU-<uuid of the card to use>"
 ```
 
-Set it in the same shell before every command on this page, including configuration prints and dry runs.
+### Other units: the NPU and the CPU
+
+The same file can declare the two units that are not GPUs. Nothing uses them unless they are declared: there is no
+implicit NPU or CPU unit, and an old file without these entries behaves exactly as before.
+
+```toml
+[devices.npu]
+kind = "npu"                         # gpu (default) | npu | cpu
+vendor = "amd"
+pci = "0000:c5:00.1"                 # identity, as for a GPU
+arch = "aie2p"
+roles = ["aux"]                      # side models only (scoring, vision, embeddings)
+driver = "amdxdna"                   # the next three keys are required before aux is granted
+firmware = "<firmware version>"
+corun_qualification = "<id of the GPU + NPU co-run receipt>"
+
+[devices.host]
+kind = "cpu"                         # no identity; at most one cpu unit
+cores = "2-15"                       # cores the host lane may pin
+roles = ["host", "aux"]              # host: tokenizer, image decode, sampling, background work
+byte_cap_gbytes_ps = 10.0            # ceiling for background memory traffic while a session is decoding
+```
+
+Rules the parser and the start gate enforce:
+
+- `decode`, `prefill`, `pair`, `draft`, `replica`, `front` and `experts` are GPU roles. An NPU takes only `aux`; a CPU
+  takes only `host` and `aux`; a GPU may also carry `aux`.
+- An NPU keeps its `aux` role refused until `driver`, `firmware` and `corun_qualification` are all present. The file
+  still loads; the unit simply gets no work.
+- `cores` and `byte_cap_gbytes_ps` belong to the cpu unit, the three qualification keys to an NPU; anywhere else they
+  are errors.
+- The start line and the receipt list the declared units after the GPU, for example
+  `units=cpu:host[host,aux cores=2-15 byte_cap=10GB/s],npu:npu[aux(refused)]`.
+
+Declaring a unit only records what the machine has and what it may do. No engine sends work to an NPU today.
 
 ## DeepSeek V4.1 Flash, standalone RTX
 
@@ -104,7 +178,7 @@ file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/READM
 The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
 that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is
 refused (this route has no CPU path). The measured-run harness above selects the card with `CUDA_VISIBLE_DEVICES` as
-described in [Pin the right GPU](#pin-the-right-gpu).
+described in [Declare the GPU to use](#declare-the-gpu-to-use).
 
 ## Troubleshooting
 

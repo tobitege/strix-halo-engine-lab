@@ -1,5 +1,7 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_ds41_expert_backend.hpp"
+#include "strix/hip_check.hpp"
+#include "strix/device/hip_gate.hpp"
 
 #include "strix/ds41_formats.hpp"
 #include "strix/gguf_reader.hpp"
@@ -29,7 +31,7 @@ using Clock = std::chrono::steady_clock;
 namespace x = xrpc;
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("hip expert backend: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("hip expert backend: ", e, what);
 }
 
 template <typename T>
@@ -144,7 +146,8 @@ class HipBackend final : public x::ExpertBackend {
 public:
     HipBackend(const std::string& path, std::uint64_t mask, std::uint32_t first, std::uint32_t end, x::Geometry* geometry_out, std::uint32_t max_rows, bool spin)
         : g_(x::read_geometry(path)), max_rows_(max_rows) {
-        if (spin) check(hipSetDeviceFlags(hipDeviceScheduleSpin), "spin scheduling");
+        // The shared host wait policy (strix/device/hip_gate.hpp): busy_poll selects spin, STRIX_HOST_WAIT overrides.
+        (void)strix::device::set_host_wait(spin ? strix::device::HostWait::spin : strix::device::HostWait::runtime, spin ? stderr : nullptr);
         const auto file = strix::gguf::read_file(path);
         if (const auto* m = file.find_metadata("deepseek41.swiglu_limit"); m != nullptr && m->floating_value) limit_ = static_cast<float>(*m->floating_value);
         first_ = first;

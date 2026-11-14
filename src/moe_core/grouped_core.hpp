@@ -663,6 +663,135 @@ static __device__ __forceinline__ void pipe_pair_or_tail(const Item& it, unsigne
     else pipe_or_tail<Bits, 8, 4, Simplify>(it, bx, by, bz);
 }
 
+// Tall PIPE bands for many-row dense items. One CTA of W waves (4 or 8) owns one column pair (32 outputs, grid x) over
+// W full 128-row tiles (grid y), so the two weight tiles of a k step are read and decoded once per 128 W rows instead of
+// once per 128 (PIPE) or 256 (paired). Wave w runs the PIPE schedule on rows band + 128 w and decodes 16 / W states per
+// lane: tile w & 1, k part w >> 1 of 0..7 (lanes 16-31: of 8..15, window 2 Bits later; part p starts 64 p Bits / W
+// later, so the word / shift constants stay those of the first states). Every lane stores its dwords at their place of
+// the B fragment in LDS (two buffers, one barrier per k tile). Same operands, WMMA chain and partial stores per output
+// as item_pipe.
+template <int Bits, int W, bool Simplify>
+static __device__ void item_pipe_band(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
+    using NW = typename WeightDecode<Bits>::Norm;
+    using Word = std::uint32_t __attribute__((may_alias));
+    static_assert(W == 4 || W == 8, "band CTAs have 4 or 8 waves");
+    constexpr int MT = 8, G = 4;
+    constexpr int N = 16 / W;            // states per lane and k tile
+    constexpr int kNL = NW::g(N - 1) + 2;  // words for the first N states of the shifted window
+    const int lane = static_cast<int>(threadIdx.x & 31U);
+    const int wave = static_cast<int>(threadIdx.x >> 5U);
+    const int c = lane & 15;
+    const bool upper = lane >= 16;
+    const int part = wave >> 1;
+    const unsigned first_row = it.row0 + (by * static_cast<unsigned>(W) + static_cast<unsigned>(wave)) * 128U;
+    const unsigned tiles_k = it.input / 16U;
+    const int begin = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * bz / it.splits);
+    const int end = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * (bz + 1U) / it.splits);
+    const int my_tile = 2 * static_cast<int>(bx) + (wave & 1);
+    const int base = 32 * (c & 7) + 4 * (c >> 3);
+    const int S = (base + 1) * Bits - 16 + 256 * Bits - 32 + (upper ? 2 * Bits : 0) + part * (4 * N * Bits);
+    const int d = S & 31, wb = (S >> 5) - (d == 0 ? 1 : 0);
+    const unsigned sh = static_cast<unsigned>((32 - d) & 31);
+    std::uint32_t loff[kNL];
+#pragma unroll
+    for (int i = 0; i < kNL; ++i)
+        loff[i] = static_cast<std::uint32_t>(my_tile * NW::kWords + (wb + i) % NW::kWords) * 4U;
+    const std::size_t k_stride = ExpertLayout::template packed_stride<NW>(it.output / 16U);
+    const auto* weights = dev::uniform(it.trellis);
+    const auto* x = dev::uniform(it.x + static_cast<std::size_t>(first_row / 16U) * tiles_k * 256U);
+    auto* shared = reinterpret_cast<Word*>(exchange);
+    const int slot = ((wave & 1) * 16 + c) * 8 + (upper ? 4 : 0) + part * (N / 2);
+    Float8 acc0[MT] = {}, acc1[MT] = {};
+    std::uint32_t ln[kNL];
+    if (begin < end) {
+        const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(begin) * k_stride));
+#pragma unroll
+        for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+    }
+    for (int tile_k = begin; tile_k < end; ++tile_k) {
+        Half16 a0[G];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
+                x + (static_cast<std::size_t>(m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
+            a0[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
+        }
+        const int buffer = (tile_k - begin) & 1;
+        { // Decode temporaries die before the second A bank becomes live.
+            std::uint32_t nrm[kNL - 1], state[N], mine[N / 2];
+#pragma unroll
+            for (int i = 0; i < kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
+#pragma unroll
+            for (int i = 0; i < N; ++i)
+                state[i] = __builtin_amdgcn_alignbit(nrm[NW::g(i) - 1], nrm[NW::g(i)], NW::shift(i)) & 65535U;
+            if constexpr (!Simplify && Traits::template Decode<Bits>::kPacked) {
+                std::uint32_t st[8];  // decode8 pairs are independent: the repeats beyond N are dead
+                Half2 decoded[4];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) st[i] = state[i % N];
+                Traits::template Decode<Bits>::decode8(st, decoded);
+#pragma unroll
+                for (int i = 0; i < N / 2; ++i) mine[i] = __builtin_bit_cast(std::uint32_t, decoded[i]);
+            } else {
+#pragma unroll
+                for (int r = 0; r < N; r += 2) {
+                    std::uint16_t v[2];
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        if constexpr (Simplify)
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::pipe_codebook(state[r + i])));
+                        else
+                            v[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(WeightDecode<Bits>::codebook_value(state[r + i])));
+                    }
+                    mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < N / 2; ++i) shared[buffer * 256 + slot + i] = mine[i];
+        }
+        Half16 a1[G];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
+                x + (static_cast<std::size_t>(G + m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
+            a1[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
+        }
+        if (tile_k + 1 < end) {
+            const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(tile_k + 1) * k_stride));
+#pragma unroll
+            for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+        }
+        // LDS release only: A and the next weight words stay outstanding across the barrier. A buffer is rewritten only
+        // after the next barrier, which every wave reaches after these reads.
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+        const Half16 b0 = exchange[buffer * 32 + c];
+        const Half16 b1 = exchange[buffer * 32 + 16 + c];
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
+            acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+        }
+#pragma unroll
+        for (int m = 0; m < G; ++m) {
+            acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
+            acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+        }
+    }
+    const unsigned col0 = bx * 32U + static_cast<unsigned>(c);
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
+            auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
+            dst[col0] = acc0[m][j];
+            dst[col0 + 16U] = acc1[m][j];
+        }
+    }
+}
+
 
 
 // V: 2 = v2 core (item_core), 3 = v3 exact, 4 = v4 (v3 + tiled A), 31 / 32 = v3 diagnostics (no A loads / no decode;

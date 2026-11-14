@@ -1,6 +1,7 @@
 // qpf2k/moe-mi: the body of down_prefill_f16x_da16 (hip_moe_prefill_da16.inc), included by that kernel (the macros expand to
 // its original lines) and by the P1 + DA16 item function. STRIX_DA16_BATCH_TILE declares batch / tile, STRIX_DA16_GUARD the
 // early return (empty in P1: decided per CTA before), STRIX_DA16_LDS(Stage, Rows) the stage `sb` (indexable) and `rows`.
+// STRIX_DA16_UNIFORM_A (a constant expression) selects the activation issue policy of moe_core/grouped_f16.hpp.
     using T=F16Tile<Tune>;
     constexpr unsigned Batch=T::Batch,Columns=T::Columns,TPC=T::TPC,AParts=Batch*4U/T::Threads;
     STRIX_DA16_BATCH_TILE
@@ -34,9 +35,10 @@
     const auto* b_src=weights+(static_cast<unsigned long long>(expert)*hidden+tile*Columns+b_col)*groups*block_bytes;
     struct Regs { uint4 a[AParts][2]{}; DownBlock<Q51> b[BBlocks]; };
     struct Cvt { uint4 a[AParts][2],b[BBlocks][4]; };
+    using AIssue=strix::moe_core::GroupedF16ActivationIssue<STRIX_DA16_UNIFORM_A>;
     const auto fetch=[&](unsigned step,Regs& r) {
 #pragma unroll
-        for(unsigned j=0;j<AParts;++j) if(a_live[j]){r.a[j][0]=f16_load(a_src[j]+8U*step);r.a[j][1]=f16_load(a_src[j]+8U*step+1U);}
+        for(unsigned j=0;j<AParts;++j)AIssue::issue(a_live[j],a_src[j]+8U*step,r.a[j]);
 #pragma unroll
         for(unsigned k=0;k<BBlocks;++k)r.b[k]=down_block<Q51>(b_src,2U*step+BBlocks*b_part+k);
     };

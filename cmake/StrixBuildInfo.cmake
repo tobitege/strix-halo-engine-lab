@@ -101,7 +101,9 @@ file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/strix" "${CMAKE_CURRE
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/include/strix/build_info.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/strix/build_info.hpp" @ONLY)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/share/strix/build-info.json" "${STRIX_BUILD_JSON}\n")
-target_include_directories(strix_core PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated")
+if(TARGET strix_core)  # absent in the standalone CUDA configuration, which includes this file for the header only
+    target_include_directories(strix_core PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated")
+endif()
 if(TARGET strix-build-info-tests AND NOT STRIX_EMBED_BUILD_INFO)
     target_compile_definitions(strix-build-info-tests PRIVATE STRIX_TEST_BUILD_INFO_OFF=1)
 endif()

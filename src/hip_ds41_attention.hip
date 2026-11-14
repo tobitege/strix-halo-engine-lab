@@ -1,8 +1,11 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 // gfx1151 kernels of the deepseek41 decode attention. The arithmetic of each kernel is its host reference in
 // src/ds41_attention.cpp (same chains, same xor butterflies, same scalar helpers), so results match bit for bit.
 #include "strix/hip_ds41_attention.hpp"
 #include "hip_ds41_attention_qk.inc"
+#include "attn_core/banded_flash_prefill.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -1778,9 +1781,7 @@ struct SegmentBatch {
     void clear() { s = SegmentLaunch<View>{}; }
 };
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 void check_rows(std::uint32_t rows) {
     const unsigned limit = strix::ds41::prefill_tuning::enabled("STRIX_DS41_PREFILL_SLABS") ? kMaxCallRows : kLegacyMaxCallRows;
     if (rows == 0U || rows > limit) throw std::invalid_argument("ds41 attention: rows exceed enabled call limit");
@@ -1795,7 +1796,7 @@ static void check_window(const WindowView& v) {
 void enqueue_window_write(const WindowView& v, hipStream_t stream) {
     check_window(v);
     hipLaunchKernelGGL(window_write_kernel, dim3(v.rows), dim3(32), 0, stream, v);
-    check(hipGetLastError(), "ds41 window write");
+    hip_check(hipGetLastError(), "ds41 window write");
 }
 int compress_ahead_mode = -1;  // set_compress_ahead: 0 / 1; -1 = STRIX_DS41_COMPRESS_AHEAD
 void set_compress_ahead(int mode) { compress_ahead_mode = mode; }
@@ -1807,8 +1808,8 @@ static void check_compress(const CompressView& v) {
 }
 // 2 fast, 1 ahead, 0 the default kernel
 static int compress_form() {
-    static const bool ahead_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_AHEAD"); return e && e[0] == '1'; }();
-    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_FAST"); return !(e && e[0] == '0'); }();  // default on
+    static const bool ahead_env = strix::envcfg::flag("STRIX_DS41_COMPRESS_AHEAD", false);
+    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_COMPRESS_FAST", true);  // default on
     if (compress_fast_mode < 0 ? fast_env : compress_fast_mode != 0) return 2;
     if (compress_ahead_mode < 0 ? ahead_env : compress_ahead_mode != 0) return 1;
     return 0;
@@ -1819,7 +1820,7 @@ void enqueue_compress(const CompressView& v, hipStream_t stream) {
     if (form == 2) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, true>), dim3(v.rows), dim3(128), 0, stream, v);
     else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<true, false>), dim3(v.rows), dim3(128), 0, stream, v);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, false>), dim3(v.rows), dim3(128), 0, stream, v);
-    check(hipGetLastError(), "ds41 compress");
+    hip_check(hipGetLastError(), "ds41 compress");
 }
 static void check_index(const IndexView& v) {
     check_rows(v.rows);
@@ -1831,7 +1832,7 @@ void enqueue_index_scores(const IndexView& v, hipStream_t stream) {
     check_index(v);
     hipLaunchKernelGGL(index_qprep_kernel, dim3(v.rows), dim3(256), 0, stream, v);
     hipLaunchKernelGGL(index_scores_kernel, dim3((v.max_count + 255U) / 256U), dim3(256), 0, stream, v);
-    check(hipGetLastError(), "ds41 index scores");
+    hip_check(hipGetLastError(), "ds41 index scores");
 }
 // slices of the two-level selection (0: one block per row)
 static unsigned select_slices(const SelectView& v) {
@@ -1858,7 +1859,7 @@ void launch_select(const SelectView& v, hipStream_t stream) {
         hipLaunchKernelGGL(select_slice_kernel<Legacy>, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
         hipLaunchKernelGGL(select_merge_kernel<Legacy>, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
     }
-    check(hipGetLastError(), "ds41 select");
+    hip_check(hipGetLastError(), "ds41 select");
 }
 void enqueue_select(const SelectView& v, hipStream_t stream) {
     if (select_v1()) launch_select<true>(v, stream);
@@ -1867,17 +1868,15 @@ void enqueue_select(const SelectView& v, hipStream_t stream) {
 namespace {
 int index_candidate_filter_mode = -1, index_direct_mode = -1, attention_segment_hpw_mode = -1;
 unsigned attention_min_blocks_value = 0;
-// on unless the variable is "0" (exact and never slower in interleaved ABA measurements: default on, =0 turns it off)
-bool env_on_unless_zero(const char* name) { const char* e = std::getenv(name); return e == nullptr || !(e[0] == '0' && e[1] == 0); }
 }  // namespace
 void set_index_candidate_filter(int mode) { index_candidate_filter_mode = mode; }
 bool index_candidate_filter() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_CAND_FILTER");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_CAND_FILTER");
     return index_candidate_filter_mode < 0 ? env : index_candidate_filter_mode != 0;
 }
 void set_index_direct(int mode) { index_direct_mode = mode; }
 bool index_direct() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_DIRECT");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_IDX_DIRECT");
     return index_direct_mode < 0 ? env : index_direct_mode != 0;
 }
 void set_attention_segment_hpw(int mode) { attention_segment_hpw_mode = mode; }
@@ -1888,7 +1887,7 @@ static unsigned attention_min_blocks() {
     return attention_min_blocks_value != 0U ? attention_min_blocks_value : env;
 }
 static bool attention_segment_hpw() {
-    static const bool env = env_on_unless_zero("STRIX_DS41_ATTN_SEG_HPW");
+    static const bool env = strix::env_flag_default_on("STRIX_DS41_ATTN_SEG_HPW");
     return attention_segment_hpw_mode < 0 ? env : attention_segment_hpw_mode != 0;
 }
 static void check_select_direct(const SelectView& v) {
@@ -1900,7 +1899,7 @@ static void check_select_direct(const SelectView& v) {
 void enqueue_select_direct(const SelectView& v, hipStream_t stream) {
     check_select_direct(v);
     hipLaunchKernelGGL(select_direct_kernel, dim3(v.rows), dim3(256), 0, stream, v);
-    check(hipGetLastError(), "ds41 select direct");
+    hip_check(hipGetLastError(), "ds41 select direct");
 }
 // chunk blocks per row: all kMaxChunks, or (AttentionView::max_visible, STRIX_DS41_ATTN_LIVE_CHUNKS) the chunks of the
 // caller's bound on any row's visible keys
@@ -1922,32 +1921,32 @@ static unsigned attention_hpw(const AttentionView& v) {
 int attention_lds_swizzle_mode = -1;
 void set_attention_lds_swizzle(int mode) { attention_lds_swizzle_mode = mode; }
 static bool attention_lds_swizzle() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LDS_SWIZZLE"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_LDS_SWIZZLE", true, strix::EnvFlagMatch::exact);  // default on, =0 off
     return attention_lds_swizzle_mode < 0 ? env : attention_lds_swizzle_mode != 0;
 }
 int attention_live_chunks_mode = -1;
 void set_attention_live_chunks(int mode) { attention_live_chunks_mode = mode; }
 bool attention_live_chunks() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LIVE_CHUNKS"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_LIVE_CHUNKS", true, strix::EnvFlagMatch::exact);  // default on, =0 off
     return attention_live_chunks_mode < 0 ? env : attention_live_chunks_mode != 0;
 }
 int attention_window_fold_mode = -1;
 void set_attention_window_fold(int mode) { attention_window_fold_mode = mode; }
 bool attention_window_fold() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_WINDOW_FOLD"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_WINDOW_FOLD", true, strix::EnvFlagMatch::exact);  // default on, =0 off
     return attention_window_fold_mode < 0 ? env : attention_window_fold_mode != 0;
 }
 int attention_tile_f16_mode = -1;
 void set_attention_tile_f16(int mode) { attention_tile_f16_mode = mode; }
 static bool attention_tile_f16() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_TILE_F16"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_TILE_F16", true, strix::EnvFlagMatch::exact);  // default on, =0 off
     return attention_tile_f16_mode < 0 ? env : attention_tile_f16_mode != 0;
 }
 int attention_wave_cap_mode = -1;
 void set_attention_wave_cap(int mode) { attention_wave_cap_mode = mode; }
 // the 6-wave form for a call: lean 3 at 4 heads per wave with compressed keys or 64 heads (default on, =0 off)
 static bool attention_wave_cap(const AttentionView& v) {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_WAVE_CAP"); return !(e && e[0] == '0' && e[1] == 0); }();
+    static const bool env = strix::envcfg::flag("STRIX_DS41_ATTN_WAVE_CAP", true, strix::EnvFlagMatch::exact);
     return (attention_wave_cap_mode < 0 ? env : attention_wave_cap_mode != 0) && (v.idx_count != nullptr || v.heads >= 64U);
 }
 int attention_lean_mode = -1;
@@ -1973,7 +1972,7 @@ static void launch_attention(const AttentionView& v, hipStream_t stream) {
     else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
-    check(hipGetLastError(), "ds41 attention");
+    hip_check(hipGetLastError(), "ds41 attention");
 }
 void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, int variant) {
     static const int env_variant = [] { const char* e = std::getenv("STRIX_DS41_BF16_ATTN_VARIANT"); return e && e[0] == '2' ? 2 : 1; }();
@@ -1983,7 +1982,7 @@ void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, 
     if (variant == 2) hipLaunchKernelGGL(attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
     else hipLaunchKernelGGL(attention_bf16_chunk, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
     hipLaunchKernelGGL(attention_combine_kernel,dim3(v.heads,v.rows),dim3(32),0,stream,v);
-    check(hipGetLastError(),"BF16 hi/lo prefill attention");
+    hip_check(hipGetLastError(),"BF16 hi/lo prefill attention");
 }
 unsigned fast_attn_cpb_value = 2U, fast_attn_heads_value = 16U;
 void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned heads_per_block) {
@@ -1992,7 +1991,7 @@ void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned h
     if (heads_per_block != 16U && heads_per_block != 32U) throw std::invalid_argument("ds41 f16wmma attention: 16 or 32 heads per block");
     fast_attn_cpb_value = chunks_per_block;
     fast_attn_heads_value = heads_per_block;
-    check(hipMemcpyToSymbol(HIP_SYMBOL(g_fast_attn_ablate), &ablate, sizeof(ablate)), "ds41 f16wmma ablate");
+    hip_check(hipMemcpyToSymbol(HIP_SYMBOL(g_fast_attn_ablate), &ablate, sizeof(ablate)), "ds41 f16wmma ablate");
 }
 template <unsigned Cpb, unsigned H>
 static void launch_f16wmma(const AttentionView& v, hipStream_t stream) {
@@ -2015,7 +2014,7 @@ void enqueue_attention_f16wmma_prefill(const AttentionView& v, hipStream_t strea
     if (v.kv != nullptr || v.ring_out != nullptr) throw std::invalid_argument("ds41 f16wmma attention: no window fold");
     if (fast_attn_heads_value == 32U && v.heads % 32U == 0U) launch_f16wmma_cpb<32>(v, stream);
     else launch_f16wmma_cpb<16>(v, stream);
-    check(hipGetLastError(), "ds41 f16wmma attention");
+    hip_check(hipGetLastError(), "ds41 f16wmma attention");
 }
 template <unsigned Lean>
 static void enqueue_attention_form(const AttentionView& v, bool fold, hipStream_t stream) {
@@ -2054,7 +2053,7 @@ void enqueue_window_write_segments(std::span<const WindowView> views, hipStream_
     for_segments(views, [&](const SegmentBatch<WindowView>& b) {
         hipLaunchKernelGGL(window_write_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const WindowView& v) { return dim3(v.rows); });
-    check(hipGetLastError(), "ds41 window write (segments)");
+    hip_check(hipGetLastError(), "ds41 window write (segments)");
 }
 void enqueue_compress_segments(std::span<const CompressView> views, hipStream_t stream) {
     for (const auto& v : views) check_compress(v);
@@ -2064,7 +2063,7 @@ void enqueue_compress_segments(std::span<const CompressView> views, hipStream_t 
         else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<true, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<false, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
     }, [](const CompressView& v) { return dim3(v.rows); });
-    check(hipGetLastError(), "ds41 compress (segments)");
+    hip_check(hipGetLastError(), "ds41 compress (segments)");
 }
 void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t stream) {
     for (const auto& v : views) if (v.max_count != 0U) check_index(v); else check_rows(v.rows);
@@ -2074,14 +2073,14 @@ void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t
     for_segments(views, [&](const SegmentBatch<IndexView>& b) {
         hipLaunchKernelGGL(index_scores_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
     }, [](const IndexView& v) { return dim3((v.max_count + 255U) / 256U); });
-    check(hipGetLastError(), "ds41 index scores (segments)");
+    hip_check(hipGetLastError(), "ds41 index scores (segments)");
 }
 void enqueue_select_direct_segments(std::span<const SelectView> views, hipStream_t stream) {
     for (const auto& v : views) check_select_direct(v);
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
         hipLaunchKernelGGL(select_direct_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
     }, [](const SelectView& v) { return dim3(v.rows); });
-    check(hipGetLastError(), "ds41 select direct (segments)");
+    hip_check(hipGetLastError(), "ds41 select direct (segments)");
 }
 template <bool Legacy>
 void launch_select_segments(std::span<const SelectView> views, hipStream_t stream) {
@@ -2095,7 +2094,7 @@ void launch_select_segments(std::span<const SelectView> views, hipStream_t strea
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
         hipLaunchKernelGGL(select_merge_seg_kernel<Legacy>, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(0) : select_merge_grid(v); });
-    check(hipGetLastError(), "ds41 select (segments)");
+    hip_check(hipGetLastError(), "ds41 select (segments)");
 }
 void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream) {
     if (select_v1()) launch_select_segments<true>(views, stream);
@@ -2136,7 +2135,7 @@ static void launch_attention_segments(std::span<const AttentionView> views, hipS
     for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
         hipLaunchKernelGGL(attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const AttentionView& v) { return v.tickets == nullptr ? dim3(v.heads, v.rows) : dim3(0); });
-    check(hipGetLastError(), "ds41 attention (segments)");
+    hip_check(hipGetLastError(), "ds41 attention (segments)");
 }
 template <unsigned Lean>
 static void enqueue_attention_segments_form(std::span<const AttentionView> views, bool fold, hipStream_t stream) {

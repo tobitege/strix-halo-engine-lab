@@ -38,6 +38,7 @@ __device__ __forceinline__ void project_f16x_body(const unsigned char* gate,cons
 #define STRIX_F16X_BATCH_TILE const unsigned batch=p1_batch,tile=p1_tile;
 #define STRIX_F16X_LDS(S,R) S* const sb=p1_sb; R& rows=p1_rows;
 #define STRIX_F16X_HDR_REUSE Reuse
+#include "strix/env_flags.hpp"
 #include "hip_moe_f16x_project_body.inc"
 #undef STRIX_F16X_HDR_REUSE
 #undef STRIX_F16X_BATCH_TILE
@@ -74,7 +75,7 @@ inline unsigned p1_lag() {
     return lag;
 }
 inline bool p1_stats_enabled() {
-    static const bool on=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_P1STATS");return v&&v[0]=='1';}();
+    static const bool on=strix::envcfg::flag("STRIX_QPF2K_MOE_P1STATS", false);
     return on;
 }
 template<bool Q5K,bool Q51,unsigned Tune>

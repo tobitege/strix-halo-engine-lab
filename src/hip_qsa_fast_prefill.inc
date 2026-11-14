@@ -63,7 +63,7 @@ __device__ __forceinline__ int q_exponent(float peak) {
     int e; (void)frexpf(peak, &e);
     return min(120, max(-120, 14 - e));
 }
-__device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total) {
+[[maybe_unused]] __device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total) {
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U;
     unsigned x = v;
     for (unsigned d = 1U; d < 32U; d <<= 1U) { const unsigned y = __shfl_up(x, d, 32); if (lane >= d) x += y; }
@@ -405,6 +405,38 @@ __device__ __forceinline__ u32x2 load8(const void* p) {
 __device__ __forceinline__ float load_scale(const void* p) {
     return *reinterpret_cast<const __attribute__((address_space(1))) float*>(reinterpret_cast<std::uintptr_t>(p));
 }
+// Selection and scale adapter for the shared selected-key flash chunk.
+template <bool Int8>
+struct SelectedFlashPolicy {
+    static constexpr unsigned kDim = qsa_fast::kDim, kPitch = qsa_fast::kPitch;
+    uint2 meta[4];
+    unsigned bit, visible, weights, half;
+    float score_scale;
+    const float* scales;
+    __device__ __forceinline__ SelectedFlashPolicy(const uint2 (&m)[4], unsigned b, unsigned vis, unsigned w,
+        unsigned h, float ss, const float* sc) : meta{m[0], m[1], m[2], m[3]}, bit(b), visible(vis), weights(w),
+        half(h), score_scale(ss), scales(sc) {}
+    // Element e: token slot 2e + half of the chunk (block e / 2), column col.
+    __device__ __forceinline__ float score(float x, unsigned e) const {
+        const uint2 blk = meta[e / 2U];
+        const unsigned token = blk.x * 4U + 2U * (e % 2U) + half;
+        const bool live = (blk.y & bit) != 0U && token < visible;
+        if constexpr (Int8) x = x * scales[2U * e + half];
+        return live ? x * score_scale : -INFINITY;
+    }
+    __device__ __forceinline__ void weight(float (&p)[8]) const {
+        if (meta[0].x == 0U)  // tokens 0..3: their multiplicity in the row's selection
+#pragma unroll
+            for (unsigned e = 0; e < 2U; ++e) p[e] *= static_cast<float>((weights >> (8U * (2U * e + half))) & 255U);
+    }
+    __device__ __forceinline__ void value_scale(float& lo, float& hi, unsigned e) const {
+        if constexpr (Int8) { lo = lo * scales[16U + 2U * e]; hi = hi * scales[17U + 2U * e]; }
+    }
+    __device__ static __forceinline__ float swap(float x) { return swap16(x); }
+    __device__ static __forceinline__ void barrier() { lds_barrier(); }
+    __device__ static __forceinline__ unsigned value_row(unsigned d) { return v_row(d); }
+};
+
 template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8, bool Capture = false>
 __device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uint16_t* kv, std::uint32_t kv_heads,
     std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug, unsigned tile, unsigned yb) {
@@ -607,65 +639,8 @@ __device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uin
         uint2 meta[4];
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) meta[i] = meta_lds[buf][i];
-        f32x8 part[2] = {};
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) {
-            const f16x16 a = *reinterpret_cast<const f16x16*>(&k_lds[buf][col][fh * (kDim / 2U) + 16U * k]);
-            part[k % 2U] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, qf[k], part[k % 2U]);
-        }
-        const f32x8 mine = part[0] + part[1];
-        *reinterpret_cast<f32x8*>(&xch[grp][fh][lane][0]) = mine;
-        lds_barrier();
-        const f32x8 other = *reinterpret_cast<const f32x8*>(&xch[grp][fh ^ 1U][lane][0]);
-        const f32x8 s = fh == 0U ? mine + other : other + mine;
-        // Element e: token slot 2e + half of the chunk (block e / 2), column col.
-        float p[8], top = -INFINITY;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) {
-            const uint2 blk = meta[e / 2U];
-            const unsigned token = blk.x * 4U + 2U * (e % 2U) + half;
-            const bool live = (blk.y & bit) != 0U && token < visible;
-            float score = s[e];
-            if constexpr (Int8) score = score * scale_lds[Int8 ? buf : 0U][Int8 ? 2U * e + half : 0U];
-            p[e] = live ? score * score_scale : -INFINITY;
-            top = fmaxf(top, p[e]);
-        }
-        top = fmaxf(top, swap16(top));
-        const float m_new = fmaxf(m_run, top);
-        const float ref = m_new == -INFINITY ? 0.0F : m_new;
-        const float alpha = __builtin_amdgcn_exp2f(m_run - ref);
-        float sum = 0.0F;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) p[e] = __builtin_amdgcn_exp2f(p[e] - ref);
-        if (meta[0].x == 0U) // tokens 0..3: their multiplicity in the row's selection
-#pragma unroll
-            for (unsigned e = 0; e < 2U; ++e) p[e] *= static_cast<float>((weights >> (8U * (2U * e + half))) & 255U);
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) sum += p[e];
-        sum += swap16(sum);
-        l_run = l_run * alpha + sum;
-        m_run = m_new;
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
-#pragma unroll
-            for (unsigned n = 0; n < 8U; ++n) acc[n] *= alpha;
-        f16x16 pb;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) {
-            const float o = swap16(p[e]);
-            float lo = half ? o : p[e], hi = half ? p[e] : o; // token slots 2e, 2e + 1
-            if constexpr (Int8) {
-                lo = lo * scale_lds[Int8 ? buf : 0U][Int8 ? 16U + 2U * e : 0U];
-                hi = hi * scale_lds[Int8 ? buf : 0U][Int8 ? 17U + 2U * e : 0U];
-            }
-            pb[2U * e] = static_cast<_Float16>(lo);
-            pb[2U * e + 1U] = static_cast<_Float16>(hi);
-        }
-#pragma unroll
-        for (unsigned n = 0; n < 8U; ++n) {
-            const f16x16 a = *reinterpret_cast<const f16x16*>(&v_lds[buf][v_row(fh * (kDim / 2U) + 16U * n + col)][0]);
-            acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, acc[n]);
-        }
-        lds_barrier();
+        strix::attn_core::selected_flash_step(qf, acc, k_lds[buf], v_lds[buf], xch[grp], col, half, fh, lane,
+            m_run, l_run, SelectedFlashPolicy<Int8>{meta, bit, visible, weights, half, score_scale, scale_lds[Int8 ? buf : 0U]});
     }
     if constexpr (Capture) { // fixture-only final online state, before the lossy output rounding
         float* state = v.scratch[r] + static_cast<std::uint64_t>(head) * kPartial;
@@ -930,65 +905,8 @@ __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std:
         uint2 meta[4];
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) meta[i] = meta_lds[buf][i];
-        f32x8 part[2] = {};
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) {
-            const f16x16 a = *reinterpret_cast<const f16x16*>(&k_lds[buf][col][fh * (kDim / 2U) + 16U * k]);
-            part[k % 2U] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, qf[k], part[k % 2U]);
-        }
-        const f32x8 mine = part[0] + part[1];
-        *reinterpret_cast<f32x8*>(&xch[grp][fh][lane][0]) = mine;
-        lds_barrier();
-        const f32x8 other = *reinterpret_cast<const f32x8*>(&xch[grp][fh ^ 1U][lane][0]);
-        const f32x8 s = fh == 0U ? mine + other : other + mine;
-        // Element e: token slot 2e + half of the chunk (block e / 2), column col.
-        float p[8], top = -INFINITY;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) {
-            const uint2 blk = meta[e / 2U];
-            const unsigned token = blk.x * 4U + 2U * (e % 2U) + half;
-            const bool live = (blk.y & bit) != 0U && token < visible;
-            float score = s[e];
-            if constexpr (Int8) score = score * scale_lds[Int8 ? buf : 0U][Int8 ? 2U * e + half : 0U];
-            p[e] = live ? score * score_scale : -INFINITY;
-            top = fmaxf(top, p[e]);
-        }
-        top = fmaxf(top, swap16(top));
-        const float m_new = fmaxf(m_run, top);
-        const float ref = m_new == -INFINITY ? 0.0F : m_new;
-        const float alpha = __builtin_amdgcn_exp2f(m_run - ref);
-        float sum = 0.0F;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) p[e] = __builtin_amdgcn_exp2f(p[e] - ref);
-        if (meta[0].x == 0U) // tokens 0..3: their multiplicity in the row's selection
-#pragma unroll
-            for (unsigned e = 0; e < 2U; ++e) p[e] *= static_cast<float>((weights >> (8U * (2U * e + half))) & 255U);
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) sum += p[e];
-        sum += swap16(sum);
-        l_run = l_run * alpha + sum;
-        m_run = m_new;
-        if (__builtin_amdgcn_ballot_w32(alpha != 1.0F))
-#pragma unroll
-            for (unsigned n = 0; n < 8U; ++n) acc[n] *= alpha;
-        f16x16 pb;
-#pragma unroll
-        for (unsigned e = 0; e < 8U; ++e) {
-            const float o = swap16(p[e]);
-            float lo = half ? o : p[e], hi = half ? p[e] : o; // token slots 2e, 2e + 1
-            if constexpr (Int8) {
-                lo = lo * scale_lds[Int8 ? buf : 0U][Int8 ? 16U + 2U * e : 0U];
-                hi = hi * scale_lds[Int8 ? buf : 0U][Int8 ? 17U + 2U * e : 0U];
-            }
-            pb[2U * e] = static_cast<_Float16>(lo);
-            pb[2U * e + 1U] = static_cast<_Float16>(hi);
-        }
-#pragma unroll
-        for (unsigned n = 0; n < 8U; ++n) {
-            const f16x16 a = *reinterpret_cast<const f16x16*>(&v_lds[buf][v_row(fh * (kDim / 2U) + 16U * n + col)][0]);
-            acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, pb, acc[n]);
-        }
-        lds_barrier();
+        strix::attn_core::selected_flash_step(qf, acc, k_lds[buf], v_lds[buf], xch[grp], col, half, fh, lane,
+            m_run, l_run, SelectedFlashPolicy<Int8>{meta, bit, visible, weights, half, score_scale, scale_lds[Int8 ? buf : 0U]});
     }
     if (splits == 1U) {
         // One slice: combine_kernel's arithmetic for one split, in place.

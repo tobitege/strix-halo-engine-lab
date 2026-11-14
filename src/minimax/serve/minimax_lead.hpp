@@ -1,9 +1,13 @@
 #pragma once
-// Rank-0 production scheduler. Engine/runner/clock are compile-time seams for host control traces.
+// Rank-0 native planner; SessionRuntime owns requests and leases.
+// Engine/runner/clock are compile-time seams for host control traces.
 #include "minimax_sched.hpp"
 #include "minimax_control.hpp"
 #include "minimax_api.hpp"
 #include "minimax_session.hpp"
+#include "session_engine.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/serve/session_runtime.hpp"
 #include "minimax/dspark/minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/lookup/index.hpp"
@@ -17,6 +21,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <type_traits>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -28,12 +33,14 @@ namespace mm = strix::minimax::engine;
 namespace sv = strix::serve;
 namespace ms = strix::minimax::serve;
 namespace ds = strix::minimax::dspark;
-
-// Automatic prefix KV reuse is opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks (this rank's hello vote). The scheduler
-// reuses only when both ranks voted (Shared::prefix_reuse), and the reports state that same value.
-inline bool prefix_cache_requested() noexcept {
-    const char* pe = std::getenv("STRIX_MM_SERVE_PREFIX");
-    return pe != nullptr && std::string_view(pe) == "1";
+// Resident-slot reuse of a prefill prefix (opt-in, exactly "1"; both ranks must vote).
+inline bool prefix_cache_requested() {
+    return strix::envcfg::flag("STRIX_MM_SERVE_PREFIX", false, strix::EnvFlagMatch::exact);
+}
+// Conversation mode on top of it (opt-in, exactly "1"; both ranks must vote): a finished reply keeps its slot's rows
+// and the follow-up turn restarts prefill at that frontier. Not bitwise equal to a cold full prefill.
+inline bool conversation_cache_requested() {
+    return strix::envcfg::flag("STRIX_MM_SERVE_CONVERSATION", false, strix::EnvFlagMatch::exact);
 }
 using Clock = std::chrono::steady_clock;
 using ms::Command;
@@ -41,10 +48,7 @@ using ms::Control;
 using ms::exchange;
 constexpr std::uint32_t kStepRows = 8;
 inline double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b-a).count(); }
-struct Drafts {
-    std::array<std::uint32_t, ds::block> tokens{};
-    std::array<float, ds::block> confidence{};
-};
+using Drafts = ms::SessionDraft;
 inline std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 14695981039346656037ULL) {
     const auto* b = static_cast<const std::uint8_t*>(p);
     for (std::size_t i = 0; i < bytes; ++i) h = (h ^ b[i]) * 1099511628211ULL;
@@ -90,18 +94,23 @@ struct Shared {
     unsigned nest_rows = 0;
     std::uint64_t active_id = 0, parked_id = 0;
     bool nest_taps = false;
-    bool prefix_reuse = false;  // both ranks voted for prefix reuse in the hello; fixed before the Lead starts
+    bool prefix_reuse = false; // negotiated once, both ranks and alignment
+    bool conversation = false; // negotiated once, both ranks, needs prefix_reuse
+    strix::session::Identity prefix_identity;
+    std::function<bool(std::uint64_t)> prefill_int4_regime;
     std::uint32_t dspark_live = 0, dspark_contexts = 0;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
 
 struct Running {
-    sv::TakenJob job;
+    explicit Running(sv::SessionLease lease) : job(lease.taken), state(lease.state), stats(lease.stats) {}
+    sv::TakenJob& job; // borrowed from SessionRuntime, never owns the ticket
+    strix::session::KvHandle state;
     std::uint32_t slot = 0;
-    std::uint32_t reused = 0;  // leading prompt tokens taken from the slot's resident cache (prefix reuse)
+    std::uint64_t reused = 0;
     std::uint64_t pos = 0;  // position of `last` (the next input token)
     std::uint32_t last = 0;
-    sv::GenerationStats stats;
+    sv::GenerationStats& stats;
     Extra x;
     ms::RequestPolicy policy;  // effective operation policy, retained for prefill, cancellation and decoder residency
     Clock::time_point decode_start, first_emit, last_emit;
@@ -184,14 +193,21 @@ template<class Engine, class Runner, class Time = std::chrono::steady_clock>
 class Lead {
 public:
     Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop,
-         std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {}, ms::SessionService* session = nullptr)
-        : eng_(eng), run_(run), queue_(queue), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
-          run_slots_(slots_), kv_(slots_), stop_(stop), session_(session), taps_(taps) {
+         std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {}, ms::SessionService* session = nullptr, std::shared_ptr<PrefixStateCache> cache_owner = {})
+        : eng_(eng), run_(run), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
+          plans_(slots_), stop_(stop), session_(session), taps_(taps),
+          backend_(run), adapter_(backend_, slots_, capacity_, [this](auto h) { release_native(h); },
+              [this] { return eng_.prefill_progress(); }),
+          store_(slots_, 2, adapter_.storage_hooks()), runtime_(queue, adapter_, store_, {}, owner_hooks(), std::move(cache_owner)) {
+        adapter_.attach(store_);
+        if (sh_.prefix_reuse) {
+            if constexpr (requires { eng_.prefill_reuse_rows(); }) reuse_rows_ = eng_.prefill_reuse_rows();
+            if (!reuse_rows_ || !sh_.prefix_identity.known() || sh_.prefix_identity.ranks != 2)
+                throw std::invalid_argument("MiniMax resident identity/alignment unavailable");
+            conversation_ = sh_.conversation;
+        } else if (sh_.conversation) throw std::invalid_argument("MiniMax conversation mode needs prefix reuse");
         prompt_bytes_ = std::move(prompt_bytes);
-        prefix_on_ = sh_.prefix_reuse;
-        reuse_rows_ = prefix_on_ ? eng_.prefill_reuse_rows() : max_rows_;
-        if (reuse_rows_ == 0) throw std::invalid_argument("prefix reuse: zero prefill alignment");
-        round_ = run.control_round;
+        lock_ = strix::pair::Lockstep(static_cast<std::uint32_t>(eng_.rank()), run.control_round);
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
         timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
         if (timeline_on_) timeline_origin_ = Time::now();
@@ -202,128 +218,161 @@ public:
             lookup_tokens_ = static_cast<std::uint32_t>(std::clamp(std::atoll(t), 1024LL, 1LL << 20));
     }
 
-    void loop() try {
-        auto last_round = Time::now();
-        while (!stop_.load() && !queue_.stopping()) {
-            refresh_policy();
-            sync_taps();
-            bool worked = false;
-            // a client gone while its prefill is open: the task is abandoned at this unit boundary (both ranks)
-            for (std::uint32_t slot = 0; slot < slots_; ++slot) {
-                auto& r = run_slots_[slot];
-                if (!r || !r->prefilling || !r->job.ticket->cancelled()) continue;
-                Control c;
-                c.command = static_cast<std::uint32_t>(Command::cancel);
-                c.task_id = r->request_id;
-                c.round = round_++;
-                (void)exchange(eng_, c);
-                const auto progress = eng_.prefill_progress(eng_.prefill_progress(true).id == c.task_id);
-                run_.prefill_cancel(c.task_id);
-                if (timeline_on_) timeline("cancel", Time::now(), "ticket", slot, progress.layer, progress.layer, timeline_task(progress));
-                layer_.reset_pending();
-                r->decode_start = Time::now();
-                r->stats.prefill_ms = elapsed(r->prefill_start);
-                finish(r, "cancelled");
-                if (slot == parked_slot_) parked_slot_ = slots_;
-                add([](Counters& k) { ++k.cancels; });
-            }
-            if (!eng_.prefill_active() && eng_.prefill_progress(true).open) unpark();
-            if (eng_.prefill_active() && !eng_.prefill_progress(true).open && pol_.nest) {
-                if (!admit(true) && nested_needs_decode_ && decoding_count() > 0) {
-                    cycle();
-                    (void)admit(true);  // re-evaluate real ages after the complete cycle
-                }
-            }
-            {
-                std::lock_guard<std::mutex> l(sh_.m);
-                sh_.active_id = eng_.prefill_active() ? eng_.prefill_progress().id : 0;
-                sh_.parked_id = eng_.prefill_progress(true).open ? eng_.prefill_progress(true).id : 0;
-            }
-            for (auto& r : run_slots_)
-                if (r && r->policy.sched == Sched::interleave && !r->prefilling && r->job.ticket->cancelled()) finish(r, "cancelled");
-            // admission: one open prefill at a time
-            if (!eng_.prefill_open()) worked |= admit();
-            if (eng_.prefill_open()) {
-                const auto& policy = run_slots_[prefill_slot_]->policy;
-                const bool off = run_slots_[prefill_slot_]->policy.sched == Sched::off;
-                const bool fresh = run_slots_[prefill_slot_]->x.units == 0;  // a started task keeps interleaving
-                // Whole admissions share a deadline; started tasks retain layer boundaries.
-                const auto n = decoding_count();
-                const bool whole = run_slots_[prefill_slot_]->x.nested || off || ms::runs_whole(fresh, predicted_rest_ms(), policy.service_ms, n > 0,
-                    live_gap_ms(policy.gap_ms), cycle_ms(std::min(n + 1, kStepRows)), longest_wait_ms(), ms::control_margin_ms);
-                if (off || whole) {
-                    prefill_unit(~0U);
-                    last_round = Time::now();
-                    // Reconsider the next candidate against all last-emission deadlines. Never wait for arrivals.
-                    continue;
-                }
-            }
-            if (decoding_count() > 0 && (!eng_.prefill_open() || !deadline_serviced_)) {
-                cycle();
-                worked = true;
-            }
-            if (eng_.prefill_open()) {
-                // A cycle just serviced every decoder. If a single layer still cannot fit, advance once;
-                // no schedule can meet that target without changing the numerical unit.
-                prefill_unit(std::max(1U, unit_layers()));
-                worked = true;
-            }
-            if (worked) {
-                last_round = Time::now();
-                continue;
-            }
-            if (std::chrono::duration<double>(Time::now() - last_round).count() > 1.0) {  // keep rank 1 and the link alive
-                Control hb;
-                hb.command = static_cast<std::uint32_t>(Command::heartbeat);
-                hb.round = round_++;
-                const auto hb0 = timeline_on_ ? Time::now() : Clock::time_point{};
-                (void)exchange(eng_, hb);
-                // Both ranks at an idle heartbeat, with no exchange in flight.
-                // Native runners retire preposted direct receives before their
-                // DMA deadline; pure host runners need no transport hook.
-                if constexpr (requires { run_.quiesce(); }) run_.quiesce();
-                if (timeline_on_) timeline("heartbeat", hb0, "deadline");
-                last_round = Time::now();
-            }
-            const auto idle0 = Time::now();
-            idle(std::chrono::milliseconds(2));
-            add([&](Counters& c) { c.idle_s += secs(idle0, Time::now()); });
-            if (timeline_on_) timeline("idle", idle0, "defer");
+    sv::SessionRuntime& runtime() noexcept { return runtime_; }
+    void loop() try { runtime().run(); }
+    catch (...) { eng_.abort("control channel: protocol failure"); throw; }
+
+private:
+    sv::SessionHooks owner_hooks() {
+        sv::SessionHooks h;
+        h.identity = sh_.prefix_identity;
+        h.resident_identity = [this](const sv::GenerationJob& job) {
+            auto id = sh_.prefix_identity;
+            if (sh_.prefill_int4_regime)
+                id.profile += sh_.prefill_int4_regime(job.prompt.size()) ? ":int4" : ":native";
+            return id;
+        };
+        h.control_turn = [this](sv::SessionRuntime&) { control_turn(); };
+        h.closing = [this] { close_native(); };
+        h.failed = [this] { eng_.abort("control channel: protocol failure"); };
+        h.stopped = [this] {
             flush_timeline();
+            Control bye; bye.command = static_cast<std::uint32_t>(Command::shutdown);
+            (void)exchange(eng_, bye, lock_);
+        };
+        h.stop_requested = [this] { return stop_.load(); };
+        h.now = [] { return Time::now(); };
+        if constexpr (requires { Time::sleep_for(std::chrono::milliseconds(2)); })
+            h.wait = [](auto d) { Time::sleep_for(d); };
+        h.validate_session = [this](const sv::GenerationJob& j) {
+            if (!session_ || j.session.empty() || !j.session_id.empty())
+                throw std::invalid_argument("unsupported named session");
+        };
+        return h;
+    }
+    void control_turn() {
+        refresh_policy();
+        sync_taps();
+        bool worked = false;
+        // a client gone while its prefill is open: the task is abandoned at this unit boundary (both ranks)
+        for (std::uint32_t slot = 0; slot < slots_; ++slot) {
+            auto& r = plans_[slot];
+            if (!r || !r->prefilling || !r->job.ticket->cancelled()) continue;
+            Control c;
+            c.command = static_cast<std::uint32_t>(Command::cancel);
+            c.task_id = r->request_id;
+            (void)exchange(eng_, c, lock_);
+            const auto progress = eng_.prefill_progress(eng_.prefill_progress(true).id == c.task_id);
+            run_.prefill_cancel(c.task_id);
+            if (timeline_on_) timeline("cancel", Time::now(), "ticket", slot, progress.layer, progress.layer, timeline_task(progress));
+            layer_.reset_pending();
+            r->decode_start = Time::now();
+            r->stats.prefill_ms = elapsed(r->prefill_start);
+            finish(r, "cancelled");
+            if (slot == parked_slot_) parked_slot_ = slots_;
+            add([](Counters& k) { ++k.cancels; });
         }
+        if (!eng_.prefill_active() && eng_.prefill_progress(true).open) unpark();
+        if (eng_.prefill_active() && !eng_.prefill_progress(true).open && pol_.nest) {
+            if (!admit(true) && nested_needs_decode_ && decoding_count() > 0) {
+                cycle();
+                (void)admit(true);  // re-evaluate real ages after the complete cycle
+            }
+        }
+        {
+            std::lock_guard<std::mutex> l(sh_.m);
+            sh_.active_id = eng_.prefill_active() ? eng_.prefill_progress().id : 0;
+            sh_.parked_id = eng_.prefill_progress(true).open ? eng_.prefill_progress(true).id : 0;
+        }
+        for (auto& r : plans_)
+            if (r && r->policy.sched == Sched::interleave && !r->prefilling && r->job.ticket->cancelled()) finish(r, "cancelled");
+        // admission: one open prefill at a time
+        if (!eng_.prefill_open()) worked |= admit();
+        if (eng_.prefill_open()) {
+            const auto& policy = plans_[prefill_slot_]->policy;
+            const bool off = plans_[prefill_slot_]->policy.sched == Sched::off;
+            const bool fresh = plans_[prefill_slot_]->x.units == 0;  // a started task keeps interleaving
+            // Whole admissions share a deadline; started tasks retain layer boundaries.
+            const auto n = decoding_count();
+            const bool whole = plans_[prefill_slot_]->x.nested || off || ms::runs_whole(fresh, predicted_rest_ms(), policy.service_ms, n > 0,
+                live_gap_ms(policy.gap_ms), cycle_ms(std::min(n + 1, kStepRows)), longest_wait_ms(), ms::control_margin_ms);
+            if (off || whole) {
+                prefill_unit(~0U);
+                last_round_ = Time::now();
+                // Reconsider the next candidate against all last-emission deadlines. Never wait for arrivals.
+                return;
+            }
+        }
+        if (decoding_count() > 0 && (!eng_.prefill_open() || !deadline_serviced_)) {
+            cycle();
+            worked = true;
+        }
+        if (eng_.prefill_open()) {
+            // A cycle just serviced every decoder. If a single layer still cannot fit, advance once;
+            // no schedule can meet that target without changing the numerical unit.
+            prefill_unit(std::max(1U, unit_layers()));
+            worked = true;
+        }
+        if (worked) {
+            last_round_ = Time::now();
+            return;
+        }
+        if (std::chrono::duration<double>(Time::now() - last_round_).count() > 1.0) {  // keep rank 1 and the link alive
+            Control hb;
+            hb.command = static_cast<std::uint32_t>(Command::heartbeat);
+            const auto hb0 = timeline_on_ ? Time::now() : Clock::time_point{};
+            (void)exchange(eng_, hb, lock_);
+            // Both ranks at an idle heartbeat, with no exchange in flight.
+            // Native runners retire preposted direct receives before their
+            // DMA deadline; pure host runners need no transport hook.
+            if constexpr (requires { run_.quiesce(); }) run_.quiesce();
+            if (timeline_on_) timeline("heartbeat", hb0, "deadline");
+            last_round_ = Time::now();
+        }
+        const auto idle0 = Time::now();
+        // Idle pause. Real clock: a submit wakes the loop at once, capped at 20 ms (and at the 1 s heartbeat) so the
+        // stop flag stays prompt; queued work that is not admitted keeps the short poll so the loop never spins. An
+        // injected test clock keeps its own 2 ms sleep.
+        auto pause = std::chrono::milliseconds(2);
+        if constexpr (std::is_same_v<Time, std::chrono::steady_clock>) {
+            if (!runtime_.has_waiting([](const sv::GenerationJob&, std::chrono::steady_clock::time_point) { return true; })) {
+                const auto due = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    last_round_ + std::chrono::seconds(1) - idle0);
+                pause = std::clamp(due, std::chrono::milliseconds(1), std::chrono::milliseconds(20));
+            }
+        }
+        runtime_.wait_for(pause);
+        add([&](Counters& c) { c.idle_s += secs(idle0, Time::now()); });
+        if (timeline_on_) timeline("idle", idle0, "defer");
+        flush_timeline();
+    }
+    void close_native() {
         for (const bool parked : {false, true}) {
             const auto p = eng_.prefill_progress(parked);
             if (!p.open) continue;
             Control c;
             c.command = static_cast<std::uint32_t>(Command::cancel);
             c.task_id = p.id;
-            c.round = round_++;
-            (void)exchange(eng_, c);
+            (void)exchange(eng_, c, lock_);
             run_.prefill_cancel(p.id);
         }
-        for (auto& r : run_slots_)
+        for (auto& r : plans_)
             if (r) finish(r, "cancelled");
-        if (pending_) {
-            sv::GenerationStats stats;
-            stats.finish = "cancelled";
-            queue_.finish(*pending_, stats);
+    }
+    void release_native(strix::session::KvHandle h) {
+        // Invalidate any partial native task before this physical slot can be
+        // leased again. Completed slots are overwritten by native prefill;
+        // no unqualified cache or old suffix becomes visible through the store.
+        for (bool parked : {false, true}) {
+            const auto p = eng_.prefill_progress(parked);
+            if (!p.open || p.slot != h.slot || p.generation != h.generation) continue;
+            Control c; c.command = static_cast<std::uint32_t>(Command::cancel);
+            c.task_id = p.id;
+            (void)exchange(eng_, c, lock_); run_.prefill_cancel(p.id);
         }
-        flush_timeline();
-        Control bye;
-        bye.command = static_cast<std::uint32_t>(Command::shutdown);
-        bye.round = round_++;
-        (void)exchange(eng_, bye);
-    } catch (...) {
-        eng_.abort("control channel: protocol failure");
-        throw;
     }
 
-private:
     static double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Time::now() - start).count(); }
-    static void idle(std::chrono::milliseconds duration) {
-        if constexpr (requires { Time::sleep_for(duration); }) Time::sleep_for(duration);
-        else std::this_thread::sleep_for(duration);
-    }
     template <class F> void add(F f) {
         std::lock_guard<std::mutex> l(sh_.m);
         f(sh_.counters);
@@ -332,15 +381,14 @@ private:
     // no prefill open; requests admitted while they were off have no drafter context.
     void sync_taps() {
         bool active = false;
-        for (const auto& r : run_slots_) active |= r && r->context;
+        for (const auto& r : plans_) active |= r && r->context;
         const bool want = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on ||
                           (pol_.dspark_mode == ds::Mode::automatic && active));
         if (want == taps_ || eng_.prefill_open() || parked_slot_ < slots_) return;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::taps);
-        c.round = round_++;
         c.pflags = want ? 1U : 0U;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         eng_.set_taps(want);
         taps_ = want;
     }
@@ -348,16 +396,15 @@ private:
         std::lock_guard<std::mutex> l(sh_.m);
         if (sh_.policy.epoch != pol_.epoch) {  // reset optimization gates, retain deadline safety estimates
             std::uint32_t retiring = 0;
-            for (const auto& r : run_slots_) if (r && r->context) retiring |= 1U << r->slot;
+            for (const auto& r : plans_) if (r && r->context) retiring |= 1U << r->slot;
             if (retiring != 0) {
                 Control c;
                 c.command = static_cast<std::uint32_t>(Command::retire);
-                c.round = round_++;
                 c.append = retiring;
-                (void)exchange(eng_, c);
+                (void)exchange(eng_, c, lock_);
                 run_.retire_contexts(retiring);
             }
-            for (auto& r : run_slots_) if (r) {
+            for (auto& r : plans_) if (r) {
                 r->context = false;
                 r->x.context = false;
                 r->automatic.retire("plain:policy_epoch");
@@ -371,16 +418,16 @@ private:
         pol_ = sh_.policy;
         sh_.dspark_live = inflight();
         sh_.dspark_contexts = 0;
-        for (const auto& r : run_slots_) if (r && r->context) ++sh_.dspark_contexts;
+        for (const auto& r : plans_) if (r && r->context) ++sh_.dspark_contexts;
     }
     std::uint32_t decoding_count() const {
         std::uint32_t n = 0;
-        for (const auto& r : run_slots_) n += r && !r->prefilling ? 1U : 0U;
+        for (const auto& r : plans_) n += r && !r->prefilling ? 1U : 0U;
         return n;
     }
     std::uint32_t inflight() const {
         std::uint32_t n = 0;
-        for (const auto& r : run_slots_) n += r ? 1U : 0U;
+        for (const auto& r : plans_) n += r ? 1U : 0U;
         return n;
     }
 
@@ -404,14 +451,18 @@ private:
             std::lock_guard<std::mutex> l(sh_.m);
             sh_.extras[r->job.ticket.get()] = r->x;
         }
-        // Keep only completed, aligned prefill rows. Decode rows can have different bits,
-        // and a cancelled prefill only guarantees its previously reused prefix.
-        if (prefix_on_) {
-            const auto resident = r->prefilling ? r->reused : r->stats.prompt_tokens;
-            kv_[r->slot].resize(static_cast<std::size_t>(resident - resident % reuse_rows_));
-        }
-        queue_.finish(r->job, r->stats);
+        const auto state = r->state;
+        const auto resident = reuse_rows_ ? (r->prefilling ? r->reused : r->stats.prompt_tokens) : 0;
+        const auto safe = reuse_rows_ ? resident - resident % reuse_rows_ : 0;
+        // Conversation mode: a reply that ended on its own (stop / length) in a plain, non-nested lane without a drafter
+        // context keeps its consumed rows (prompt + reply up to the last committed token; the final emitted token is
+        // the pending anchor and stays in the next turn's suffix). Everything else keeps the aligned prompt record.
+        const bool keep_reply = conversation_ && !r->prefilling && !r->context && !r->x.nested && (why == "stop" || why == "length");
+        const auto consumed = keep_reply ? store_.consumed(state) : 0;
+        const auto prompt_rows = r->stats.prompt_tokens;
         r.reset();
+        if (keep_reply && consumed >= prompt_rows) runtime_.complete(state, {}, sv::ResidentClaim{consumed, consumed - prompt_rows});
+        else runtime_.complete(state, {}, safe);
     }
 
     // Emits `ids` of request r in order until a stop token, a cancellation or its token limit; returns false when r ended.
@@ -425,8 +476,8 @@ private:
             } else r->x.max_gap_ms = std::max(r->x.max_gap_ms, std::chrono::duration<double, std::milli>(now - r->last_emit).count());
             r->last_emit = now;
             r->x.ids_fnv = fnv(&id, 4, r->x.ids_fnv);
-            ++r->stats.generated_tokens;
-            const bool more = r->job.job.on_tokens(std::span(&id, 1));
+            adapter_.commit(r->state, id);
+            const bool more = runtime_.publish(r->state, std::span(&id, 1));
             if (is_stop(*r, id)) {
                 finish(r, "stop");
                 return false;
@@ -444,7 +495,7 @@ private:
     }
 
     bool protected_decoder(Clock::time_point submitted) const {
-        for (const auto& r : run_slots_)
+        for (const auto& r : plans_)
             if (r && !r->prefilling && !r->job.ticket->cancelled() && ms::protects(submitted, r->first_emit, r->stats.generated_tokens > 0)) return true;
         return false;
     }
@@ -460,7 +511,7 @@ private:
             return false;
         };
         if (!eng_.prefill_active()) return reject("no boundary");
-        const auto& parent = *run_slots_[prefill_slot_];
+        const auto& parent = *plans_[prefill_slot_];
         if (!ms::nest_timing(parent.policy.sched == Sched::off, protected_decoder(submitted),
             waiting_child(job, submitted, parent.job.submitted, parent.prefill_start))) return reject("timing");
         const auto n = decoding_count();
@@ -486,26 +537,25 @@ private:
     }
     void unpark() {
         const auto slot = parked_slot_;
-        if (slot >= slots_ || !run_slots_[slot]) throw std::runtime_error("nested parent reservation lost");
+        if (slot >= slots_ || !plans_[slot]) throw std::runtime_error("nested parent reservation lost");
         Control c;
         c.command = static_cast<std::uint32_t>(Command::resume_parked);
-        c.round = round_++;
-        c.task_id = run_slots_[slot]->request_id;
+        c.task_id = plans_[slot]->request_id;
         const auto start = Time::now();
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         eng_.prefill_resume_parked(c.task_id);
         if (timeline_on_) timeline("unpark", start, "nested", slot, eng_.prefill_layer(), eng_.prefill_layer(),
             timeline_task(eng_.prefill_progress()));
         const double wall = elapsed(park_start_);
-        run_slots_[slot]->nest_quota.wall_ms += wall;
-        run_slots_[slot]->x.park_wall_ms += wall;
+        plans_[slot]->nest_quota.wall_ms += wall;
+        plans_[slot]->x.park_wall_ms += wall;
         prefill_slot_ = slot;
         parked_slot_ = slots_;
         layer_.reset_pending();
         // The child's first emission starts a real deadline; decode only if the next parent unit cannot fit.
         deadline_serviced_ = unit_layers() > 0;
         const double switch_ms = ms::nest_switch_ms(elapsed(nest_start_), nest_service_ms_);
-        run_slots_[slot]->x.nest_switch_ms += switch_ms;
+        plans_[slot]->x.nest_switch_ms += switch_ms;
         nest_switch_upper_ms_ = std::max(nest_switch_upper_ms_, switch_ms);
     }
 
@@ -514,7 +564,7 @@ private:
         const auto a0 = Time::now();
         std::uint32_t free_slot = slots_;
         for (std::uint32_t s = 0; s < slots_; ++s)
-            if (!run_slots_[s]) {
+            if (!plans_[s]) {
                 free_slot = s;
                 break;
             }
@@ -527,10 +577,10 @@ private:
             }
         }
         // Reserve one selected candidate without opening device state; it remains ahead of later arrivals.
-        if (!pending_) {
+        if (!runtime_.reservation()) {
             pending_short_first_ = false;
-            pending_ = queue_.take(false, pol_.sched == Sched::interleave && pol_.short_first ?
-                sv::QueueSelection::short_first : sv::QueueSelection::fifo, {},
+            (void)runtime_.reserve(pol_.sched == Sched::interleave && pol_.short_first ?
+                sv::QueueSelection::short_first : sv::QueueSelection::fifo,
                 [&](Clock::time_point submitted) {
                     pending_short_first_ = ms::reorder_prompts(pol_.sched, pol_.short_first, protected_decoder(submitted));
                     return pending_short_first_;
@@ -541,19 +591,18 @@ private:
                     timeline("nest-reject", Time::now(), "overtake");
                 }) : std::function<void()>{});
         }
-        if (!pending_) return false;
+        const auto* pending = runtime_.reservation();
+        if (!pending) return false;
         // Nested take is an atomic eligibility-aware reservation. Consume it in this admission;
         // never hold a rejected/oversized nested candidate ahead of later eligible queue entries.
-        if (pending_->ticket->cancelled()) {
-            queue_.finish(*pending_, {});
-            pending_.reset();
+        if (pending->ticket->cancelled()) {
+            runtime_.refuse();
             return true;
         }
-        if (session_ && !pending_->job.session.empty()) {
+        if (session_ && !pending->job.session.empty()) {
             if (nested || inflight() != 0) return false;
-            auto t = std::move(pending_);
-            pending_.reset();
-            t->started = Time::now();
+            auto lease = runtime_.activate();
+            auto* t = &lease.taken;
             auto command = sv::Json::object(); command.set("op", sv::Json("generate")); command.set("id", sv::Json(t->job.session));
             auto tokens = sv::Json::array(), stops = sv::Json::array();
             for (auto id : t->job.prompt) tokens.push(sv::Json(std::uint64_t(id)));
@@ -562,43 +611,44 @@ private:
             command.set("count", sv::Json(std::uint64_t(t->job.max_tokens)));
             command.set("defer_park", sv::Json(true));  // answered first, parked below before anything else runs
             const auto begin = Time::now();
-            sv::GenerationStats stats; stats.prompt_tokens = t->job.prompt.size();
-            auto publish = [&](std::span<const std::uint32_t> ids) {
+            auto& stats = lease.stats;
+            ms::SessionService::Publish publish = [&](std::span<const std::uint32_t> ids) {
                 if (stats.generated_tokens == 0 && t->job.observation_complete()) stats.first_token_ms = elapsed(t->submitted);
-                stats.generated_tokens += ids.size();
-                return !t->ticket->cancelled() && (!t->job.on_tokens || t->job.on_tokens(ids));
+                return runtime_.publish(lease.state, ids, !t->ticket->cancelled() && !runtime_.stopping());
             };
+            publish.state = [&](auto history, auto pending_token) { adapter_.observe_named(lease.state,history,pending_token); };
             auto reply = dispatch_session(command.dump(), publish);
             stats.decode_ms = elapsed(begin);
-            if (const auto* error = reply.find("error")) queue_.finish(*t, stats, error->find("code")->as_string() + ": " + error->find("message")->as_string());
+            if (const auto* error = reply.find("error")) runtime_.complete(lease.state, error->find("code")->as_string() + ": " + error->find("message")->as_string());
             else {
                 std::vector<std::uint32_t> ids;
                 for (const auto& id : reply.find("token_ids")->as_array()) ids.push_back(static_cast<std::uint32_t>(id.as_int()));
                 stats.generated_tokens = ids.size(); stats.cached_tokens = reply.find("hit")->as_bool() ? stats.prompt_tokens : 0;
                 const auto* finish = reply.find("finish");
-                stats.finish = t->ticket->cancelled() ? "cancelled" : finish ? finish->as_string() :
+                stats.finish = t->ticket->cancelled() || runtime_.stopping() ? "cancelled" : finish ? finish->as_string() :
                                ids.size() < t->job.max_tokens ? "stop" : "length";
-                queue_.finish(*t, stats);
+                const auto session_id = t->job.session;
+                runtime_.complete(lease.state);
                 // The reply is out; park the conversation (capture + receipts on both ranks) before the next admission
                 // can reuse the slot. A failed park only loses the stored state: the next turn is a miss.
-                auto park = sv::Json::object(); park.set("op", sv::Json("park_active")); park.set("id", sv::Json(t->job.session));
+                auto park = sv::Json::object(); park.set("op", sv::Json("park_active")); park.set("id", sv::Json(session_id));
                 const auto parked = dispatch_session(park.dump());
                 if (const auto* park_error = parked.find("error"))
                     std::fprintf(stderr, "session park after reply failed: %s\n", park_error->dump().c_str());
             }
             return true;
         }
-        const auto& candidate = pending_->job.prompt;
+        const auto& candidate = pending->job.prompt;
         const auto n = decoding_count();
-        const bool nesting = !nested && pending_->reordered && pol_.nest && pol_.sched == Sched::interleave &&
+        const bool nesting = !nested && pending->reordered && pol_.nest && pol_.sched == Sched::interleave &&
             candidate.size() > 512 && inflight() + 1 < slots_ && *eng_.prefill_unlimited_reason() == 0 &&
-            queue_.has_waiting([&](const sv::GenerationJob& j, Clock::time_point submitted) {
-                return waiting_child(j, submitted, pending_->submitted, a0) &&
+            runtime_.has_waiting([&](const sv::GenerationJob& j, Clock::time_point submitted) {
+                return waiting_child(j, submitted, pending->submitted, a0) &&
                     ms::nest_fits(j.prompt.size(), eng_.nested_rows(), true, true, true, true, false, true,
                         ms::NestQuota{}, predicted_prompt_ms(j.prompt.size()), live_gap_ms(pol_.gap_ms),
                         longest_wait_ms(), cycle_ms(std::min(n + 1, kStepRows)), nest_switch_upper_ms_, n > 0);
             });
-        const bool off = ms::off_admission(pol_.sched, protected_decoder(pending_->submitted), nested || nesting);
+        const bool off = ms::off_admission(pol_.sched, protected_decoder(pending->submitted), nested || nesting);
         if (!nested && !off && n > 0) {
             const double gap = live_gap_ms(pol_.gap_ms), next = cycle_ms(std::min(n + 1, kStepRows));
             const double predicted = predicted_prompt_ms(candidate.size());
@@ -609,38 +659,17 @@ private:
                 return false;
             }
         }
-        auto t = std::move(pending_);
-        pending_.reset();
-        t->started = Time::now();
-        auto& prompt = t->job.prompt;
-        if (prompt.empty() || prompt.size() + 1 >= capacity_) {
-            queue_.finish(*t, {}, "prompt of " + std::to_string(prompt.size()) + " tokens does not fit the context (" +
+        const auto& candidate_prompt = pending->job.prompt;
+        if (candidate_prompt.empty() || candidate_prompt.size() + 1 >= capacity_) {
+            runtime_.refuse({}, "prompt of " + std::to_string(candidate_prompt.size()) + " tokens does not fit the context (" +
                                       std::to_string(capacity_) + ")");
             return true;
         }
-        // Prefix reuse: among the free slots, the one sharing the longest leading prefix with this prompt reuses those
-        // resident cache rows; only the suffix is prefilled. Capped at prompt.size()-1 (the last token is always
-        // prefilled, to produce its logits) and rounded down to whole prefill chunks (below). A drafter-context request
-        // does not reuse (v1 archive-coverage guard, below).
-        std::uint32_t reuse = 0;
-        if (prefix_on_ && !nested) {
-            std::uint32_t best = free_slot, best_n = 0;
-            const std::uint32_t lim = static_cast<std::uint32_t>(prompt.size() - 1);
-            for (std::uint32_t s = 0; s < slots_; ++s) {
-                if (run_slots_[s]) continue;  // only free slots hold reusable resident state
-                const auto& k = kv_[s];
-                const std::uint32_t cap = static_cast<std::uint32_t>(std::min<std::size_t>(k.size(), lim));
-                std::uint32_t match = 0;
-                while (match < cap && k[match] == prompt[match]) ++match;
-                // Whole prefill chunks only. A prefill tiles its rows from the chunk's first row (16-query windows), so a
-                // suffix that opens inside a chunk is tiled differently from the same rows in a full prefill and its
-                // bits differ. Opening on a max_rows boundary gives the suffix the chunks a full prefill would use.
-                match -= static_cast<std::uint32_t>(match % reuse_rows_);
-                if (match > best_n) { best_n = match; best = s; }
-            }
-            if (best_n != 0) { free_slot = best; reuse = best_n; }
-        }
-        Running r;
+        auto lease = runtime_.activate(!nested ? (conversation_ ? 1 : reuse_rows_) : 0);
+        auto* t = &lease.taken;
+        auto& prompt = t->job.prompt;
+        free_slot = lease.state.slot; // shared cache selects the longest FREE resident slot
+        Running r(lease);
         r.policy = pol_;
         r.dspark_prior = pol_.dspark_prior;
         if (!nested && off) r.policy.sched = Sched::off;  // effective operation policy, including cancellation/DSpark residency
@@ -656,7 +685,7 @@ private:
         // A second admission retires the original auto context permanently before any newcomer work.
         if (pol_.dspark_mode == ds::Mode::automatic && inflight() != 0) {
             std::uint32_t retiring = 0;
-            for (auto& old : run_slots_) if (old && old->context) {
+            for (auto& old : plans_) if (old && old->context) {
                 retiring |= 1U << old->slot;
                 old->context = old->x.context = false;
                 old->automatic.retire("plain:concurrency");
@@ -664,13 +693,13 @@ private:
             }
             if (retiring) {
                 Control c; c.command = static_cast<std::uint32_t>(Command::retire);
-                c.round = round_++; c.append = retiring;
-                (void)exchange(eng_, c); run_.retire_contexts(retiring);
+                c.append = retiring;
+                (void)exchange(eng_, c, lock_); run_.retire_contexts(retiring);
                 sync_taps();
             }
         }
         const bool competing = nested || parked_slot_ < slots_ ||
-            queue_.has_waiting([](const sv::GenerationJob&, Clock::time_point) { return true; });
+            runtime_.has_waiting([](const sv::GenerationJob&, Clock::time_point) { return true; });
         ds::Features structure;
         if (pol_.dspark_mode == ds::Mode::automatic && pol_.dspark_prior == ds::Prior::structural_v1 &&
             run_.dd && inflight() == 0 && !competing &&
@@ -681,14 +710,21 @@ private:
                            pol_.dspark_prior, structure});
         const bool promoted = pol_.dspark_mode == ds::Mode::automatic && r.automatic.state == ds::AutoRequest::State::active;
         if (promoted && !taps_ && !eng_.prefill_open() && parked_slot_ >= slots_) {
-            Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.round = round_++; c.pflags = 1;
-            (void)exchange(eng_, c); eng_.set_taps(true); taps_ = true;
+            Control c; c.command = static_cast<std::uint32_t>(Command::taps); c.pflags = 1;
+            (void)exchange(eng_, c, lock_); eng_.set_taps(true); taps_ = true;
         }
         r.context = run_.dd != nullptr && (pol_.dspark_mode == ds::Mode::on || promoted) && taps_ &&
                     inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ && prompt.size() + ds::block + 1 < capacity_;
         r.x.dspark_mode = ds::mode_name(pol_.dspark_mode);
         r.x.dspark_reason = pol_.dspark_mode == ds::Mode::on ? (r.context ? "legacy" : "plain:legacy_ineligible") : r.automatic.reason;
+        r.reused = lease.stats.cached_tokens;
+        if (reuse_rows_) {  // reported only when resident reuse is on, so the default response is unchanged
+            r.x.resident_reported = true;
+            r.x.reply_extended = lease.resident_reply;
+        }
+        if (r.context && r.reused) { runtime_.abandon_resident(lease.state); r.reused = 0; }
         r.x.context = r.context;
+        r.x.prefill_computed = prompt.size() - r.reused;
         r.x.sched = pol_.sched == Sched::off ? "off" : "interleave";
         r.x.service_ms = pol_.service_ms;
         r.x.short_first = pending_short_first_;
@@ -696,9 +732,9 @@ private:
         if (off) r.x.fallback_reason = pol_.sched == Sched::off ? "sched_off" : "no_protected_decoder";
         const bool admission_whole = timeline_on_ && (r.policy.sched == Sched::off || ms::runs_whole(true, predicted_prompt_ms(prompt.size()),
             pol_.service_ms, n > 0, live_gap_ms(pol_.gap_ms), cycle_ms(std::min(n + 1, kStepRows)), longest_wait_ms(), ms::control_margin_ms));
-        const auto parent_id = nested ? run_slots_[prefill_slot_]->request_id : 0;
+        const auto parent_id = nested ? plans_[prefill_slot_]->request_id : 0;
         if (nested) {
-            auto& parent = *run_slots_[prefill_slot_];
+            auto& parent = *plans_[prefill_slot_];
             parent.nest_quota.admitted();
             ++parent.x.nest_count;
             parked_slot_ = prefill_slot_;
@@ -707,9 +743,8 @@ private:
             park_start_ = Time::now();
             Control park;
             park.command = static_cast<std::uint32_t>(Command::park);
-            park.round = round_++;
             park.task_id = parent_id;
-            (void)exchange(eng_, park);
+            (void)exchange(eng_, park, lock_);
             const auto progress = eng_.prefill_progress();
             eng_.prefill_park(parent_id);
             if (timeline_on_) timeline("park", park_start_, "nested", parent.slot, progress.layer, progress.layer,
@@ -717,34 +752,25 @@ private:
             r.x.nested = true;
             r.x.parent_request = parent_id;
         }
-        if (r.context) reuse = 0;  // v1 guard: a drafter-context request re-prefills in full (its archive must cover the window)
-        r.reused = reuse;
-        r.stats.cached_tokens = reuse;
-        const std::span<const std::uint32_t> suffix(prompt.data() + reuse, prompt.size() - reuse);
         Control c;
         c.task_id = r.request_id;
         c.parent_task_id = parent_id;
         c.bank = nested ? 1U : 0U;
-        c.slot_generation = ++slot_generation_[free_slot];
+        c.slot_generation = lease.state.generation;
         c.command = static_cast<std::uint32_t>(nested ? Command::nest : Command::prefill);
-        c.round = round_++;
         c.pslot = free_slot;
-        c.pstart = reuse;
+        const auto suffix = std::span<const std::uint32_t>(prompt).subspan(static_cast<std::size_t>(r.reused));
+        c.pstart = static_cast<std::uint32_t>(r.reused);
         c.plen = static_cast<std::uint32_t>(suffix.size());
         c.pflags = r.context ? 1U : 0U;
-        (void)exchange(eng_, c);
-        if (reuse == 0) run_.send_prompt(prompt);
-        else {
-            std::vector<std::uint32_t> wire(suffix.begin(), suffix.end());
-            run_.send_prompt(wire);
-        }
+        (void)exchange(eng_, c, lock_);
+        if (!r.reused) run_.send_prompt(prompt);
+        else { std::vector<std::uint32_t> wire(suffix.begin(),suffix.end()); run_.send_prompt(wire); }
         const auto begin0 = timeline_on_ ? Time::now() : Clock::time_point{};
-        run_.prefill_begin(free_slot, suffix, r.context, c.task_id, parent_id, c.slot_generation, reuse);
+        adapter_.begin(lease.state, suffix, r.context, c.task_id, parent_id, r.reused);
         layer_.reset_pending();
-        if (prefix_on_) kv_[free_slot].assign(prompt.begin(), prompt.end());
-        r.job = std::move(*t);
         r.prefill_start = Time::now();
-        run_slots_[free_slot] = std::move(r);
+        plans_[free_slot].emplace(std::move(r));
         prefill_slot_ = free_slot;
         add([](Counters& k) { ++k.prefills; });
         if (timeline_on_) timeline(nested ? "nest" : "admit", a0, admission_whole ? "whole" : "deadline", prefill_slot_, 0, 0, timeline_prefill(prefill_slot_, true) + "," + timeline_task(eng_.prefill_progress()), begin0);
@@ -774,12 +800,12 @@ private:
     // longest time a decoding request has waited since its last token (ms)
     double longest_wait_ms() const {
         double w = 0;
-        for (const auto& r : run_slots_)
+        for (const auto& r : plans_)
             if (r && !r->prefilling) w = std::max(w, elapsed(r->last_emit));
         return w;
     }
     double live_gap_ms(double candidate) const {
-        for (const auto& r : run_slots_)
+        for (const auto& r : plans_)
             if (r) candidate = std::min(candidate, r->policy.gap_ms);
         return candidate;
     }
@@ -793,8 +819,8 @@ private:
         return predicted;
     }
     unsigned unit_layers() const {
-        const auto& policy = run_slots_[prefill_slot_]->policy;
-        if (run_slots_[prefill_slot_]->policy.sched == Sched::off) return ~0U;
+        const auto& policy = plans_[prefill_slot_]->policy;
+        if (plans_[prefill_slot_]->policy.sched == Sched::off) return ~0U;
         // Preserve the observed-gap goal rather than spending all of the default 1500 ms.
         return ms::unit_layers(policy.service_ms, decoding_count() > 0, std::min(live_gap_ms(policy.gap_ms), 1300.0),
             cycle_ms(decoding_count()), layer_.fixed_ms,
@@ -807,21 +833,20 @@ private:
         if (*eng_.prefill_unlimited_reason() != 0) layers = ~0U;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::unit);
-        c.round = round_++;
         c.layers = layers;
         c.bank = eng_.prefill_progress().bank;
-        c.task_id = run_slots_[prefill_slot_]->request_id;
-        (void)exchange(eng_, c);
+        c.task_id = plans_[prefill_slot_]->request_id;
+        (void)exchange(eng_, c, lock_);
         const std::uint64_t unit_rows = eng_.prefill_unit_rows(), left0 = eng_.prefill_rows_left();
         const unsigned layer0 = eng_.prefill_layer();
         const auto summary = timeline_on_ ? timeline_prefill(prefill_slot_, layers == ~0U) : std::string{};
         const auto t0 = Time::now();
         std::uint32_t next = 0;
-        const bool done = run_.prefill_unit(layers, &next);
+        const bool done = adapter_.unit(plans_[prefill_slot_]->state, layers, &next);
         const auto returned = timeline_on_ ? Time::now() : Clock::time_point{};
         const double ms = elapsed(t0);
         if (parked_slot_ < slots_) {
-            run_slots_[parked_slot_]->x.nest_service_ms += ms;
+            plans_[parked_slot_]->x.nest_service_ms += ms;
             nest_service_ms_ += ms;
         }
         // layer time of units that stayed inside one chunk / group (or ended the last one)
@@ -829,13 +854,13 @@ private:
         else if (done && left0 == unit_rows) layer_.observe(unit_rows, 60 - layer0, ms);
         else layer_.reset_pending();  // a resume spanning groups has no single-bucket sample
         if (done) layer_.reset_pending();
-        auto& r = run_slots_[prefill_slot_];
+        auto& r = plans_[prefill_slot_];
         ++r->x.units;
         r->x.max_unit_layers = std::max(r->x.max_unit_layers,
             layers == ~0U || *eng_.prefill_unlimited_reason() != 0 ? ~0U : layers);
         // the decoding requests stalled for this unit
         double stalled = 0;
-        for (auto& o : run_slots_)
+        for (auto& o : plans_)
             if (o && !o->prefilling) {
                 o->x.stall_ms += ms;
                 stalled += ms / 1e3;
@@ -854,11 +879,10 @@ private:
         if (r->x.nested) {
             Control check;
             check.command = static_cast<std::uint32_t>(Command::check);
-            check.round = round_++;
             check.task_id = r->request_id;
             check.plen = next;
             const auto checked = timeline_on_ ? Time::now() : Clock::time_point{};
-            const auto reply = exchange(eng_, check);
+            const auto reply = exchange(eng_, check, lock_);
             if (timeline_on_) timeline("check", checked, "nested", prefill_slot_, 60, 60, timeline_task(eng_.prefill_progress()));
             if (reply.plen != next) {
                 eng_.abort("nested completion token mismatch");
@@ -888,11 +912,11 @@ private:
         const auto op0 = Time::now();
         std::vector<std::uint32_t> order;
         for (std::uint32_t s = 0; s < slots_; ++s)
-            if (run_slots_[s] && !run_slots_[s]->prefilling) {
-                const auto action = ms::decode_action(run_slots_[s]->policy.sched == Sched::interleave && run_slots_[s]->job.ticket->cancelled(),
-                                                       run_slots_[s]->pos + 1 >= capacity_);
+            if (plans_[s] && !plans_[s]->prefilling) {
+                const auto action = ms::decode_action(plans_[s]->policy.sched == Sched::interleave && plans_[s]->job.ticket->cancelled(),
+                                                       plans_[s]->pos + 1 >= capacity_);
                 if (action != ms::DecodeAction::step) {
-                    finish(run_slots_[s], action == ms::DecodeAction::cancel ? "cancelled" : "context");
+                    finish(plans_[s], action == ms::DecodeAction::cancel ? "cancelled" : "context");
                     continue;
                 }
                 order.push_back(s);
@@ -905,7 +929,7 @@ private:
              (pol_.dspark_mode == ds::Mode::automatic && inflight() == 1 && parked_slot_ >= slots_));
         std::uint32_t append = 0;
         for (auto s : order) {
-            auto& r = run_slots_[s];
+            auto& r = plans_[s];
             if (!keep) {
                 r->context = false;  // stale for good (acceptance only)
                 r->x.context = false;
@@ -917,7 +941,7 @@ private:
         // DSpark drafts this cycle for a slot with a context, room for its block and tokens to go, while the gate is open
         // (asked once per cycle: the gate's draft() spends its backoff)
         const auto dspark_eligible = [&](std::uint32_t s) {
-            const auto& r = run_slots_[s];
+            const auto& r = plans_[s];
             return keep && r->context && r->pos + ds::block + 1 < capacity_ && r->stats.generated_tokens + 1 < r->job.job.max_tokens;
         };
         bool any_eligible = false;
@@ -954,7 +978,7 @@ private:
                 return std::max(c, ref + row * (rows - ref_rows));
             };
             for (auto s : order) {
-                auto& r = run_slots_[s];
+                auto& r = plans_[s];
                 if (!r->lk || r->lk_next != r->pos + 1) continue;  // not current
                 const auto m = r->lk->longest({}, kLookupMin, ds::block);
                 if (m.length < kLookupMin || m.available == 0) continue;
@@ -1010,19 +1034,18 @@ private:
         const auto c0 = Time::now();
         double t_draft = 0;
         if (!cand.empty() && gate_open) {
-            std::sort(cand.begin(), cand.end(), [&](auto a, auto b) { return run_slots_[a]->tau > run_slots_[b]->tau; });
+            std::sort(cand.begin(), cand.end(), [&](auto a, auto b) { return plans_[a]->tau > plans_[b]->tau; });
             cand.resize(std::min<std::size_t>({cand.size(), static_cast<std::size_t>(budget - lk_rows), pol_.draft_slots}));
             Control c;
             c.command = static_cast<std::uint32_t>(Command::draft);
-            c.round = round_++;
             c.dslots = static_cast<std::uint32_t>(cand.size());
             for (std::size_t i = 0; i < cand.size(); ++i) {
                 c.dslot[i] = cand[i];
-                c.danchor[i] = run_slots_[cand[i]]->last;
-                c.dpos[i] = run_slots_[cand[i]]->pos;
+                c.danchor[i] = plans_[cand[i]]->last;
+                c.dpos[i] = plans_[cand[i]]->pos;
             }
-            (void)exchange(eng_, c);
-            for (auto s : cand) drafts[s] = run_.draft(s, run_slots_[s]->last, run_slots_[s]->pos);
+            (void)exchange(eng_, c, lock_);
+            for (auto s : cand) drafts[s] = adapter_.draft(plans_[s]->state, plans_[s]->last, plans_[s]->pos);
             drafted = true;
             t_draft = secs(c0, Time::now());
             Costs::ema(costs_.draft, t_draft / static_cast<double>(cand.size()));
@@ -1038,7 +1061,7 @@ private:
             };
             std::vector<Inc> inc;
             for (auto& [s, d] : drafts) {
-                const auto& r = run_slots_[s];
+                const auto& r = plans_[s];
                 const std::uint64_t room = std::min<std::uint64_t>(r->job.job.max_tokens - r->stats.generated_tokens - 1,
                                                                    capacity_ - r->pos - 1);
                 double surv = 1.0;
@@ -1067,11 +1090,10 @@ private:
         // the step rows: every decoding slot's anchor, then its window's drafts
         Control c;
         c.command = static_cast<std::uint32_t>(Command::step);
-        c.round = round_++;
         c.append = append;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> span_of;  // slot -> (first row, rows)
         for (auto s : order) {
-            auto& r = run_slots_[s];
+            auto& r = plans_[s];
             const std::uint32_t first = c.rows;
             c.row[c.rows++] = mm::Row{s, r->last, r->pos};
             if (lk_k.count(s) != 0) {  // a lookup window
@@ -1084,10 +1106,11 @@ private:
         }
         const auto summary = timeline_on_ ? timeline_step(c) : std::string{};
         const auto t0 = Time::now();
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         const auto control_end = timeline_on_ ? Time::now() : Clock::time_point{};
-        const auto next = run_.step(std::span(c.row, c.rows), append);
-        if (append != 0) run_.synchronize();  // the context appends are part of this cycle's work
+        std::array<strix::session::KvHandle,kStepRows> bindings{};
+        for (std::uint32_t i=0;i<c.rows;++i) bindings[i]=plans_[c.row[i].slot]->state;
+        const auto next = adapter_.step(std::span(c.row, c.rows), append, std::span(bindings).first(c.rows));  // includes context appends
         const auto t_done = Time::now();
         const double t_step = secs(t0, t_done);  // control exchange + step + appends, completed
         const bool windows = c.rows > n;
@@ -1098,7 +1121,7 @@ private:
         std::uint32_t k_min = ~0U, k_max = 0;
         for (std::size_t i = 0; i < order.size(); ++i) {
             const std::uint32_t s = order[i];
-            auto& r = run_slots_[s];
+            auto& r = plans_[s];
             const auto [first, rows] = span_of[i];
             std::vector<std::uint32_t> d;
             for (std::uint32_t j = 1; j < rows; ++j) d.push_back(c.row[first + j].token);
@@ -1179,7 +1202,7 @@ private:
             ",\"checkpoint\":" + std::to_string(p.layer) + ",\"predicted_ms\":" + std::to_string(predicted_prompt_ms(p.rows));
     }
     std::string timeline_prefill(std::uint32_t slot, bool whole = false) const {
-        const auto& r = *run_slots_[slot];
+        const auto& r = *plans_[slot];
         auto left = whole ? eng_.prefill_rows_left() : eng_.prefill_unit_rows();
         std::string out = "\"rows\":" + std::to_string(left) + ",\"members\":[";
         for (bool first = true; left > 0; first = false) {
@@ -1195,7 +1218,7 @@ private:
     std::string timeline_step(const Control& c) const {
         std::string out = "\"rows\":" + std::to_string(c.rows) + ",\"slots\":[";
         for (unsigned i = 0; i < c.rows; ++i) {
-            const auto& r = *run_slots_[c.row[i].slot];
+            const auto& r = *plans_[c.row[i].slot];
             if (i > 0) out += ",";
             out += "{\"slot\":" + std::to_string(c.row[i].slot) + ",\"request\":" + std::to_string(r.request_id) +
                    ",\"pos\":" + std::to_string(c.row[i].pos) + ",\"token_index\":" + std::to_string(r.stats.generated_tokens + c.row[i].pos - r.pos) + "}";
@@ -1217,7 +1240,7 @@ private:
         timeline_records_.push_back("{\"event\":\"mmserve-timeline\",\"op\":" + std::to_string(op) + ",\"epoch\":" + std::to_string(pol_.epoch) +
             ",\"kind\":\"" + kind + "\",\"t_start_us\":" + std::to_string(us(start)) + ",\"t_end_us\":" + std::to_string(us(end)) +
             ",\"control_end_us\":" + std::to_string(us(control_end)) + ",\"run_end_us\":" + std::to_string(us(run_end)) +
-            ",\"round\":" + std::to_string(round_ - 1) + ",\"layer0\":" + std::to_string(layer0) + ",\"layer1\":" + std::to_string(layer1) + ",\"reason\":\"" + reason + "\",\"age_ms\":" +
+            ",\"round\":" + std::to_string(lock_.round() - 1) + ",\"layer0\":" + std::to_string(layer0) + ",\"layer1\":" + std::to_string(layer1) + ",\"reason\":\"" + reason + "\",\"age_ms\":" +
             std::to_string(longest_wait_ms()) + ",\"slack_ms\":" + std::to_string(ms::remaining_ms(live_gap_ms(pol_.gap_ms), cycle_ms(decoding_count()), longest_wait_ms())) + "," + row + "}");
     }
     void flush_timeline() {
@@ -1231,12 +1254,10 @@ private:
     }
 
     sv::Json dispatch_session(const std::string& body, const ms::SessionService::Publish& publish = {}) {
-        // A session command restores, captures or generates in the slots without passing through admit / step: no
-        // slot's resident tokens are known afterwards (it runs with nothing in flight, so every slot is free here).
-        for (auto& k : kv_) k.clear();
+        runtime_.invalidate_residents();
+        if constexpr (requires { run_.invalidate_residents(); }) run_.invalidate_residents();
         Control c; c.command = static_cast<std::uint32_t>(Command::session); c.plen = static_cast<std::uint32_t>(body.size());
-        c.round = round_++;
-        (void)exchange(eng_, c);
+        (void)exchange(eng_, c, lock_);
         const auto wire = ms::session_wire(eng_, body, body.size());
         const auto available = eng_.peer(session_ && session_->execute ? 1U : 0U);
         auto reply = available ? session_->execute(wire, publish) : sv::session_error("session_budget", "peer session precondition failed", 507);
@@ -1247,19 +1268,11 @@ private:
     std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes_;
     Engine& eng_;
     Runner& run_;
-    sv::GenerationQueue& queue_;
     Shared& sh_;
     const std::uint32_t slots_;
     const std::uint64_t capacity_;
     const std::uint64_t max_rows_;
-    std::vector<std::optional<Running>> run_slots_;
-    // Prefix reuse: the token sequence resident in each free slot's cache. A new prompt sharing a leading prefix with a
-    // free slot reuses those cache rows and prefills only the suffix (opt-in: STRIX_MM_SERVE_PREFIX=1 on both ranks).
-    // Records contain prefill tokens only, never generated tokens.
-    std::vector<std::vector<std::uint32_t>> kv_;
-    std::uint64_t reuse_rows_ = 0;
-    bool prefix_on_ = false;
-    std::optional<sv::TakenJob> pending_;
+    std::vector<std::optional<Running>> plans_;
     bool pending_short_first_ = false;
     bool deadline_serviced_ = false;
     const char* step_reason_ = "deadline";
@@ -1267,9 +1280,8 @@ private:
     Clock::time_point timeline_origin_;
     std::uint64_t timeline_op_ = 0, timeline_dropped_ = 0, request_id_ = 0;
     std::vector<std::string> timeline_records_;
-    std::uint64_t round_ = 0;
+    strix::pair::Lockstep lock_{0};
     std::uint32_t prefill_slot_ = 0;
-    std::array<std::uint64_t, kStepRows> slot_generation_{};
     std::uint32_t parked_slot_ = slots_;
     Clock::time_point park_start_;
     Clock::time_point nest_start_;
@@ -1325,6 +1337,13 @@ private:
     bool taps_ = false;  // the engine's taps (set to the startup policy before READY, then sync_taps)
     std::vector<ds::DraftGate> gates_ = std::vector<ds::DraftGate>(kStepRows + 1);  // one per decoding count
     std::array<std::uint64_t, kStepRows + 1> explore_{};
+    Clock::time_point last_round_ = Time::now();
+    ms::SessionBackend<Runner> backend_;
+    ms::SessionEngine adapter_;
+    strix::session::KvStore store_;
+    sv::SessionRuntime runtime_;
+    std::uint64_t reuse_rows_ = 0;
+    bool conversation_ = false;
 };
 
 } // namespace strix::minimax::serve::lead

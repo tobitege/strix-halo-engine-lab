@@ -1,3 +1,5 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/env_flags.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
@@ -5,6 +7,8 @@
 #include "strix/qwen_prefill_balance.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/startup_markers.hpp"
+#include "strix/power/sampler.hpp"
+#include "strix/route_receipt.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
 #include "http_slot_capacity.hpp"
@@ -981,7 +985,7 @@ public:
             rows_.push_back({tokens[r], first_position + r, {values[r].begin(), values[r].end()}});
         tiled_rows_ += count;
         // STRIX_PREFILL_TIMING=1: host milliseconds of scoring and spooling each block on stderr.
-        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        static const bool timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
         if (timing)
             std::fprintf(stderr, "teacher block %llu rows: score %.1f ms\n", static_cast<unsigned long long>(count),
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_at).count());
@@ -1210,6 +1214,18 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
 static int run_decode_entry(
     int argc,
     char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
+    strix::device::bind_hip_main(argc, argv);
+    // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
+    // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
+    try {
+        (void)strix::device::set_host_wait(strix::device::HostWait::blocking);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 2;
+    }
     if (strix::print_device_profile_if_requested(argc, argv)) return 0;
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
@@ -1718,6 +1734,43 @@ static int run_decode_entry(
     if (const auto refusal = strix::decode_cli::separate_pool_residency_refusal(options, strix::host_memory_is_separate_pool());
         !refusal.empty())
         throw std::invalid_argument(refusal);
+    {
+        // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
+        // differently from the same switches), requested vs effective, with the selector's own reason text.
+        namespace rr = strix::route;
+        rr::set_engine("qwen");
+        // Bind the resolved arithmetic, including governed options and numerical policy values.
+        const auto pair = strix::decode_cli::numerical_profile_pair(options);
+        const auto budget = options.resolved_qsa_prefill_budget.value_or(0U);
+        const auto union_cap = strix::qsa_union_cap_active();
+        rr::lever("qwen.prefill_identity", "resolved",
+                  strix::prefill_identity_name(effective.prefill_option_mask, budget, union_cap) + ":hash=" +
+                  rr::detail::hex(strix::prefill_identity_hash(effective.prefill_option_mask, budget, union_cap)));
+        rr::lever("qwen.numerical_profile_pair", "resolved",
+                  std::to_string(strix::numerical_profile_pair_identity(pair)));
+        rr::lever("qwen.gsq_owner", "resolved", effective.gsq_owner ? "1" : "0");
+        const bool automatic = options.automatic_prefill;
+        const std::string_view why = effective.reason;
+        const auto code = automatic ? rr::Reason::selected :
+            why == "explicit-route" || why == "baseline" || why == "explicit-diagnostic-or-execution-control" ? rr::Reason::wrong_route :
+            why == "feature-disabled" || why == "not-requested" ? rr::Reason::disabled :
+            why == "prompt-not-eligible" ? rr::Reason::short_call :
+            why == "a8-runtime-not-built" ? rr::Reason::build :
+            why.find("memory") != std::string_view::npos ? rr::Reason::memory :
+            why.find("qualified") != std::string_view::npos ? rr::Reason::qualification : rr::Reason::no_match;
+        rr::lever("qwen.entry", options.http_serve ? "http" : "cli", options.http_serve ? "http" : "cli", rr::Reason::selected, false);
+        rr::lever("qwen.prefill_auto", "auto", automatic ? "tiled-f16:rows=" + std::to_string(options.known_prefix_prefill_rows) : "declined", code, true,
+                  effective.reason);
+        // The tile the prompt actually runs on: the server admits its own (resolve_serve_prefill), so the same switches
+        // do not give the HTTP route the CLI's arithmetic.
+        rr::lever("qwen.prefill_tile_rows", options.http_serve ? "serve-auto" : "auto",
+                  options.known_prefix_prefill_rows ? "tiled:rows=" + std::to_string(options.known_prefix_prefill_rows) : "untiled",
+                  options.known_prefix_prefill_rows ? rr::Reason::selected : rr::Reason::disabled, true, effective.serve_prefill_notice);
+        if (!effective.arithmetic_fallback.empty())
+            rr::lever("qwen.prefill_arithmetic", "auto", "fallback", rr::Reason::no_match, true, effective.arithmetic_fallback);
+        if (!effective.tile_fallback.empty())
+            rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
+    }
     // Export only after the resolved route has admitted the profile proposals.
     strix::qwen::profile::withdraw_declined(options.product_profile);
     strix::qwen::profile::apply(options.product_profile);
@@ -2564,6 +2617,31 @@ static int run_decode_entry(
         else if (hipMemset(load_balloon, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) (void)hipGetLastError();
         std::cerr << "load balloon: " << (load_balloon ? "reserved " : "could not reserve ") << bytes << " bytes before registration\n";
     }
+    // STRIX_SERVE_CENSUS=1: host and device-visible memory at three points of one load (before load, after load,
+    // at the slot probe), so the bytes that leave MemAvailable between preflight and the probe can be attributed.
+    const bool serve_census_on = options.http_serve && strix::serve::census_enabled();
+    const auto serve_census = [&](const char* point,
+            std::initializer_list<std::pair<const char*, std::uint64_t>> charged) {
+        strix::serve::MemoryCensus census;
+        census.point = point;
+        strix::decode_cli::PrefillCapabilities census_caps;
+        const auto seen = strix::decode_cli::observe_prefill_memory(census_caps);
+        census.host_total = seen.total; census.host_available = seen.available;
+        census.device_limit = seen.gtt_limit; census.device_used = seen.gtt_used;
+        const auto [meminfo, meminfo_status] = strix::read_linux_uma_text("/proc/meminfo");
+        if (meminfo_status == strix::LinuxUmaReadStatus::read)
+            strix::serve::append_kb_fields(census, meminfo, {"MemFree", "Cached", "Buffers", "Shmem", "AnonPages",
+                "Mapped", "Unevictable", "Mlocked", "SReclaimable", "SUnreclaim"});
+        const auto [status, status_state] = strix::read_linux_uma_text("/proc/self/status");
+        if (status_state == strix::LinuxUmaReadStatus::read)
+            strix::serve::append_kb_fields(census, status, {"VmRSS", "RssAnon", "RssFile", "RssShmem", "VmLck", "VmPin"},
+                "self_");
+        for (const auto& [name, bytes] : charged) census.fields.emplace_back(name, bytes);
+        std::cerr << strix::serve::format_memory_census(census) << '\n';
+        return census;
+    };
+    std::optional<strix::serve::MemoryCensus> census_before_load;
+    if (serve_census_on) census_before_load = serve_census("before_load", {});
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
@@ -3413,13 +3491,20 @@ static int run_decode_entry(
             pair_legal[pair_layer] = pair_first != compiled.execution.steps.end() &&
                 pair_first->op == strix::SerialOp::attn_hyper_mix && pair_inject;
         }
+        const auto pair_legal_half = strix::qwen_pp::legal_cuts(compiled.execution.steps,
+            strix::SerialOp::mlp_hyper_mix, strix::SerialOp::mlp_inject, false);
         if (pair_cost_env) {
             const auto pair_costs = strix::qwen_pp::load_costs(pair_cost_env, options.tokens.size());
             pair_bucket = pair_costs.context;
             pair_cost_bucket = pair_costs;
             pair_prediction = pair_cut_env ? strix::qwen_pp::predict_cut(pair_costs,
-                strix::qwen_pp::parse_cut(pair_cut_env, pair_legal)) : strix::qwen_pp::choose_cut(pair_costs, pair_legal);
-        } else pair_prediction.cut = strix::qwen_pp::parse_cut(pair_cut_env, pair_legal);
+                strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
+                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
+        } else {
+            const auto pair_cut = strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half);
+            pair_prediction.cut = pair_cut.layer;
+            pair_prediction.half = pair_cut.half;
+        }
         const auto pair_legacy_rows = options.known_prefix_prefill_rows;
         const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
             pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
@@ -4276,7 +4361,7 @@ static int run_decode_entry(
         // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view. Under
         // a split prefill profile the owners run the sibling prefill execution with the prefill launcher
         // configuration over this slot's resources, and each backend hands this slot's session to it and back.
-        const auto add_tiled = [&](CohortStack& stack) {
+        const auto add_tiled = [&](CohortStack& stack, strix::qpf2k::PrefillConstruction construction) {
             if (!known_prefill_plan || !known_prefix_memory)
                 throw std::logic_error("batched MTP requests need the tiled prefill");
             const auto workspace = [&](const std::shared_ptr<KnownPromptMemory>& arena) {
@@ -4301,6 +4386,22 @@ static int run_decode_entry(
             stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
                 known_prefix_memory->scratch, model.vocab_size, original_work_device);
             hand_off(*stack.blocks);
+            // A failed admission poisons the owner: unwind before publishing this slot.
+            // On-demand slots retain execution-time admission of the geometry actually used.
+            {
+                const auto setup_start = std::chrono::steady_clock::now();
+                if (strix::qpf2k::prepare_first_block_admission(options.early_setup, construction,
+                    *stack.block_owner, stack.session, [&](auto& setup_session) {
+                        if (compiled_prefill)
+                            strix::hand_off_serial_session(setup_session, {&compiled, &stack.parents->resources},
+                                {&*compiled_prefill, &stack.prefill_resources});
+                    })) {
+                    static const bool setup_timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
+                    if (setup_timing)
+                        std::fprintf(stderr, "prefill startup static-setup %.2f ms (resident slot, outside any request)\n",
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - setup_start).count());
+                }
+            }
             for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
                 stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], owner_compiled, model,
                     owner_catalog, owner_resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
@@ -4430,6 +4531,15 @@ static int run_decode_entry(
             const auto staging_reserve=qwen_http_batch_staging_reserve(options,model,state_layout);
             headroom=add(headroom,staging_reserve);
             const auto before = observe();
+            std::optional<strix::serve::MemoryCensus> census_after_load;
+            if (serve_census_on) {
+                census_after_load = serve_census("after_load", {{"registered", model_residency.registered_bytes()},
+                    {"registered_locked", model_residency.registered_locked_bytes()},
+                    {"charged_unlocked_registered", unlocked_registered}, {"charged_reserved_table", reserved_table_bytes},
+                    {"charged_headroom", headroom}, {"slot_estimate", estimate}});
+                if (census_before_load)
+                    std::cerr << strix::serve::format_census_delta(*census_before_load, *census_after_load) << '\n';
+            }
             auto retained = estimate;
             // Observations of the last fit, reused if the route falls back to the single runner.
             // The host fit runs against the pool host memory comes from (the same pool on a UMA node).
@@ -4441,7 +4551,7 @@ static int run_decode_entry(
             if (single_route) capacity.slots=1;
             if (capacity.slots >= 2U) {
                 auto probe = make_stack();
-                add_tiled(*probe);
+                add_tiled(*probe, strix::qpf2k::PrefillConstruction::startup);
                 check_hip(hipDeviceSynchronize(), "HTTP slot measurement fence");
                 const auto after = observe();
                 const auto delta = [](std::optional<std::uint64_t> a, std::optional<std::uint64_t> b) {
@@ -4490,6 +4600,19 @@ static int run_decode_entry(
                 cache_prompt_transient=add(cache_prompt_transient,4U*(11U*640U+1U)+2U*4U*10240U*4U);
             }
             options.http_slot_reason = "limited by " + capacity.limiting;
+            if (serve_census_on) {
+                const auto census_probe = serve_census("probe", {{"registered", model_residency.registered_bytes()},
+                    {"registered_locked", model_residency.registered_locked_bytes()},
+                    {"charged_unlocked_registered", unlocked_registered}, {"charged_reserved_table", reserved_table_bytes},
+                    {"charged_headroom", headroom}, {"slot_estimate", estimate}, {"slot_retained", retained}});
+                if (census_after_load)
+                    std::cerr << strix::serve::format_census_delta(*census_after_load, census_probe) << '\n';
+                if (census_before_load)
+                    std::cerr << strix::serve::format_census_delta(*census_before_load, census_probe) << '\n';
+                // Same inputs as the last fit; `slots` is the memory answer before the single-route override.
+                std::cerr << strix::serve::format_capacity_report(strix::serve::report_bridge_capacity(retained, serving,
+                    fit_host, fit_device, headroom, headroom, options.http_batch_cap)) << '\n';
+            }
             batch_slots = !single_route && (capacity.slots > 1U ||
                 ((options.http_batch_explicit || deployment.plan) && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
@@ -4698,15 +4821,15 @@ static int run_decode_entry(
         }
         if (batch_slots) {
             batch_stream = std::make_shared<const SharedWindowStream>();
-            const auto build_slot = [&, batch_stream]() -> strix::decode_cli::MtpBatchSlotSetup {
+            const auto build_slot = [&, batch_stream](strix::qpf2k::PrefillConstruction construction) -> strix::decode_cli::MtpBatchSlotSetup {
                 const auto slot = batch_stacks.size() + 1U;
                 const auto built = std::chrono::steady_clock::now();
                 auto stack = make_stack();
                 const auto stacked = std::chrono::steady_clock::now();
-                add_tiled(*stack);
+                add_tiled(*stack, construction);
                 batch_stacks.push_back(std::move(stack));
                 // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
-                static const bool timing = [] { const char* v = std::getenv("STRIX_HTTP_SLOT_TIMING"); return v && v[0] == '1'; }();
+                static const bool timing = strix::envcfg::flag("STRIX_HTTP_SLOT_TIMING", false);
                 if (timing) std::fprintf(stderr, "http slot %zu built: stack %.0f ms tiled %.0f ms\n", slot,
                     std::chrono::duration<double, std::milli>(stacked - built).count(),
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stacked).count());
@@ -4717,10 +4840,13 @@ static int run_decode_entry(
             for (const auto& stack : batch_stacks)
                 parents->batch_slots.push_back({stack->parents, &stack->session, &*stack->dispatcher,
                     window_factory_for(stack->parents, batch_stream)});
-            while (batch_stacks.size() + 1U < eager_slots) parents->batch_slots.push_back(build_slot());
+            while (batch_stacks.size() + 1U < eager_slots)
+                parents->batch_slots.push_back(build_slot(strix::qpf2k::PrefillConstruction::startup));
             parents->batch_capacity = batch_slots;
             parents->batch_memory_ok = batch_memory_ok;
-            parents->grow_batch_slot = build_slot;
+            parents->grow_batch_slot = [build_slot] {
+                return build_slot(strix::qpf2k::PrefillConstruction::on_demand);
+            };
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
@@ -5687,31 +5813,36 @@ static int run_decode_entry(
             const unsigned pair_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0] == '0' ? 0U : 1U;
             if (pair_cost_bucket && session.next_position != 0U)
                 throw std::invalid_argument("pair prefill cost-driven chunk selection requires a fresh prompt");
-            const auto pair_range = pair_rank == 0U ? "0:" + std::to_string(pair_prediction.cut) :
-                std::to_string(pair_prediction.cut) + ":48";
+            const auto pair_cut_text = pair_prediction.stage().text();
+            const auto pair_range = pair_rank == 0U ? "0:" + pair_cut_text : pair_cut_text + ":48";
             if (!strix::process_environment::set("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), true))
                 throw std::runtime_error("pair prefill layer range update failed");
-            std::fprintf(stderr, "qwen-pair rank=%u cut=%u cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_prediction.cut, pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "default"),
+            std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
+                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.
             auto pair_link = deployment.pair_link
                 ? std::make_unique<strix::qwen_pp::PairTransport>(std::move(deployment.pair_link))
                 : std::make_unique<strix::qwen_pp::PairTransport>(pair_rank);
+            strix::dist::PipelineTimeline pair_timeline("qwen-prefill", pair_rank, strix::qwen_pp::pair_timing_columns());
             strix::qwen_pp::Pipe pair_pipe(pair_rank,
                 (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
                 [&](std::span<std::byte> data) { pair_link->receive(data); },
-                [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.cut,
-                [&] { return strix::qwen_pp::make_hip_pipe_staging(
-                    static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes); },
+                [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.stage(),
+                [&] {
+                    auto staging = strix::qwen_pp::make_hip_pipe_staging(
+                        static_cast<std::size_t>(known_prefill_plan->logical_rows) * strix::qwen_pp::Seam::row_bytes);
+                    staging->route_device([link = pair_link.get()](std::size_t bytes) { return link->device_checked(bytes); });
+                    return staging; },
                 [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
                 [&](bool sending, strix::qwen_pp::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
                     return pair_link->piece(sending, staging, offset, bytes);
-                });
+                }, &pair_timeline);
             auto& pair_context = strix::qwen_pp::pipe_context;
-            pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut};
+            pair_context = {&pair_pipe, pair_rank, 0U, known_prefill_plan->prefill_execution_identity, pair_prediction.cut,
+                pair_timeline.enabled() ? &pair_timeline : nullptr, pair_prediction.half};
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
             for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
                 pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
@@ -5741,6 +5872,11 @@ static int run_decode_entry(
                     if (!pair_chunks.advance()) break;
                     const auto pair_rows = std::min<std::size_t>(known_prefill_plan->logical_rows, static_cast<std::size_t>(pair_prompt_size) - pair_position);
                     if (pair_rank == 1U) pair_pipe.release(pair_context.sequence);
+                    if (pair_timeline.enabled()) {
+                        const auto pair_chunk_end = std::chrono::steady_clock::now();
+                        pair_timeline.add(pair_context.sequence, strix::qwen_pp::pt_chunk, pair_chunk_start, pair_chunk_end);
+                        pair_timeline.mark(pair_context.sequence, pair_chunk_start, pair_chunk_end);
+                    }
                     std::fprintf(stderr, "qwen-pair rank=%u chunk=%llu position=%llu rows=%llu seam-bytes=%llu chunk-ms=%.3f\n",
                         pair_rank, static_cast<unsigned long long>(pair_context.sequence), static_cast<unsigned long long>(pair_position),
                         static_cast<unsigned long long>(pair_rows), static_cast<unsigned long long>(pair_rows * strix::qwen_pp::Seam::row_bytes),
@@ -5760,14 +5896,16 @@ static int run_decode_entry(
             if (strix::qwen_pp::decode_enabled()) {
                 const auto handoff_start = std::chrono::steady_clock::now();
                 check_hip(hipDeviceSynchronize(), "pair handoff state producer fence");
-                const auto views = pair_state_views(pair_prediction.cut, 48U);
+                // A half-layer cut leaves the attention state of the cut layer with stage A.
+                const auto pair_state_begin = pair_prediction.stage().state_begin();
+                const auto views = pair_state_views(pair_state_begin, 48U);
                 std::vector<strix::qwen_pp::StatePart> parts;
                 for (const auto& view : views) parts.push_back(view.first);
                 parts.push_back({48U, 0xffffffffU, model.vocab_size * sizeof(float)});
                 if (pair_rank == 0U) pair_final_logits.resize(static_cast<std::size_t>(model.vocab_size));
                 auto pair_staging = strix::qwen_pp::make_hip_state_staging();
                 const auto handoff_bytes = strix::qwen_pp::handoff_overlap(pair_rank == 1U, parts,
-                    pair_context.identity ^ session.state_layout_identity, session.next_position, pair_prediction.cut, *pair_staging,
+                    pair_context.identity ^ session.state_layout_identity, session.next_position, pair_state_begin, *pair_staging,
                     [&](std::span<const std::byte> data) { pair_link->send(data); },
                     [&](std::span<std::byte> data) { pair_link->receive(data); },
                     [&](bool save, std::size_t index, std::uint64_t offset, std::span<std::byte> data) {
@@ -5783,11 +5921,15 @@ static int run_decode_entry(
                     }, [](std::span<const std::byte> data) { return strix::dist::crc32c(data); },
                     [&] { pair_link->abort("pair handoff state transfer failed"); });
                 check_hip(hipDeviceSynchronize(), "pair handoff installed state fence");
-                pair_dump_state(pair_rank == 0U ? 0U : pair_prediction.cut, 48U, pair_rank == 0U ? "handoff-r0" : "handoff-r1");
+                pair_dump_state(pair_rank == 0U ? 0U : pair_state_begin, 48U, pair_rank == 0U ? "handoff-r0" : "handoff-r1");
                 std::fprintf(stderr, "qwen-handoff rank=%u handoff-bytes=%llu handoff-seconds=%.6f prefill-handoff-seconds=%.6f\n",
                     pair_rank, static_cast<unsigned long long>(handoff_bytes),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - handoff_start).count(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - pair_start).count());
+                if (pair_timeline.enabled()) {
+                    pair_timeline.add_since(pair_context.sequence, strix::qwen_pp::pt_handoff, handoff_start);
+                    pair_timeline.mark(pair_context.sequence, handoff_start, std::chrono::steady_clock::now());
+                }
                 if (pair_rank == 0U) pair_decode_logits = std::move(pair_final_logits);
                 pair_context = {};
                 if (!strix::process_environment::unset("STRIX_QWEN_PF_LAYER_RANGE"))
@@ -5811,6 +5953,7 @@ static int run_decode_entry(
                     raw_require_identity();
                 });
             }
+            pair_timeline.report(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_start).count());
             std::fprintf(stderr, "qwen-pair rank=%u prefill-wall-ms=%.3f decode=%s\n", pair_rank,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pair_start).count(),
                 strix::qwen_pp::decode_enabled() ? "rank0" : "out-of-scope");
@@ -5938,10 +6081,11 @@ static int run_decode_entry(
             const auto setup_start=std::chrono::steady_clock::now();
             // Use the existing sibling handoff on a copy; the live decode session and
             // persistent state stay at their original frontier until the real block.
-            auto setup_session=session;
-            if(compiled_prefill)
-                strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
-            known_prefix_owner->prepare_prefill_geometry(setup_session);
+            strix::qpf2k::prepare_first_block_admission(true, strix::qpf2k::PrefillConstruction::startup,
+                *known_prefix_owner,session,[&](auto& setup_session) {
+                if(compiled_prefill)
+                    strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
+            });
             const char* timing=std::getenv("STRIX_PREFILL_TIMING");
             if(timing && timing[0]=='1')
                 std::fprintf(stderr,"prefill startup static-setup %.2f ms (outside generation request)\n",
@@ -6500,6 +6644,10 @@ static int run_decode_entry(
                 << "  \"known_prefix_source_projection_launches_saved_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->projection_launches_saved) << ",\n"
                 << "  \"known_prefix_source_logical_weight_bytes_avoided_per_window\":" << (known_prefill_plan ? 0U : known_prefix_plan->logical_projection_weight_bytes_avoided) << ",\n";
         }
+        // Shared power receipt of the timed request (strix/power/sampler.hpp); no member with STRIX_POWER_SAMPLER=0.
+        if (generation_request_timing_enabled && strix::power::sampler_enabled())
+            if (const auto member = strix::power::block_member(strix::power::request_block(generation_request_start, generation_request_stop, options.tokens.size(), result.generated_tokens.size())); !member.empty())
+                std::cout << "  " << member << ",\n";
         if (generation_request_timing_enabled)
             std::cout << "  \"generation_request_elapsed_ms\":" << generation_request_elapsed_ms << ",\n"
                       << "  \"generation_request_output_tokens\":" << result.generated_tokens.size() << ",\n"

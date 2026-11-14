@@ -69,6 +69,8 @@ struct MArgs {
 struct Args {
     MArgs m0, m1, m2;
     unsigned rows;
+    unsigned pub_blocks;               // 128-output blocks of member 0 (the whole partial) when pub is on
+    strix::pair::ProducerPublish pub;  // o_proj launches: member 0 publishes its output (producer_publish.hpp)
 };
 
 __device__ __forceinline__ float load_agent(const float* p) { return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); }
@@ -140,7 +142,7 @@ template <class G, int R, unsigned SG, unsigned TPW> constexpr std::size_t smem_
 // library order; at every split end the 4-lane reduction and the split partial store at its GLOBAL split index
 // (plane stride kMaxRows * N, row stride N). Finish = output_transform of the block.
 template <class G, int R, unsigned SG, bool Prime, unsigned TPW>
-__device__ __forceinline__ void member_cta(const MArgs a, unsigned local, unsigned rows, unsigned char* smem) {
+__device__ __forceinline__ unsigned member_cta(const MArgs a, unsigned local, unsigned rows, unsigned char* smem) {
     constexpr unsigned kRunU = run_u<TPW>(), kUpl = upl<TPW>(), Cg = G::template cg<TPW>();
     constexpr unsigned Ch = SG * G::Kps * 16U;  // channels of the CTA (whole H128 blocks)
     constexpr unsigned Xb = Ch / 128U;
@@ -298,9 +300,14 @@ __device__ __forceinline__ void member_cta(const MArgs a, unsigned local, unsign
             for (int j = 0; j < 4; ++j) out[32 * j] = v[j] * d::half_bits(a.svh[block * 128U + lane + 32U * static_cast<unsigned>(j)]);
         }
     };
+    unsigned finished = 0;  // output blocks completed by this CTA (uniform over its threads)
 #pragma unroll
     for (unsigned h = 0; h < TPW / 2U; ++h)
-        if (last_arrival(a.cnt + cg * (TPW / 2U) + h, G::S / SG)) finish(cg * (TPW / 2U) + h);
+        if (last_arrival(a.cnt + cg * (TPW / 2U) + h, G::S / SG)) {
+            finish(cg * (TPW / 2U) + h);
+            ++finished;
+        }
+    return finished;
 }
 
 // By value, explicit branches: a runtime-indexed member array would put Args in scratch.
@@ -316,10 +323,15 @@ __global__ __launch_bounds__(128) void group_kernel(Args a) {
     constexpr unsigned n0 = G0::template ctas<SG, TPW>(), n1 = G1::template ctas<SG, TPW>();
     const unsigned b = blockIdx.x;
     if (b < M0 * n0) {
-        member_cta<G0, R, SG, Prime, TPW>(member(a, b / n0), b % n0, a.rows, smem);
+        const unsigned finished = member_cta<G0, R, SG, Prime, TPW>(member(a, b / n0), b % n0, a.rows, smem);
+        if constexpr (M0 == 1 && M1 == 0) {  // single-member launches (o_proj): the producer may publish its partial
+            if (a.pub.on() && finished != 0) strix::pair::producer_publish(a.pub, a.pub_blocks, finished);
+        } else {
+            (void)finished;
+        }
     } else if constexpr (M1 > 0) {
         const unsigned b1 = b - M0 * n0;
-        member_cta<G1, R, SG, Prime, TPW>(member(a, M0 + b1 / n1), b1 % n1, a.rows, smem);
+        (void)member_cta<G1, R, SG, Prime, TPW>(member(a, M0 + b1 / n1), b1 % n1, a.rows, smem);
     }
 }
 
@@ -487,7 +499,8 @@ void kda_qkv(const Mat (&m)[3], const float* x, unsigned x_stride, unsigned rows
     a.rows = rows;
     launch<GQkv, 3, GQkv, 0>(a, resolve(k, Group::KdaQkv, rows), s);
 }
-void kda_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s, Knobs k) {
+void kda_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s, Knobs k,
+           const strix::pair::ProducerPublish* pub) {
     if (!supported(Group::KdaO, &m, 1)) throw std::invalid_argument("glm attn tierb: kda_o shape");
     check_rows(rows, x, x_stride, GQkv::In, ws);
     check_out(y, y_stride, GQkv::Out, rows);
@@ -495,6 +508,10 @@ void kda_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float
     a.m0 = margs(m, x, x_stride, y, y_stride, ws, 0);
     a.m1 = a.m2 = a.m0;
     a.rows = rows;
+    if (pub != nullptr && pub->on()) {
+        a.pub = *pub;
+        a.pub_blocks = GQkv::Out / 128U;
+    }
     launch<GQkv, 1, GQkv, 0>(a, resolve(k, Group::KdaO, rows), s);
 }
 void dsa_a(const Mat& q_a, const Mat& kv_a, const float* x, unsigned x_stride, unsigned rows, float* qa, unsigned qa_stride, float* kva,
@@ -525,7 +542,8 @@ void dsa_b(const Mat& q_b, const Mat& wq_b, const float* qr, unsigned qr_stride,
     a.rows = rows;
     launch<GQb, 1, GWqb, 1>(a, resolve(k, Group::DsaB, rows), s);
 }
-void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s, Knobs k) {
+void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s, Knobs k,
+           const strix::pair::ProducerPublish* pub) {
     if (!supported(Group::DsaO, &m, 1)) throw std::invalid_argument("glm attn tierb: dsa_o shape");
     check_rows(rows, x, x_stride, GDo::In, ws);
     check_out(y, y_stride, GDo::Out, rows);
@@ -533,6 +551,10 @@ void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float
     a.m0 = margs(m, x, x_stride, y, y_stride, ws, 0);
     a.m1 = a.m2 = a.m0;
     a.rows = rows;
+    if (pub != nullptr && pub->on()) {
+        a.pub = *pub;
+        a.pub_blocks = GDo::Out / 128U;
+    }
     launch<GDo, 1, GDo, 0>(a, resolve(k, Group::DsaO, rows), s);
 }
 

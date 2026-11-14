@@ -56,11 +56,16 @@ class LinuxGpuQueueTests(unittest.TestCase):
                                      'STRIX_TEST_GPU_QUEUE_LEAN': '1' if lean else '0'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('PASS ' + case, result.stdout)
+        return result.stdout
+
+    def test_counts(self):
+        # Identity checks and ioctls around one exchange, both modes (printed for the record).
+        print(''.join(line + '\n' for line in self.run_case('counts').splitlines() if line.startswith('COUNT')), end='')
 
 for case in CASES:
     setattr(LinuxGpuQueueTests, 'test_' + case, lambda self, case=case: self.run_case(case))
 # The same cases on the lean hot path (identity is per call there by design: covered by 'lean').
-for case in (*(c for c in CASES if c != 'identity'), 'lean'):
+for case in (*(c for c in CASES if c != 'identity'), 'lean', 'lean_recheck', 'lean_ioctl_errors'):
     setattr(LinuxGpuQueueTests, 'test_lean_' + case, lambda self, case=case: self.run_case(case, lean=True))
 
 if __name__ == '__main__':

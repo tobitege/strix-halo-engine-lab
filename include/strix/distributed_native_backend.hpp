@@ -118,15 +118,11 @@ public:
 class HipDistributedTokenParticipant;
 class NativeDistributedBackend;
 struct NativeDistributedTokenLedger;
-struct CopiedDistributedTokenLedger;
-class CopiedStreamDistributedBackend;
 enum class NativeDistributedRetirementOutcome { completed_boundaries, aborted_attempt };
 // Move-only, privately minted evidence of actual token operation retirement.
 // NOT a token-commit/decision permit or physical transport qualification.
 // The supplied composite owner retains the actual sessions, native provider,
 // imported pools, staging and GPU source/consumer owners until this proof dies.
-// The explicit copied route uses its separate ledger and persistent host epoch;
-// the incumbent type name does not turn host-copy evidence into GPU DMA proof.
 class NativeDistributedTokenRetirement final {
 public:
     NativeDistributedTokenRetirement() = default;
@@ -140,14 +136,7 @@ public:
         const DistributedRuntimeRequest&,std::uint32_t local_node,NativeDistributedRetirementOutcome) const;
 private:
     friend class NativeDistributedBackend;
-    friend class CopiedStreamDistributedBackend;
     friend class HipDistributedTokenParticipant;
-    explicit NativeDistributedTokenRetirement(std::shared_ptr<CopiedDistributedTokenLedger> ledger)
-        : copied_(std::move(ledger)) {}
-    void validate_copied_matches(std::uint64_t, std::uint64_t, const DistributedRuntimeRequest&,
-        std::uint32_t, NativeDistributedRetirementOutcome) const;
-    void consume_copied_matches() noexcept;
-    std::shared_ptr<CopiedDistributedTokenLedger> copied_;
     explicit NativeDistributedTokenRetirement(std::shared_ptr<NativeDistributedTokenLedger> ledger)
         : ledger_(std::move(ledger)) {}
     // Check first, consume last. No own-container allocation; native provider

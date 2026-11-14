@@ -669,7 +669,11 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
         expect(f.session.next_position==rows&&f.session.committed_tokens==rows&&f.session.state.generations==expected_generations,
             "T prefill commits real T inputs and exactly serial state generations once");
         expect(f.state_words==expected_state,"T step-major prefill preserves all seven logical host state payloads");
-        expect(result.shared_rows_dispatches==48U*(rows/8U)&&
+        // The final-block cone runs the trailing stateless steps (here: the last layer's shared step) from the tile
+        // of the terminal row only.
+        expect(policy!=P::terminal_row||rows<=8U||(rows%8U!=0U||(result.final_cone_first_row==rows-8U&&result.final_cone_steps>0U)),
+            "a terminal-row T block cones its trailing stateless steps to the terminal tile");
+        expect(result.shared_rows_dispatches==48U*(rows/8U)-result.final_cone_skipped_tiles&&
             (mixed?result.gdn_rows_dispatches==36U*(rows/8U):result.r2_dispatches==36U*(rows/2U)),
             "T prefill uses real closed tiles at every source step and explicit row tails");
         expect(f.trace.head_admissions.size()==(prefill.terminal_logits_arena?prefill.logit_row_indices.size():rows),
@@ -1091,6 +1095,79 @@ void actual_known_window_lineage_tests(const strix::ModelContract& model) {
     expect(failed && failing.trace.calls>0U && failing.quiesces==1U && failing.session.health==SerialSessionHealth::poisoned &&
         failing.session.next_position==0U && failing.session.committed_tokens==0U && failing.session.arithmetic_lineage.intervals.empty() &&
         failing.session.arithmetic_lineage.tainted,"failed native completion drains and publishes neither chunk history nor target frontier");
+}
+
+void known_window_run_cache_tests(const strix::ModelContract& model) {
+    using namespace strix;
+    using V = KnownWindowR2Variant;
+    for (const auto rows : {2U, 8U}) for (const bool promote : {false, true}) {
+        KnownRuntimeFixture reference(model, promote, false, rows), cached(model, promote, false, rows);
+        KnownWindowRunCache cache;
+        std::vector<const void*> memo;
+        std::vector<std::array<std::uintptr_t, 2>> slots;
+        auto hooks = cached.hooks();
+        hooks.run_cache = &cache; hooks.preflight_memo = &memo; hooks.preflight_slots = &slots;
+        std::array<KnownWindowR2Entry, 2> pairs{{
+            {V::shared_q8_virtual256_r2_v1, &cached.trace, &recording_r2_preflight, &recording_r2_launch},
+            {V::gdn_q8_virtual256_r2_v1, &cached.trace, &recording_r2_preflight, &recording_r2_launch}}};
+        std::array<KnownWindowRowsEntry, 1> wide{{
+            {V::shared_q8_virtual256_r8_v1, &cached.trace, &recording_rows_preflight, &recording_rows_launch}}};
+        auto reference_pairs = pairs;
+        for (auto& entry : reference_pairs) entry.config = &reference.trace;
+        auto reference_wide = wide; reference_wide[0].config = &reference.trace;
+        std::vector<const CompiledLaunchPlan*> plans, reference_plans;
+        for (const auto& plan : cached.row_launch) plans.push_back(&plan);
+        for (const auto& plan : reference.row_launch) reference_plans.push_back(&plan);
+        auto alternate_plans = cached.row_launch;
+        auto alternate_memory = cached.state_memory;
+        std::array<SerialSessionContext, 2> sessions{cached.session, cached.session};
+        const ExecutionDispatchContext* prior_context = nullptr;
+        const ExecutionRuntimeResources* prior_resource = nullptr;
+        for (unsigned cycle = 0; cycle < 7U; ++cycle) {
+            // Cold, warm, owner invalidation, plan-key change, resource rebinding,
+            // slot invalidation, then warm again. The session object alternates too.
+            if (cycle == 2U) { memo.clear(); slots.clear(); }
+            if (cycle == 3U) for (std::size_t r = 0; r < plans.size(); ++r) plans[r] = &alternate_plans[r];
+            if (cycle == 4U) cached.resources.session_state_memory = &alternate_memory;
+            if (cycle == 5U) slots.clear();
+            auto& session = sessions[cycle % 2U];
+            session = cached.session;
+            for (std::uint32_t r = 0; r < rows; ++r)
+                cached.tokens[r] = reference.tokens[r] = 7U + cycle + r;
+            hooks.before_step = [&](std::size_t i, const auto& contexts) {
+                if (i == 0U) {
+                    if (cycle == 1U || cycle == 6U)
+                        expect(prior_context == contexts[0].data() && prior_resource == contexts[0][0].resources,
+                            "warm window retains contexts and their owned resource copies");
+                    prior_context = contexts[0].data(); prior_resource = contexts[0][0].resources;
+                }
+                return false;
+            };
+            const auto expected = execute_known_prefix_window_eager(reference.window, reference.source.serial,
+                reference.resources, reference.window_memory, reference.session, reference.tokens,
+                reference_plans, reference_pairs, reference_wide, reference.hooks());
+            const auto actual = execute_known_prefix_window_eager(cached.window, cached.source.serial,
+                cached.resources, cached.window_memory, session, cached.tokens, plans, pairs, wide, hooks);
+            cached.session = session;
+            for (std::size_t r = 0; r < actual.logits.size(); ++r)
+                expect(actual.logits[r].bytes == expected.logits[r].bytes &&
+                    std::memcmp(reinterpret_cast<const void*>(actual.logits[r].address),
+                        reinterpret_cast<const void*>(expected.logits[r].address), actual.logits[r].bytes) == 0,
+                    "cached and uncached window logits match byte for byte across cycles");
+            expect(cached.state_words == reference.state_words && session.state.valid == reference.session.state.valid &&
+                session.state.generations == reference.session.state.generations &&
+                session.next_position == reference.session.next_position && session.committed_tokens == reference.session.committed_tokens,
+                "cached window preserves all state payloads, generations and session frontiers");
+            expect(session.arithmetic_lineage.intervals == reference.session.arithmetic_lineage.intervals &&
+                session.arithmetic_lineage.history_identity == reference.session.arithmetic_lineage.history_identity &&
+                session.arithmetic_lineage.tainted == reference.session.arithmetic_lineage.tainted,
+                "cached window prepares and publishes the same complete arithmetic lineage");
+            expect(actual.execution.completion_order == expected.execution.completion_order &&
+                actual.execution.completed_steps == expected.execution.completed_steps &&
+                actual.r2_dispatches == expected.r2_dispatches && actual.shared_rows_dispatches == expected.shared_rows_dispatches,
+                "cached window refreshes per-cycle completion records and dispatch counters");
+        }
+    }
 }
 
 void known_window_runtime_tests(const strix::ModelContract& model) {
@@ -2326,6 +2403,15 @@ void known_window_mixed_format_tests(const strix::ModelContract& model) {
 }  // namespace
 
 int main() {
+    // The final-block cone keeps 128 trailing rows by default; the fixtures here are smaller, so cone to one tile, and cone
+    // every trailing stateless step (the fixture has no step observer).
+#ifdef _WIN32
+    _putenv_s("STRIX_PREFILL_FINAL_CONE_ROWS", "8");
+    _putenv_s("STRIX_PREFILL_FINAL_CONE", "2");
+#else
+    setenv("STRIX_PREFILL_FINAL_CONE_ROWS", "8", 1);
+    setenv("STRIX_PREFILL_FINAL_CONE", "2", 1);
+#endif
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 
@@ -2551,6 +2637,7 @@ int main() {
     known_window_trellis_profile_tests(model);
     known_window_qsa_bf16_indexer_tests(model);
     known_window_tests(model);
+    known_window_run_cache_tests(model);
     known_window_runtime_tests(model);
     actual_known_window_lineage_tests(model);
     known_window_output_policy_tests(model);

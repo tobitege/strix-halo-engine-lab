@@ -72,6 +72,7 @@
 // X-State-Sha256 (the SHA-256 of the body); the reply must echo the same sha256 and the prompt's position.
 // Events on stdout (one JSON line each): {"event":"loaded",...}, {"event":"READY",...}, {"event":"request",...},
 // {"event":"STOPPED"}. SIGINT / SIGTERM stop accepting, finish the running prefill and exit.
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/cuda_ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
@@ -1460,6 +1461,9 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     CudaPrefillOptions o;

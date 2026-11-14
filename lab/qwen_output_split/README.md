@@ -120,10 +120,9 @@ waits/abort remain bounded. No native test or turn is launched by configuration.
 
 ## Remaining model work
 
-Reuse the existing `HipDistributedStageResources`, complete-layer bridge,
-`HipDistributedKnownSequence` and `HipDistributedGreedyRequest` for PP. Their
-standalone two-host commissioning/bootstrap is still outstanding; their callable
-source cases are not executed hardware qualification. This fixture supplies a
+The first-generation `HipDistributedStageResources`,
+`HipDistributedKnownSequence` and `HipDistributedGreedyRequest` were test-only and
+were removed in R3-B1; PP work starts from the current transport. This fixture supplies a
 separate complete-output-row seam and a runnable native decision gate, without
 another model PP executor or positive transport-qualification assertion.
 

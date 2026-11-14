@@ -175,4 +175,10 @@ class MtpBatchWindowController;
 [[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
     std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr,
     MtpBatchWindowController* joint=nullptr,MtpBatchWindowController* policy_joint=nullptr);
+// Serve cycle receipt (STRIX_SERVE_RECEIPT=1, strix/serve/cycle_receipt.hpp). Wall time the calling thread spent
+// proposing drafts since the previous call (0 with the switch unset), and the resolved state of the runtime's
+// serve levers for the activation lines.
+[[nodiscard]] double hip_mtp_take_serve_draft_ms() noexcept;
+struct HipMtpServeLever {std::string name,env;bool active=false;std::string value;};
+[[nodiscard]] std::vector<HipMtpServeLever> hip_mtp_serve_levers();
 } // namespace strix

@@ -56,7 +56,7 @@ __device__ unsigned exchanges(unsigned bits, unsigned lane) {
 
 __global__ void compare(const unsigned* input, const std::uint64_t* masks, unsigned* failures) {
     const unsigned at = blockIdx.x * stride + threadIdx.x;
-    const unsigned physical_lane = threadIdx.x % warpSize;
+    const unsigned physical_lane = threadIdx.x % static_cast<unsigned>(warpSize);
     const unsigned lane = threadIdx.x & 31U;
     if ((masks[blockIdx.x] & (std::uint64_t{1} << physical_lane)) == 0) return;
     const unsigned bits = input[at];

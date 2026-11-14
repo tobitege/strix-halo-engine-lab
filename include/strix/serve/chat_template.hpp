@@ -5,6 +5,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace strix::serve {
@@ -42,10 +43,27 @@ struct AssistantOutput {
     std::vector<bool> call_complete;
     bool unfinished_call = false;  // a tool-call frame did not close (whether or not a call could be parsed from it)
     bool reasoning_complete = false;
+    std::string withheld;          // tool_choice "none": the notice appended to content when a call was withheld
 };
 // thinking: the prompt ended with "<think>\n" (generation starts inside the reasoning block).
 // tools: the request's tools, used to type parameter values (string unless the schema says otherwise).
 [[nodiscard]] AssistantOutput parse_assistant_output(const std::string& text, bool thinking, const Json& tools);
+
+// ---- tool_choice "none" (shared by every chat API and model family) ----
+// Removing the tool definitions is not enough once the history holds earlier calls: the model can imitate them.
+// The request keeps its history (calls and results stay renderable), gets a closing instruction, and any call the
+// model still emits is withheld from the reply.
+inline constexpr const char* no_tools_hint =
+    "Tools are disabled for this reply. Do not call a tool; answer in plain text using the conversation so far.";
+// True for tool_choice "none" and {"type":"none"}.
+[[nodiscard]] bool tool_choice_is_none(const Json& body);
+// The messages with `hint` added at the end, when the history holds a tool call or a tool result and ends with a
+// user or tool message: appended to a closing user message, or added as a user message after a closing tool
+// result. nullopt: nothing to add (the messages render as they are).
+[[nodiscard]] std::optional<Json> messages_with_no_tools_hint(const Json& messages, std::string_view hint = no_tools_hint);
+// Withholds every tool call of a parsed turn: parsed calls are dropped, an unparsed frame is cut from `marker` on,
+// and a one-line notice (also left in `withheld`) is appended to the content so the reply is never empty.
+void withhold_tool_calls(AssistantOutput& output, std::string_view marker);
 
 // Python str.strip() whitespace.
 [[nodiscard]] std::string strip(const std::string& text);

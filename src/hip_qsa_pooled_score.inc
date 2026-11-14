@@ -12,8 +12,10 @@
 // Maxima (one serial decode row, STRIX_QSA_DECODE_FUSED_MAXIMA): the wave also writes the 4-block group maxima of its 32
 // blocks with row_maxima_kernel's expression fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)) over the scores it stores (-inf past
 // the row's blocks), so the selection reads them without the separate row_maxima_kernel launch.
-template <unsigned Rows, unsigned RowsPerWave, class Key, bool Maxima>
-__device__ __forceinline__ void block_score_pooled_rows_body(const QsaRowsScoreViews<Rows>& views, const Key* pooled_keys,
+// Views: any score views with at least Rows entries (the merged cohort kernels pass a session's 8-entry views in
+// place for 2 or 4 rows; a narrowed local copy indexed by the wave's row lands in scratch memory).
+template <unsigned Rows, unsigned RowsPerWave, class Key, bool Maxima, class Views = QsaRowsScoreViews<Rows>>
+__device__ __forceinline__ void block_score_pooled_rows_body(const Views& views, const Key* pooled_keys,
     std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima) {
 #pragma clang fp contract(off)
     constexpr unsigned Heads = 4U, Dim = 128U; // head_dim == Dim (checked by the caller)

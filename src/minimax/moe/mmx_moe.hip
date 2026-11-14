@@ -1,4 +1,5 @@
 #include "../../moe_core/decode.hpp"
+#include "../../moe_core/route.hpp"
 #include "mmx_moe_traits.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
@@ -155,6 +156,31 @@ __device__ __forceinline__ void lean_publish(const PublishTarget& p, unsigned bl
 }
 
 // ---------------------------------------------------------------- router + top-4 + dispatch table
+struct DispatchRoutePolicy {
+    static constexpr unsigned experts = kExperts, top_k = kTopE;
+    static constexpr float sum_eps = kSumEps, route_scale = kRouteScale;
+    const Args& a;
+    const float* sc;
+    const float* ch;
+    unsigned t;
+    Dispatch* dp;
+    std::uint32_t (*s_id)[kTopE];
+    float (*s_w)[kTopE];
+    __device__ float score(std::uint32_t e) const { return sc[e]; }
+    __device__ bool better(std::uint32_t e, std::uint32_t pick) const { return ch[e] > ch[pick]; }
+    __device__ void write_id(unsigned, std::uint32_t) const {}
+    __device__ void write_weight(unsigned k, std::uint32_t best, float wk) const {
+        const unsigned id = a.controlled_ids != nullptr ? a.controlled_ids[t * kTopE + k] : best;
+        const float weight = a.controlled_weights != nullptr ? a.controlled_weights[t * kTopE + k] : wk;
+        s_id[t][k] = id;
+        s_w[t][k] = weight;
+        dp->ids[t][k] = id;
+        dp->weights[t][k] = weight;
+        if (a.ids != nullptr) a.ids[t * kTopE + k] = id;
+        if (a.weights != nullptr) a.weights[t * kTopE + k] = weight;
+    }
+};
+
 template <unsigned NT>
 __device__ void route_tail(const Args& a) {
     // Top-4 and dispatch table, built in LDS by parallel threads (only stores go to global memory: a single thread
@@ -170,30 +196,7 @@ __device__ void route_tail(const Args& a) {
     __syncthreads();
     Dispatch* dp = a.disp();
     if (t < rows) {  // route_row / post_exchange_kernel selection: k-th best by (choice desc, id asc)
-        std::uint32_t best[kTopE];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            std::uint32_t pick = kExperts;
-            for (std::uint32_t x = 0; x < kExperts; ++x) {
-                bool taken = false;
-                for (unsigned q = 0; q < k; ++q) taken |= best[q] == x;
-                if (taken) continue;
-                if (pick == kExperts || s_ch[t][x] > s_ch[t][pick]) pick = x;  // ascending scan: ties keep the smaller id
-            }
-            best[k] = pick;
-        }
-        float sum = 0.0F;
-        for (unsigned k = 0; k < kTopE; ++k) sum = sum + s_sc[t][best[k]];
-        for (unsigned k = 0; k < kTopE; ++k) {
-            const float wk = (s_sc[t][best[k]] / (sum + kSumEps)) * kRouteScale;
-            const unsigned id = a.controlled_ids != nullptr ? a.controlled_ids[t * kTopE + k] : best[k];
-            const float weight = a.controlled_weights != nullptr ? a.controlled_weights[t * kTopE + k] : wk;
-            s_id[t][k] = id;
-            s_w[t][k] = weight;
-            dp->ids[t][k] = id;
-            dp->weights[t][k] = weight;
-            if (a.ids != nullptr) a.ids[t * kTopE + k] = id;
-            if (a.weights != nullptr) a.weights[t * kTopE + k] = weight;
-        }
+        strix::moe_core::route_topk(DispatchRoutePolicy{a, s_sc[t], s_ch[t], t, dp, s_id, s_w});
     }
     __syncthreads();
     if (t < kExperts) {
@@ -1480,27 +1483,26 @@ __global__ __launch_bounds__(256) void router_rows_kernel(unsigned rows, const f
         }
     }
 }
+struct InterleavedRoutePolicy {
+    static constexpr unsigned experts = kExperts, top_k = kTopE;
+    static constexpr float sum_eps = kSumEps, route_scale = kRouteScale;
+    const float* sc;
+    unsigned t;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ float score(std::uint32_t e) const { return sc[2 * e]; }
+    __device__ bool better(std::uint32_t e, std::uint32_t pick) const { return sc[2 * e + 1] > sc[2 * pick + 1]; }
+    __device__ void write_id(unsigned k, std::uint32_t id) const { ids[static_cast<std::size_t>(t) * kTopE + k] = id; }
+    __device__ void write_weight(unsigned k, std::uint32_t, float weight) const {
+        weights[static_cast<std::size_t>(t) * kTopE + k] = weight;
+    }
+};
+
 __global__ __launch_bounds__(64) void topk_rows_kernel(unsigned rows, const float* scratch, std::uint32_t* ids, float* weights) {
     const unsigned t = blockIdx.x * 64 + threadIdx.x;
     if (t >= rows) return;
     const float* sc = scratch + static_cast<std::size_t>(t) * kExperts * 2;
-    std::uint32_t best[kTopE];
-    for (unsigned k = 0; k < kTopE; ++k) {
-        std::uint32_t pick = kExperts;
-        for (std::uint32_t x = 0; x < kExperts; ++x) {
-            bool taken = false;
-            for (unsigned q = 0; q < k; ++q) taken |= best[q] == x;
-            if (taken) continue;
-            if (pick == kExperts || sc[2 * x + 1] > sc[2 * pick + 1]) pick = x;
-        }
-        best[k] = pick;
-    }
-    float sum = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) sum = sum + sc[2 * best[k]];
-    for (unsigned k = 0; k < kTopE; ++k) {
-        ids[static_cast<std::size_t>(t) * kTopE + k] = best[k];
-        weights[static_cast<std::size_t>(t) * kTopE + k] = (sc[2 * best[k]] / (sum + kSumEps)) * kRouteScale;
-    }
+    strix::moe_core::route_topk(InterleavedRoutePolicy{sc, t, ids, weights});
 }
 }  // namespace
 

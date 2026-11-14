@@ -2,6 +2,7 @@
 // host emulation (src/glm/host/glm_host.cpp): R1 ascending fmaf chains, R2 lane-strided partials + LDS halving tree,
 // separate multiply/add elsewhere. Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm_norm.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "../../ops/norm/norm_device.hpp"
 
 #include <stdexcept>
@@ -271,8 +272,8 @@ __global__ void swiglu_kernel(const float* g, const float* u, float* a, std::siz
 
 __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsigned n, std::uint32_t id0, float* value,
                                                      std::uint32_t* id, unsigned* flag, unsigned flag_stride) {
-    __shared__ float sv[256];
-    __shared__ std::uint32_t si[256];
+    struct Best { float value; std::uint32_t id; };
+    __shared__ Best s[256];
     const unsigned r = blockIdx.x, l = threadIdx.x;
     if (flag) flag += static_cast<std::size_t>(r) * flag_stride;
     const float* lg = logits + static_cast<std::size_t>(r) * n;
@@ -286,22 +287,16 @@ __global__ __launch_bounds__(256) void argmax_kernel(const float* logits, unsign
             bi = i;
         }
     }
-    sv[l] = bv;
-    si[l] = bi;
-    __syncthreads();
-    for (unsigned h = 128; h > 0; h >>= 1U) {
-        if (l < h && si[l + h] != 0xffffffffU) {
-            const bool take = si[l] == 0xffffffffU || sv[l + h] > sv[l] || (sv[l + h] == sv[l] && si[l + h] < si[l]);
-            if (take) {
-                sv[l] = sv[l + h];
-                si[l] = si[l + h];
-            }
-        }
-        __syncthreads();
-    }
+    // Shared argmax tree (R2-07); this kernel keeps its own ordering (the first strided element is taken
+    // even when non-finite, flagged separately) so the combine below is unchanged.
+    const Best best = strix::argmax::block_reduce<256>(s, l, Best{bv, bi}, [](const Best& x, const Best& y) {
+        if (y.id == 0xffffffffU) return x;
+        const bool take = x.id == 0xffffffffU || y.value > x.value || (y.value == x.value && y.id < x.id);
+        return take ? y : x;
+    });
     if (l == 0) {
-        value[r] = sv[0];
-        id[r] = id0 + si[0];
+        value[r] = best.value;
+        id[r] = id0 + best.id;
     }
 }
 

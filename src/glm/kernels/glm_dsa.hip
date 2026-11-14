@@ -2,6 +2,7 @@
 // (glm_host.cpp dsa_append / indexer_select / mla_attention). Build with -ffp-contract=off -fno-fast-math
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/kernels/glm_dsa.hpp"
+#include "attn_core/select.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -99,76 +100,9 @@ __global__ __launch_bounds__(1024) void idx_select_kernel(const std::uint32_t* k
     __shared__ unsigned scan_eq[1024], scan_sel[1024];
     const unsigned l = threadIdx.x;
     const unsigned k = P < kIdxPools ? P : kIdxPools;
-    if (l == 0) {
-        sh_prefix = 0;
-        sh_mask = 0;
-        sh_remaining = k;
-        sh_carry_eq = 0;
-        sh_carry_out = 0;
-    }
-    __syncthreads();
-    if (k > 0) {
-        for (int shift = 24; shift >= 0; shift -= 8) {
-            for (unsigned d = l; d < 256; d += 1024) hist[d] = 0;
-            __syncthreads();
-            const unsigned prefix = sh_prefix, mask = sh_mask;
-            for (unsigned p = l; p < P; p += 1024)
-                if ((keys[p] & mask) == prefix) atomicAdd(&hist[(keys[p] >> shift) & 255U], 1U);
-            __syncthreads();
-            if (l == 0) {
-                unsigned rem = sh_remaining;
-                for (int d = 255; d >= 0; --d) {
-                    if (hist[d] >= rem) {
-                        sh_prefix = prefix | (static_cast<unsigned>(d) << shift);
-                        break;
-                    }
-                    rem -= hist[d];
-                }
-                sh_remaining = rem;  // pools with key == K* still to take (lowest indices first)
-                sh_mask = mask | (255U << shift);
-            }
-            __syncthreads();
-        }
-        const unsigned kstar = sh_prefix, take_eq = sh_remaining;
-        for (unsigned base = 0; base < P; base += 1024) {  // ordered compaction, chunk by chunk
-            const unsigned p = base + l;
-            const unsigned key = p < P ? keys[p] : 0U;
-            const unsigned eq = (p < P && key == kstar) ? 1U : 0U;
-            scan_eq[l] = eq;
-            __syncthreads();
-            for (unsigned off = 1; off < 1024; off <<= 1U) {  // inclusive scan (Hillis-Steele)
-                const unsigned v = l >= off ? scan_eq[l - off] : 0U;
-                __syncthreads();
-                scan_eq[l] += v;
-                __syncthreads();
-            }
-            const unsigned eq_rank = sh_carry_eq + scan_eq[l] - eq;  // equal keys before p
-            const unsigned sel = (p < P && (key > kstar || (eq && eq_rank < take_eq))) ? 1U : 0U;
-            scan_sel[l] = sel;
-            __syncthreads();
-            for (unsigned off = 1; off < 1024; off <<= 1U) {
-                const unsigned v = l >= off ? scan_sel[l - off] : 0U;
-                __syncthreads();
-                scan_sel[l] += v;
-                __syncthreads();
-            }
-            if (sel) {
-                const unsigned at = sh_carry_out + scan_sel[l] - 1;
-                for (unsigned j = 0; j < kKpool; ++j) tokens[at * kKpool + j] = p * kKpool + j;
-            }
-            __syncthreads();
-            if (l == 1023) {
-                sh_carry_eq += scan_eq[1023];
-                sh_carry_out += scan_sel[1023];
-            }
-            __syncthreads();
-        }
-    }
-    if (l == 0) {  // tail: positions 4P .. t
-        unsigned n = sh_carry_out * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tokens[n++] = pos;
-        *n_out = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::ChunkPolicy<kKpool, true>>(
+        keys, P, t, k, l, tokens, n_out,
+        strix::attn_core::select::ChunkStorage{hist, sh_prefix, sh_mask, sh_remaining, sh_carry_eq, sh_carry_out, scan_eq, scan_sel});
 }
 
 // ---------------------------------------------------------------- MLA (R13)

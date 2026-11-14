@@ -1245,7 +1245,7 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
         Span state, scratch; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory;
         ExecutionMemoryBinding arena; ExecutionRuntimeResources resources; std::array<ExecutionDispatchContext, 8> rows;
     };
-    std::array<Session, 8> sessions;
+    std::array<Session, 16> sessions;
     for (std::size_t k = 0; k < sessions.size(); ++k) {
         auto& session = sessions[k];
         session.scratch = f.owner.allocate(f.window.physical.total_bytes);
@@ -1298,8 +1298,13 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
                  {2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}, {8U, 8U, 8U, 8U}, {8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U},
                  {4U, 4U, 2U}, {8U, 4U, 2U}, {8U, 8U, 4U, 2U, 2U}})
             shapes.push_back(wide);
-    const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U, 2047U, 1U, 2201U, 3U, 1000U},
+    if (dense) shapes.emplace_back(16U, 2U); // maximum descriptor-table occupancy
+    std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U, 2047U, 1U, 2201U, 3U, 1000U},
         {2047U, 1U, 2201U, 3U, 2042U, 0U, 6U, 1500U}, {2201U, 2042U, 3U, 0U, 1000U, 6U, 2047U, 1U}};
+    for (auto& positions : placements) {
+        const auto repeat = positions;
+        positions.insert(positions.end(), repeat.begin(), repeat.end());
+    }
     for (const auto& sizes : shapes)
         for (const auto& positions : placements) {
             const auto reference_bytes = run(sizes, positions, false);
@@ -2769,6 +2774,14 @@ void rows_bench() {
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc > 1 && std::string_view(argv[1]) == "--qsa-cohort") {
+        // Optional family index 0..3 (dense * 2 + !bf16_indexer): one family per run keeps each run short.
+        const int only = argc > 2 ? std::atoi(argv[2]) : -1;
+        int family = 0;
+        for (bool dense : {false, true}) for (bool bf16_indexer : {true, false})
+            if (only < 0 || only == family++) qsa_cohort_family(dense, bf16_indexer);
+        return 0;
+    }
     if (argc > 1 && std::string_view(argv[1]) == "--router-bf16") { router_bf16_family(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-lifecycle") { qsa_pool_idle_owner(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-tests") {

@@ -1,4 +1,5 @@
 #include "strix/execution_arena.hpp"
+#include "../src/core/row_layout.hpp"
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 
@@ -334,7 +335,15 @@ int main() {
             expect(ring.physical.total_bytes==998400ULL*rows,"logits still bound score-free uniform arena at every maximum");
             const auto terminal=strix::build_known_prefill_arena(source,256,rows,full.block_scores_bytes,true);
             const auto legacy_terminal=strix::build_known_prefill_arena(source,256,rows,0,true);
-            expect(terminal.physical.total_bytes==324352ULL*rows+993280ULL,"score-free headless arena matches independent capacity port");
+            // The capacity port describes the tight layout; the shared row layout policy may only add its step to
+            // the strides that were page multiples (two stream slots and the MLP intermediate here).
+            constexpr strix::core::RowLayoutPolicy tight_rows{4096, 0, 2, 16};
+            const auto tight_terminal=strix::build_known_prefill_arena(source,256,rows,full.block_scores_bytes,true,true,0,&tight_rows);
+            expect(tight_terminal.physical.total_bytes==324352ULL*rows+993280ULL,"score-free headless arena matches independent capacity port");
+            expect(terminal.physical.total_bytes>=tight_terminal.physical.total_bytes &&
+                terminal.physical.total_bytes<=(324352ULL+3U*256U)*rows+993280ULL,"row layout policy adds at most its step per moved stride");
+            if(rows==8192U) std::cout<<"headless arena bytes/row tight "<<(tight_terminal.physical.total_bytes-993280ULL)/rows
+                <<" policy "<<(terminal.physical.total_bytes-993280ULL)/rows<<'\n';
             expect(terminal.row_stride.back()==0 && terminal.row_view.front().allocations.back().bytes==0 &&
                 terminal.row_view.back().allocations.back().bytes==993280U,"only the terminal row exposes the single logits stripe");
             const auto lookup=strix::ArenaLookupIndex::uniform_views(terminal.row_view);

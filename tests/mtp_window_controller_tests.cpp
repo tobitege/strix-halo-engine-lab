@@ -273,8 +273,10 @@ int main() {
 #endif
         };
         set_env(nullptr);
-        const auto automatic=Controller::rule_from_env();
-        expect(automatic.calibrated && automatic.calibrated_min_members==3U,"unset env defaults to calibrated-c3");
+        const auto unset_default=Controller::rule_from_env();
+        expect(unset_default.budget && !unset_default.calibrated,"unset env defaults to the row budget");
+        const auto automatic=Controller::parse_rule("calibrated-c3");
+        expect(automatic.calibrated && automatic.calibrated_min_members==3U && !automatic.budget,"calibrated-c3 parses to three plan members");
         expect(!Controller::rule_from_env(true).calibrated,"baseline defaults to production");
         for(const auto* text:{"production","0","calibrated","calibrated-c3"}) {
             set_env(text);
@@ -338,6 +340,70 @@ int main() {
         const std::vector<strix::MtpBatchWindowController::Request> q{{0,8,probabilities},{4,8,probabilities}};
         expect(growing.choose(q,16)==eager.choose(q,16),"growth preserves old history and initializes appended slots like eager slots");
         expect(growing.plan(q,16)==eager.plan(q,16),"growth preserves shared planning state");
+    }
+    {
+        // Budget rule: rows come from the shared row budget. Rows per lane shrink as lanes grow, every plan is
+        // made of admitted owners, small totals are 4 or 8, and limits hold.
+        using Controller=strix::MtpBatchWindowController;
+        const auto rule=Controller::parse_rule("budget");
+        expect(rule.budget && !Controller::parse_rule("calibrated-c3").budget,"budget rule name parses");
+        Controller c(8,rule);
+        const auto model=c.budget_cost();
+        expect(!model.fitted && model.fixed_ms+model.lane_ms==34.0 && model.row_ms==6.0,"budget cost starts from the 34 + 6 x rows prior of one lane");
+        const std::vector<float> sure(7,0.95F),poor(7,0.05F);
+        std::uint32_t previous=UINT32_MAX;
+        for(std::uint32_t lanes=1;lanes<=8U;++lanes) {
+            std::vector<Controller::Request> q;
+            for(std::uint32_t k=0;k<lanes;++k) q.push_back({k,8,sure});
+            const auto rows=c.choose(q,32);
+            std::uint32_t total=0,widest=0;
+            for(const auto r:rows) {expect(r==2U || r==4U || r==8U,"budget rows are admitted owners");total+=r;widest=std::max(widest,r);}
+            expect(total<=32U,"budget plan stays inside the row budget");
+            expect(total>8U || total==4U || total==8U,"small budget totals are four or eight rows");
+            expect(widest<=previous,"rows per lane do not grow with the lanes of a cycle");
+            previous=widest;
+            if(lanes==6U) expect(total>12U,"six confident lanes get more than the fixed table");
+            if(lanes>6U) expect(total==2U*lanes && widest==2U,"above the lane bound every request gets the fixed two rows");
+        }
+        const std::vector<Controller::Request> one{{0,8,sure}},eight{{0,8,sure},{1,8,sure},{2,8,sure},{3,8,sure},{4,8,sure},
+            {5,8,sure},{6,8,sure},{7,8,sure}};
+        expect(c.choose(one,32).front()>c.choose(eight,32).front(),"one lane drafts deeper than eight lanes");
+        const std::vector<Controller::Request> mixed{{0,8,sure},{1,8,poor},{2,8,sure},{3,8,poor}};
+        const auto split=c.choose(mixed,32);
+        expect(split[0]>=split[1] && split[2]>=split[3] && split[1]==2U && split[3]==2U,"rows go to the lanes whose drafts are likely");
+        const std::vector<Controller::Request> limited{{0,2,sure},{1,4,sure},{2,8,sure}};
+        const auto bounded=c.choose(limited,32);
+        expect(bounded[0]==2U && bounded[1]<=4U,"budget rows respect each request's owner limit");
+        const std::vector<Controller::Request> tails{{0,2,{}},{1,2,{}},{2,2,{}}};
+        expect(c.choose(tails,32)==std::vector<std::uint32_t>({2,2,2}),"three two-row tails keep their small chunks");
+        // Measured topologies replace the prior once rows and lanes moved apart: 20 + 10 x rows + 3 x lanes.
+        Controller measured(8,rule);
+        std::vector<Controller::Request> four,two;
+        for(std::uint32_t k=0;k<4U;++k) four.push_back({k,8,sure});
+        for(std::uint32_t k=0;k<2U;++k) two.push_back({k,8,sure});
+        const auto before=measured.choose(four,32);
+        const std::array<std::uint32_t,4> r2{2,2,2,2},r4{4,4,4,4},none{0,0,0,0};
+        const std::array<std::uint32_t,2> p4{4,4},p8{8,8},none2{0,0};
+        const auto ms=[](double base,double per_row,double per_lane,double row_count,double lane_count){return base+per_row*row_count+per_lane*lane_count;};
+        for(int k=0;k<8;++k) {measured.observe(four,r2,none,0.0,ms(20,10,3,8,4),0);measured.observe(four,r4,none,0.0,ms(20,10,3,16,4),0);}
+        expect(!measured.budget_cost().fitted,"one lane count does not identify the lane term: the prior stays");
+        for(int k=0;k<8;++k) {measured.observe(two,p4,none2,0.0,ms(20,10,3,8,2),0);measured.observe(two,p8,none2,0.0,ms(20,10,3,16,2),0);}
+        const auto fit=measured.budget_cost();
+        expect(fit.fitted && std::abs(fit.fixed_ms-20.0)<1.0 && std::abs(fit.row_ms-10.0)<0.5 && std::abs(fit.lane_ms-3.0)<0.5,
+            "budget cost follows the measured topologies");
+        Controller dear(8,rule);
+        for(int k=0;k<8;++k) {dear.observe(four,r2,none,0.0,ms(2,40,1,8,4),0);dear.observe(four,r4,none,0.0,ms(2,40,1,16,4),0);
+            dear.observe(two,p4,none2,0.0,ms(2,40,1,8,2),0);dear.observe(two,p8,none2,0.0,ms(2,40,1,16,2),0);}
+        const std::vector<float> half(7,0.5F);
+        std::vector<Controller::Request> unsure;
+        for(std::uint32_t k=0;k<4U;++k) unsure.push_back({k,8,half});
+        std::uint32_t cheap_total=0,dear_total=0;
+        for(const auto r:c.choose(unsure,32)) cheap_total+=r;
+        for(const auto r:dear.choose(unsure,32)) dear_total+=r;
+        expect(dear_total<=cheap_total && before.size()==4U,"dearer rows never widen the plan");
+        // plan() before drafting: 0 = no draft, else an owner; the probe schedule still explores.
+        Controller planner(4,rule);
+        for(int k=0;k<40;++k) for(const auto r:planner.plan(four,32)) expect(r==0U || r==2U || r==4U || r==8U,"budget plan rows are owners or no draft");
     }
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
     std::cout<<"mtp window controller: legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)

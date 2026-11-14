@@ -4,27 +4,18 @@ add_library(strix_gemma4_engine STATIC
     src/gemma4/engine/coordinator.cpp
     src/gemma4/engine/host_backend.cpp
     src/gemma4/engine/chat_runner.cpp
+    src/gemma4/engine/session_engine.cpp
     src/gemma4/engine/api.cpp
-    src/serve/deployment.cpp
     src/gemma4/engine/runtime.cpp)
 target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_ref strix_gemma4_dflash strix_gemma4_eagle strix_engine_deploy)
 strix_target_warnings(strix_gemma4_engine)
 if(MSVC)
     target_compile_definitions(strix_gemma4_engine PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
-if(WIN32)
-    # Portable FIFO queue; the socket transport remains Linux-only.
-    target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_serve)
-    target_sources(strix_gemma4_engine PRIVATE src/serve/engine.cpp)
-else()
-    # Compile the existing family adapter and shared primitives unchanged. The
-    # full shared ApiService also pulls unrelated engine-core implementations.
-    target_sources(strix_gemma4_engine PRIVATE
-        src/gemma4/serve/tokenizer.cpp src/gemma4/serve/chat.cpp
-        src/gemma4/serve/parse.cpp src/gemma4/serve/adapter.cpp
-        src/serve/json.cpp src/serve/bpe_tokenizer.cpp src/serve/chat_template.cpp
-        src/serve/engine.cpp src/serve/http_server.cpp)
-endif()
+target_link_libraries(strix_gemma4_engine PUBLIC strix_gemma4_serve strix_session_runtime)
+add_library(strix_gemma4_session_service STATIC src/gemma4/engine/session_service.cpp)
+target_link_libraries(strix_gemma4_session_service PUBLIC strix_gemma4_engine strix_gemma4_description)
+strix_target_warnings(strix_gemma4_session_service)
 if(STRIX_GEMMA4_DEVICE_BACKEND)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT STRIX_ENABLE_HIP_RUNTIME OR NOT TARGET strix_gemma4_device)
         message(FATAL_ERROR "STRIX_GEMMA4_DEVICE_BACKEND requires Linux, HIP and strix_gemma4_device")
@@ -37,15 +28,15 @@ endif()
 add_executable(strix-gemma4-decode apps/gemma4_decode_main.cpp)
 target_link_libraries(strix-gemma4-decode PRIVATE strix_gemma4_engine)
 strix_target_warnings(strix-gemma4-decode)
-if(NOT WIN32)
+if(STRIX_LEGACY_MAINS)
     add_executable(strix-gemma4-serve apps/gemma4_serve_main.cpp)
     target_link_libraries(strix-gemma4-serve PRIVATE strix_gemma4_engine)
     strix_target_warnings(strix-gemma4-serve)
 endif()
 if(BUILD_TESTING)
-    if(WIN32)
-        # The socket server is native-only; still compile its deployment binding
-        # in host CI without linking or allocating an accelerator.
+    if(WIN32 AND STRIX_LEGACY_MAINS)
+        # Retain the direct deployment-binding compile probe with the legacy
+        # target; neither host target allocates an accelerator.
         add_library(strix-gemma4-deploy-cli-compile OBJECT apps/gemma4_serve_main.cpp)
         target_link_libraries(strix-gemma4-deploy-cli-compile PRIVATE strix_gemma4_engine)
         strix_target_warnings(strix-gemma4-deploy-cli-compile)

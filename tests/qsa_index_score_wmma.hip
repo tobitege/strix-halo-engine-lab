@@ -4,6 +4,7 @@
 #include <array>
 #include <iostream>
 #include <iomanip>
+#include "row_fixture_stride.hpp"
 namespace strix { namespace {
 #include "../src/hip_qsa_index_score_wmma.inc"
 #include "../src/hip_qsa_stage_score.inc"
@@ -67,7 +68,9 @@ template <unsigned Rows> void tails() {
     std::cout << "INDEX_TAIL_PASS rows=" << Rows << " blocks=67 packed_and_fp32_keys=1 skipped_query=1\n";
 }
 void run(unsigned position, bool timing, bool packed) {
-    const unsigned blocks = (position + T) / ratio, stride = blocks + Guard;
+    const unsigned blocks = (position + T) / ratio, tight_stride = blocks + Guard;
+    const unsigned stride = static_cast<unsigned>(fixture_row_stride_bytes(tight_stride * 4ULL) / 4U);
+    std::cout << "INDEX_ROWS P=" << position << " T=" << T << " tight_bytes=" << tight_stride * 4U << " stride_bytes=" << stride * 4U << '\n';
     const unsigned max_stride = (blocks + 3U) / 4U + Guard, selected_stride = budget + 3U + Guard;
     const std::size_t elements = static_cast<std::size_t>(T) * stride;
     Device<float> keys(static_cast<std::size_t>(blocks) * dim), query(T * heads * dim);
@@ -155,7 +158,7 @@ void run(unsigned position, bool timing, bool packed) {
         changes.add(x, y);
         for (unsigned arm = 0U; arm < 2U; ++arm) {
             const auto& ids = arm ? y : x;
-            std::copy(ids.begin(), ids.end(), want[arm].begin() + static_cast<std::size_t>(r) * topk);
+            std::copy(ids.begin(), ids.end(), want[arm].begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(r) * topk));
         }
     }
     require(maximum < 1e-3F * (1.0F + scale) && oracle_error < 1e-3F, "WMMA arithmetic/mapping sanity bound");

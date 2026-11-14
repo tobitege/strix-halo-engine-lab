@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -26,6 +27,7 @@
 
 #include "hip_ds41_prepared_load.hpp"
 
+#include "core/hip_range_weight_loader.hpp"
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -57,7 +59,7 @@ namespace {
 constexpr std::size_t control_bytes = 64U << 10U;
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 batch forward: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 batch forward: ", e, what);
 }
 
 template <typename T>
@@ -140,44 +142,13 @@ private:
     const std::uint8_t* base_ = nullptr;
 };
 
-// Byte ranges of the model file into device memory through a pinned staging buffer, with O_DIRECT (DeviceForward's
-// loader: the weights never enter the page cache).
-class DirectLoader {
-public:
-    static constexpr std::uint64_t align = 4096, chunk = 256ULL << 20U;
-    explicit DirectLoader(const std::filesystem::path& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd_ < 0) throw std::runtime_error("deepseek41 batch forward: cannot open " + path.string());
-        strix::LoaderCapture::record(path, fd_);
-        check(hipHostMalloc(reinterpret_cast<void**>(&buffer_), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
+// Byte ranges of the model file into device memory through the shared weight-load queue (core/weight_load_queue.hpp):
+// O_DIRECT reads on bounded workers, per-ticket pinned staging retired by upload events, an own non-blocking copy
+// stream. load() only queues; ready() is the one wait, at the end of the load or before the first consumer.
+struct DirectLoader : strix::core::HipRangeWeightLoader {
+    explicit DirectLoader(const std::filesystem::path& path) : HipRangeWeightLoader(path.string()) {
+        strix::LoaderCapture::record(path, fd());
     }
-    ~DirectLoader() {
-        if (buffer_ != nullptr) (void)hipHostFree(buffer_);
-        if (fd_ >= 0) ::close(fd_);
-    }
-    DirectLoader(const DirectLoader&) = delete;
-    DirectLoader& operator=(const DirectLoader&) = delete;
-    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
-        std::uint64_t done = 0;
-        while (done < bytes) {
-            const std::uint64_t at = offset + done, base = at & ~(align - 1U), lead = at - base;
-            const std::uint64_t take = std::min(bytes - done, chunk - lead);
-            const std::uint64_t want = (lead + take + align - 1U) & ~(align - 1U);
-            std::uint64_t got = 0;
-            while (got < lead + take) {
-                const auto n = ::pread(fd_, buffer_ + got, want - got, static_cast<off_t>(base + got));
-                if (n <= 0) throw std::runtime_error("deepseek41 batch forward: short read of the weights");
-                got += static_cast<std::uint64_t>(n);
-            }
-            check(hipMemcpy(device + done, buffer_ + lead, take, hipMemcpyHostToDevice), "weight upload");
-            done += take;
-        }
-    }
-
-private:
-    int fd_ = -1;
-    std::uint8_t* buffer_ = nullptr;
 };
 
 // Engram output-row TP (ds41::engram_tp()): rows [first, first + half) of every token row of ekv ([rows][n]) packed
@@ -786,6 +757,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     DirectLoader loader(gguf);
     std::unique_ptr<DirectLoader> overlay_loader;
     if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+    const std::function<void()> loaded = [&] { loader.ready(); if (overlay_loader) overlay_loader->ready(); };
     ds41::prepared::HipLoader prepared(gguf, m.overlay ? m.overlay->path() : std::filesystem::path{}, m.model, options.rank, options.world, m.expert_tp);
     const bool use_router_bf16 = strix::env_flag_default_on("STRIX_DS41_ROUTER_BF16", strix::EnvFlagMatch::first_character);
     const bool use_f16_as_f8 = strix::env_flag_default_on("STRIX_DS41_F16_AS_F8", strix::EnvFlagMatch::first_character);
@@ -849,7 +821,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
             Dev<std::uint8_t> d(ds41::expert_tp::part_bytes(bytes, c.n_routed_experts, down, c.hidden_size));
             auto& from = over != nullptr ? *overlay_loader : loader;
             ds41::expert_tp::load_part([&](std::uint64_t o, std::uint64_t b, std::uint8_t* dst) { from.load(o, b, dst); }, offset, bytes,
-                                       c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream);
+                                       c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream, loaded);
             m.expert_bytes += d.n / c.n_routed_experts;  // one expert's part, summed over the layers below
             m.weights.emplace(n, std::move(d));
             continue;
@@ -896,6 +868,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
                                  : bytes;
         m.weights.emplace(n, std::move(d));
     }
+    loaded();  // end-of-load publication: the one wait for every tensor queued above
     prepared.report();
     ds41::prepared::device_hashes(m.weights, options.rank, m.stream);
     m.expert_bytes /= std::max<std::uint32_t>(options.layers, 1U);  // per layer (every layer has the same expert shapes)
@@ -1232,7 +1205,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         return !((v && *v == '0') || (b && *b == '0'));
     }();
     // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
-    m.compress_ring = [] { const char* v = std::getenv("STRIX_DS41_COMPRESS_RING"); return !(v && *v == '0'); }();
+    m.compress_ring = strix::envcfg::flag("STRIX_DS41_COMPRESS_RING", true);
     m.never = Dev<std::uint32_t>(1);
     {
         const std::size_t n = W * K + 1U;
@@ -1934,24 +1907,20 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     const Step* deferred_shared = nullptr;
     // STRIX_DS41_HC_SITE=1 / STRIX_DS41_QA_KV=1: as DeviceForward (one enqueue_hc_site per hyper-connection boundary,
     // q_a and kv in one launch over one A8 of the attention input), same bits. HC_SITE is off with layer timing.
-    static const bool hc_site_flag = [] { const char* v = std::getenv("STRIX_DS41_HC_SITE"); return !(v && v[0] == '0'); }();
+    static const bool hc_site_flag = strix::envcfg::flag("STRIX_DS41_HC_SITE", true);
     // QA_KV is OFF in BatchForward: with it every request generated one repeated token in P12 (57328), while the
     // in-batch gate compared two wrong runs. Only STRIX_DS41_BATCH_QA_KV=1 enables it,
     // for investigating the fix; DeviceForward keeps QA_KV on (gated against the CPU host forward).
-    static const bool qa_kv_flag = [] { const char* v = std::getenv("STRIX_DS41_BATCH_QA_KV"); return v && v[0] == '1'; }();
+    static const bool qa_kv_flag = strix::envcfg::flag("STRIX_DS41_BATCH_QA_KV", false);
     const bool fuse_hc = hc_site_flag && !m.options.layer_timing;
     const bool fuse_qa_kv = qa_kv_flag;
     // STRIX_DS41_ATTN_A8=1: the attention combine writes o_a's input A8 and o_a's product kernel o_b's, same bits.
-    static const bool attn_a8 = [] { const char* v = std::getenv("STRIX_DS41_ATTN_A8"); return v && v[0] == '1'; }();
+    static const bool attn_a8 = strix::envcfg::flag("STRIX_DS41_ATTN_A8", false);
     // STRIX_DS41_BATCH_SEGMENTS (default on since P17.2, =0 off): the stateful attention kernels of every request segment
     // in one launch per kernel (enqueue_*_segments), each segment's blocks unchanged, same bits. The segment views below
-    // are sized for max_rows requests: unset, it is off with STRIX_DS41_BATCH_ROWS16=1 (16 rows); =1 with ROWS16 is refused.
-    static const char* const segments_env = std::getenv("STRIX_DS41_BATCH_SEGMENTS");
-    static const bool batch_segments = segments_env != nullptr && segments_env[0] != '\0'
-                                           ? segments_env[0] == '1'
-                                           : BatchForward::configured_row_limit() <= BatchForward::max_rows;
-    if (batch_segments && BatchForward::configured_row_limit() > BatchForward::max_rows)
-        throw std::invalid_argument("deepseek41 batch forward: STRIX_DS41_BATCH_SEGMENTS=1 is not qualified with STRIX_DS41_BATCH_ROWS16=1");
+    // hold one view per request of the configured step limit (8, or 16 with STRIX_DS41_BATCH_ROWS16=1); the device side
+    // flushes a launch every attn::hip::kMaxSegments views, so 16 requests are two launches per kernel instead of 16.
+    static const bool batch_segments = strix::envcfg::flag("STRIX_DS41_BATCH_SEGMENTS", true);
     struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
     PendingPost post;  // an expansion not yet enqueued; stream_now() is already its output
     // capture_main_hidden (as DeviceForward): the input of layers [layers - 3, layers) once the expansion is stored
@@ -1991,7 +1960,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         late_mix = nullptr;
     };
     // Residual boundary fusions; each flag is independent (QNORM_A8 off by default, ROUTES on by default).
-    static const bool qnorm_a8 = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_QNORM_A8"); return v && v[0] == '1'; }();
+    static const bool qnorm_a8 = strix::envcfg::flag("STRIX_DS41_R1FUSE_QNORM_A8", false);
     const bool router_routes = ds41::r1fuse_routes();  // STRIX_DS41_R1FUSE_ROUTES: default on, =0 off
     bool q_a8 = false, routes_ready = false;
     const auto route_view = [&] {
@@ -2056,7 +2025,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     };
     // the weights of the steps after `from` (whole tensors in step order, the last one cut), up to prefetch_bytes;
     // the routed experts (which rows are unknown) and the embedding tables are skipped
-    static const bool past_experts = [] { const char* v = std::getenv("STRIX_DS41_PREFETCH_PAST_EXPERTS"); return v && v[0] == '1'; }();
+    static const bool past_experts = strix::envcfg::flag("STRIX_DS41_PREFETCH_PAST_EXPERTS", false);
     const auto prefetch_after = [&](const Step& from) {
         if (m.prefetch_bytes == 0U) return;
         std::uint64_t left = m.prefetch_bytes;
@@ -2535,7 +2504,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         case Op::window_write: {
             if (attn::hip::attention_window_fold()) break;   // STRIX_DS41_ATTN_WINDOW_FOLD: the attention kernel inserts the rows
             const auto& r = m.roles[layer];
-            std::array<attn::hip::WindowView, max_rows> views{};
+            std::array<attn::hip::WindowView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 attn::hip::WindowView v{};
@@ -2571,7 +2540,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_f16_rows_pair(f16_proj(p + "attn_compressor_kv.weight", m.ckv[layer].p),
                                             f16_proj(p + "attn_compressor_gate.weight", m.cscore[layer].p), st);
             else ds41::enqueue_f16_rows(f16_proj(p + "attn_compressor_kv.weight", m.ckv[layer].p), st);
-            std::array<attn::hip::CompressView, max_rows> views{};
+            std::array<attn::hip::CompressView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 auto& L = m.slots[g.slot].layers[layer];
@@ -2630,8 +2599,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 wv.out = m.iw.p;
                 ds41::enqueue_f16_rows_pair(qv, wv, st);  // one launch with STRIX_DS41_F16_PAIR=1 (F16 q_b)
             }
-            std::array<attn::hip::IndexView, max_rows> ivs{};
-            std::array<attn::hip::SelectView, max_rows> svs{}, dvs{};
+            std::array<attn::hip::IndexView, extended_max_rows> ivs{};
+            std::array<attn::hip::SelectView, extended_max_rows> svs{}, dvs{};
             std::size_t nv = 0, nd = 0;
             for (const auto& g : segments) {
                 const std::uint32_t count = (g.position + g.count) / ratio;  // of the segment's last row
@@ -2693,7 +2662,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         }
         case Op::attention: {
             const auto& r = m.roles[layer];
-            std::array<attn::hip::AttentionView, max_rows> views{};
+            std::array<attn::hip::AttentionView, extended_max_rows> views{};
             std::size_t nv = 0;
             for (const auto& g : segments) {
                 const auto& S = m.slots[g.slot];

@@ -129,6 +129,7 @@ public:
         const std::lock_guard<std::mutex> l(m_);
         return max_tokens_;
     }
+    sv::SamplingParameters sampling() { const std::lock_guard<std::mutex> lock(m_); return sampling_; }
     std::vector<std::uint32_t> prompt() {
         const std::lock_guard<std::mutex> l(m_);
         return prompt_;
@@ -140,12 +141,14 @@ public:
     }
     std::optional<mo::RequestExtra> take_extra(const sv::GenerationTicket& t) {
         const std::lock_guard<std::mutex> l(m_);
+        ++take_calls_;
         const auto it = extras_.find(&t);
         if (it == extras_.end()) return std::nullopt;
         const auto x = it->second;
         extras_.erase(it);
         return x;
     }
+    [[nodiscard]] unsigned take_calls() { const std::lock_guard<std::mutex> lock(m_); return take_calls_; }
     [[nodiscard]] std::size_t extras_left() {
         const std::lock_guard<std::mutex> l(m_);
         return extras_.size();
@@ -164,6 +167,7 @@ private:
                 const std::lock_guard<std::mutex> l(m_);
                 s = script_;
                 session_ = t->job.session;
+                sampling_ = t->job.sampling;
                 max_tokens_ = t->job.max_tokens;
                 prompt_ = t->job.prompt;
             }
@@ -239,10 +243,12 @@ private:
     std::condition_variable cv_;
     Script script_;
     std::string session_;
+    sv::SamplingParameters sampling_;
     std::uint32_t max_tokens_ = 0;
     std::vector<std::uint32_t> prompt_;
     bool released_ = false;
     bool keep_extras_ = false;
+    unsigned take_calls_ = 0;
     std::map<const sv::GenerationTicket*, mo::RequestExtra> extras_;
     std::uint64_t published_ = 0, finished_ = 0;
     std::thread thread_;
@@ -846,6 +852,9 @@ void test_request_fields() {
         rig.api.handle(post("/v1/chat/completions", kChat + "," + extra + "}"), w);
         rig.engine.wait_finished(n);
         check(w.status == 200, "neutral values accepted: " + extra);
+        const auto fixed=rig.engine.sampling();
+        check(fixed.temperature==0 && fixed.top_p==1 && fixed.top_k==0 && fixed.min_p==0 && !fixed.seeded && fixed.seed==0,
+              "accepted filters/seed retain exact fixed planner input");
         return sv::parse_json(w.body);
     };
     auto j = accepted(R"("stop":null,"n":1,"logprobs":false,"presence_penalty":0,"logit_bias":{},"response_format":{"type":"text"},"tool_choice":"auto","seed":7)", 1);
@@ -895,7 +904,51 @@ void test_deployment_surface() {
     check(draining.status == 503 && !rig.queue.submit({}), "drain health and admission");
 }
 
+void test_once_terminal_hooks() {
+    mo::observe_reset_for_tests();Rig rig(true);
+    unsigned accepted=0;
+    for (unsigned mode=0;mode<5;++mode) {
+        rig.engine.next({mode==4 ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{5,kEos},mode==4 ? "generation error" : ""});
+        Writer writer;
+        if (mode==1)writer.fail_begin=true;
+        if (mode==2)writer.gone_after=0;
+        if (mode==3)writer.gone_now=true;
+        const auto body=kChat+(mode==0 || mode==4 ? "}" : R"(,"stream":true})");
+        rig.api.handle(post("/v1/chat/completions",body),writer);++accepted;
+        check(rig.engine.take_calls()==accepted && rig.engine.extras_left()==0,"one terminal hook even without scheduler data");
+    }
+    Writer validation;rig.api.handle(post("/v1/completions",R"({"prompt":"x","thinking_budget":1})"),validation);
+    check(validation.status==400 && rig.engine.take_calls()==accepted,"validation never takes a receipt");
+    Writer bad_ids;rig.api.handle(post("/v1/chat/completions",kChat+R"(,"return_token_ids":1})"),bad_ids);
+    check(bad_ids.status==400 && rig.engine.take_calls()==accepted,"malformed return IDs refuse before ticket/owner work");
+    rig.queue.shutdown();Writer refused;rig.api.handle(post("/v1/completions",R"({"prompt":"x"})"),refused);
+    check(refused.status==503 && rig.engine.take_calls()==accepted,"queue rejection never takes a receipt");
+}
+
+void test_neutral_scoring_fields() {
+    Rig rig;
+    for (const bool chat:{false,true})for(const char* value:{"0","false"}) {
+        rig.engine.next({{5,kEos}});Writer writer;
+        const auto body=std::string(chat?R"({"messages":[{"role":"user","content":"hi"}],"logprobs":)":R"({"prompt":"hi","logprobs":)")+value+"}";
+        rig.api.handle(post(chat?"/v1/chat/completions":"/v1/completions",body),writer);
+        check(writer.status==200,"legacy zero/false logprobs remain neutral without metadata or target scoring");
+    }
+}
+
+void test_scheduler_callback_error() {
+    Rig rig;
+    mo::MinimaxApiOptions options;
+    options.admin_sched=[](const sv::HttpRequest&)->Json { throw std::runtime_error("scheduler unavailable"); };
+    mo::MinimaxApi api(fake_tokenizer(),rig.queue,std::move(options),rig.observer);
+    Writer writer;api.handle(post("/admin/sched","{}"),writer);
+    check(writer.status==400 && writer.body==R"({"error":{"message":"scheduler unavailable","type":"invalid_request_error"}})","scheduler callback exceptions retain the original error envelope");
+    check(rig.engine.finished()==0 && rig.engine.take_calls()==0,"scheduler callback failure submits no generation and takes no receipt");
+}
+
 int main() {
+    test_scheduler_callback_error();
+    test_neutral_scoring_fields();
+    test_once_terminal_hooks();
     test_deployment_surface();
     test_request_fields();
     test_unarmed_non_stream();

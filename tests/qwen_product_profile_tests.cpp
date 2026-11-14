@@ -56,23 +56,22 @@ void product() {
             Env exported;
             pr::apply(r, [&](const char* key, const char* value) { exported[key] = value; return true; });
             const bool provisional = profile == pr::Name::fast;
-            // With permission fast also applies the runnable GDN chunk row as unqualified.
-            const bool gdn = provisional && allow;
+            // Fast applies the runnable GDN chunk row as provisional, with or without permission.
+            const bool gdn = provisional;
             check(exported.size() == (provisional ? (gdn ? 6U : 4U) : 0U), "provisional runnable rows and provenance export without permission");
             if (gdn) check(exported.at("STRIX_QPF2K_GDN_FP16_CHUNK") == "1" &&
-                exported.at("STRIX_QWEN_PROFILE_OWNED_gdn_fp16_chunk") == "fast:unqualified:1", "allow-pending applies the GDN chunk row");
+                exported.at("STRIX_QWEN_PROFILE_OWNED_gdn_fp16_chunk") == "fast:provisional:1", "fast applies the GDN chunk row without permission");
             if (provisional) {
                 check(exported.at("STRIX_QPF2K_MOE_ROUTE_BF16") == "1", "fast exports BF16 storage without permission");
                 check(exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
                     "fast exports distinct provisional provenance without permission");
             }
-            check(r.qualification() == (provisional ? (gdn ? "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk"
-                : "qualification in progress: qsa_budget,moe_route_bf16") : "qualified"), "qualification names applied provisional rows");
+            check(r.qualification() == (provisional ? "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk" : "qualified"), "qualification names applied provisional rows");
             check(r.entries.size() == (profile == pr::Name::fast ? 4U : 0U), "only fast has product rows");
             const auto json = strix::serve::parse_json_unique(r.json());
             check(json.find("profile")->as_string() == pr::name(profile), "JSON profile name");
-            check(json.find("unqualified")->size() == (gdn ? 1U : 0U), "provisional is distinct from unqualified rows");
-            check(json.find("provisional")->size() == (provisional ? 2U : 0U) &&
+            check(json.find("unqualified")->size() == 0U, "provisional is distinct from unqualified rows");
+            check(json.find("provisional")->size() == (provisional ? 3U : 0U) &&
                 (!provisional || json.find("provisional")->as_array()[0].as_string() == "qsa_budget"), "JSON provisional list");
             check(json.find("pending")->size() == r.entries.size() - (provisional ? 2U : 0U) - (gdn ? 1U : 0U), "JSON pending rows");
             for (const auto& entry : r.entries) {
@@ -86,13 +85,13 @@ void product() {
                 } else if (provisional && entry.lever->name == "qsa_budget") {
                     check(entry.status == pr::Status::provisional && entry.value == "1536", "provisional QSA budget applies");
                 } else if (gdn && entry.lever->name == "gdn_fp16_chunk") {
-                    check(entry.status == pr::Status::unqualified && entry.value == "1", "allow-pending runs the GDN chunk row");
+                    check(entry.status == pr::Status::provisional && entry.value == "1", "provisional GDN chunk row applies");
                 } else {
                     check(entry.status == pr::Status::pending && entry.value == entry.lever->builtin, "pending keeps builtin");
                     check(!entry.target.empty(), "pending records declared target");
                 }
             }
-            check(r.notices().size() == (profile == pr::Name::quality ? 1U : r.entries.size() - (gdn ? 1U : 0U)),
+            check(r.notices().size() == (profile == pr::Name::quality ? 1U : r.entries.size()),
                 "one notice per provisional or pending row");
             unsigned provisional_notices = 0;
             for (const auto& notice : r.notices()) if (notice.find("moe_route_bf16") != std::string::npos) {
@@ -109,11 +108,13 @@ void product() {
     for (const auto& lever : pr::levers()) {
         check(!lever.name.empty() && !lever.option.empty() && !lever.source.empty(), "editable table has provenance and option");
         check(lever.value[0].empty() && lever.value[2].empty(), "default and quality leave every lever alone");
-        check(!lever.ready[1] && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk"),
-            "QSA budget, MoE route storage and the GDN chunk route are runnable");
+        check(!lever.ready[1] && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk" ||
+                lever.name == "moe_route_prune"),
+            "QSA budget, MoE route storage, the GDN chunk route and the optional route prune are runnable");
         check(!lever.provisional[0] && !lever.provisional[2] &&
-            lever.provisional[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16"), "fast QSA budget and MoE route storage are provisional");
-        if (lever.env.empty()) continue;
+            lever.provisional[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk"),
+            "fast QSA budget, MoE route storage and the GDN chunk route are provisional");
+        if (lever.env.empty() || lever.value[1].empty()) continue;  // an optional lever in no profile has no fast value to export
         Env env{{std::string(lever.env), std::string(lever.value[1])}};
         inputs = {{}, lookup(env), true};
         if (lever.runnable[1])
@@ -123,8 +124,8 @@ void product() {
         const auto off = pr::resolve(pr::Name::fast, inputs);
         check(off.find(lever.name)->status == pr::Status::off, "explicit env off wins");
         if (lever.name == "moe_route_bf16") {
-            // allow-pending (inputs above) still runs the runnable GDN chunk row, stamped unqualified.
-            check(off.qualification() == "qualification in progress: qsa_budget; unqualified: gdn_fp16_chunk", "explicit off removes MoE provisional qualification");
+            // The provisional GDN chunk row stays applied.
+            check(off.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk", "explicit off removes MoE provisional qualification");
             unsigned writes = 0;
             pr::apply(off, [&](const char* key, const char*) {
                 writes += std::string_view(key).find("MOE_ROUTE_BF16") != std::string_view::npos ||
@@ -259,9 +260,9 @@ void native_switch_and_yarn() {
         check(row->status == (on ? pr::Status::explicit_cli : pr::Status::off) && row->value == (on ? "1" : "0"), "native CLI wins over profile");
         unsigned writes = 0;
         pr::apply(o.product_profile, [&](const char*, const char*) { ++writes; return true; });
-        // With --allow-pending fast also exports the runnable GDN chunk row (switch + provenance).
-        check(writes == (allow ? 4U : 2U), "native CLI retains optional field while other profile rows export");
-        check(o.product_profile.qualification() == (allow ? "qualification in progress: qsa_budget; unqualified: gdn_fp16_chunk" : "qualification in progress: qsa_budget"),
+        // Fast also exports the provisional GDN chunk row (switch + provenance).
+        check(writes == 4U, "native CLI retains optional field while other profile rows export");
+        check(o.product_profile.qualification() == "qualification in progress: qsa_budget,gdn_fp16_chunk",
             "explicit native override is not applied by provisional profile");
     }
     refuses([] { (void)parse({"decoder","model.gguf","1","--prefill-moe-route-bf16","maybe"}); }, "requires on or off");
@@ -279,13 +280,11 @@ void native_switch_and_yarn() {
         check(dc::yarn_environment_refusal(execution, 2).empty(), "profile cannot introduce YaRN refusal");
         const bool fast = std::string_view(profile) == "fast";
         // YaRN admits BF16 route storage and the GDN chunk route (no rotary sites), so fast applies them there as on native.
-        const Env fast_env = allow ? Env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", "1"}}
-                                   : Env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}};
+        const Env fast_env{{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", "1"}};
         check(fast ? execution == fast_env : execution.empty(), "YaRN exports only admitted profile switches");
         check(!fast || exported.at("STRIX_QWEN_PROFILE_OWNED_moe_route_bf16") == "fast:provisional:1",
             "YaRN exports provisional provenance");
-        check(o.product_profile.qualification() == (fast ? (allow ? "qualification in progress: moe_route_bf16; unqualified: gdn_fp16_chunk"
-            : "qualification in progress: moe_route_bf16") : "qualified"), "YaRN stamps the applied provisional row");
+        check(o.product_profile.qualification() == (fast ? "qualification in progress: moe_route_bf16,gdn_fp16_chunk" : "qualified"), "YaRN stamps the applied provisional row");
         if (!fast) continue;
         const auto* row = o.product_profile.find("moe_route_bf16");
         check(row && row->status == pr::Status::provisional && row->value == "1" && row->reason.empty(),
@@ -298,11 +297,11 @@ void native_switch_and_yarn() {
     pr::Inputs inputs{{}, lookup(env), false};
     env["STRIX_QWEN_PROFILE_ALLOW_PENDING"] = "1";
     auto r = pr::resolve(pr::Name::fast, inputs);
-    check(r.qualification() == "qualification in progress: qsa_budget,moe_route_bf16; unqualified: gdn_fp16_chunk",
+    check(r.qualification() == "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk",
         "allow-pending alias preserves provisional status");
     pr::apply(r, [&](const char* key, const char* value) { env[key] = value; return true; });
-    check(env.at("STRIX_QPF2K_GDN_FP16_CHUNK") == "1", "allow-pending alias applies the GDN chunk row");
-    // Without the alias an inherited unqualified switch is explicit again; keep this case to the provisional row.
+    check(env.at("STRIX_QPF2K_GDN_FP16_CHUNK") == "1", "fast applies the GDN chunk row");
+    // Drop the exported GDN chunk switch so the re-resolution below starts from the table again.
     env.erase("STRIX_QPF2K_GDN_FP16_CHUNK");
     env.erase("STRIX_QWEN_PROFILE_OWNED_gdn_fp16_chunk");
     check(env.at("STRIX_QPF2K_MOE_ROUTE_BF16") == "1", "MoE route BF16 environment exported");
@@ -311,7 +310,7 @@ void native_switch_and_yarn() {
     {
         const auto again = pr::resolve(pr::Name::fast, inputs);
         const auto *a = again.find("moe_route_bf16"), *b = r.find("moe_route_bf16");
-        check(a->status == b->status && a->value == b->value && again.qualification() == "qualification in progress: qsa_budget,moe_route_bf16",
+        check(a->status == b->status && a->value == b->value && again.qualification() == "qualification in progress: qsa_budget,moe_route_bf16,gdn_fp16_chunk",
             "MoE route BF16 provenance re-resolves identically");
     }
     env["STRIX_QPF2K_MOE_ROUTE_BF16"] = "0";
@@ -330,8 +329,9 @@ void declined_provenance() {
     const auto erase = [&](const char* key) { env.erase(key); return true; };
     pr::withdraw_declined(got.options.product_profile, lookup(env), erase);
     pr::apply(got.options.product_profile, [&](const char* key, const char* value) { env[key] = value; return true; });
-    check(env.size() == 2 && env.at("STRIX_QPF2K_QSA_BUDGET") == "1536" &&
-            env.count("STRIX_QWEN_PROFILE_OWNED_qsa_budget") == 1,
+    check(env.size() == 4 && env.at("STRIX_QPF2K_QSA_BUDGET") == "1536" &&
+            env.count("STRIX_QWEN_PROFILE_OWNED_qsa_budget") == 1 && env.at("STRIX_QPF2K_GDN_FP16_CHUNK") == "1" &&
+            env.count("STRIX_QWEN_PROFILE_OWNED_gdn_fp16_chunk") == 1,
         "declined inherited proposal and provenance are removed before runtime");
     env.erase("STRIX_QPF2K_QSA_BUDGET");
     env.erase("STRIX_QWEN_PROFILE_OWNED_qsa_budget");

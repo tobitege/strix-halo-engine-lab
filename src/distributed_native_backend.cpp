@@ -431,7 +431,6 @@ NativeDistributedTokenRetirement NativeDistributedBackend::retire_aborted_token(
 }
 void NativeDistributedTokenRetirement::validate_matches(std::uint64_t binding,std::uint64_t placement,
     const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) const {
-    if(copied_) {validate_copied_matches(binding,placement,request,node,outcome);return;}
     if(!ledger_ || !ledger_->sealed || ledger_->binding!=binding || ledger_->placement!=placement ||
         ledger_->node!=node || ledger_->outcome!=outcome || !retirement_request_equal(ledger_->request,request))
         throw std::invalid_argument("native token retirement proof is empty, foreign or has the wrong outcome");
@@ -440,7 +439,6 @@ void NativeDistributedTokenRetirement::validate_matches(std::uint64_t binding,st
 void NativeDistributedTokenRetirement::consume_matches(std::uint64_t binding,std::uint64_t placement,
     const DistributedRuntimeRequest& request,std::uint32_t node,NativeDistributedRetirementOutcome outcome) {
     validate_matches(binding,placement,request,node,outcome);
-    if(copied_) { consume_copied_matches();return; }
     ledger_->consumed=true;
 }
 

@@ -7,6 +7,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
+#include "strix/session/speculation_default.hpp"
 
 #include <array>
 #include <cstdio>
@@ -96,7 +97,6 @@ constexpr Item kItems[] = {
     {"markov_topc_v2", "STRIX_MM_MARKOV_TOPC", "v2", "v1",
      "Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU)"},
     // prefill
-    {"pf_core_v4", "STRIX_MMX_PREFILL_CORE", "v4", "lib", "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib"},
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_router_batch", "STRIX_MM_PF_ROUTER_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
@@ -133,6 +133,8 @@ constexpr Item kItems[] = {
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_chunk", "STRIX_DIST_HOST_CHUNK_BYTES", "1048576", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
+    {"pfx_joined", "STRIX_MM_PFX_JOINED", "1", "0",
+     "Prefill exchange wire form: identity and CRC list ride with the last chunk (two rendezvous fewer per message); payload bytes unchanged"},
 };
 
 // Route switches whose code default is the production route; printed as set or "default".
@@ -238,6 +240,8 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
         if (a == "--dspark-prior") {
             if (!has) throw std::invalid_argument("--dspark-prior requires a version");
             c.dspark_prior = dspark::prior_name(dspark::parse_prior(args[++i].c_str()));
+        } else if (strix::session::speculation_opt_out_argument(a) && app == "serve") {
+            if (c.dspark_mode.empty()) c.dspark_mode = "off";  // an explicit --dspark-mode wins
         } else if (a == "--dspark-mode" && app == "serve") {
             if (!has) throw std::invalid_argument("--dspark-mode requires off | auto | on");
             c.dspark_mode = dspark::mode_name(dspark::parse_mode(args[++i]));
@@ -296,7 +300,7 @@ SessionConfig session_policy(const Cli& cli, const Lookup& env, bool explicit_cl
     else if (c.max_parked == 0) c.reason = "max parked is zero";
     // Live direct serving is unqualified even with an explicit cache opt-in.
     // Runtime callers supply the negotiated transport, not the request spelling.
-    else if (cli.app == "serve" && cli.transport == "usb4gpu")
+    else if (cli.app == "serve" && cli.transport == kRouteGpu)
         c.reason = "route not yet GPU-qualified: " + c.route;
     else if (!explicit_cli && !qualified && mode != "1" && mode != "on")
         c.reason = "route not yet GPU-qualified: " + c.route;
@@ -424,6 +428,9 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
             (void)export_env(flag.second, argv[++i], 1); break;
         }
     }
+    // shared opt-out: DSpark off unless STRIX_MM_SERVE_DSPARK is set (must precede apply(), which exports the default)
+    if (app == "serve" && strix::session::speculation_environment_off(process_env(strix::session::speculation_environment)))
+        (void)export_env("STRIX_MM_SERVE_DSPARK", "0", 0);
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);

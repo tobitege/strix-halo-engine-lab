@@ -157,7 +157,7 @@ int main(){
             HttpSessionStore api(dir/"errors",1U<<20,2,heap,compat);
             try { (void)api.command("resume","unknown",""); check(false,"missing session accepted"); }
             catch (const SessionApiError& e) {
-                auto json=session_error_json(e);
+                auto json=serve::session_error(e.code,e.what(),e.status);
                 check(e.status==404 && json.find("error")->find("code")->as_string()=="session_not_found","404 shape");
             }
             publish_session_checkpoint(dir/"errors"/"bad",blob);

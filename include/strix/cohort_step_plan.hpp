@@ -1,12 +1,36 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
 namespace strix {
+struct CohortRowLaunch {
+    std::size_t offset = 0;
+    std::size_t rows = 0;
+};
+// For 0..32 rows; zero-row entries are unused. Split only if >=2 pad rows are saved to amortize extra launches.
+constexpr std::array<CohortRowLaunch, 3> cohort_row_split(std::size_t count) {
+    if (count > 32U) throw std::invalid_argument("cohort row split requires 0..32 rows");
+    std::array<CohortRowLaunch, 3> plan{};
+    if (count == 15U || count == 31U) {
+        plan[0] = {0U, count + 1U};
+        return plan;
+    }
+    std::size_t offset = 0;
+    std::size_t launch = 0;
+    while (count != 0U) {
+        const auto rows = count >= 32U ? 32U : count >= 16U ? 16U : count >= 8U ? 8U : count;
+        plan[launch++] = {offset, rows};
+        offset += rows;
+        count -= rows;
+    }
+    return plan;
+}
 // Served MTP cohort policy: <=8 rows -> default path, 9-15 -> wide R16 MoE,
 // exactly 16 -> wide with project G=4. STRIX_COHORT_AUTO=0 restores the old defaults; explicit knobs win.
 inline bool cohort_auto() {

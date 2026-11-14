@@ -1,11 +1,9 @@
 // Diagnostic candidate based on the wide-rows OUT16 kernel. Original OUT16 source is untouched.
 // Only the epilogue visit order and inverse reuse differ; matrix/prefetch unchanged.
+#include "strix/env_flags.hpp"
 #include "qpf2k_hc_inverse_reuse_layout.hpp"
 bool qpf2k_hc_inverse_reuse_requested() {
-    static const bool requested = [] {
-        const char* v = std::getenv("STRIX_QPF2K_HC_OUT16_INVERSE_REUSE");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
+    static const bool requested = strix::envcfg::flag("STRIX_QPF2K_HC_OUT16_INVERSE_REUSE", false, strix::EnvFlagMatch::exact);
     return requested;
 }
 

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <span>
 #include <vector>
+#include <optional>
 namespace strix::minimax::serve {
 namespace sv = strix::serve;
 // Session commands share the ordinary control channel and run only at an idle boundary.
@@ -80,6 +81,12 @@ std::string session_wire(Engine& eng, std::string body, std::size_t size) {
     return eng.rank() == 0 ? body : peer;
 }
 struct SessionCounts { std::uint64_t hits = 0, misses = 0, refusals = 0; };
+struct SessionPublish : std::function<bool(std::span<const std::uint32_t>)> {
+    using std::function<bool(std::span<const std::uint32_t>)>::function;
+    // Borrowed authoritative local frontier at a completed paired boundary.
+    // This is metadata observation, never a substitute for rank snapshots.
+    std::function<void(std::span<const std::uint32_t>, std::optional<std::uint32_t>)> state;
+};
 template<class Runtime>
 sv::Json session_metadata(Runtime& rt, const SessionCounts& counts, bool list) {
     auto reply = sv::Json::object();
@@ -104,7 +111,7 @@ sv::Json session_metadata(Runtime& rt, const SessionCounts& counts, bool list) {
 template<class Engine, class Runtime>
 sv::Json session_execute(Engine& eng, Runtime& rt,
                          const std::string& body, SessionCounts& counts,
-                         const std::function<bool(std::span<const std::uint32_t>)>& publish = {}) {
+                         const SessionPublish& publish = {}) {
     auto reply = sv::Json::object();
     try {
         const auto req = sv::parse_json(body);
@@ -123,6 +130,8 @@ sv::Json session_execute(Engine& eng, Runtime& rt,
             if (room == 0) { rt.park(id); throw sv::SessionApiError(400, "context_length_exceeded", "the session fills the context; nothing can be generated"); }
             const auto n = static_cast<unsigned>(std::min<std::uint64_t>(static_cast<std::uint64_t>(req.find("count")->as_int()), room));
             const auto generated = rt.generate(n, {}, stops, publish);
+            if constexpr (requires { rt.canonical_tokens(); rt.canonical_pending(); })
+                if (publish.state) publish.state(rt.canonical_tokens(), rt.canonical_pending());
             for (const auto token : generated) ids.push(sv::Json(std::uint64_t(token)));
             // defer_park: the caller answers the request first and then sends park_active before anything else runs.
             const auto* defer = req.find("defer_park");
@@ -161,7 +170,7 @@ sv::Json session_execute(Engine& eng, Runtime& rt,
 }
 
 struct SessionService {
-    using Publish = std::function<bool(std::span<const std::uint32_t>)>;
+    using Publish = SessionPublish;
     SessionTasks tasks;
     std::function<sv::Json(const std::string&, const Publish&)> execute;
 };

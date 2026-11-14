@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.24)
+project(strix_audit565_host LANGUAGES CXX)
+include(CTest)
+get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+if(MSVC)
+    add_compile_options(/W4 /WX /EHsc /utf-8)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+else()
+    add_compile_options(-Wall -Wextra -Werror -Wno-misleading-indentation -Wno-unused-function)
+endif()
+include("${ROOT}/cmake/StrixSession.cmake")
+if(MSVC)
+    # Existing host environ declaration; keep /WX for all audit changes.
+    set_source_files_properties("${ROOT}/src/session_state_cache.cpp" PROPERTIES COMPILE_OPTIONS /wd4273)
+endif()
+add_subdirectory("${ROOT}/tests/minimax_session_shared" minimax)
+if(MSVC)
+    # Existing queue fixture intentionally pads its cache-line-aligned control.
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/minimax/queue_fixture.cpp"
+        TARGET_DIRECTORY minimax_replay_family PROPERTIES COMPILE_OPTIONS /wd4324)
+endif()
+add_library(audit565_keep STATIC "${ROOT}/src/serve/conversation_keep.cpp" "${ROOT}/src/serve/prefix_directory.cpp")
+target_include_directories(audit565_keep PUBLIC "${ROOT}/include" "${ROOT}/src")
+target_compile_features(audit565_keep PUBLIC cxx_std_20)
+add_executable(audit565_cache "${ROOT}/tests/audit565_cache_tests.cpp")
+target_link_libraries(audit565_cache PRIVATE audit565_keep)
+add_test(NAME audit565-cache COMMAND audit565_cache)
+add_executable(audit565_keep_tests "${ROOT}/tests/conversation_keep_tests.cpp")
+target_link_libraries(audit565_keep_tests PRIVATE audit565_keep)
+add_test(NAME audit565-keep COMMAND audit565_keep_tests)
+add_executable(audit565_regime "${ROOT}/tests/audit565_regime_tests.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/minimax/capture_noop.cpp")
+target_link_libraries(audit565_regime PRIVATE minimax_replay_family)
+add_test(NAME audit565-regime COMMAND audit565_regime)
+add_executable(audit565_glm "${ROOT}/tests/glm_serve_cpu_tests.cpp"
+    "${ROOT}/src/glm/serve/glm_session_owner.cpp"
+    "${ROOT}/src/glm/spec/glm_spec_host.cpp"
+    "${ROOT}/src/glm/host/glm_host.cpp"
+    "${CMAKE_CURRENT_BINARY_DIR}/minimax/capture_noop.cpp")
+target_link_libraries(audit565_glm PRIVATE minimax_replay_family audit565_keep)
+if(MSVC)
+    target_compile_options(audit565_glm PRIVATE "/FI${CMAKE_CURRENT_LIST_DIR}/msvc_math.hpp")
+endif()
+add_test(NAME audit565-glm COMMAND audit565_glm --prefix-only)
+set_tests_properties(audit565-glm PROPERTIES TIMEOUT 120)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME audit565-conversation-gate COMMAND "${Python3_EXECUTABLE}" "${ROOT}/tests/minimax_prefix_cache_gpu_gate.py" self-test)

@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
@@ -21,7 +22,7 @@ namespace strix {
 namespace {
 constexpr std::size_t buffer_count=static_cast<std::size_t>(HipMtpBuffer::count);
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
-void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(message);}
+using strix::hip_check_message;
 std::uint64_t mul(std::uint64_t a,std::uint64_t b) {
     if(a && b>UINT64_MAX/a) throw std::overflow_error("MTP allocation product overflows");return a*b;
 }
@@ -170,8 +171,8 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     const auto state_plan=plan_mtp_draft_state_memory(plan.proposal_identity,plan.state,1U,2U,256U);
     p.state={state_plan.plan_identity,state_plan.proposal_identity,state_plan.state_width,1U,2U,256U,
         p.views[static_cast<std::size_t>(HipMtpBuffer::wide_current)].address,state_plan.total_bytes,p.pool_generation};
-    p.guard->run([&] {check(hipStreamCreateWithFlags(&p.stream,hipStreamNonBlocking),"MTP stream creation failed");
-        check(hipMemsetAsync(reinterpret_cast<void*>(p.pool),0,static_cast<std::size_t>(bytes),p.stream),"MTP pool initialization failed");});
+    p.guard->run([&] {hip_check_message(hipStreamCreateWithFlags(&p.stream,hipStreamNonBlocking),"MTP stream creation failed");
+        hip_check_message(hipMemsetAsync(reinterpret_cast<void*>(p.pool),0,static_cast<std::size_t>(bytes),p.stream),"MTP pool initialization failed");});
     // Save only actual stable retained table addresses after the factory has
     // closed all 34 roles. A later reallocation is rejected before dereference.
     p.sidecar_data=p.sidecar->binding().tensors.data(); p.sidecar_size=p.sidecar->binding().tensors.size();
@@ -243,7 +244,7 @@ void HipMtpResources::validate_stage() const {
     if(!p.validation_entry) {validate();return;}
     require(!p.failed && p.guard && p.pool && p.stream,"MTP owner is failed or uninitialized");
     int device=-1;
-    check(hipGetDevice(&device),"MTP current device query failed");
+    hip_check_message(hipGetDevice(&device),"MTP current device query failed");
     require(device==p.guard->device_index(),"MTP native stage changed its admitted device");
     const auto& sidecar=p.sidecar->binding(); const auto& target=p.target->binding();
     require(p.sidecar->generation()==p.sidecar_generation && p.target->generation()==p.target_generation &&
@@ -283,8 +284,8 @@ void HipMtpResources::complete() {
     auto& p=*impl_;validate_stage();require(p.pending,"MTP completion requires submitted native work");
     try {
         std::array<std::uint32_t,2> status{};const auto source=view(HipMtpBuffer::status);
-        check(hipMemcpyAsync(status.data(),reinterpret_cast<const void*>(source.address),8U,hipMemcpyDeviceToHost,p.stream),"MTP status transfer failed");
-        check(hipStreamSynchronize(p.stream),"MTP native completion failed");p.guard->require_original();
+        hip_check_message(hipMemcpyAsync(status.data(),reinterpret_cast<const void*>(source.address),8U,hipMemcpyDeviceToHost,p.stream),"MTP status transfer failed");
+        hip_check_message(hipStreamSynchronize(p.stream),"MTP native completion failed");p.guard->require_original();
         require(!status[0] && !status[1],"MTP native first-error status is nonzero");p.pending=false;p.deferred=false;
     } catch(...) {fail();throw;}
 }

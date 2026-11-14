@@ -1,4 +1,5 @@
 #include "strix/model_input.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include "strix/ds41_file_reader.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/gguf_reader.hpp"
@@ -12,7 +13,8 @@
 #include <array>
 #include <algorithm>
 #include <cstdlib>
-#include <barrier>
+#include <condition_variable>
+#include <mutex>
 #include <fstream>
 #include <iostream>
 #include <chrono>
@@ -21,6 +23,10 @@
 
 using namespace strix::deepseek41;
 using Sessions = PrefixCache::Sessions;
+namespace io = strix::session::checkpoint_io;
+#ifdef NDEBUG
+#error DS41 host tests require active assertions
+#endif
 namespace {
 void require(bool ok, const char *why) {
     if (!ok)
@@ -74,15 +80,27 @@ SessionCheckpoint sample(unsigned rank, const std::string &id = "aa", const std:
     return c;
 }
 struct Pair {
-    std::barrier<> sync{2};
+    std::mutex mutex;
+    std::condition_variable cv;
+    unsigned arrived = 0, departed = 0, round = 0;
+    bool broken = false;
     std::array<SessionBytes, 2> packets;
     std::array<std::exception_ptr, 2> errors;
     SessionExchange exchange(unsigned r) {
         return [this, r](std::span<const std::uint8_t> b) {
+            std::unique_lock<std::mutex> lock(mutex);
+            const auto epoch = round;
+            const auto wait = [&](auto ready) {
+                if (!cv.wait_for(lock, std::chrono::seconds(5), [&] { return broken || ready(); })) {
+                    broken = true; cv.notify_all();
+                }
+                require(!broken, "paired exchange deadline (never an expected refusal)");
+            };
             packets[r].assign(b.begin(), b.end());
-            sync.arrive_and_wait();
+            ++arrived; cv.notify_all(); wait([&] { return arrived == 2; });
             auto out = packets[1 - r];
-            sync.arrive_and_wait();
+            if (++departed == 2) { arrived = departed = 0; ++round; cv.notify_all(); }
+            else wait([&] { return round != epoch; });
             return out;
         };
     }
@@ -674,12 +692,12 @@ void incompatible_tests(const std::filesystem::path& dir) {
     pair.run([&](unsigned r, const auto& ex) { check([&] { (void)cache[r]->resume("aa", true, ex); }); });
     std::cout << "PASS inspect/resume schema, DSpark mode, model and selector incompatibility/409\n";
 }
-void disk_worker(const std::filesystem::path& dir, const std::string& id) {
+void disk_worker(const std::filesystem::path& dir, const std::string& id, bool shared = false) {
     Pair pair;
     std::array<std::unique_ptr<Sessions>, 2> cache;
     const auto n = serialize_session(sample(0)).size();
     for (unsigned r = 0; r < 2; ++r)
-        cache[r] = std::make_unique<Sessions>(compat(r), r, 8*n, dir / ("rank"+std::to_string(r)), 1, (4U << 20U)+3*n+65536U);
+        cache[r] = std::make_unique<Sessions>(compat(r), r, 8*n, dir / (shared ? "shared" : "rank"+std::to_string(r)), 1, (4U << 20U)+3*n+65536U);
     for (unsigned i = 0; i < 8; ++i) {
         pair.run([&](unsigned r, const auto& ex) {
             cache[r]->capture(sample(r, id, "generation"+std::to_string(i)), ex);
@@ -688,6 +706,279 @@ void disk_worker(const std::filesystem::path& dir, const std::string& id) {
         });
     }
 }
+SessionBytes file_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    require(bool(in), "fixture open");
+    return SessionBytes((std::istreambuf_iterator<char>(in)), {});
+}
+std::map<std::string, SessionBytes> publications(const std::filesystem::path& dir) {
+    std::map<std::string, SessionBytes> out;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".state" || e.path().extension() == ".group")
+            out.emplace(e.path().filename().string(), file_bytes(e.path()));
+    return out;
+}
+struct FaultGuard {
+    io::Faults saved = io::faults();
+    FaultGuard() { io::faults() = {}; }
+    ~FaultGuard() { io::faults() = saved; }
+};
+void production_faults(const std::filesystem::path& root) {
+    // Payload and manifest seams are armed in the actual rank thread. A descriptor
+    // exchange follows the payload vote, and precedes manifest publication.
+    unsigned index = 0;
+    for (unsigned failed = 0; failed < 2; ++failed)
+    for (bool manifest : {false, true})
+    for (auto op : {io::Operation::create, io::Operation::write, io::Operation::sync,
+                    io::Operation::replace, io::Operation::directory_sync})
+    for (bool previous : {false, true}) {
+        const auto dir = root / ("fault" + std::to_string(index++));
+        Pair pair;
+        std::array<std::filesystem::path,2> paths{dir/"r0",dir/"r1"};
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        std::array<std::map<std::string,SessionBytes>,2> old;
+        const auto fresh = [&] {
+            for(unsigned r=0;r<2;++r) cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,paths[r]);
+        };
+        fresh();
+        if(previous) {
+            pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+            for(unsigned r=0;r<2;++r) old[r]=publications(paths[r]);
+        }
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);});
+        std::array<bool,2> observed{};
+        pair.run([&](unsigned r,const auto& ex) {
+            FaultGuard guard;
+            bool armed=false;
+            const auto arm=[&] {
+                if(r!=failed || armed) return;
+                armed=true;
+                if(op==io::Operation::write) {io::faults().max_write=3;io::faults().fail_write_at=7;}
+                else io::faults().fail=op;
+            };
+            if(!manifest) arm();
+            const auto wire=[&](std::span<const std::uint8_t> b) {
+                const auto peer=ex(b);
+                if(manifest && b.size()>1) arm();
+                // Model a bounded one-shot failure. This explicitly clears the
+                // injected fault before real rollback IO; it proves no persistent
+                // media-failure guarantee.
+                if(b.size()==1 && b[0]==0 && armed) { observed[r]=true;io::faults()={}; }
+                return peer;
+            };
+            cache[r]->checkpoint("aa",wire);
+        },false);
+        require(observed[failed],"fault did not reach actual production failed IO vote");
+        try {std::rethrow_exception(pair.errors[failed]);}
+        catch(const io::Error& e) {require(e.operation==op,"wrong operation-specific family error");}
+        catch(...) {throw std::runtime_error("lost operation-specific family error");}
+        for(unsigned r=0;r<2;++r) {
+            std::uint64_t used=0;
+            for(const auto& e:std::filesystem::directory_iterator(paths[r])) {
+                const auto name=e.path().filename().string();
+                require(name.find(".tmp") == std::string::npos,"failed publication leaked its temporary");
+                if(e.path().extension()==".state" || e.path().extension()==".group")used+=e.file_size();
+            }
+            require(cache[r]->disk_bytes()==used,"orphan/manifest quota bytes lost");
+            if(previous) for(const auto& [name,bytes]:old[r])
+                require(file_bytes(paths[r]/name)==bytes,"failed publication lost exact prior publication");
+            else require(!std::filesystem::exists(paths[r]/("aa.rank"+std::to_string(r)+".group")),"failed fresh group became visible");
+        }
+        fresh();
+        pair.run([&](unsigned r,const auto& ex) {
+            auto c=cache[r]->resume("aa",true,ex);
+            require(c.generation=="generation1" && c.frontier.pending==17,"failed replacement restored broken/new group");
+        },previous);
+        // Clear-fault retry restores the new generation, even with an already
+        // published immutable orphan payload from the refused attempt.
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);cache[r]->checkpoint("aa",ex);});
+        fresh();
+        pair.run([&](unsigned r,const auto& ex){require(cache[r]->resume("aa",true,ex).generation=="generation2","bounded retry did not restore new generation");});
+    }
+    // Read admission/allocation failures also stay on the same collective sequence.
+    for(unsigned failed=0;failed<2;++failed) for(auto op:{io::Operation::allocation,io::Operation::read}) {
+        const auto dir=root/("read"+std::to_string(index++));Pair pair;
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,dir/("r"+std::to_string(r)));
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+        pair.run([&](unsigned r,const auto& ex){FaultGuard guard;if(r==failed)io::faults().fail=op;(void)cache[r]->resume("aa",true,ex);},false);
+        pair.run([&](unsigned r,const auto& ex){require(cache[r]->resume("aa",true,ex).generation=="generation1","read retry changed group");});
+    }
+    std::cout<<"PASS production Sessions per-rank payload/manifest create/partial-write/sync/replace/directory-sync, real rollback, retry and read faults\n";
+}
+
+void quota_and_cleanup(const std::filesystem::path& root) {
+    const auto n=serialize_session(sample(0)).size();
+    for(bool enough:{false,true}) {
+        Pair pair; const auto dir=root/(enough?"peak-enough":"peak-insufficient");
+        const auto cap=(4U<<20U)+(enough?3:1)*n+64U;
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        std::array<std::map<std::string,SessionBytes>,2> old;
+        const auto fresh=[&] {for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8*n,dir/("r"+std::to_string(r)),1,cap);};
+        fresh();
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+        for(unsigned r=0;r<2;++r)old[r]=publications(dir/("r"+std::to_string(r)));
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);cache[r]->checkpoint("aa",ex);},enough);
+        for(unsigned r=0;r<2;++r) {
+            require(cache[r]->disk_bytes()<=cap,"replacement inflated unchanged quota");
+            if(!enough)require(publications(dir/("r"+std::to_string(r)))==old[r],"insufficient peak space changed prior bytes");
+        }
+        fresh();pair.run([&](unsigned r,const auto& ex){require(cache[r]->resume("aa",true,ex).generation==(enough?"generation2":"generation1"),"peak-space restart generation");});
+    }
+    // Shared-directory cleanup recognizes only exact ID/generation/rank grammar;
+    // both spellings of orphan temporaries stay charged until family cleanup.
+    Pair pair;const auto dir=root/"cleanup-shared";
+    std::array<std::unique_ptr<Sessions>,2> cache;
+    for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,dir);
+    pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+    const auto write=[&](const std::string& name){std::ofstream(dir/name,std::ios::binary)<<"1234567";};
+    for(unsigned r=0;r<2;++r) {
+        const auto rank=".rank"+std::to_string(r);
+        const auto before=cache[r]->disk_bytes();
+        for(const auto& stem:{"aa.old"+rank+".state","aa"+rank+".group"})
+            for(const auto& tmp:{".tmp.legacy",".tmp-123-4"})write(stem+tmp);
+        require(cache[r]->disk_bytes()==before+28,"historical/new temporary bytes uncharged");
+        write("bb.old"+rank+".state.tmp-123-4");
+        write("aa.invalid.extra"+rank+".state.tmp-123-4");
+        write("aa.old"+rank+".state.tmp-123-4.extra");
+    }
+    write("target");
+    std::error_code ec;std::filesystem::create_symlink("target",dir/"aa.link.rank0.state",ec);
+    const bool symlink=!ec;
+    if(!symlink)std::cout<<"NOT RUN symlink creation on this host: "<<ec.message()<<'\n';
+    pair.run([&](unsigned r,const auto& ex){cache[r]->erase("aa",ex);});
+    for(unsigned r=0;r<2;++r) {
+        const auto rank=".rank"+std::to_string(r);
+        require(cache[r]->disk_bytes()==7,"cleanup lost other ID/rank bytes or left owned temporary");
+        require(std::filesystem::exists(dir/("bb.old"+rank+".state.tmp-123-4")),"cleanup deleted another ID");
+        require(std::filesystem::exists(dir/("aa.invalid.extra"+rank+".state.tmp-123-4")),"cleanup accepted invalid generation");
+        require(std::filesystem::exists(dir/("aa.old"+rank+".state.tmp-123-4.extra")),"cleanup accepted invalid temporary suffix");
+        require(std::filesystem::exists(dir/(".session-rank"+std::to_string(r)+".lock")),"cleanup unlinked lock inode");
+    }
+    if(symlink)require(std::filesystem::is_symlink(dir/"aa.link.rank0.state") && file_bytes(dir/"target")==SessionBytes({'1','2','3','4','5','6','7'}),"cleanup deleted symlink/target");
+    // Each rank's lock failure must vote before the next ordered acquisition.
+    for(unsigned failed=0;failed<2;++failed) {
+        const auto base=root/("lockfail"+std::to_string(failed));
+        std::array<std::filesystem::path,2> paths{base/"r0",base/"r1"};
+        for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,paths[r]);
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);});
+        std::filesystem::remove(paths[failed]);{std::ofstream(paths[failed])<<"block";}
+        pair.run([&](unsigned r,const auto& ex){cache[r]->checkpoint("aa",ex);},false);
+        std::filesystem::remove(paths[failed]);std::filesystem::create_directory(paths[failed]);
+        pair.run([&](unsigned r,const auto& ex){cache[r]->checkpoint("aa",ex);});
+    }
+    std::cout<<"PASS unchanged peak quota, sufficient replacement, exact temporary ownership, ordered lock failures/retry\n";
+}
+SessionCheckpoint reference_sample(unsigned r,unsigned variant) {
+    auto c=sample(r,variant==0?"aa":variant==1?"bb":"draft",variant==0?"generation1":"generation2");
+    if(variant) {c.attention.next_token=c.frontier.pending=23;c.attention.tokens={4,5,6};c.frontier.emitted=3;}
+    if(variant==2) {
+        auto cfg=compat(r);cfg.fields["dspark"]="on";c.compat_record=cfg.record();
+        c.draft.emplace();c.draft->context.next=3;c.draft->context.core=100;
+        for(unsigned i=0;i<3;++i)c.draft->context.rings[i].resize(128U*528U,static_cast<std::uint8_t>(17+i));
+        c.draft->context.extra={127000,101,129000};c.draft->controller.decisions=31;
+        c.draft->exchange_request=65;c.draft->windows=13;c.draft->verified=22;c.draft->accepted=9;
+        c.frontier.drafter=3;c.frontier.lineage="ds41-dspark-r1-committed-turn-v2";
+    }
+    return c;
+}
+void entry_publications(const std::filesystem::path& root,bool write,const std::filesystem::path& reference={}) {
+    // Fixed before adoption from an independently built entry production Sessions
+    // executable. Never regenerate expectations with the adopted implementation.
+    const char* payload[3][2]={
+        {"830389713c2f5a3d97b3e671e415731e463aadcccf167c30c631df3dabb28e9c","93e3aa0a3650314555fb3f87844403692df4c73a2a59d1e330c30a340a53f274"},
+        {"f5d6734910a3c48c82271ab4ef3f61294900bf2d5a7b6ed79c4348b5c5cb454b","297b12d3515bcc56f54d5771c8df4b813af63e420977433b2ad2988db1e3f31e"},
+        {"10566534f8bfb6a0492d16aa4a51a88cb0932cd825b79828e1d54a871e2852ab","4ef10070da470ae3c4374d8274d042c4573756340968945b90f1cf4d34b01558"}};
+    const char* group[]={"91aaca4b8d61e604d52f17e11c2bc5b397d7a5513428a9ef1a7b8da8555c5560","beb48d1c3d2abd9fda6868cbeaf428d023518b48222d7c4609e480151cfb0650","436b27e17a6cd94a3da326428607424aaa2e540326c825cbf751b9a7359ca9ce"};
+    for(unsigned v=0;v<3;++v) {
+        Pair pair;std::array<std::unique_ptr<Sessions>,2> cache;
+        for(unsigned r=0;r<2;++r) {
+            auto cfg=compat(r);if(v==2)cfg.fields["dspark"]="on";
+            cache[r]=std::make_unique<Sessions>(cfg,r,8U<<20U,root/("case"+std::to_string(v))/("rank"+std::to_string(r)));
+        }
+        const auto id=reference_sample(0,v).id;
+        if(write)pair.run([&](unsigned r,const auto& ex){cache[r]->capture(reference_sample(r,v),ex);cache[r]->checkpoint(id,ex);});
+        pair.run([&](unsigned r,const auto& ex){require(serialize_session(cache[r]->resume(id,true,ex))==serialize_session(reference_sample(r,v)),"entry reference full restored state/pending/draft");});
+        for(unsigned r=0;r<2;++r)for(const auto& [name,bytes]:publications(root/("case"+std::to_string(v))/("rank"+std::to_string(r)))) {
+            require(strix::model_content_identity_hex(strix::sha256_bytes(std::as_bytes(std::span(bytes))))==(name.ends_with(".group")?group[v]:payload[v][r]),"entry published filename/codec bytes changed");
+            if(!reference.empty())require(bytes==file_bytes(reference/("case"+std::to_string(v))/("rank"+std::to_string(r))/name),"independent entry published bytes differ");
+        }
+    }
+    std::cout<<"PASS entry fixed payload/group hashes, full restore and optional independent byte comparisons\n";
+}
+
+void persistent_rollback_faults(const std::filesystem::path& root) {
+    for(unsigned failed=0;failed<2;++failed) {
+        Pair pair;const auto dir=root/("persistent"+std::to_string(failed));
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,dir/("r"+std::to_string(r)));
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);});
+        // The first fault occurs AFTER manifest replacement. Keep it active for
+        // rollback and separately force rollback replacement to fail on that rank.
+        pair.run([&](unsigned r,const auto& ex) {
+            FaultGuard guard;bool manifest=false;
+            const auto wire=[&](std::span<const std::uint8_t> b) {
+                auto peer=ex(b);
+                if(r==failed && b.size()>1) {manifest=true;io::faults().fail=io::Operation::directory_sync;}
+                if(r==failed && manifest && b.size()==1 && b[0]==0)io::faults().fail=io::Operation::replace;
+                return peer;
+            };
+            cache[r]->checkpoint("aa",wire);
+        },false);
+        for(auto e:pair.errors)try {std::rethrow_exception(e);}catch(const std::exception& why) {
+            require(std::string(why.what()).find("durable commit uncertain")!=std::string::npos,"rollback failure lost durability uncertainty");
+        }
+        for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,dir/("r"+std::to_string(r)));
+        pair.run([&](unsigned r,const auto& ex){(void)cache[r]->resume("aa",true,ex);},false);
+        // Repair uses real publication with the fault removed, under both locks.
+        // This bounded retry does not certify rollback on persistently failed media.
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);cache[r]->checkpoint("aa",ex);});
+        pair.run([&](unsigned r,const auto& ex){require(cache[r]->resume("aa",true,ex).generation=="generation2","uncertain publication retry failed");});
+        for(unsigned r=0;r<2;++r) for(const auto& e:std::filesystem::directory_iterator(dir/("r"+std::to_string(r))))
+            require(e.path().filename().string().find(".tmp")==std::string::npos,"rollback failure leaked temporary");
+    }
+    std::cout<<"PASS post-replace uncertainty, failed real rollback, mixed-group rejection on both ranks and bounded repair\n";
+}
+
+void generation_and_temp_pressure(const std::filesystem::path& root) {
+    const auto n=serialize_session(sample(0)).size();
+    for(unsigned changed=0;changed<2;++changed) {
+        Pair pair;const auto dir=root/("duplicate"+std::to_string(changed));
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        std::array<std::map<std::string,SessionBytes>,2> old;
+        const auto fresh=[&]{for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8U<<20U,dir/("r"+std::to_string(r)));};
+        fresh();pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+        for(unsigned r=0;r<2;++r)old[r]=publications(dir/("r"+std::to_string(r)));
+        pair.run([&](unsigned r,const auto& ex){auto c=sample(r);if(r==changed)c.attention.layers[0].ring[100U*528U]^=1;cache[r]->capture(c,ex);});
+        pair.run([&](unsigned r,const auto& ex){cache[r]->checkpoint("aa",ex);},false);
+        try{std::rethrow_exception(pair.errors[changed]);}catch(const std::exception& why){require(std::string(why.what()).find("generation already exists with different bytes")!=std::string::npos,"duplicate generation failed for wrong reason");}
+        for(unsigned r=0;r<2;++r)require(publications(dir/("r"+std::to_string(r)))==old[r],"duplicate generation replaced prior bytes");
+        fresh();pair.run([&](unsigned r,const auto& ex){require(serialize_session(cache[r]->resume("aa",true,ex))==serialize_session(sample(r)),"duplicate generation damaged restore");});
+    }
+    for(const auto* temporary:{".tmp.legacy",".tmp-123-4"})for(unsigned pressured=0;pressured<2;++pressured) {
+        Pair pair;const auto dir=root/(std::string("pressure")+temporary+std::to_string(pressured));
+        const auto cap=(4U<<20U)+2*n+65536U;
+        std::array<std::unique_ptr<Sessions>,2> cache;
+        std::array<std::map<std::string,SessionBytes>,2> old;
+        for(unsigned r=0;r<2;++r)cache[r]=std::make_unique<Sessions>(compat(r),r,8*n,dir/("r"+std::to_string(r)),1,cap);
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r),ex);cache[r]->checkpoint("aa",ex);});
+        for(unsigned r=0;r<2;++r)old[r]=publications(dir/("r"+std::to_string(r)));
+        const auto path=dir/("r"+std::to_string(pressured))/("orphan.generation.rank"+std::to_string(pressured)+".state"+temporary);
+        const auto before=cache[pressured]->disk_bytes();
+        {std::ofstream out(path,std::ios::binary);std::string bytes(70000,'x');out.write(bytes.data(),static_cast<std::streamsize>(bytes.size()));}
+        require(cache[pressured]->disk_bytes()==before+70000,"temporary forgotten before admission");
+        pair.run([&](unsigned r,const auto& ex){cache[r]->capture(sample(r,"aa","generation2"),ex);cache[r]->checkpoint("aa",ex);},false);
+        for(unsigned r=0;r<2;++r)require(publications(dir/("r"+std::to_string(r)))==old[r],"temporary pressure destroyed prior generation");
+        require(std::filesystem::file_size(path)==70000,"refused transaction deleted another ID temporary");
+        pair.run([&](unsigned r,const auto& ex){cache[r]->erase("orphan",ex);});
+        pair.run([&](unsigned r,const auto& ex){cache[r]->checkpoint("aa",ex);});
+        for(unsigned r=0;r<2;++r)require(cache[r]->disk_bytes()<=cap,"temporary retry changed quota");
+        pair.run([&](unsigned r,const auto& ex){require(cache[r]->resume("aa",true,ex).generation=="generation2","temporary cleanup retry restore");});
+    }
+    std::cout<<"PASS duplicate-generation conflicts per rank and both temporary spellings under asymmetric quota pressure\n";
+}
+
 void lru() {
     const auto n = serialize_session(sample(0)).size();
     std::array<std::unique_ptr<Sessions>, 2> c;
@@ -723,8 +1014,11 @@ void lru() {
 }
 } // namespace
 int main(int argc, char** argv) {
-    if (argc == 4 && std::string_view(argv[1]) == "--disk-worker") {
-        disk_worker(argv[2], argv[3]); return 0;
+    if (argc == 4 && (std::string_view(argv[1]) == "--disk-worker" || std::string_view(argv[1]) == "--disk-worker-shared")) {
+        disk_worker(argv[2], argv[3], std::string_view(argv[1]) == "--disk-worker-shared"); return 0;
+    }
+    if (argc == 3 && (std::string_view(argv[1]) == "--codec-write" || std::string_view(argv[1]) == "--codec-read")) {
+        entry_publications(argv[2], std::string_view(argv[1]) == "--codec-write"); return 0;
     }
     if (argc == 4 && std::string_view(argv[1]) == "--compat-probe") {
         auto c = session_compat({{"rank", argv[3]}, {"world", "2"}, {"dspark", "off"}},
@@ -747,6 +1041,11 @@ int main(int argc, char** argv) {
         lru();
         quota_tests(dir);
         incompatible_tests(dir);
+        production_faults(dir);
+        quota_and_cleanup(dir);
+        persistent_rollback_faults(dir);
+        generation_and_temp_pressure(dir);
+        entry_publications(dir/"entry-bytes",true,argc>1?std::filesystem::path(argv[1]):std::filesystem::path{});
         std::filesystem::remove_all(dir);
         std::cout << "PASS all session cache CPU tests\n";
         return 0;

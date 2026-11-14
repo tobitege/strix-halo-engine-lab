@@ -1,7 +1,12 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
+#include "strix/prefill_moe_policy.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_arch_caps.hpp"
 #include "moe_core/grouped_policy.hpp"
+#include "moe_core/device_plan.hpp"
+#include "moe_core/route_prune.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -43,9 +48,7 @@ struct DeviceCsr {
     unsigned* summary; unsigned* offsets; unsigned* touched;
     unsigned* rows; unsigned* slots; unsigned* experts; unsigned* begins;
 };
-void check(hipError_t error,const char* operation) {
-    if(error!=hipSuccess)throw std::runtime_error(std::string(operation)+": "+hipGetErrorString(error));
-}
+using strix::hip_check;
 __device__ int dot(int a,unsigned b,int acc) {
     return __builtin_amdgcn_sudot4(true,a,false,static_cast<int>(b),acc,false);
 }
@@ -660,142 +663,39 @@ __global__ __launch_bounds__(256) void down_window_q20(const unsigned char* weig
 template<class T> __device__ __forceinline__ T* at(StridedRows<T> v,unsigned r) {
     return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base)+static_cast<unsigned long long>(r)*v.stride);
 }
-// Prefill CSR over T*top_k assignments, one 1024-thread CTA: counting sort by
-// expert; assignment a=r*top_k+s goes to offsets[e]+#{a'<a with expert e}, so
-// each expert's rows (then slots) ascend. Batches are runs of at most `cap`
-// assignments of one expert. Runs after the prologue and folds every row
-// status into summary[0], so the projection kernels read one word.
-constexpr unsigned serial_csr_max_rows=2048U; // build_prefill_csr keeps the expert of every assignment in LDS
-__global__ __launch_bounds__(1024) void build_prefill_csr(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
-    const auto& csr=v.csr;
-    const unsigned t=threadIdx.x,count=rows*top_k;
-    __shared__ unsigned short expert_of[serial_csr_max_rows*10U];
-    __shared__ unsigned n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
-    if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
-    if(t<16U)hist[t]=0U;
-    if(t<512U)n_of[t]=0U;
-    __syncthreads();
-    for(unsigned a=t;a<count;a+=1024U) {
-        const unsigned r=a/top_k,s=a%top_k,e=at(v.routes,r)[s];
-        if(e>=experts||!isfinite(at(v.route_weights,r)[s]))atomicOr(&failure,invalid_route);
-        expert_of[a]=static_cast<unsigned short>(e<experts?e:0U);
-    }
-    for(unsigned r=t;r<rows;r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
-    __syncthreads();
-    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
-    for(unsigned a=t;a<count;a+=1024U)atomicAdd(&n_of[expert_of[a]],1U);
-    __syncthreads();
-    const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
-    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
-    __syncthreads();
-    for(unsigned d=1U;d<512U;d<<=1U) {
-        unsigned x[3]={};
-        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
-        __syncthreads();
-        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
-        __syncthreads();
-    }
-    if(t<experts) {
-        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
-        csr.offsets[t]=off;
-        if(t==experts-1U)csr.offsets[experts]=off+n;
-        if(n) {
-            csr.touched[touched]=t;atomicMax(&maximum,n);
-            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
-            unsigned k=0U,unique=0U,last=UINT32_MAX;
-            for(unsigned a=0;a<count&&k<n;++a)if(expert_of[a]==t) {
-                const unsigned r=a/top_k;
-                csr.rows[off+k]=r;csr.slots[off+k]=a%top_k;++k;
-                unique+=r!=last;last=r;
-            }
-            atomicAdd(&hist[min(8U,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
+// Stable assignment CSR: shared packed-assignment planner, runtime experts/top-k, no shared expert.
+struct PrefillCsrPolicy {
+    static constexpr unsigned kExperts=512U,kTopK=10U,kThreads=1024U,kAssignmentsPerWave=64U;
+    static constexpr unsigned kCountLimit=65535U,kHistogramBins=8U,kInvalid=invalid_route;
+    using View=PrefillRows;
+    __device__ __forceinline__ static const auto& tables(const View& v){return v.csr;}
+    __device__ __forceinline__ static const unsigned* routes(const View& v,unsigned r){return at(v.routes,r);}
+    __device__ __forceinline__ static unsigned expert(const View& v,unsigned r,unsigned s){return at(v.routes,r)[s];}
+    __device__ __forceinline__ static unsigned status(const View& v,unsigned r){return *at(v.status,r);}
+    // RoutePrune: a pruned assignment carries weight 0 (moe_core/route_prune.hpp).
+    __device__ __forceinline__ static bool kept(const View& v,unsigned r,unsigned s){return at(v.route_weights,r)[s]!=0.0F;}
+    template<bool Certificate>
+    __device__ __forceinline__ static bool invalid(const View& v,unsigned r,unsigned s,unsigned e,unsigned experts,bool& unsafe) {
+        if constexpr(Certificate) {
+            const float weight=at(v.route_weights,r)[s];
+            unsafe|=(__float_as_uint(weight)&0x7fffffffU)>0x3f800000U;
+            return e>=experts||!isfinite(weight);
+        } else {
+            (void)unsafe;
+            return e>=experts||!isfinite(at(v.route_weights,r)[s]);
         }
     }
-    __syncthreads();
-    if(t==0U)csr.begins[scan[2][511]]=count;
-    if(t<32U)csr.summary[t]=t==0U?status:t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
-        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
-}
-// build_prefill_csr with the same outputs (every array and summary word) in parallel: wave w
-// owns the assignments [w*S, (w+1)*S) and counts its experts (two 16-bit counters per word);
-// exclusive prefixes over the waves (16-bit, relative to the expert's offset) plus the expert
-// offsets give each wave's first position per expert; then each wave walks its range in order,
-// 32 assignments at a time, ranking lanes of one expert by lane order, so each expert's
-// assignments ascend exactly as in the serial scan. An expert with 65536 or more assignments
-// (possible only with repeated routes, T * top_k > 65535) fails closed as an invalid route.
-__global__ __launch_bounds__(1024) void build_prefill_csr_waves(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned cap) {
-    constexpr unsigned Waves=32U;
-    const auto& csr=v.csr;
-    const unsigned t=threadIdx.x,lane=t&31U,wave=t/32U,count=rows*top_k,span=(count+Waves-1U)/Waves;
-    const unsigned first=wave*span,last=min(count,first+span);
-    __shared__ unsigned position[Waves][256],n_of[512],scan[3][512],hist[16],failure,status,duplicates,maximum;
-    if(t==0){failure=0U;status=0U;duplicates=0U;maximum=0U;}
-    if(t<16U)hist[t]=0U;
-    for(unsigned k=t;k<Waves*256U;k+=1024U)position[k/256U][k%256U]=0U;
-    __syncthreads();
-    const auto expert_at=[&](unsigned a){return at(v.routes,a/top_k)[a%top_k];};
-    for(unsigned a=first+lane;a<last;a+=32U) {
-        const unsigned e=expert_at(a);
-        if(e>=experts||!isfinite(at(v.route_weights,a/top_k)[a%top_k]))atomicOr(&failure,invalid_route);
-        else atomicAdd(&position[wave][e/2U],1U<<(16U*(e&1U)));
+    __device__ __forceinline__ static void certificate(const View& v){atomicOr(v.unsafe,1U);}
+    __device__ __forceinline__ static void failure(const View& v,unsigned t,unsigned bits,unsigned count,unsigned rows) {
+        if(t<32U)v.csr.summary[t]=t==0U?bits:t==3U?count:t==6U?rows:t==7U?1U:0U;
     }
-    for(unsigned r=t;r<rows;r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
-    __syncthreads();
-    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
-    if(t<256U) {
-        unsigned lo=0U,hi=0U;
-        for(unsigned w=0;w<Waves;++w){const unsigned c=position[w][t];position[w][t]=lo|hi<<16U;lo+=c&65535U;hi+=c>>16U;}
-        if(lo>65535U||hi>65535U)atomicOr(&failure,invalid_route);
-        n_of[2U*t]=lo;n_of[2U*t+1U]=hi;
+    __device__ __forceinline__ static void summary(const View& v,unsigned t,unsigned status,unsigned touched,unsigned batches,
+        unsigned count,unsigned duplicates,unsigned maximum,unsigned rows,const unsigned* hist) {
+        if(t<32U)v.csr.summary[t]=t==0U?status:t==1U?touched:t==2U?batches:t==3U?count:t==4U?duplicates:t==5U?maximum:
+            t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
     }
-    __syncthreads();
-    if(failure){if(t<32U)csr.summary[t]=t==0U?failure|status:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
-    const unsigned n=t<512U?n_of[t]:0U,nb=(n+cap-1U)/cap;
-    if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
-    __syncthreads();
-    for(unsigned d=1U;d<512U;d<<=1U) {
-        unsigned x[3]={};
-        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
-        __syncthreads();
-        if(t>=d&&t<512U)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
-        __syncthreads();
-    }
-    for(unsigned step=first;step<last;step+=32U) {
-        const unsigned a=step+lane;
-        const bool valid=a<last;
-        const unsigned e=valid?expert_at(a):0U;
-        unsigned active=static_cast<unsigned>(__ballot(valid)),peers=0U;
-        while(active) {
-            const unsigned leader_e=static_cast<unsigned>(__shfl(static_cast<int>(e),__ffs(active)-1,32));
-            const unsigned same=static_cast<unsigned>(__ballot(valid&&e==leader_e))&active;
-            if(valid&&e==leader_e)peers=same;
-            active&=~same;
-        }
-        if(valid) {
-            const unsigned slot=scan[0][e]-n_of[e]+((position[wave][e/2U]>>(16U*(e&1U)))&65535U);
-            const unsigned at_pos=slot+static_cast<unsigned>(__popc(peers&((1U<<lane)-1U)));
-            csr.rows[at_pos]=a/top_k;csr.slots[at_pos]=a%top_k;
-            if((peers&((1U<<lane)-1U))==0U)atomicAdd(&position[wave][e/2U],static_cast<unsigned>(__popc(peers))<<(16U*(e&1U)));
-        }
-    }
-    __syncthreads();
-    if(t<experts) {
-        const unsigned off=scan[0][t]-n,touched=scan[1][t]-(n!=0U),batch=scan[2][t]-nb;
-        csr.offsets[t]=off;
-        if(t==experts-1U)csr.offsets[experts]=off+n;
-        if(n) {
-            csr.touched[touched]=t;atomicMax(&maximum,n);
-            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(8U,min(cap,n-b*cap))-1U],1U);}
-            unsigned unique=0U,previous=UINT32_MAX;
-            for(unsigned k=0;k<n;++k){const unsigned r=csr.rows[off+k];unique+=r!=previous;previous=r;}
-            atomicAdd(&hist[min(8U,unique)-1U],1U);atomicAdd(&duplicates,n-unique);
-        }
-    }
-    __syncthreads();
-    if(t==0U)csr.begins[scan[2][511]]=count;
-    if(t<32U)csr.summary[t]=t==0U?status:t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
-        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
-}
+};
+using PrefillCsrPlan=::strix::moe_core::device_plan::PackedPlan<PrefillCsrPolicy>;
 // project_window over strided prefill rows: same per-(row,slot) lane arithmetic,
 // staging, chains and A8 down quantizer epilogue. Grid x = CSR batch (runs of one
 // expert are adjacent, so their weight slices hit L2), y = 32-output tile.
@@ -1662,41 +1562,11 @@ template<unsigned Tune,unsigned Core> struct F16TileX {
 };
 template<bool Wide> struct f16_qv { using type=uint4; };
 template<> struct f16_qv<false> { using type=uint2; };
-__device__ __forceinline__ uint2 f16_load8(const void* p) {
-    typedef unsigned f16_u32x2 __attribute__((ext_vector_type(2)));
-    const f16_u32x2 v=*reinterpret_cast<const __attribute__((address_space(1))) f16_u32x2*>(reinterpret_cast<std::uintptr_t>(p));
-    return uint2{v.x,v.y};
-}
-// The K loop shared by both projections: two register stages (or one with bit 0), LDS-only barriers.
+__device__ __forceinline__ uint2 f16_load8(const void* p){return strix::moe_core::GroupedF16Issue::load8<uint2>(p);}
+// The K loop shared by both projections (moe_core/grouped_f16.hpp): two register stages (or one with bit 0).
 template<unsigned Tune,class Regs,class Fetch,class Stage,class Step>
 __device__ __forceinline__ void f16_pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
-    if constexpr(Tune&1U) {
-        Regs r;
-        fetch(0U,r);
-        for(unsigned step=0;step<steps;++step) {
-            if(step)f16_barrier();
-            stage(step,r,0U);
-            f16_barrier();
-            if(step+1U<steps)fetch(step+1U,r);
-            step_fn(0U);
-        }
-    } else {
-        Regs r0,r1;
-        fetch(0U,r0);fetch(1U,r1); // steps is even
-#pragma unroll 1
-        for(unsigned step=0;step<steps;step+=2U) {
-            if(step)f16_barrier();
-            stage(step,r0,0U);
-            f16_barrier();
-            if(step+2U<steps)fetch(step+2U,r0);
-            step_fn(0U);
-            f16_barrier();
-            stage(step+1U,r1,0U);
-            f16_barrier();
-            if(step+3U<steps)fetch(step+3U,r1);
-            step_fn(0U);
-        }
-    }
+    strix::moe_core::GroupedF16Issue::pipeline<(Tune&1U)!=0U,Regs>(steps,fetch,stage,step_fn);
 }
 template<bool Q5K,unsigned Tune,unsigned Core=0U>
 __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_waves(Tune,Core)) void project_prefill_f16x(const unsigned char* gate,const unsigned char* up,PrefillRows view,
@@ -1709,7 +1579,7 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
 }
 inline int& direct_b_override(){static int v=-1;return v;}
 inline bool direct_b_requested(){
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DIRECT_B");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_DIRECT_B", false, strix::EnvFlagMatch::exact);
     return direct_b_override()<0?env:direct_b_override()==1;
 }
 inline bool& direct_b_ran(){static thread_local bool v=false;return v;}
@@ -1859,13 +1729,13 @@ bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.
 template<bool Q51,unsigned Tune> void prefill_route_i8_resources() {
     static const bool admitted=[]{
         constexpr unsigned Threads=F16Tile<Tune>::Threads;
-        const auto base=down_prefill_f16x_da16_certificate_bf16<Q51,Tune>;
-        const auto compact=down_prefill_f16x_da16_certificate_i8<Q51,Tune>;
+        const auto base=STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,Q51,Tune);
+        const auto compact=STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,Q51,Tune);
         hipFuncAttributes a{},b{};int old_blocks=0,new_blocks=0;
-        check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(base)),"route BF16 resource attributes");
-        check(hipFuncGetAttributes(&b,reinterpret_cast<const void*>(compact)),"route I8 resource attributes");
-        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&old_blocks,base,Threads,0),"route BF16 occupancy");
-        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&new_blocks,compact,Threads,0),"route I8 occupancy");
+        hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(base)),"route BF16 resource attributes");
+        hip_check(hipFuncGetAttributes(&b,reinterpret_cast<const void*>(compact)),"route I8 resource attributes");
+        hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&old_blocks,base,Threads,0),"route BF16 occupancy");
+        hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&new_blocks,compact,Threads,0),"route I8 occupancy");
         const bool ok=old_blocks>0&&new_blocks>=old_blocks&&b.localSizeBytes<=a.localSizeBytes;
         std::fprintf(stderr,"moe-route-i8-resource tune=%u q51=%u vgpr=%d->%d lds=%zu->%zu local=%zu->%zu blocks=%d->%d %s\n",
             Tune,static_cast<unsigned>(Q51),a.numRegs,b.numRegs,a.sharedSizeBytes,b.sharedSizeBytes,a.localSizeBytes,b.localSizeBytes,
@@ -1875,11 +1745,11 @@ template<bool Q51,unsigned Tune> void prefill_route_i8_resources() {
     if(!admitted)throw std::runtime_error("BEST-ALREADY: MoE route I8 drops occupancy or increases private storage; restore route BF16");
 }
 void prefill_resources_at(const void* kernel,const char* name,unsigned tune,unsigned threads) {
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");return v&&v[0]=='1';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_INTPREFILL_RESOURCES", false);
     if(!enabled)return;
     hipFuncAttributes attributes{};int blocks=0;
-    check(hipFuncGetAttributes(&attributes,kernel),"prefill resource attributes");
-    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,static_cast<int>(threads),0),"prefill resident block query");
+    hip_check(hipFuncGetAttributes(&attributes,kernel),"prefill resource attributes");
+    hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,static_cast<int>(threads),0),"prefill resident block query");
     std::fprintf(stderr,"intprefill-resource %s tune=%u threads=%u vgpr=%d lds=%zu local=%zu resident_blocks_per_mp=%d\n",
         name,tune,threads,attributes.numRegs,attributes.sharedSizeBytes,attributes.localSizeBytes,blocks);
 }
@@ -1891,7 +1761,7 @@ template<auto Kernel,unsigned Threads> void prefill_resources(const char* name,u
 template<unsigned Tune,bool DA16> bool direct_b_resource_admitted() {
     static const bool admitted=[]{
         hipFuncAttributes a{};
-        check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(direct_b_kernel<Tune,DA16>())),"direct B resources");
+        hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(direct_b_kernel<Tune,DA16>())),"direct B resources");
         // Split gate/up waves keep tune 82's eight row16 accumulators within
         // the same register ceiling as the four paired row16 tiles at 80/88.
         constexpr int ceiling=160;
@@ -1912,7 +1782,7 @@ Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51
     if(!workspace.owner||!workspace.memory.execution_identity||!workspace.memory.allocation_generation||
         csr.address%256U||csr.bytes!=layout.bytes)throw std::invalid_argument("A8 CSR gate/up retained CSR owner differs");
     if(!stream||stream==hipStreamLegacy||stream==hipStreamPerThread)throw std::invalid_argument("A8 CSR gate/up admits explicit eager streams only");
-    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(stream,&capture),"A8 CSR gate/up capture query");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;hip_check(hipStreamIsCapturing(stream,&capture),"A8 CSR gate/up capture query");
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("A8 CSR gate/up admits explicit eager streams only");
     Prepared out;std::array<DeviceBytes,5U*max_union_rows> writes{};std::array<DeviceBytes,4U*max_union_rows> reads{};
     for(unsigned r=0;r<rows.size();++r) {
@@ -2051,7 +1921,7 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else if(!q5k){if(step16){STRIX_A8_WINDOW_PROJECT(16U,false,true);}else if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
     else {if(step16){STRIX_A8_WINDOW_PROJECT(16U,true,true);}else if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
 #undef STRIX_A8_WINDOW_PROJECT
-    check(hipGetLastError(),"A8 window shared gate/up projection");
+    hip_check(hipGetLastError(),"A8 window shared gate/up projection");
     if(!a8)return;
     const auto* down=reinterpret_cast<const unsigned char*>(window.down_weights.address);
     const dim3 down_grid(request.shape.hidden/64U,count*request.shape.top_k);
@@ -2074,12 +1944,12 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     else if(window.down_type==7U){if(step16){STRIX_A8_WINDOW_DOWN(16U,true);}else if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
     else {if(step16){STRIX_A8_WINDOW_DOWN(16U,false);}else if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN
-    check(hipGetLastError(),"A8 window shared integer down");
+    hip_check(hipGetLastError(),"A8 window shared integer down");
 }
 PrefillKernelForm prefill_kernel_form(const Request& request,unsigned down_type,int form) {
     const bool q20=gsq_a8::gate_type(request.gate_type);
     // STRIX_PREFILL_MOE_WMMA=0/1: dot4 or iu8 WMMA kernels (bit-identical results; default WMMA).
-    static const int wmma_env=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_WMMA");return v?std::atoi(v):-1;}();
+    static const int wmma_env=strix::envcfg::integer("STRIX_PREFILL_MOE_WMMA", -1);
     // GSQ experts take the FP16 forms (hip_moe_gsq_f16_prefill.inc: every GSQ gate/up type with a GSQ down type, Q2_0 or
     // IQ4_NL) unless STRIX_GSQ_PREFILL_F16=0 (gsq_prefill_f16_enabled).
     static const bool gsq_f16_env=gsq_prefill_f16_enabled();
@@ -2208,7 +2078,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     const unsigned cap=f16?((tune&2U)?2U*f16_batch:f16_batch):wmma?wmma_batch:dot4_cap;
     if(f16) {
         if(request.input!=InputKind::bf16)throw std::invalid_argument("A8 prefill FP16 WMMA requires BF16 input rows");
-        check(hipPeekAtLastError(),"FP16 prefill prologue stale error");
+        hip_check(hipPeekAtLastError(),"FP16 prefill prologue stale error");
         // qpf2k/moe-mi STRIX_QPF2K_MOE_ROUTE bit 2 (hip_moe_prefill_route.inc): same words, one read of each row, one barrier.
         const auto aligned16=[](const void* p,std::size_t stride){return reinterpret_cast<std::uintptr_t>(p)%16U==0U&&stride%16U==0U;};
         // ROUTE bit 8 (hip_moe_prefill_route.inc): the accumulation view is not zeroed here; the caller's merge
@@ -2230,37 +2100,30 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         } else
         hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
             request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr);
-        check(hipGetLastError(),"FP16 prefill prologue");
+        hip_check(hipGetLastError(),"FP16 prefill prologue");
     } else enqueue_prefill_prologue(request,rows,count,clear_words,stream);
     const unsigned assignments=count*request.shape.top_k;
-    // The WMMA forms (and every T above the serial builder's 2048 rows) build the identical CSR with
-    // the parallel builder; form 2 keeps the serial one.
-    if(form==2&&count>serial_csr_max_rows)throw std::invalid_argument("A8 prefill serial CSR builder admits at most 2048 rows");
-    if(((wmma&&form!=2)||count>serial_csr_max_rows)&&(prefill_route()&4U)) { // qpf2k/moe-mi route bit 4: multi-CTA CSR, same words
-        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route csr multi-cta active\n");return true;}();(void)witness;
-        const unsigned blocks=(count*request.shape.top_k+csr_mw_span-1U)/csr_mw_span;
-        if(blocks==0U||blocks>csr_mw_blocks_max())throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range");
-        unsigned* scratch=csr_mw_scratch();
-        check(hipMemsetAsync(scratch,0,csr_mw_head*sizeof(unsigned),stream),"qpf2k CSR scratch clear");
-        if(certificate)hipLaunchKernelGGL(csr_mw_count_certificate,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,scratch);
-        else
-        hipLaunchKernelGGL(csr_mw_count,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,scratch);
-        hipLaunchKernelGGL(csr_mw_scan,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap,blocks,scratch);
-        hipLaunchKernelGGL(csr_mw_scatter,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.top_k,scratch);
-    } else if(((wmma&&form!=2)||count>serial_csr_max_rows)&&(prefill_route()&1U)) { // qpf2k/moe-mi route bit 1: same words
-        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route csr v2 active\n");return true;}();(void)witness;
-        hipLaunchKernelGGL(build_prefill_csr_waves_v2,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
-    } else if((wmma&&form!=2)||count>serial_csr_max_rows)
-        hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
-    else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
-    check(hipGetLastError(),"A8 prefill CSR");
+    // Form 2 retains its historical test admission bound; every admitted form now uses the shared CSR.
+    if(form==2&&count>2048U)throw std::invalid_argument("A8 prefill serial CSR builder admits at most 2048 rows");
+    const unsigned blocks=PrefillCsrPlan::blocks_for(count,request.shape.top_k);
+    if(blocks==0U||blocks>csr_mw_blocks_max())throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range");
+    // RoutePrune (FAST, default off): zero the negligible route weights, then plan the kept assignments only.
+    const auto prune=prefill_route_prune_state();
+    if(prune.active()) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe route prune active\n");return true;}();
+        (void)witness;
+        hip_check(::strix::moe_core::enqueue_route_prune(const_cast<float*>(rows.route_weights.base),rows.route_weights.stride,count,
+            request.shape.top_k,prune,stream),"MoE route prune");
+    }
+    hip_check(PrefillCsrPlan::enqueue(rows,count,request.shape.experts,request.shape.top_k,cap,csr_mw_scratch(),stream,certificate,
+        prune.active()),"A8 prefill CSR");
     prefill_stage_reached(1U,stream);
     // STRIX_PREFILL_MOE_CSR_DUMP=1 (diagnostic, synchronizes): rows-per-expert histogram of each call.
-    static const bool csr_dump=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_CSR_DUMP");return v&&v[0]=='1';}();
+    static const bool csr_dump=strix::envcfg::flag("STRIX_PREFILL_MOE_CSR_DUMP", false);
     if(csr_dump) {
         std::vector<unsigned> offsets(request.shape.experts+1U);
-        check(hipMemcpyAsync(offsets.data(),rows.csr.offsets,4U*offsets.size(),hipMemcpyDeviceToHost,stream),"CSR dump");
-        check(hipStreamSynchronize(stream),"CSR dump");
+        hip_check(hipMemcpyAsync(offsets.data(),rows.csr.offsets,4U*offsets.size(),hipMemcpyDeviceToHost,stream),"CSR dump");
+        hip_check(hipStreamSynchronize(stream),"CSR dump");
         std::array<unsigned,8> bucket{};unsigned largest=0;
         for(unsigned e=0;e<request.shape.experts;++e) {
             const unsigned n=offsets[e+1U]-offsets[e];largest=std::max(largest,n);
@@ -2306,10 +2169,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             case gsq_a8::type_iq3_s: gate_up.template operator()<gsq_a8::type_iq3_s>(); break;
             default: gate_up.template operator()<gsq_a8::type_iq4_xs>(); break;
             }
-            check(hipGetLastError(),"GSQ FP16 prefill gate/up projection");
+            hip_check(hipGetLastError(),"GSQ FP16 prefill gate/up projection");
             if(down_type==gsq_a8::type_q2_0)down.template operator()<gsq_a8::type_q2_0>();
             else down.template operator()<gsq_a8::type_iq4_nl>();
-            check(hipGetLastError(),"GSQ FP16 prefill down");
+            hip_check(hipGetLastError(),"GSQ FP16 prefill down");
         };
         const bool launched=[&]<unsigned... T>(std::integer_sequence<unsigned,T...>){
             return ((gtune==T&&(launch.template operator()<T>(),true))||...);
@@ -2354,9 +2217,9 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         const unsigned G=request.shape.rows/Outs,Dn=request.shape.hidden/Tile::Columns;
                         if(batches>p1_max_batches()||p1_pool_words()%2U)throw std::invalid_argument("qpf2k P1 batch counters exceed the pool");
                         unsigned* pool=p1_counter_pool();
-                        check(hipMemsetAsync(pool,0,(2U+static_cast<std::size_t>(batches))*sizeof(unsigned),stream),"qpf2k P1 counters clear");
+                        hip_check(hipMemsetAsync(pool,0,(2U+static_cast<std::size_t>(batches))*sizeof(unsigned),stream),"qpf2k P1 counters clear");
                         unsigned* stats=p1_stats_enabled()?pool+p1_pool_words()-p1_stats_words:nullptr;
-                        if(stats)check(hipMemsetAsync(stats,0,p1_stats_words*sizeof(unsigned),stream),"qpf2k P1 stats clear");
+                        if(stats)hip_check(hipMemsetAsync(stats,0,p1_stats_words*sizeof(unsigned),stream),"qpf2k P1 stats clear");
                         const P1Args pa{pool,pool+1,stats,batches,lag,G,Dn,lag==65535U?1U:0U};
                         const dim3 grid((G+Dn)*batches);
                         // qpf2k/moe-mi: P1 + DA16 (hip_moe_prefill_p1da16.inc) when STRIX_QPF2K_MOE_DA16=1. Same bits.
@@ -2368,7 +2231,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             if(!seen16){seen16=true;std::fprintf(stderr,"qpf2k-moe-mi p1+da16 active tune=%u\n",Tune);}
                             if(batches>da16_counter_words())throw std::invalid_argument("qpf2k DA16 batch counters exceed the pool");
                             arrive=da16_counters();image=da16_image();
-                            check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k P1+DA16 counters clear");
+                            hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k P1+DA16 counters clear");
                         }
                         const auto go=[&]<bool QG,bool QD>(){
                             if(p1da16)hipLaunchKernelGGL(HIP_KERNEL_NAME(p1_prefill_f16x_da16<QG,QD,Tune>),grid,dim3(Threads),0,stream,
@@ -2379,7 +2242,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         };
                         if(q5k){if(down_type==7U)go.template operator()<true,true>();else go.template operator()<true,false>();}
                         else {if(down_type==7U)go.template operator()<false,true>();else go.template operator()<false,false>();}
-                        check(hipGetLastError(),"FP16 prefill WMMA gate/up + down (qpf2k P1)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up + down (qpf2k P1)");
                         return;
                     }
                     if(core&1024U) {
@@ -2412,7 +2275,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                         } else if(core&2U)gu.template operator()<128U>();
                         else gu.template operator()<256U>();
-                        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (g3)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (g3)");
                         if(core&4U) {
                             const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                             if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
@@ -2421,7 +2284,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                         } else if(core&2U)dn.template operator()<128U>();
                         else dn.template operator()<256U>();
-                        check(hipGetLastError(),"FP16 prefill WMMA down (g3)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA down (g3)");
                         return;
                     }
                     const auto run=[&]<unsigned Core>() {
@@ -2448,19 +2311,19 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
                                 gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                         }
-                        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (core2)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (core2)");
                         const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                         FuseArgT<Core> fa{};
                         if constexpr((Core&512U)!=0U) {
                             fa=FuseArgs{fuse_counter_pool(),request.shape.top_k,request.shape.hidden/Tile::Columns,count};
-                            check(hipMemsetAsync(fa.count,0,(static_cast<std::size_t>(count)*fa.tiles+1U)*sizeof(unsigned),stream),"fused merge counters clear");
+                            hip_check(hipMemsetAsync(fa.count,0,(static_cast<std::size_t>(count)*fa.tiles+1U)*sizeof(unsigned),stream),"fused merge counters clear");
                             prefill_fused_flag()=true;
                         }
                         if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune,Core>),down_grid,dim3(Threads),0,
                             stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
                         else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune,Core>),down_grid,dim3(Threads),0,
                             stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
-                        check(hipGetLastError(),"FP16 prefill WMMA down (core2)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA down (core2)");
                     };
                     switch(core&~8U) {
                     case 3U: run.template operator()<3U>(); break;
@@ -2492,7 +2355,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     unsigned* arrive=da16_counters();
                     uint4* image=da16_image();
                     prefill_da16_mark(0U,stream);
-                    check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
+                    hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
                     // Tunes 80/88 already have 64-row CTAs; retain their launch path.
                     if constexpr(Tune==82U) if(prefill_tiers()) {
                         if(prefill_tile64()) {
@@ -2502,11 +2365,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         }
                         unsigned* narrow=prefill_tier_lists();
                         unsigned* full=narrow+da16_counter_words()+1U;
-                        check(hipMemsetAsync(narrow,0,sizeof(unsigned),stream),"DA16 narrow count clear");
-                        check(hipMemsetAsync(full,0,sizeof(unsigned),stream),"DA16 full count clear");
+                        hip_check(hipMemsetAsync(narrow,0,sizeof(unsigned),stream),"DA16 narrow count clear");
+                        hip_check(hipMemsetAsync(full,0,sizeof(unsigned),stream),"DA16 full count clear");
                         prefill_tier_resources<build_prefill_tiers>();
                         hipLaunchKernelGGL(build_prefill_tiers,dim3((batches+255U)/256U),dim3(256),0,stream,rows,narrow,full);
-                        check(hipGetLastError(),"DA16 tier lists");
+                        hip_check(hipGetLastError(),"DA16 tier lists");
                         const bool reuse=prefill_hdr_reuse(q20||qpf2k::gsq_model);
                         if(prefill_tiers()==2)
                             launch_prefill_tier<88U>(gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image,narrow,batches,q5k,reuse,stream);
@@ -2551,13 +2414,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
-                    check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
+                    hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
                     prefill_da16_mark(1U,stream);
                     prefill_stage_reached(2U,stream);
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                     if(tile64&2U) {
                         launch_tile64_down_mode(down_type==7U,certificate,down_weights,rows,request.shape.hidden,request.shape.rows,image,batches,stream);
-                        check(hipGetLastError(),"FP16 prefill WMMA down (TILE64)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA down (TILE64)");
                         if(certificate)prefill_certificate_flag()=true;
                         prefill_da16_mark(2U,stream);
                         return;
@@ -2570,22 +2433,22 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                             return;
                         }
                         if(rows.route_i8) {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_i8<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_i8,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image,request.shape.top_k);
                         } else if(rows.route_bf16) {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate_bf16,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         } else {
-                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
+                            if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,true,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
+                            else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16_certificate,false,Tune),down_grid,dim3(Threads),0,
                                 stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         }
-                        check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
+                        hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
                         prefill_certificate_flag()=true; // publish only after the entire producer chain was enqueued
                         prefill_da16_mark(2U,stream);
                         return;
@@ -2595,11 +2458,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         prefill_da16_mark(2U,stream);
                         return;
                     }
-                    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<true,Tune>),down_grid,dim3(Threads),0,
+                    if(down_type==7U)hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,true,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<false,Tune>),down_grid,dim3(Threads),0,
+                    else hipLaunchKernelGGL(STRIX_DA16_ISSUE_KERNEL(down_prefill_f16x_da16,false,Tune),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                    check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
+                    hip_check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
                     prefill_da16_mark(2U,stream);
                     return;
                 }
@@ -2613,13 +2476,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_small<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
-                    check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (SMALL)");
+                    hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (SMALL)");
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                     if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
-                    check(hipGetLastError(),"FP16 prefill WMMA down (SMALL: base down)");
+                    hip_check(hipGetLastError(),"FP16 prefill WMMA down (SMALL: base down)");
                     return;
                 }
                 if constexpr(Tune==80U||Tune==82U||Tune==88U) {
@@ -2630,13 +2493,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     gate,up,rows,request.shape.hidden,request.shape.rows,a16);
                 else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
                     gate,up,rows,request.shape.hidden,request.shape.rows,a16);
-                check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
+                hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
                 const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                 if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
                     stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
                 else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
                     stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
-                check(hipGetLastError(),"FP16 prefill WMMA down");
+                hip_check(hipGetLastError(),"FP16 prefill WMMA down");
             } else {
             constexpr unsigned Threads=256U,Outs=Threads/2U;
             if(q5k)prefill_resources<project_prefill_f16<true,Tune>,Threads>("gate_up_q5k",Tune);
@@ -2648,13 +2511,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                 gate,up,rows,request.shape.hidden,request.shape.rows);
             else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,request.shape.hidden,request.shape.rows);
-            check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
+            hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
             const dim3 down_grid(request.shape.hidden/Threads,batches);
             if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<true,Tune>),down_grid,dim3(Threads),0,
                 stream,down_weights,rows,request.shape.hidden,request.shape.rows);
             else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<false,Tune>),down_grid,dim3(Threads),0,
                 stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-            check(hipGetLastError(),"FP16 prefill WMMA down");
+            hip_check(hipGetLastError(),"FP16 prefill WMMA down");
             }
         };
         [&]<unsigned... T>(std::integer_sequence<unsigned,T...>){(void)((tune==T&&(launch.template operator()<T>(),true))||...);}
@@ -2675,10 +2538,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if(q20) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma_q20<project_waves>),dim3(batches,request.shape.rows/(8U*project_waves)),
                 dim3(32U*project_waves),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows);
-            check(hipGetLastError(),"A8 prefill WMMA Q2_0 gate/up projection");
+            hip_check(hipGetLastError(),"A8 prefill WMMA Q2_0 gate/up projection");
             hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma_q20<down_waves>),dim3(batches,request.shape.hidden/(16U*down_waves)),
                 dim3(32U*down_waves),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-            check(hipGetLastError(),"A8 prefill WMMA Q2_0 down");
+            hip_check(hipGetLastError(),"A8 prefill WMMA Q2_0 down");
             return;
         }
         const dim3 project_grid(batches,request.shape.rows/(8U*project_waves));
@@ -2686,13 +2549,13 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             gate,up,rows,request.shape.hidden,request.shape.rows);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<false,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
             gate,up,rows,request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"A8 prefill WMMA gate/up projection");
+        hip_check(hipGetLastError(),"A8 prefill WMMA gate/up projection");
         const dim3 down_grid(batches,request.shape.hidden/(16U*down_waves));
         if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<true,down_waves>),down_grid,dim3(32U*down_waves),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma<false,down_waves>),down_grid,dim3(32U*down_waves),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"A8 prefill WMMA integer down");
+        hip_check(hipGetLastError(),"A8 prefill WMMA integer down");
         return;
     }
     const dim3 project_grid(batches,request.shape.rows/32U);
@@ -2705,7 +2568,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_q20<4U>),project_grid,dim3(256),0,stream,gate,up,rows,
             request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"A8 prefill GSQ gate/up projection");
+        hip_check(hipGetLastError(),"A8 prefill GSQ gate/up projection");
         if(down_type==gsq_a8::type_iq4_nl)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_iq<gsq_a8::type_iq4_nl,8U>),
             dim3(batches,request.shape.hidden/64U),dim3(256),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
         else if(down_type==42U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_q20<8U>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
@@ -2714,24 +2577,26 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
             stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"A8 prefill Q2_0 integer down");
+        hip_check(hipGetLastError(),"A8 prefill Q2_0 integer down");
         return;
     }
     if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
         request.shape.hidden,request.shape.rows);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
         request.shape.hidden,request.shape.rows);
-    check(hipGetLastError(),"A8 prefill gate/up projection");
+    hip_check(hipGetLastError(),"A8 prefill gate/up projection");
     const dim3 down_grid(batches,request.shape.hidden/64U);
     if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),down_grid,dim3(256),0,stream,down_weights,rows,
         request.shape.hidden,request.shape.rows);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
         request.shape.hidden,request.shape.rows);
-    check(hipGetLastError(),"A8 prefill integer down");
+    hip_check(hipGetLastError(),"A8 prefill integer down");
 }
 void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
+void set_prefill_route_prune(moe_core::RoutePrune prune){prefill_route_prune_slot()=prune;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
+void set_prefill_da16_issue(int on){prefill_da16_issue_override()=on;}
 void set_prefill_tile64(int on){prefill_tile64_override()=on;}
 void set_prefill_test_events(hipEvent_t* events){prefill_test_events()=events;}
 void set_prefill_hdr(int on){prefill_hdr_override()=on;}
@@ -2764,18 +2629,18 @@ std::array<std::uint64_t, 2> prefill_test_image_generations() {
 }
 void prefill_test_poison_da16(hipStream_t stream, unsigned rows) {
     reserve_prefill_pools(rows);
-    check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,stream),"poison DA16 image");
+    hip_check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,stream),"poison DA16 image");
 }
 const void* prefill_test_da16_image(){return da16_image();}
 void prefill_test_poison_a16(hipStream_t stream, unsigned rows) {
     reserve_prefill_pools(rows);
-    check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_hidden*2U,stream),"poison FP16 prefill A image");
+    hip_check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_hidden*2U,stream),"poison FP16 prefill A image");
 }
 bool prefill_fused_merge(){return prefill_fused_flag();}
 std::array<unsigned,8> prefill_p1_stats() {
     std::array<unsigned,8> out{};
-    check(hipDeviceSynchronize(),"P1 stats sync");
-    check(hipMemcpy(out.data(),p1_counter_pool()+p1_pool_words()-p1_stats_words,sizeof(out),hipMemcpyDeviceToHost),"P1 stats read");
+    hip_check(hipDeviceSynchronize(),"P1 stats sync");
+    hip_check(hipMemcpy(out.data(),p1_counter_pool()+p1_pool_words()-p1_stats_words,sizeof(out),hipMemcpyDeviceToHost),"P1 stats read");
     return out;
 }
 namespace {
@@ -2813,31 +2678,31 @@ __global__ void prefill_merge_check_kernel(PrefillRows v,unsigned* header,unsign
 void enqueue_prefill_merge_check(const PrefillRows& rows,unsigned count,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream) {
     const unsigned* flag=fuse_counter_pool()+static_cast<std::size_t>(count)*(hidden/256U);
     hipLaunchKernelGGL(prefill_merge_check_kernel,dim3((hidden+255U)/256U,count),dim3(256),0,stream,rows,rows.csr.summary,hidden,experts,top_k,flag);
-    check(hipGetLastError(),"fused merge check");
+    hip_check(hipGetLastError(),"fused merge check");
 }
 std::array<unsigned long long,9> fast_dequant_selftest(unsigned long long seed,unsigned blocks) {
     unsigned long long* counts=nullptr;
-    check(hipMalloc(&counts,9U*sizeof(unsigned long long)),"fast dequant self-test allocation");
-    check(hipMemset(counts,0,9U*sizeof(unsigned long long)),"fast dequant self-test clear");
+    hip_check(hipMalloc(&counts,9U*sizeof(unsigned long long)),"fast dequant self-test allocation");
+    hip_check(hipMemset(counts,0,9U*sizeof(unsigned long long)),"fast dequant self-test clear");
     hipLaunchKernelGGL(fast_dequant_selftest_kernel,dim3(blocks),dim3(256),0,nullptr,seed,counts);
-    check(hipGetLastError(),"fast dequant self-test launch");
+    hip_check(hipGetLastError(),"fast dequant self-test launch");
     std::array<unsigned long long,9> out{};
-    check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"fast dequant self-test read");
-    check(hipFree(counts),"fast dequant self-test free");
+    hip_check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"fast dequant self-test read");
+    hip_check(hipFree(counts),"fast dequant self-test free");
     return out;
 }
 std::array<unsigned long long,5> gsq_q20_decode_selftest(unsigned seed,unsigned rows) {
     const unsigned count=64U*rows;
     unsigned char* blocks=nullptr;unsigned long long* counts=nullptr;
-    check(hipMalloc(&blocks,18ULL*count+16U),"GSQ Q2_0 decode self-test blocks");
-    check(hipMalloc(&counts,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test counts");
-    check(hipMemset(counts,0,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test clear");
+    hip_check(hipMalloc(&blocks,18ULL*count+16U),"GSQ Q2_0 decode self-test blocks");
+    hip_check(hipMalloc(&counts,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test counts");
+    hip_check(hipMemset(counts,0,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test clear");
     hipLaunchKernelGGL(gsq_q20_fill_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,seed);
     hipLaunchKernelGGL(gsq_q20_decode_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,counts);
-    check(hipGetLastError(),"GSQ Q2_0 decode self-test launch");
+    hip_check(hipGetLastError(),"GSQ Q2_0 decode self-test launch");
     std::array<unsigned long long,5> out{};
-    check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"GSQ Q2_0 decode self-test read");
-    check(hipFree(blocks),"GSQ Q2_0 decode self-test free");check(hipFree(counts),"GSQ Q2_0 decode self-test free");
+    hip_check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"GSQ Q2_0 decode self-test read");
+    hip_check(hipFree(blocks),"GSQ Q2_0 decode self-test free");hip_check(hipFree(counts),"GSQ Q2_0 decode self-test free");
     return out;
 }
 std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsigned seed,unsigned blocks) {
@@ -2848,9 +2713,9 @@ std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsig
     const unsigned groups=blocks*(be/32U);
     unsigned char* bytes=nullptr;unsigned long long* counts=nullptr;
     const std::size_t total=static_cast<std::size_t>(blocks)*gsq_a8::block_bytes(type);
-    check(hipMalloc(&bytes,total),"GSQ IQ decode self-test blocks");  // no slack: the decoders read inside the rows
-    check(hipMalloc(&counts,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test counts");
-    check(hipMemset(counts,0,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test clear");
+    hip_check(hipMalloc(&bytes,total),"GSQ IQ decode self-test blocks");  // no slack: the decoders read inside the rows
+    hip_check(hipMalloc(&counts,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test counts");
+    hip_check(hipMemset(counts,0,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test clear");
     const auto run=[&]<std::uint32_t T>() {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_fill_kernel<T>),dim3((blocks+255U)/256U),dim3(256),0,nullptr,bytes,blocks,seed);
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_decode_kernel<T>),dim3((groups+255U)/256U),dim3(256),0,nullptr,bytes,groups,width,counts);
@@ -2860,12 +2725,12 @@ std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsig
     else if(type==gsq_a8::type_iq3_s)run.template operator()<gsq_a8::type_iq3_s>();
     else if(type==gsq_a8::type_iq4_xs)run.template operator()<gsq_a8::type_iq4_xs>();
     else run.template operator()<gsq_a8::type_iq4_nl>();
-    check(hipGetLastError(),"GSQ IQ decode self-test launch");
+    hip_check(hipGetLastError(),"GSQ IQ decode self-test launch");
     std::array<unsigned long long,5> out{};
-    check(hipMemcpy(out.data(),counts,3U*sizeof(unsigned long long),hipMemcpyDeviceToHost),"GSQ IQ decode self-test read");
+    hip_check(hipMemcpy(out.data(),counts,3U*sizeof(unsigned long long),hipMemcpyDeviceToHost),"GSQ IQ decode self-test read");
     // Coverage of the fixture (host): distinct grid indices (or IQ4 nibble values) and sign patterns over all groups.
     std::vector<unsigned char> host(total);
-    check(hipMemcpy(host.data(),bytes,total,hipMemcpyDeviceToHost),"GSQ IQ decode self-test bytes");
+    hip_check(hipMemcpy(host.data(),bytes,total,hipMemcpyDeviceToHost),"GSQ IQ decode self-test bytes");
     std::vector<char> grid(1024,0),signs(256,0);
     const unsigned bb=gsq_a8::block_bytes(type);
     for(unsigned b=0;b<blocks;++b) {
@@ -2890,16 +2755,16 @@ std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsig
     }
     for(const char c:grid)out[3]+=c?1ULL:0ULL;
     for(const char c:signs)out[4]+=c?1ULL:0ULL;
-    check(hipFree(bytes),"GSQ IQ decode self-test free");check(hipFree(counts),"GSQ IQ decode self-test free");
+    hip_check(hipFree(bytes),"GSQ IQ decode self-test free");hip_check(hipFree(counts),"GSQ IQ decode self-test free");
     return out;
 }
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);
 }
 void enqueue(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
-    const auto p=prepare(request,rows,workspace,stream);check(hipPeekAtLastError(),"A8 CSR gate/up stale launch error");
+    const auto p=prepare(request,rows,workspace,stream);hip_check(hipPeekAtLastError(),"A8 CSR gate/up stale launch error");
     admit_csr<<<1,1,0,stream>>>(p.rows,p.csr,static_cast<unsigned>(rows.size()),request.shape.experts,request.shape.top_k);
-    check(hipGetLastError(),"A8 CSR gate/up device CSR admission");
+    hip_check(hipGetLastError(),"A8 CSR gate/up device CSR admission");
 #define STRIX_A8_CSR_PROJECT(R) \
     hipLaunchKernelGGL(HIP_KERNEL_NAME(project_csr<R>),dim3(request.shape.rows/32U,static_cast<unsigned>(rows.size())*request.shape.top_k), \
         dim3(256),0,stream,reinterpret_cast<const unsigned char*>(rows.front().gate.address), \
@@ -2908,7 +2773,7 @@ void enqueue(const Request& request,std::span<const Bindings> rows,const q51_kno
     else if(rows.size()==4U){STRIX_A8_CSR_PROJECT(4);}
     else {STRIX_A8_CSR_PROJECT(8);}
 #undef STRIX_A8_CSR_PROJECT
-    check(hipGetLastError(),"A8 CSR shared gate/up projection");
+    hip_check(hipGetLastError(),"A8 CSR shared gate/up projection");
 }
 
 void set_prefill_direct_b(int on){direct_b_override()=on;}
@@ -2939,7 +2804,7 @@ void prefill_project_test(const PrefillRows& rows,unsigned hidden,unsigned outpu
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),dim3(outputs/(T::Columns/2U),batches),dim3(T::Threads),0,stream,
                 gate,up,rows,hidden,outputs,a16,arrive,image);
         }
-        check(hipGetLastError(),"gate/up fixture projection");
+        hip_check(hipGetLastError(),"gate/up fixture projection");
     };
     switch(tune){case 80:run.template operator()<80>();break;case 82:run.template operator()<82>();break;
         case 88:run.template operator()<88>();break;default:throw std::invalid_argument("direct B fixture tune");}
@@ -2947,18 +2812,18 @@ void prefill_project_test(const PrefillRows& rows,unsigned hidden,unsigned outpu
 DirectBFragmentResult direct_b_fragment_test(const unsigned char* raw,const unsigned char* packed,unsigned pairs,bool paired_planes) {
     // Keep the flattened coordinate within 32 bits above the two FP16 values.
     if(!pairs||pairs>(1U<<18U))throw std::invalid_argument("direct B fragment pair count");
-    unsigned long long* stats=nullptr;check(hipMalloc(&stats,32),"direct B fragment counters");
-    check(hipMemset(stats,0,24),"direct B fragment clear");
-    check(hipMemset(stats+3,255,8),"direct B first fragment clear");
+    unsigned long long* stats=nullptr;hip_check(hipMalloc(&stats,32),"direct B fragment counters");
+    hip_check(hipMemset(stats,0,24),"direct B fragment clear");
+    hip_check(hipMemset(stats+3,255,8),"direct B first fragment clear");
     if(paired_planes) {
         hipLaunchKernelGGL(direct_b_fragment_probe<true>,dim3(2U*pairs),dim3(32),0,nullptr,raw,packed,stats);
     } else {
         hipLaunchKernelGGL(direct_b_fragment_probe<false>,dim3(pairs),dim3(32),0,nullptr,raw,packed,stats);
     }
-    check(hipGetLastError(),"direct B fragment probe");
+    hip_check(hipGetLastError(),"direct B fragment probe");
     std::array<unsigned long long,4> result{};
-    check(hipMemcpy(result.data(),stats,32,hipMemcpyDeviceToHost),"direct B fragment result");
-    check(hipFree(stats),"direct B fragment free");
+    hip_check(hipMemcpy(result.data(),stats,32,hipMemcpyDeviceToHost),"direct B fragment result");
+    hip_check(hipFree(stats),"direct B fragment free");
     DirectBFragmentResult out{result[0],result[1],result[2]};
     if(out.mismatched_elements) {
         out.actual=static_cast<unsigned>(result[3]&65535U);out.expected=static_cast<unsigned>((result[3]>>16U)&65535U);

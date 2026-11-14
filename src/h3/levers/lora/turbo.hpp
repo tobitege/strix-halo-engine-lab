@@ -8,6 +8,7 @@
 // One stream at a time per holder (the scratch is shared). apply on a (site, block) that was never uploaded throws,
 // so a missing tensor cannot silently fall back to the dense path.
 #include <hip/hip_runtime.h>
+#include "strix/hip_check.hpp"
 
 #include <cstdint>
 #include <map>
@@ -79,7 +80,7 @@ private:
     struct Branch { std::uint16_t* a; std::uint16_t* b; std::uint32_t k, n, rank; float scale; };
     using Key = std::pair<Site, std::uint32_t>;
     static void check(hipError_t e, const char* what) {
-        if (e != hipSuccess) throw std::runtime_error(std::string("h3 lora: ") + what + ": " + hipGetErrorString(e));
+        ::strix::hip_check_prefixed("h3 lora: ", e, what);
     }
     float s_;
     std::uint32_t max_rows_;

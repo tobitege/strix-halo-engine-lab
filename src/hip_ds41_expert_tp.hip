@@ -61,7 +61,7 @@ std::uint64_t part_bytes(std::uint64_t bytes, std::uint32_t experts, bool down, 
 }
 
 void load_part(const LoadFn& load, std::uint64_t offset, std::uint64_t bytes, std::uint32_t experts, bool down, std::uint32_t hidden,
-               unsigned rank, std::uint8_t* out, void* stream) {
+               unsigned rank, std::uint8_t* out, void* stream, const std::function<void()>& loaded) {
     const auto check = [](hipError_t e, const char* what) {
         if (e != hipSuccess) throw std::runtime_error(std::string("ds41 expert tp: ") + what + ": " + hipGetErrorString(e));
     };
@@ -77,6 +77,7 @@ void load_part(const LoadFn& load, std::uint64_t offset, std::uint64_t bytes, st
             for (std::uint64_t e = 0; e < E; e += chunk) {
                 const auto n = std::min(chunk, E - e);
                 load(offset + e * per, n * per, staging);
+                if (loaded) loaded();  // the pack kernel reads the staging
                 enqueue_pack_down_rows(staging, out + e * rows * device_down_row_bytes(), n * rows, rank, packed_from_env(), stream);
                 check(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "pack");  // before the staging is refilled
             }

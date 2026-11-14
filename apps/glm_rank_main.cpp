@@ -1,3 +1,5 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm_deploy_owners.hpp"
 #include "glm/load/glm_rank_plan.hpp"
@@ -58,6 +60,7 @@
 
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 
 #include "glm/attn/glm_attn_fast.hpp"
@@ -69,6 +72,8 @@
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
+#include "attn_core/index_score_mode.hpp"
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/spec/glm_spec_run.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
@@ -115,11 +120,14 @@ std::vector<std::uint32_t> read_u32(const std::string& path) {
     return v;
 }
 
-using strix::glm::rank_transport::open_transport;
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed run still leaves every printed line in its log
     std::setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered (the C default, made explicit): progress and errors land at once
     try {
@@ -237,6 +245,7 @@ int main(int argc, char** argv) {
             else if (a == "--tf-stop") tf_stop = std::stoull(next());
             else if (a == "--state-out") state_out = next();
             else if (a == "--state-in") state_in = next();
+            else if (strix::session::speculation_opt_out_argument(a)) {}  // resolved by rank_defaults
             else if (a == "--baseline") {}  // resolved by rank_defaults (old path of every default-on item)
             else if (a == "--print-effective-config") print_config = true;
             else if (a == "--print-model-graph") print_graph = true;
@@ -259,6 +268,10 @@ int main(int argc, char** argv) {
         }
         if (print_config) {  // dry run: no environment change, no GPU, no peer
             std::fputs(rd::print(eff).c_str(), stdout);
+            // Serving-only lever, named here too: the server resolves it with this same function.
+            std::fputs(strix::glm::pf::dense_policy::chunk_line(strix::glm::pending_prefill_chunk(
+                false, 0, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
+                [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); })).c_str(), stdout);
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
@@ -342,8 +355,9 @@ int main(int argc, char** argv) {
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-            std::string receipt;
-            auto transport = open_transport(transport_spec, opt.rank, receipt);
+            auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            auto transport = std::move(opened.host);
+            const auto& receipt = opened.receipt;
             if (deployment.provider) deployment.resolve_live(opt, *transport);
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
             if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
@@ -354,18 +368,44 @@ int main(int argc, char** argv) {
             } else {
             // one exchange carries up to max(8, max_rows) rows of 4096 floats (a chunked prefill exchanges whole chunks)
             opt.exchange_rows = rd::max_rows_auto(eff) ? rd::kFallbackMaxRows : opt.max_rows;
-            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
+            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(), secs(t_start, Clock::now()));
             }
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        const bool startup_handshake = rd::has_startup_handshake(opt.world, xch_kind, decode_n > 0, reference_gate);
+        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate, !tf_tokens.empty());
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
-        // that handshake cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        // that handshake (or the --tf config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::attn_wmma::enabled())
+            throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
+                                        "needs the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "are checked to run the same prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::kda_wmma::enabled())
+            throw std::invalid_argument("the FAST KDA projections (STRIX_GLM_PF_KDA_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
+                                        "need the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
-            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, comm exchange, "
-                                        "no reference gate) so both ranks are checked to run the same prefill identity");
+            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
+                                        "comm exchange) so both ranks are checked to run the same prefill identity");
+        // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
+        // Unset or exact: WMMA scores with exact rescoring of the cut-off, the pool lists of the exact kernels, so it is
+        // not an identity of its own (agreement value 0, like STRIX_IDX_WMMA=0).
+        const unsigned idx_mode = strix::attn_core::idx::wmma_mode(strix::glm::pf::kIndexerWmmaUnsetMode);
+        if (idx_mode == strix::attn_core::idx::kModeBf16x2)
+            throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes 0, bf16, f16 or exact (bf16x2 needs BF16 keys)");
+        const unsigned idx_wmma = idx_mode == strix::attn_core::idx::kModeExact ? 0U : idx_mode;
+        if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
+            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
+                                        "so both ranks are checked to run the same indexer identity");
+        if (idx_wmma != 0)
+            std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
+                        strix::attn_core::idx::wmma_mode_name(idx_wmma));
         ge::Engine eng(opt, comm.get());
+        // Shared route receipt: the same lever keys as the server (apps/glm_route_levers.hpp).
+        (void)strix::glm::record_route_levers("cli", opt.rank, prefill_requested, prefill_mode, ge::identity_mode_name(eng.identity_mode()),
+                                              opt.max_rows);
+        // The same resolver as the server: what a served prompt would be chunked to while another request decodes.
+        (void)strix::glm::record_prefill_chunk("cli", false, 0, opt.world, opt.max_rows, prefill_mode);
         // STRIX_GLM_MODEL_FORMAT=fast_i4 (glm-fast-i4, lossy): the routed EXL3 weights are replaced, so the exact /
         // reference identities (decode-row reference prefill, reference gates, identity checks) are refused.
         // --tf scoring (no prompt prefill, verify rows only, no --tf-check) stays available for the quality comparison.
@@ -388,7 +428,10 @@ int main(int argc, char** argv) {
                 (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
                 (eng.decode_xfer_enabled() ? 1U << 10 : 0U) |
                 (strix::glm::pf::wmma_x::enabled() ? rd::kPfWmmaConfig : 0U) |  // FAST prefill identity must match on both ranks
-                (eng.model_fast_i4() ? rd::kFastI4Config : 0U);                 // and the model format (also in the load vote)
+                (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
+                (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
+                (strix::glm::pf::kda_wmma::enabled() ? rd::kPfKdaWmmaConfig : 0U) |
+                (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
                  static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
@@ -1077,6 +1120,12 @@ int main(int argc, char** argv) {
                             wm ? wm : "unset", prefill_mode.c_str(), static_cast<unsigned long long>(wd), static_cast<unsigned long long>(wmo));
                 if (wq) std::printf(" iu4 moe %llu", static_cast<unsigned long long>(wq));  // STRIX_GLM_PF_IU4=1 only
                 std::printf("\n");
+                if (const auto ac = strix::glm::pf::attn_wmma::calls.exchange(0); ac != 0)
+                    std::printf("rank %u prefill identity glm-pf-attn-wmma FAST (fused bf16 WMMA MLA/DSA core, "
+                                "T %u, calls %llu)\n", opt.rank, strix::glm::pf::attn_wmma::block_keys(), static_cast<unsigned long long>(ac));
+                if (const auto kc = strix::glm::pf::kda_wmma::calls.exchange(0); kc != 0)
+                    std::printf("rank %u prefill identity glm-pf-kda-wmma-v1 FAST (KDA plain-weight projections on the dense "
+                                "FP16 WMMA core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(kc));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());
@@ -1172,11 +1221,23 @@ int main(int argc, char** argv) {
             namespace FA = strix::glm::fast;
             const std::size_t pe = std::min(prompt.find(','), prompt.size());
             const auto toks = read_u32(prompt.substr(0, pe));
-            for (int k = 0; k < 7; ++k) {
+            // STRIX_GLM_ABA_RUNS=n (odd, 3..7; default 7): shorter series for long prompts (each run prefills again).
+            const int aba_runs = std::getenv("STRIX_GLM_ABA_RUNS") != nullptr ? std::clamp(std::atoi(std::getenv("STRIX_GLM_ABA_RUNS")) | 1, 3, 7) : 7;
+            for (int k = 0; k < aba_runs; ++k) {
                 const bool b = k % 2 == 1;
-                TB::set_table_enabled(b);
-                if (b) FA::set_scores_auto();
-                else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                // STRIX_GLM_ABA_XBPUB=1: the same series over the decode producer publication instead (A off, B on).
+                static const bool xbpub = std::getenv("STRIX_GLM_ABA_XBPUB") != nullptr && std::string(std::getenv("STRIX_GLM_ABA_XBPUB")) == "1";
+                // STRIX_GLM_ABA_FOLD=1: the same series over the exchange row fold (A off, B on; needs STRIX_GLMX_FOLD=rows).
+                static const bool xfold = strix::envcfg::flag("STRIX_GLM_ABA_FOLD", false, strix::EnvFlagMatch::exact);
+                if (xbpub) {
+                    ge::set_decode_producer_publish(b ? 1 : 0);
+                } else if (xfold) {
+                    strix::glm::xfer::XferExchange::set_fold_enabled(b);
+                } else {
+                    TB::set_table_enabled(b);
+                    if (b) FA::set_scores_auto();
+                    else FA::set_scores_schedule(FA::DenseSchedule::kLane);
+                }
                 eng.reset(0);
                 std::uint32_t nx = eng.prefill(0, toks, 0);
                 std::vector<std::uint32_t> out{nx};
@@ -1200,6 +1261,8 @@ int main(int argc, char** argv) {
             }
             TB::set_table_enabled(true);
             FA::set_scores_auto();
+            ge::set_decode_producer_publish(-1);
+            strix::glm::xfer::XferExchange::set_fold_enabled(true);
         }
         // --aba-xch N: in-process A B A B A B A of the decode exchange, A = CommExchange (the Communicator), B =
         // XferExchange borrowing the communicator's transport (one load, same session). Per run: reset slots 0..R-1 and

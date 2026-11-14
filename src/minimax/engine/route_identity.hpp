@@ -1,5 +1,6 @@
 #pragma once
-// Host route policy shared by launchers and the CPU census. No HIP dependencies.
+// Host route policy shared by launchers and the CPU census. No HIP dependencies. The GEMM/row-tile policy is
+// constexpr, so the device MoE planner (mmx_prefill.hip) evaluates the same functions.
 // The GEMM policy below preserves the adopted strix-trellis 0.3 policy verbatim.
 #include <algorithm>
 #include <cstddef>
@@ -22,7 +23,7 @@ inline std::vector<std::vector<std::uint32_t>> expert_rows(std::span<const std::
         }
     return grouped;
 }
-inline bool medium_prefill_candidate(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+constexpr bool medium_prefill_candidate(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     if (rows < 32) return false;
     if (rows >= 256) return (bits == 6 && input == 5120 && output == 1280) || (bits == 5 && input == 4096 && output == 1024);
     if (bits == 6) return input == 5120 && output == 1280;
@@ -30,18 +31,18 @@ inline bool medium_prefill_candidate(unsigned input, unsigned output, unsigned b
     return (input == 1280 && output == 32768) || (input == 8192 && output == 5120) || (input == 5120 && output == 2304) ||
            (input == 2304 && output == 5120) || (input == 4096 && output == 1024);
 }
-inline unsigned measured_vector_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+constexpr unsigned measured_vector_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     if (bits == 5) {
         if (input == 4096 && output == 1024 && (rows == 1 || rows == 4 || rows == 8)) return 16;
         if (input == 5120 && output == 2304 && rows == 8) return 8;
     }
     return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
 }
-inline unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+constexpr unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return medium_prefill_candidate(input, output, bits, rows) || (rows >= 256 && output >= 2304) ||
                    (rows >= 64 && output >= 32768 && bits == 5) ? 64U : 16U;
 }
-inline unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+constexpr unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     std::size_t requested;
     if (rows > 8) {
         const std::size_t tile_m = gemm_tile_rows(input, output, bits, rows);
@@ -63,10 +64,10 @@ inline unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsi
     }
     return static_cast<unsigned>(std::min<std::size_t>(requested, input / 16));
 }
-inline unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
-inline unsigned mt_of_class(unsigned cls) { return 1U << cls; }
+constexpr unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
+constexpr unsigned mt_of_class(unsigned cls) { return 1U << cls; }
 struct MtFit { unsigned main, remainder, tail_class; };
-inline MtFit mtfit(unsigned rows) {
+constexpr MtFit mtfit(unsigned rows) {
     const unsigned remainder = rows % 128;
     return {rows / 128, remainder, remainder != 0 ? (remainder + 15) / 16 - 1 : 0U};
 }

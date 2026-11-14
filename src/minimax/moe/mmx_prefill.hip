@@ -5,12 +5,18 @@
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
+#include "core/trellis_codec.hpp"
 #ifndef STRIX_MMX_IU4_LIB
 #define STRIX_MMX_IU4_LIB 0
 #endif
 #if STRIX_MMX_IU4_LIB
+#include "core/moe_i4_chain.hpp"
 #include "core/wmma_tiled.hpp"  // shared tiled core: grouped IU4 kernel and convert_exl3_iu4 (strix_tiled_core)
 #endif
+#include "moe_core/device_plan.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
+
 
 #include <algorithm>
 #include <chrono>
@@ -40,38 +46,7 @@ constexpr unsigned kHB = kHidden / 128, kIB = kInter / 128;  // 48, 12
 
 
 // ---------------------------------------------------------------- library WMMA core pieces (gemm.hip, trellis_device.hpp)
-__device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
-template <int Bits> struct WaveTile {
-    std::uint32_t lo, hi;
-    static constexpr int words = Bits * 8;
-    __device__ explicit WaveTile(const std::uint32_t* data) {
-        const int lane = static_cast<int>(threadIdx.x & 31U);
-        lo = lane < words ? data[lane] : 0;
-        if constexpr (words > 32) hi = lane + 32 < words ? data[lane + 32] : 0;
-        else hi = 0;
-    }
-    __device__ __forceinline__ std::uint32_t word(int index) const {
-        const std::uint32_t first = __shfl(lo, index & 31, 32);
-        if constexpr (words > 32) {
-            const std::uint32_t second = __shfl(hi, index & 31, 32);
-            return index < 32 ? first : second;
-        }
-        return first;
-    }
-    __device__ __forceinline__ std::uint32_t state(int position) const {
-        const int end = (position + 1) * Bits + 256 * Bits;
-        const int start = end - 16;
-        const std::uint32_t earlier = word((start / 32) % words);
-        const std::uint32_t later = word(((end - 1) / 32) % words);
-        const std::uint64_t pair = (static_cast<std::uint64_t>(earlier) << 32) | later;
-        return static_cast<std::uint32_t>(pair >> ((32 - (end & 31)) & 31)) & 65535U;
-    }
-};
+template <int Bits> using WaveTile = strix::core::trellis::WaveTile<Bits>;
 using Half16 = _Float16 __attribute__((ext_vector_type(16)));
 using Float8 = float __attribute__((ext_vector_type(8)));
 
@@ -107,7 +82,7 @@ __device__ void wmma_item(const WItem& it, unsigned bx, unsigned by, unsigned bz
             for (int j = 0; j < 8; ++j) {
                 const int r = 2 * (lane % 4) + (j % 2) + 8 * ((j / 2) % 2);
                 const int c = lane / 4 + 8 * (j / 4);
-                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(codebook_mul1(tile.state(8 * lane + j)));
+                q[wave * 256 + r * 16 + c] = static_cast<_Float16>(strix::core::trellis::codebook_value(tile.state(8 * lane + j), 2));
             }
         }
         __syncthreads();
@@ -181,7 +156,21 @@ struct Tables {
     unsigned pairs, rows, shared_group;
     unsigned tpairs;  // padded rows of the tile-major layout (v4); xt = [2][tpairs][6144], at = [tpairs][1536]
     unsigned fakeq;   // STRIX_MMX_FAKEQ_A4 (quality study): v4 transformed rows fake-quantised to A4 g64 before the FP16 store
+    // Group-wide call: row r lives in chunk r / seg_rows (seg_rows = 0: one buffer, the kernels' y / out arguments).
+    unsigned seg_rows;
+    const float* seg_y[kPrefillMoeSegments];
+    float* seg_out[kPrefillMoeSegments];
 };
+__device__ __forceinline__ const float* moe_row_in(const float* y, const Tables& t, unsigned r) {
+    if (t.seg_rows == 0) return y + static_cast<std::size_t>(r) * kHidden;
+    const unsigned s = r / t.seg_rows;
+    return t.seg_y[s] + static_cast<std::size_t>(r - s * t.seg_rows) * kHidden;
+}
+__device__ __forceinline__ float* moe_row_out(float* out, const Tables& t, unsigned r) {
+    if (t.seg_rows == 0) return out + static_cast<std::size_t>(r) * kHidden;
+    const unsigned s = r / t.seg_rows;
+    return t.seg_out[s] + static_cast<std::size_t>(r - s * t.seg_rows) * kHidden;
+}
 
 // FAST_I4 fake-quant (quality study): FP16-exact values -> q * s of the A4 g64 quantiser (core/activation_quant.hpp).
 __device__ __forceinline__ void fakeq128(float (&v)[4]) {
@@ -195,18 +184,7 @@ __device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigne
     return ((static_cast<std::size_t>(R >> 4U) * (K >> 4U) + (ch >> 4U)) << 8U) + ((R & 15U) << 4U) + (ch & 15U);
 }
 
-__global__ __launch_bounds__(256) void gather_transform_kernel(const float* y, Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * 2 * kHB) return;
-    const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    InputTransform::input_block(y + static_cast<std::size_t>(t.pair_row[p]) * kHidden, suh,
-                       t.xt + (static_cast<std::size_t>(m) * t.pairs + p) * kHidden, b * 128U, lane);
-}
-
-// v4: gather + input transform as gather_transform_kernel (transform_block's operation order), stored tile-major.
+// v4: gather + input transform (transform_block's operation order), stored tile-major.
 __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float* y, Tables t) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned q = blockIdx.x * 8U + wave;
@@ -214,7 +192,7 @@ __global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float
     const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
     const PGroup& g = t.groups[t.pair_group[p]];
     const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* x = y + static_cast<std::size_t>(t.pair_row[p]) * kHidden;
+    const float* x = moe_row_in(y, t, t.pair_row[p]);
     float v[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -237,7 +215,7 @@ __global__ __launch_bounds__(256) void gather_transform_token_kernel(const float
     const unsigned q = blockIdx.x * 8U + wave;
     if (q >= t.rows * kHB) return;
     const unsigned tok = q / kHB, b = q % kHB;
-    const float* x = y + static_cast<std::size_t>(tok) * kHidden;
+    const float* x = moe_row_in(y, t, tok);
     float xv[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) xv[j] = x[b * 128U + lane + 32U * static_cast<unsigned>(j)];
@@ -279,30 +257,6 @@ __device__ __forceinline__ void finish_block(const float* part, unsigned splits,
     return Epilogue::finish_block(part, splits, rows, row, output, b, svh, lane, v);
 }
 
-__global__ __launch_bounds__(256) void gate_up_finish_kernel(Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * kIB) return;
-    const unsigned p = q / kIB, b = q % kIB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const unsigned i = p - g.pair_begin;
-    float gv[4], uv[4];
-    finish_block(t.part + g.part_gu, g.s_gu, g.n, i, kInter, b, g.w.gate.svh, lane, gv);
-    finish_block(t.part + g.part_gu + static_cast<std::size_t>(g.s_gu) * g.n * kInter, g.s_gu, g.n, i, kInter, b, g.w.up.svh, lane, uv);
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128 + lane + 32U * static_cast<unsigned>(j);
-        const float act = swiglu(gv[j], uv[j]);
-        const float scaled = InputTransform::scale(act, g.w.down.suh[c]);
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    InputTransform::h128(v, lane);
-    _Float16* out = t.at + static_cast<std::size_t>(p) * kInter;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[b * 128 + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
-}
-
 // Shared epilogue: preserve output transforms, SwiGLU and both FP16 conversions.
 __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, unsigned p, unsigned i,
                                                   unsigned b, unsigned lane, const float (&gv)[4],
@@ -330,7 +284,7 @@ __device__ __forceinline__ void gate_up_tiled_store(Tables t, const PGroup& g, u
     for (int j = 0; j < 4; ++j) t.at[tiled_at(R, b * 128 + lane + 32U * static_cast<unsigned>(j), kInter)] = static_cast<_Float16>(v[j]);
 }
 
-// v4: gate_up_finish_kernel with the down input stored tile-major.
+// v4: gate/up finish with the down input stored tile-major.
 __global__ __launch_bounds__(256) void gate_up_finish_tiled_kernel(Tables t, bool fused, float* debug) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned q = blockIdx.x * 8U + wave;
@@ -430,9 +384,9 @@ __global__ __launch_bounds__(256) void down_combine_kernel(Tables t, float* out)
     const PGroup& sg = t.groups[t.shared_group];
     float v[4];
     finish_block(t.part + sg.part_dn, sg.s_dn, sg.n, tok, kHidden, b, sg.w.down.svh, lane, v);
+    float* const o = moe_row_out(out, t, tok);
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
-        out[static_cast<std::size_t>(tok) * kHidden + b * 128 + lane + 32U * static_cast<unsigned>(j)] = Epilogue::shared_add(acc[j], v[j]);
+    for (int j = 0; j < 4; ++j) o[b * 128 + lane + 32U * static_cast<unsigned>(j)] = Epilogue::shared_add(acc[j], v[j]);
 }
 
 // Dense prefill linears on the v4 core (enqueue_prefill_dense): the library input transform, row-major x -> tile-major
@@ -661,14 +615,12 @@ unsigned prefill_tile() {
     return t;
 }
 
-// Prefill WMMA core: 0 = the library port above (wmma_item), 1 / 2 / 3 = mmx_prefill_core.hpp v2 /
-// v3 / v4 (same bits). STRIX_MMX_PREFILL_CORE=v4 (default) | v3 | v2 | lib sets the process default; set_prefill_core
-// overrides it (tests, ABA).
-int g_core_override = -1;
+// The v4 WMMA core is the sole prefill core path.
 int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
 int g_pipe_pair_override = -1;
+int g_dense_band_override = -1;
 int g_tail_stream_override = -1;
 int g_gufuse_override = -1;
 int g_gather_tok_override = -1;
@@ -680,20 +632,6 @@ void* g_marker_user = nullptr;
 void mark(const char* label, hipStream_t stream) {
     if (g_marker != nullptr) g_marker(label, stream, g_marker_user);
 }
-unsigned prefill_core() {
-    if (g_core_override >= 0) return static_cast<unsigned>(g_core_override);
-    static const unsigned c = [] {
-        const char* e = std::getenv("STRIX_MMX_PREFILL_CORE");
-        // Default v4 (measurement: bitwise everywhere incl. every split partial; whole call 0.34-0.58x lib, 0.69-0.99x v3, 0.68-0.89x v2).
-        if (e == nullptr || std::string(e) == "v4") return 3U;
-        if (std::string(e) == "lib") return 0U;
-        if (std::string(e) == "v2") return 1U;
-        if (std::string(e) == "v3") return 2U;
-        throw std::invalid_argument("STRIX_MMX_PREFILL_CORE must be lib, v2, v3 or v4");
-    }();
-    return c;
-}
-
 bool prefill_mtfit_default() {
     static const bool on = [] {
         const char* e = std::getenv("STRIX_MMX_PREFILL_MTFIT");
@@ -748,6 +686,17 @@ bool prefill_pipe_pair(unsigned rows) {
     const int mode = g_pipe_pair_override < 0 ? prefill_pipe_pair_default() : g_pipe_pair_override;
     return mode == 1 || (mode == 2 && rows >= kPairMinRows);
 }
+// STRIX_MMX_PREFILL_DENSE_BAND (dense linears under PIPE): 0 (default) = MT8 PIPE CTAs, 4 / 8 = tall bands of that many
+// waves over 512 / 1024 rows (one weight decode per band); rows beyond the last full band keep PIPE / the tail. Same bits.
+int prefill_dense_band_default() {
+    static const int value = static_cast<int>(
+        4 * strix::env_choice("STRIX_MMX_PREFILL_DENSE_BAND", 0, {"0", "4", "8"}));  // 0 / 4 / 8
+    return value;
+}
+unsigned prefill_dense_band() {
+    if (prefill_pipe() == 0) return 0;
+    return static_cast<unsigned>(g_dense_band_override < 0 ? prefill_dense_band_default() : g_dense_band_override);
+}
 
 // STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
 // stream beside the MT8 launch, joined before the stage's consumer; 0 = every class launch on the caller's stream.
@@ -792,12 +741,11 @@ struct V2Items {
     std::vector<pfk::Item> gu[8], dn[8], fused[8];
     unsigned gu_ctas[8] = {}, dn_ctas[8] = {}, fused_ctas[8] = {};
 };
-V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, bool gufuse) {
+V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool mtfit, bool gufuse) {
     V2Items v;
     auto* xt = reinterpret_cast<_Float16*>(ws + p.off_xt);
     auto* at = reinterpret_cast<_Float16*>(ws + p.off_at);
     auto* part = reinterpret_cast<float*>(ws + p.off_part);
-    const std::size_t P = p.pair_row.size();
     for (const PGroup& g : p.groups) {
         const unsigned cls = pfk::mt_class(g.n), tm = 16U * pfk::mt_of_class(cls);
         const bool fuse = gufuse && g.s_gu == 1;
@@ -820,20 +768,19 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
                     lists[c].push_back(up);
                 }
             };
-            if (tiled && mtfit) {
+            if (mtfit) {
                 const auto fit = route::mtfit(g.n);
                 if (fit.main != 0) emit(7, 0, fit.main);
                 if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
             } else {
-                emit(tiled ? pfk::mt_of_class(cls) - 1 : cls, 0, (g.n + tm - 1) / tm);
+                emit(pfk::mt_of_class(cls) - 1, 0, (g.n + tm - 1) / tm);
             }
         };
         for (unsigned m = 0; m < (fuse ? 1U : 2U); ++m) {
             const Exl3& w = m == 0 ? g.w.gate : g.w.up;
             pfk::Item it{};
             it.trellis = w.trellis;
-            it.x = tiled ? xt + (static_cast<std::size_t>(m) * p.tpairs + g.tbegin) * kHidden
-                         : xt + (static_cast<std::size_t>(m) * P + g.pair_begin) * kHidden;
+            it.x = xt + (static_cast<std::size_t>(m) * p.tpairs + g.tbegin) * kHidden;
             it.part = part + g.part_gu + static_cast<std::size_t>(m) * g.s_gu * g.n * kInter;
             it.input = kHidden;
             it.output = kInter;
@@ -845,7 +792,7 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
         }
         pfk::Item it{};
         it.trellis = g.w.down.trellis;
-        it.x = at + static_cast<std::size_t>(tiled ? g.tbegin : g.pair_begin) * kInter;
+        it.x = at + static_cast<std::size_t>(g.tbegin) * kInter;
         it.part = part + g.part_dn;
         it.input = kInter;
         it.output = kHidden;
@@ -919,56 +866,47 @@ void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
         hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
-template <int V>
+template <int W>
+void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
+    if (prefill_pipe() == 2)
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+    else if (prefill_p1_packed())
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, true>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+    else
+        hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
+}
+
 void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
-    if constexpr (V == 4) {
-        if (cls == 7 && prefill_pipe() != 0) {
-            const bool simplify = prefill_pipe() == 2;
-            if (prefill_p1_packed())
-                launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
-            else
-                launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
-            return;
-        }
-        if (cls == 7 && prefill_core8() != 0) {
-            if (prefill_core8() == 1)
-                hipLaunchKernelGGL((pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
-            else
-                hipLaunchKernelGGL((pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
-            return;
-        }
-        switch (cls) {
-            case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 2: hipLaunchKernelGGL((pfk::grouped_kernel<3, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 3: hipLaunchKernelGGL((pfk::grouped_kernel<4, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 4: hipLaunchKernelGGL((pfk::grouped_kernel<5, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 5: hipLaunchKernelGGL((pfk::grouped_kernel<6, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 6: hipLaunchKernelGGL((pfk::grouped_kernel<7, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-            case 7: hipLaunchKernelGGL((pfk::grouped_kernel<8, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        }
+    if (cls == 7 && prefill_pipe() != 0) {
+        const bool simplify = prefill_pipe() == 2;
+        if (prefill_p1_packed())
+            launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
+        else
+            launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
+        return;
+    }
+    if (cls == 7 && prefill_core8() != 0) {
+        if (prefill_core8() == 1)
+            hipLaunchKernelGGL((pfk::grouped_core8_kernel<1>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        else
+            hipLaunchKernelGGL((pfk::grouped_core8_kernel<2>), dim3(ctas), dim3(128), 0, stream, items_d, n);
         return;
     }
     switch (cls) {
-        case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 2: hipLaunchKernelGGL((pfk::grouped_kernel<4, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        default: hipLaunchKernelGGL((pfk::grouped_kernel<8, V>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 0: hipLaunchKernelGGL((pfk::grouped_kernel<1, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 1: hipLaunchKernelGGL((pfk::grouped_kernel<2, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 2: hipLaunchKernelGGL((pfk::grouped_kernel<3, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 3: hipLaunchKernelGGL((pfk::grouped_kernel<4, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 4: hipLaunchKernelGGL((pfk::grouped_kernel<5, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 5: hipLaunchKernelGGL((pfk::grouped_kernel<6, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 6: hipLaunchKernelGGL((pfk::grouped_kernel<7, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 7: hipLaunchKernelGGL((pfk::grouped_kernel<8, 4>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
-// core: 1 = v2, 2 = v3, 3 = v4, 8 / 9 = v3 diagnostics (no A loads / no decode); pair = this MoE call's paired MT8 PIPE bands
-void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, unsigned core, hipStream_t stream,
-               bool pair) {
+// pair = this MoE call's paired MT8 PIPE bands
+void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, hipStream_t stream, bool pair) {
     if (list.empty()) return;
-    const auto n = static_cast<unsigned>(list.size());
-    switch (core) {
-        case 1: launch_class<2>(items_d, n, ctas, cls, stream); break;
-        case 2: launch_class<3>(items_d, n, ctas, cls, stream); break;
-        case 3: launch_class<4>(items_d, n, ctas, cls, stream, pair); break;
-        case 8: launch_class<31>(items_d, n, ctas, cls, stream); break;
-        case 9: launch_class<32>(items_d, n, ctas, cls, stream); break;
-        default: throw std::invalid_argument("minimax prefill moe: unknown core " + std::to_string(core));
-    }
+    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair);
 }
 
 template <int MT>
@@ -1040,6 +978,666 @@ void fill_items(Plan& p, unsigned char* ws) {
     }
 }
 
+// ---------------------------------------------------------------- device plan (STRIX_MMX_PF_PLAN, default device)
+// The v4 + mtfit tables of make_plan / fill_items_v2 built on the GPU from the device routes by the shared planner
+// (moe_core/device_plan.hpp): no route download, host sync, host table build or table upload per MoE call. Groups are
+// not compacted (group x = expert x, shared = kExperts; an absent expert has n = 0 and no pairs or items), the
+// tile-major stride `tpairs` is the bound 5T + 15 x 129, and every (stage, class) item list has a fixed slot; the pair,
+// token, group-member and item contents are those of the host plan, so every CTA does the host CTA's work.
+namespace dp = ::strix::moe_core::device_plan;
+using Queue = dp::ItemQueue<pfk::Item>;
+// Group-wide plan (enqueue_prefill_moe_group): one call over the chunks of a prefill group. A row's bits depend on the
+// K split count of its item, and the adopted policy picks the splits from the rows an expert holds in the row's own
+// chunk. The group-wide plan therefore merges, per expert, the chunks' rows by split class: every (chunk, expert) row
+// set joins the group (expert, class of its chunk-local count), which runs with that class's splits. Rows keep their
+// per-chunk arithmetic (same splits, same K ranges, row-independent fragments) while an expert's weights are decoded
+// once for the group's rows of a class instead of once per chunk.
+constexpr unsigned kGwClasses = 5;
+constexpr unsigned kGwSplitGu[kGwClasses] = {1, 2, 4, 8, 16}, kGwSplitDn[kGwClasses] = {1, 1, 1, 2, 4};
+constexpr unsigned gw_class(unsigned n) { return n >= 97 ? 0U : n >= 49 ? 1U : n >= 17 ? 2U : n >= 9 ? 3U : 4U; }
+constexpr bool gw_classes_match_policy() {
+    for (unsigned n = 1; n <= 300; ++n)
+        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U})
+            if (route::gemm_splits(kHidden, kInter, bits, n) != kGwSplitGu[gw_class(n)] ||
+                route::gemm_splits(kInter, kHidden, bits, n) != kGwSplitDn[gw_class(n)])
+                return false;
+    return true;
+}
+static_assert(gw_classes_match_policy(), "group-wide split classes must follow route::gemm_splits");
+// C = split classes per expert: 1 = the per-chunk plan (129 groups), kGwClasses = the group-wide plan (641 groups).
+template <unsigned C> struct DevDims {
+    static constexpr unsigned kVirtual = C * kExperts, kGroups = kVirtual + 1;
+    static constexpr unsigned kGuSlot = 2 * kGroups, kDnSlot = kGroups;  // items per class: gate+up per group / down
+    static constexpr unsigned kItems = 8 * kGuSlot + 8 * kDnSlot;
+};
+constexpr unsigned kDevGroups = DevDims<1>::kGroups;
+constexpr unsigned kGuSlot = DevDims<1>::kGuSlot, kDnSlot = DevDims<1>::kDnSlot;
+struct DevMeta {  // [0..7] gate/up classes, [8..15] down classes
+    unsigned count[16], total[16];
+};
+struct DevOut {
+    PGroup* groups;
+    std::uint32_t* pair_row;
+    std::uint32_t* pair_group;
+    std::uint32_t* tok_pair;
+    float* tok_w;
+    pfk::Item* items;
+    DevMeta* meta;
+    const ExpertSlices* experts;  // device [kExperts]
+    ExpertSlices shared;
+    _Float16* xt;
+    _Float16* at;
+    float* part;
+    unsigned tpairs;
+    bool i4=false;
+    unsigned grid[16];  // the launch grid of every (stage, class): a bound of its CTAs (class_grids)
+    // Group-wide plan only: the chunks' router tables ([n][4] ids, then [n][4] weights, n = the chunk's rows) and the
+    // per-chunk expert counts [segments][128] of seg_count_kernel.
+    const std::uint32_t* seg_routes[kPrefillMoeSegments];
+    unsigned* seg_count;
+    unsigned seg_rows, segments;
+};
+template <unsigned C> struct DevPolicyT {
+    static constexpr unsigned kReal = ::strix::minimax::moe::opt::kExperts;
+    static constexpr unsigned kExperts = DevDims<C>::kVirtual, kGroups = DevDims<C>::kGroups, kTopK = kTopE, kRows = 256;
+    static constexpr unsigned kGuSlot = DevDims<C>::kGuSlot, kDnSlot = DevDims<C>::kDnSlot;
+    static constexpr bool kDropInvalid = false;  // keep 5T pairs: an invalid row plans experts 0..3 with weight 0
+    using Out = DevOut;
+    using A = dp::Args<DevPolicyT>;
+    // The token order of make_plan: the row's 4 (id, weight) in ascending id (a sorting network; the ids of a valid row
+    // are distinct, so the order is that of the insertion sort). `seg` = the row's chunk (0 for the per-chunk plan).
+    __device__ static bool load_real(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE], unsigned& seg) {
+        const std::uint32_t* ids = p.ids;
+        const float* weights = p.weights;
+        unsigned local = r;
+        seg = 0;
+        if constexpr (C > 1) {
+            seg = r / p.out.seg_rows;
+            local = r - seg * p.out.seg_rows;
+            const unsigned n = seg + 1U == p.out.segments ? p.rows - seg * p.out.seg_rows : p.out.seg_rows;
+            ids = p.out.seg_routes[seg];
+            weights = reinterpret_cast<const float*>(ids + std::size_t{n} * kTopE);
+        }
+#pragma unroll
+        for (unsigned k = 0; k < kTopE; ++k) {
+            e[k] = ids[std::size_t{local} * kTopE + k];
+            w[k] = weights[std::size_t{local} * kTopE + k];
+        }
+        auto cs = [&](unsigned i, unsigned j) {
+            if (e[i] > e[j]) {
+                const unsigned te = e[i];
+                e[i] = e[j];
+                e[j] = te;
+                const float tw = w[i];
+                w[i] = w[j];
+                w[j] = tw;
+            }
+        };
+        cs(0, 1);
+        cs(2, 3);
+        cs(0, 2);
+        cs(1, 3);
+        cs(1, 2);
+        return e[3] >= kReal || e[0] == e[1] || e[1] == e[2] || e[2] == e[3];
+    }
+    // Planner ids. Group-wide: expert e of a chunk plans as (class of the chunk's count of e) x 128 + e, in the row's
+    // real-id slot order (the combine order of the per-chunk plan). The fallback ids are mapped here as well, so
+    // fallback() below has nothing left to do.
+    __device__ static bool load(const A& p, unsigned r, unsigned (&e)[kTopE], float (&w)[kTopE]) {
+        unsigned seg = 0;
+        const bool bad = load_real(p, r, e, w, seg);
+        if constexpr (C > 1) {
+#pragma unroll
+            for (unsigned k = 0; k < kTopE; ++k) {
+                if (bad) e[k] = k, w[k] = 0.0F;
+                e[k] += gw_class(p.out.seg_count[seg * kReal + e[k]]) * kReal;
+            }
+        }
+        return bad;
+    }
+    __device__ static void fallback(unsigned (&e)[kTopE], float (&w)[kTopE]) {
+        if constexpr (C == 1) {
+#pragma unroll
+            for (unsigned k = 0; k < kTopE; ++k) e[k] = k, w[k] = 0.0F;
+        } else {
+            (void)e;
+            (void)w;
+        }
+    }
+    // The groups of make_plan and the v4 + mtfit items of fill_items_v2 (gufuse off), in their order: thread x sizes
+    // group x, exclusive scans over the groups (row tiles, partial floats, per-class item counts and CTAs), then
+    // thread x writes its group and items.
+    __device__ static void finish(const A& p, const unsigned* count, const unsigned* start) {
+        if(p.out.i4) {
+            const unsigned e=threadIdx.x;
+            if(e<kGroups) {
+                PGroup g{}; g.expert=e; g.n=count[e]; g.pair_begin=start[e];
+                g.w=e<kExperts ? p.out.experts[e % kReal] : p.out.shared;
+                p.out.groups[e]=g;
+                // Reuse the item arena for the library's device group list.
+                auto* tab=reinterpret_cast<unsigned*>(p.out.items);
+                tab[3*e]=e; tab[3*e+1]=start[e]; tab[3*e+2]=count[e];
+            }
+            return;
+        }
+        // Per group and stage (0 gate/up, 1 down): [stage] = its MT8 items, [2 + stage] = its tail items. In: the CTAs
+        // of the stage's items of that kind; after the scans: their CTA prefix (cta) and item prefix (slot) inside
+        // their class queue. A group's MT8 and tail items share class 7 when its remainder is 113..127 rows.
+        __shared__ unsigned cta[4][kGroups], slot[4][kGroups], tile_rows[kGroups + 1];
+        __shared__ unsigned char tail_cls[kGroups], has_main[kGroups];
+        __shared__ std::size_t floats[kGroups + 1];
+        const unsigned x = threadIdx.x;
+        const bool mine = x < kGroups;
+        const unsigned n = mine ? count[x] : 0U;
+        ExpertSlices w{};
+        unsigned s_gu = 0, s_dn = 0;
+        route::MtFit fit{};
+        if (mine) {
+            w = x < kExperts ? p.out.experts[x % kReal] : p.out.shared;
+            if (C > 1 && x < kExperts) {
+                s_gu = n ? kGwSplitGu[x / kReal] : 0U;
+                s_dn = n ? kGwSplitDn[x / kReal] : 0U;
+            } else {
+                s_gu = n ? route::gemm_splits(kHidden, kInter, w.gate.bits, n) : 0U;
+                s_dn = n ? route::gemm_splits(kInter, kHidden, w.down.bits, n) : 0U;
+            }
+            fit = route::mtfit(n);
+            tile_rows[x] = (n + 15U) / 16U * 16U;
+            floats[x] = 2 * static_cast<std::size_t>(s_gu) * n * kInter + static_cast<std::size_t>(s_dn) * n * kHidden;
+            // gate/up: 2 items per used class (gate, up); down: 1. gx = 12 / 48.
+            has_main[x] = fit.main != 0 ? 1 : 0;
+            tail_cls[x] = static_cast<unsigned char>(fit.remainder != 0 ? fit.tail_class : 255U);
+            cta[0][x] = 2 * (kInter / 128) * fit.main * s_gu;
+            cta[1][x] = (kHidden / 128) * fit.main * s_dn;
+            cta[2][x] = 2 * (kInter / 128) * s_gu;
+            cta[3][x] = (kHidden / 128) * s_dn;
+        }
+        __syncthreads();
+        // Exclusive scans down the groups: thread q = class queue q (stage q / 8, class q % 8).
+        if (x < 16) {
+            const unsigned st = x >> 3U, cls = x & 7U, per = st ? 1U : 2U;
+            unsigned c = 0, t = 0;
+            for (unsigned g = 0; g < kGroups; ++g) {
+                if (cls == 7U && has_main[g] != 0) {
+                    const unsigned d = cta[st][g];
+                    cta[st][g] = t;
+                    slot[st][g] = c;
+                    c += per;
+                    t += d;
+                }
+                if (tail_cls[g] == cls) {
+                    const unsigned d = cta[2U + st][g];
+                    cta[2U + st][g] = t;
+                    slot[2U + st][g] = c;
+                    c += per;
+                    t += d;
+                }
+            }
+            p.out.meta->count[x] = c;
+            p.out.meta->total[x] = t;
+            if (t > p.out.grid[x]) atomicOr(p.flag, 2U);  // above the launch grid (bug)
+        } else if (x == 16) {
+            unsigned t = 0;
+            for (unsigned g = 0; g <= kGroups; ++g) { const unsigned d = g < kGroups ? tile_rows[g] : 0U; tile_rows[g] = t; t += d; }
+        } else if (x == 17) {
+            std::size_t t = 0;
+            for (unsigned g = 0; g <= kGroups; ++g) { const std::size_t d = g < kGroups ? floats[g] : 0U; floats[g] = t; t += d; }
+        }
+        __syncthreads();
+        if (mine) {
+            PGroup g{};
+            g.w = w;
+            g.n = n;
+            g.pair_begin = start[x];
+            g.tbegin = tile_rows[x];
+            g.s_gu = s_gu;
+            g.s_dn = s_dn;
+            g.part_gu = floats[x];
+            g.part_dn = floats[x] + 2 * static_cast<std::size_t>(s_gu) * n * kInter;
+            p.out.groups[x] = g;
+            if (n != 0) {
+                // Matrix m of a stage; a queue holds a group's items as gate main, gate tail, up main, up tail.
+                const bool both = fit.main != 0 && fit.remainder != 0 && fit.tail_class == 7U;
+                auto append = [&](pfk::Item it, unsigned stage, unsigned m) {
+                    const unsigned main_ctas = it.gx * fit.main * it.splits, tail_ctas = it.gx * it.splits;
+                    auto emit = [&](unsigned c, unsigned row0, unsigned gy, unsigned at, unsigned cta_begin) {
+                        it.row0 = row0;
+                        it.gy = gy;
+                        it.cta_begin = cta_begin;
+                        p.out.items[(stage ? 8U * kGuSlot + c * kDnSlot : c * kGuSlot) + at] = it;
+                    };
+                    if (fit.main != 0)
+                        emit(7, 0, fit.main, slot[stage][x] + m * (both ? 2U : 1U),
+                             cta[stage][x] + m * (main_ctas + (both ? tail_ctas : 0U)));
+                    if (fit.remainder != 0) {
+                        if (both)
+                            emit(7, fit.main * 128, 1, slot[stage][x] + 1U + 2U * m,
+                                 cta[stage][x] + main_ctas + m * (main_ctas + tail_ctas));
+                        else
+                            emit(fit.tail_class, fit.main * 128, 1, slot[2U + stage][x] + m, cta[2U + stage][x] + m * tail_ctas);
+                    }
+                };
+                for (unsigned m = 0; m < 2U; ++m) {
+                    const Exl3& mw = m == 0 ? w.gate : w.up;
+                    pfk::Item it{};
+                    it.trellis = mw.trellis;
+                    it.x = p.out.xt + (static_cast<std::size_t>(m) * p.out.tpairs + g.tbegin) * kHidden;
+                    it.part = p.out.part + g.part_gu + static_cast<std::size_t>(m) * s_gu * n * kInter;
+                    it.input = kHidden;
+                    it.output = kInter;
+                    it.bits = mw.bits;
+                    it.rows = n;
+                    it.splits = s_gu;
+                    it.gx = kInter / 128;
+                    append(it, 0, m);
+                }
+                pfk::Item it{};
+                it.trellis = w.down.trellis;
+                it.x = p.out.at + static_cast<std::size_t>(g.tbegin) * kInter;
+                it.part = p.out.part + g.part_dn;
+                it.input = kInter;
+                it.output = kHidden;
+                it.bits = w.down.bits;
+                it.rows = n;
+                it.splits = s_dn;
+                it.gx = kHidden / 128;
+                append(it, 1, 0);
+            }
+        }
+    }
+    __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned e, float w, unsigned pos) {
+        p.out.pair_row[pos] = r;
+        p.out.pair_group[pos] = e;
+        p.out.tok_pair[std::size_t{r} * kTopE + k] = pos;
+        p.out.tok_w[std::size_t{r} * kTopE + k] = w;
+    }
+    __device__ static void shared(const A& p, unsigned r, unsigned pos) {
+        p.out.pair_row[pos] = r;
+        p.out.pair_group[pos] = kExperts;
+    }
+};
+static_assert(DevDims<1>::kItems == 24U * DevDims<1>::kGroups && DevDims<kGwClasses>::kItems == 24U * DevDims<kGwClasses>::kGroups);
+using DevPolicy = DevPolicyT<1>;
+using GwPolicy = DevPolicyT<kGwClasses>;
+
+// Per-chunk expert counts of the group-wide plan: [segments][128], zeroed by the caller. One thread per row.
+__global__ __launch_bounds__(256) void seg_count_kernel(dp::Args<GwPolicy> p) {
+    const unsigned r = blockIdx.x * 256U + threadIdx.x;
+    if (r >= p.rows) return;
+    unsigned e[kTopE], seg = 0;
+    float w[kTopE];
+    const bool bad = GwPolicy::load_real(p, r, e, w, seg);
+#pragma unroll
+    for (unsigned k = 0; k < kTopE; ++k) atomicAdd(&p.out.seg_count[seg * GwPolicy::kReal + (bad ? k : e[k])], 1U);
+}
+
+// Device-plan workspace of a T-row call (a function of T only).
+struct DevLayout {
+    unsigned tpairs = 0;
+    std::size_t groups = 0, pair_row = 0, pair_group = 0, tok_pair = 0, tok_w = 0, items = 0, meta = 0, scratch = 0, xt = 0,
+                at = 0, part = 0, bytes = 0, seg_count = 0;
+};
+// Partial floats of any routes of T rows: the sum over the 129 groups of 2 s_gu(n) n 1536 + s_dn(n) n 6144 is at most
+// 5T c + 129 max_n (f(n) - c n), c = 2 x 1536 + 6144 (the splits are 1 for large n). Bits do not enter the policy at
+// these shapes; the bound still takes the maximum over them.
+std::size_t dev_part_floats(unsigned T, unsigned groups = kDevGroups) {
+    static unsigned cached_t = 0, cached_groups = 0;
+    static std::size_t cached = 0;
+    if (cached_t == T && cached_groups == groups) return cached;
+    constexpr std::size_t c = 2ULL * kInter + kHidden;
+    std::size_t extra = 0;
+    for (unsigned n = 1; n <= T; ++n)
+        for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+            const std::size_t f = 2ULL * route::gemm_splits(kHidden, kInter, bits, n) * n * kInter +
+                                  std::size_t{route::gemm_splits(kInter, kHidden, bits, n)} * n * kHidden;
+            if (f > c * n) extra = std::max(extra, f - c * n);
+        }
+    cached = 5ULL * T * c + std::size_t{groups} * extra;
+    cached_t = T;
+    cached_groups = groups;
+    return cached;
+}
+// classes = 1: the per-chunk plan; kGwClasses: the group-wide plan (641 groups, their item queues and seg_count).
+DevLayout dev_layout(unsigned T,bool i4=false,unsigned classes=1) {
+    DevLayout l;
+    const unsigned groups = classes * kExperts + 1U;
+    l.tpairs = (5U * T + 15U * groups + 15U) / 16U * 16U;
+    std::size_t off = 0;
+    auto take = [&](std::size_t bytes) {
+        const std::size_t at = off;
+        off += align256(bytes);
+        return at;
+    };
+    l.groups = take(groups * sizeof(PGroup));
+    l.pair_row = take(5ULL * T * 4);
+    l.pair_group = take(5ULL * T * 4);
+    l.tok_pair = take(4ULL * T * 4);
+    l.tok_w = take(4ULL * T * 4);
+    l.items = take(std::size_t{24U * groups} * sizeof(pfk::Item));
+    l.meta = take(sizeof(DevMeta));
+    l.scratch = take(classes == 1 ? dp::scratch_bytes<DevPolicy>(T) : dp::scratch_bytes<GwPolicy>(T));
+    if (classes != 1) l.seg_count = take(std::size_t{kPrefillMoeSegments} * kExperts * sizeof(unsigned));
+    if(i4) {
+        l.xt=off;
+        // Largest tile list (BM32), count word, the global down operand (A4 + FP32 scales) and the
+        // FP32 down rows of the ordered (deterministic) combine, then the gate/up A4 image
+        // (row 2*pair+m, quantised once by the pre-pass) with its FP32 scales.
+        take(align256(((5ULL*T+31)/32+kDevGroups)*12)+256+
+             align256(5ULL*T*(kInter/2))+align256(5ULL*T*(kInter/64)*4)+align256(5ULL*T*kHidden*4)+
+             align256(2ULL*5ULL*T*(kHidden/2))+align256(2ULL*5ULL*T*(kHidden/64)*4)+
+             (strix::core::moe_i4::gsave_enabled() ? align256(5ULL*T*kInter*4) : 0));  // GSave: FP32 pass-0 gate of the paired chain GEMM
+        l.bytes=off;
+        return l;
+    }
+    l.xt = take(2ULL * l.tpairs * kHidden * 2);
+    l.at = take(std::size_t{l.tpairs} * kInter * 2);
+    l.part = take(dev_part_floats(T, groups) * 4);
+    l.bytes = off;
+    return l;
+}
+
+unsigned* g_dev_flag = nullptr;  // sticky invalid-route flag of device-planned calls (prefill_moe_device_check)
+unsigned* dev_flag() {
+    if (g_dev_flag == nullptr) {
+        unsigned* f = nullptr;
+        ok(hipMalloc(reinterpret_cast<void**>(&f), sizeof(unsigned)), "device plan flag");
+        if (hipMemset(f, 0, sizeof(unsigned)) != hipSuccess) {
+            (void)hipFree(f);
+            throw std::runtime_error("minimax prefill moe: device plan flag init");
+        }
+        g_dev_flag = f;
+    }
+    return g_dev_flag;
+}
+
+#define STRIX_MMX_BITS_SWITCH(CALL) \
+    switch (it.bits) {              \
+        case 3: CALL(3); break;     \
+        case 4: CALL(4); break;     \
+        case 5: CALL(5); break;     \
+        case 6: CALL(6); break;     \
+        default: CALL(8); break;    \
+    }
+// grouped_kernel<MT, 4> (tail classes MT 1..7, and MT8 without PIPE / core8).
+template <int MT> __global__ __launch_bounds__(128) void dq_v4_kernel(Queue q) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::item_core_v3<B, MT, 0, true>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
+    __shared__ pfk::Half16 exchange[128];  // as grouped_pipe_pair_kernel
+    dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed>(it, bx, by, bz, exchange)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queue q) {
+    __shared__ pfk::Half16 exchange[256];  // as grouped_core8_kernel
+    dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::item_core8<B, Core8>(it, bx, by, bz, exchange)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+#undef STRIX_MMX_BITS_SWITCH
+
+void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t stream, bool pair) {
+    const dim3 g(grid);
+    switch (cls) {
+        case 0: hipLaunchKernelGGL(dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
+        case 1: hipLaunchKernelGGL(dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
+        case 2: hipLaunchKernelGGL(dq_v4_kernel<3>, g, dim3(128), 0, stream, q); return;
+        case 3: hipLaunchKernelGGL(dq_v4_kernel<4>, g, dim3(128), 0, stream, q); return;
+        case 4: hipLaunchKernelGGL(dq_v4_kernel<5>, g, dim3(128), 0, stream, q); return;
+        case 5: hipLaunchKernelGGL(dq_v4_kernel<6>, g, dim3(128), 0, stream, q); return;
+        case 6: hipLaunchKernelGGL(dq_v4_kernel<7>, g, dim3(128), 0, stream, q); return;
+        default: break;
+    }
+    // Class 7: the kernel that launch_class<4> selects, from the same switches.
+    if (prefill_pipe() != 0) {
+        const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
+        if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false>), g, dim3(128), 0, stream, q);
+        else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true>), g, dim3(128), 0, stream, q);
+        else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false>), g, dim3(128), 0, stream, q);
+        else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false>), g, dim3(128), 0, stream, q);
+        else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true>), g, dim3(128), 0, stream, q);
+        else hipLaunchKernelGGL((dq_pipe_kernel<false, false>), g, dim3(128), 0, stream, q);
+        return;
+    }
+    if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
+    else if (prefill_core8() == 2) hipLaunchKernelGGL((dq_core8_kernel<2>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_v4_kernel<8>), g, dim3(128), 0, stream, q);
+}
+// CTA bound of every (stage, class) for any routes of T rows: the launch grids (surplus CTAs return at once).
+// MT8: an MT8 item is the 128-row tiles of a group (floor(n / 128)) or its remainder when that is >= 113 rows, both with
+// splits 1 (n >= 113); floor(n / 128) + [n % 128 >= 113] <= n / 113 and the groups hold 5T rows, so these items have at
+// most gx x matrices x floor(5T / 113) CTAs. Tail items of class c: at most one per matrix and group, so 129 groups x
+// gx x matrices x the largest split count of a group size whose remainder falls in class c.
+// Group-wide plan (classes > 1, `segs` chunks): a group (expert, class k) holds at most segs x (the class's largest
+// chunk count) rows and runs with the class's splits; class 0 and the shared expert keep the bound above.
+std::array<unsigned, 16> class_grids(unsigned T, unsigned classes = 1, unsigned segs = 1) {
+    static unsigned cached_t = 0, cached_classes = 0, cached_segs = 0;
+    static std::array<unsigned, 16> cached{};
+    if (cached_t == T && cached_classes == classes && cached_segs == segs) return cached;
+    std::array<unsigned, 16> g{};
+    const unsigned tiles = std::max(1U, 5U * T / 113U);
+    if (classes == 1) {
+        for (unsigned n = 1; n <= T; ++n) {
+            const auto fit = route::mtfit(n);
+            if (fit.remainder == 0) continue;
+            for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+                g[fit.tail_class] = std::max(g[fit.tail_class], 2U * (kInter / 128) * route::gemm_splits(kHidden, kInter, bits, n));
+                g[8 + fit.tail_class] = std::max(g[8 + fit.tail_class], (kHidden / 128) * route::gemm_splits(kInter, kHidden, bits, n));
+            }
+        }
+        for (unsigned c = 0; c < 16; ++c) g[c] *= kDevGroups;
+        g[7] += 2U * (kInter / 128) * tiles;
+        g[15] += (kHidden / 128) * tiles;
+    } else {
+        constexpr unsigned kChunkMax[kGwClasses] = {0, 96, 48, 16, 8};  // largest chunk count of a class (0: unbounded)
+        for (unsigned k = 0; k < kGwClasses; ++k) {
+            const unsigned nmax = k == 0 ? T : std::min(T, segs * kChunkMax[k]);
+            bool tail[8] = {};
+            for (unsigned n = 1; n <= nmax; ++n) {
+                const auto fit = route::mtfit(n);
+                if (fit.remainder != 0) tail[fit.tail_class] = true;
+            }
+            const unsigned groups = kExperts + (k == 0 ? 1U : 0U);  // class 0 also bounds the shared expert's tail
+            for (unsigned c = 0; c < 8; ++c) {
+                if (!tail[c]) continue;
+                g[c] += groups * 2U * (kInter / 128) * kGwSplitGu[k];
+                g[8 + c] += groups * (kHidden / 128) * kGwSplitDn[k];
+            }
+            const unsigned main = k == 0 ? tiles : std::min(tiles, kExperts * (nmax / 128U));
+            g[7] += 2U * (kInter / 128) * main * kGwSplitGu[k];
+            g[15] += (kHidden / 128) * main * kGwSplitDn[k];
+        }
+    }
+    for (auto& v : g) v = std::max(v, 1U);
+    cached = g;
+    cached_t = T;
+    cached_classes = classes;
+    cached_segs = segs;
+    return cached;
+}
+
+#if STRIX_MMX_IU4_LIB
+void launch_i4_chain(const Tables&,const I4Layer&,const float*,float*,const strix::core::IU4Group*,unsigned char*,std::size_t,hipStream_t,bool);
+#endif
+// The launches of a device-planned call over its tables: gather, gate/up classes, finish, down classes, combine.
+// The class queues hold gu_slot / dn_slot items (DevDims of the plan).
+void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Item* items, DevMeta* meta,
+                           const std::array<unsigned, 16>& grids, unsigned gu_slot, unsigned dn_slot, bool token_gather,
+                           hipStream_t stream) {
+    const unsigned T = t.rows;
+    if (token_gather) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    launched("gather transform");
+    mark("gather", stream);
+    const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
+        auto queue = [&](unsigned stage, unsigned c) {
+        const unsigned qi = stage * 8U + c;
+        return Queue{items + (stage ? 8U * gu_slot + c * dn_slot : c * gu_slot), &meta->count[qi], &meta->total[qi]};
+    };
+    // As the stage() of enqueue_prefill_moe: tails (MT 1..7) on the side stream beside MT8, joined before the consumer.
+    auto stage = [&](unsigned s, const char* const* labels) {
+        if (side) tail_fork(stream);
+        try {
+            for (unsigned c = 0; c < 7; ++c) {
+                launch_dq_class(queue(s, c), c, grids[s * 8U + c], side ? g_tail_side : stream, pair);
+                if (!side) mark(labels[c], stream);
+            }
+            launch_dq_class(queue(s, 7), 7, grids[s * 8U + 7], stream, pair);
+            mark(labels[7], stream);
+        } catch (...) {
+            if (side) tail_join(stream);
+            throw;
+        }
+        if (side) {
+            tail_join(stream);
+            mark(labels[6], stream);
+        }
+    };
+    stage(0, kGuLabel);
+    launched("gate/up device plan");
+    hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, false, g_gufuse_intermediates);
+    launched("gate/up finish");
+    mark("finish", stream);
+    stage(1, kDnLabel);
+    launched("down device plan");
+    hipLaunchKernelGGL(down_combine_kernel, dim3((T * kHB + 7) / 8), dim3(256), 0, stream, t, out);
+    launched("down combine");
+    mark("combine", stream);
+}
+
+void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    const unsigned T = v.rows;
+    if (T == 0 || v.y == nullptr || v.routes == nullptr || v.experts == nullptr || v.out == nullptr)
+        throw std::invalid_argument("minimax prefill moe: invalid device view");
+    const DevLayout l = dev_layout(T,v.i4!=nullptr);
+    if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
+    auto* ws = static_cast<unsigned char*>(workspace);
+    dp::Args<DevPolicy> a{};
+    a.rows = T;
+    a.ids = v.routes;
+    a.weights = reinterpret_cast<const float*>(v.routes + std::size_t{T} * kTopE);
+    dp::bind_scratch(a, ws + l.scratch, T);
+    a.flag = dev_flag();
+    a.out.groups = reinterpret_cast<PGroup*>(ws + l.groups);
+    a.out.pair_row = reinterpret_cast<std::uint32_t*>(ws + l.pair_row);
+    a.out.pair_group = reinterpret_cast<std::uint32_t*>(ws + l.pair_group);
+    a.out.tok_pair = reinterpret_cast<std::uint32_t*>(ws + l.tok_pair);
+    a.out.tok_w = reinterpret_cast<float*>(ws + l.tok_w);
+    a.out.items = reinterpret_cast<pfk::Item*>(ws + l.items);
+    a.out.meta = reinterpret_cast<DevMeta*>(ws + l.meta);
+    a.out.experts = v.experts;
+    a.out.shared = v.shared;
+    a.out.i4 = v.i4 != nullptr;
+    a.out.xt = reinterpret_cast<_Float16*>(ws + l.xt);
+    a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
+    a.out.part = reinterpret_cast<float*>(ws + l.part);
+    a.out.tpairs = l.tpairs;
+    const auto grids = class_grids(T);
+    for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
+    mark("start", stream);
+    ok(dp::enqueue(a, stream), "device plan");
+    Tables t{};
+    t.groups = a.out.groups;
+    t.pair_row = a.out.pair_row;
+    t.pair_group = a.out.pair_group;
+    t.tok_pair = a.out.tok_pair;
+    t.tok_w = a.out.tok_w;
+    t.xt = a.out.xt;
+    t.at = a.out.at;
+    t.part = a.out.part;
+    t.pairs = 5U * T;
+    t.rows = T;
+    t.shared_group = kExperts;
+    t.tpairs = l.tpairs;
+    // The device planner historically ignores the environment fakeq switch.
+    // Only an explicit per-call override changes its arithmetic.
+    t.fakeq = v.i4 == nullptr && v.fakeq_a4 == PrefillFakeq::on ? 1U : 0U;
+#if STRIX_MMX_IU4_LIB
+    if(v.i4) {
+        if(!v.i4_all || !v.i4_chain) throw std::invalid_argument("device i4 needs the all-scope candidate chain");
+        launch_i4_chain(t,*v.i4,v.y,v.out,reinterpret_cast<const strix::core::IU4Group*>(a.out.items),
+            ws+l.xt,workspace_bytes-l.xt,stream,true);
+        return;
+    }
+#endif
+    launch_device_planned(t, v.y, v.out, a.out.items, a.out.meta, grids, kGuSlot, kDnSlot,
+                          v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok(), stream);
+}
+
+// Group-wide call: seg_count -> the planner over all rows with the split-class policy -> the same launches.
+void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    const unsigned T = v.rows, S = v.segments;
+    if (S == 0 || S > kPrefillMoeSegments || v.seg_rows == 0 || T <= (S - 1U) * v.seg_rows || T > S * v.seg_rows ||
+        T - (S - 1U) * v.seg_rows < prefill_moe_group_min_rows() || v.experts == nullptr)
+        throw std::invalid_argument("minimax prefill moe: invalid group view");
+    for (unsigned c = 0; c < S; ++c)
+        if (v.y[c] == nullptr || v.routes[c] == nullptr || v.out[c] == nullptr)
+            throw std::invalid_argument("minimax prefill moe: invalid group view");
+    const DevLayout l = dev_layout(T, false, kGwClasses);
+    if (workspace == nullptr || workspace_bytes < l.bytes) throw std::invalid_argument("minimax prefill moe: workspace too small");
+    auto* ws = static_cast<unsigned char*>(workspace);
+    dp::Args<GwPolicy> a{};
+    a.rows = T;
+    dp::bind_scratch(a, ws + l.scratch, T);
+    a.flag = dev_flag();
+    a.out.groups = reinterpret_cast<PGroup*>(ws + l.groups);
+    a.out.pair_row = reinterpret_cast<std::uint32_t*>(ws + l.pair_row);
+    a.out.pair_group = reinterpret_cast<std::uint32_t*>(ws + l.pair_group);
+    a.out.tok_pair = reinterpret_cast<std::uint32_t*>(ws + l.tok_pair);
+    a.out.tok_w = reinterpret_cast<float*>(ws + l.tok_w);
+    a.out.items = reinterpret_cast<pfk::Item*>(ws + l.items);
+    a.out.meta = reinterpret_cast<DevMeta*>(ws + l.meta);
+    a.out.experts = v.experts;
+    a.out.shared = v.shared;
+    a.out.xt = reinterpret_cast<_Float16*>(ws + l.xt);
+    a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
+    a.out.part = reinterpret_cast<float*>(ws + l.part);
+    a.out.tpairs = l.tpairs;
+    a.out.seg_count = reinterpret_cast<unsigned*>(ws + l.seg_count);
+    a.out.seg_rows = v.seg_rows;
+    a.out.segments = S;
+    for (unsigned c = 0; c < S; ++c) a.out.seg_routes[c] = v.routes[c];
+    const auto grids = class_grids(T, kGwClasses, S);
+    for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
+    mark("start", stream);
+    ok(hipMemsetAsync(a.out.seg_count, 0, std::size_t{kPrefillMoeSegments} * kExperts * sizeof(unsigned), stream), "group counts");
+    hipLaunchKernelGGL(seg_count_kernel, dim3((T + 255U) / 256U), dim3(256), 0, stream, a);
+    launched("group counts");
+    ok(dp::enqueue(a, stream), "device plan");
+    Tables t{};
+    t.groups = a.out.groups;
+    t.pair_row = a.out.pair_row;
+    t.pair_group = a.out.pair_group;
+    t.tok_pair = a.out.tok_pair;
+    t.tok_w = a.out.tok_w;
+    t.xt = a.out.xt;
+    t.at = a.out.at;
+    t.part = a.out.part;
+    t.pairs = 5U * T;
+    t.rows = T;
+    t.shared_group = GwPolicy::kExperts;
+    t.tpairs = l.tpairs;
+    t.seg_rows = v.seg_rows;
+    for (unsigned c = 0; c < S; ++c) t.seg_y[c] = v.y[c], t.seg_out[c] = v.out[c];
+    launch_device_planned(t, nullptr, nullptr, a.out.items, a.out.meta, grids, GwPolicy::kGuSlot, GwPolicy::kDnSlot,
+                          prefill_gather_tok(), stream);
+}
+
 }  // namespace
 
 void set_prefill_table_ring(int on) {
@@ -1063,10 +1661,6 @@ void cleanup_prefill_table_ring() noexcept {
     g_table_next = 0;
 }
 
-void set_prefill_core(int core) {  // exact cores only
-    if (core < -1 || core > 3) throw std::invalid_argument("set_prefill_core: core must be -1, 0, 1, 2 or 3");
-    g_core_override = core;
-}
 void set_prefill_mtfit(int on) {
     if (on < -1 || on > 1) throw std::invalid_argument("set_prefill_mtfit: value must be -1, 0 or 1");
     (void)prefill_mtfit_default();  // capture the environment once, including at Engine startup
@@ -1077,6 +1671,12 @@ void set_prefill_pipe_pair(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe_pair: value must be -1, 0, 1 or 2 (auto)");
     (void)prefill_pipe_pair_default();  // capture once, including at Engine startup
     g_pipe_pair_override = value;
+}
+void set_prefill_dense_band(int value) {
+    if (value != -1 && value != 0 && value != 4 && value != 8)
+        throw std::invalid_argument("set_prefill_dense_band: value must be -1, 0, 4 or 8");
+    (void)prefill_dense_band_default();  // capture once, including at Engine startup
+    g_dense_band_override = value;
 }
 void set_prefill_pipe(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe: value must be -1, 0, 1 or 2");
@@ -1117,10 +1717,6 @@ void set_prefill_gufuse_debug(bool on, float* intermediates, bool producer_only)
     g_gufuse_intermediates = intermediates;
     g_gufuse_producer_only = producer_only;
 }
-void set_prefill_diagnostic_core(int core) {  // bench only: wrong outputs by design
-    if (core != 8 && core != 9) throw std::invalid_argument("set_prefill_diagnostic_core: core must be 8 or 9");
-    g_core_override = core;
-}
 void set_prefill_marker(PrefillMarker marker, void* user) {
     g_marker = marker;
     g_marker_user = user;
@@ -1153,7 +1749,58 @@ std::size_t prefill_moe_workspace_bound(std::uint32_t rows) {
     const std::size_t PX = P + 15ULL * groups;  // v4 pads every group to 16 rows
     b += align256(2 * PX * kHidden * 2) + align256(PX * kInter * 2);
     b += align256((groups * 128 + P) * (2ULL * kInter + kHidden) * 4);
-    return b;
+    return std::max(b, dev_layout(rows).bytes);  // the device plan's fixed layout (prefill_moe_device_plan)
+}
+
+std::size_t prefill_i4_workspace_bound(std::uint32_t rows) { return dev_layout(rows,true).bytes; }
+
+bool prefill_i4_chain(std::size_t) {
+#if STRIX_MMX_IU4_LIB
+    return strix::core::moe_i4::enabled(true);  // FAST_I4 scope all; same bits as unfused
+#else
+    return false;
+#endif
+}
+
+bool prefill_moe_device_plan(std::uint32_t rows) {
+    static const bool device = [] {
+        const char* e = std::getenv("STRIX_MMX_PF_PLAN");
+        if (e == nullptr || std::string(e) == "device") return true;
+        if (std::string(e) == "host") return false;
+        throw std::invalid_argument("STRIX_MMX_PF_PLAN must be device or host");
+    }();
+    return device && rows > 0 && prefill_mtfit() && !(rows > 8 && prefill_gufuse());
+}
+
+void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
+                                hipStream_t stream) {
+    if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_device_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, v.i4 != nullptr ? strix::route::Family::iu4 : strix::route::Family::exact, v.rows);
+}
+
+unsigned prefill_moe_group_min_rows() { return 97; }  // every chunk's shared expert (and class 0) at splits 1
+std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows) { return dev_layout(rows, false, kGwClasses).bytes; }
+void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream) {
+    if (!prefill_moe_device_plan(v.rows)) throw std::invalid_argument("minimax prefill moe: device plan not selected for this call");
+    enqueue_group_moe(v, workspace, workspace_bytes, stream);
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // group-wide calls are EXL3 only
+}
+
+void prefill_moe_device_check() {
+    if (g_dev_flag == nullptr) return;
+    unsigned flag = 0;
+    ok(hipMemcpy(&flag, g_dev_flag, sizeof(flag), hipMemcpyDeviceToHost), "device plan flag read");
+    if (flag != 0) {
+        ok(hipMemset(g_dev_flag, 0, sizeof(unsigned)), "device plan flag reset");
+        throw std::runtime_error(flag & 2U ? "minimax prefill moe: device plan class above its grid bound (bug)"
+                                            : "minimax prefill moe: device plan saw invalid routes (expert id >= 128 or repeated in a row)");
+    }
+}
+
+void cleanup_prefill_device_plan() noexcept {
+    if (g_dev_flag != nullptr) (void)hipFree(g_dev_flag);
+    g_dev_flag = nullptr;
 }
 
 #include "minimax/moe/mmx_prefill_iu4.inc"
@@ -1164,10 +1811,8 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     auto* ws = static_cast<unsigned char*>(workspace);
     const bool i4 = v.i4 != nullptr && v.i4->on();
     if (i4 && !iu4_built()) throw std::invalid_argument("minimax prefill moe: fast_i4 layer but no IU4 core in this build");
-    const unsigned core = i4 ? 3U : prefill_core();
-    const bool pair = core == 3 && prefill_pipe_pair(v.rows);
-    const bool gufuse = core == 3 && v.rows > 8 && prefill_gufuse();
-    const bool v2 = core != 0;  // the grouped v2 item layout (v2, v3 and the v3 diagnostics)
+    const bool pair = prefill_pipe_pair(v.rows);
+    const bool gufuse = v.rows > 8 && prefill_gufuse();
     V2Items v2i;
     std::vector<WItem> items;
     std::vector<pfk::Item> items2;  // gate/up classes, then down classes (same table region)
@@ -1181,17 +1826,11 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             items = p.dn_items16;
             items.insert(items.end(), p.dn_items64.begin(), p.dn_items64.end());
         }
-    } else if (v2) {
-        v2i = fill_items_v2(p, ws, core == 3, core == 3 && prefill_mtfit(), gufuse);
+    } else {
+        v2i = fill_items_v2(p, ws, prefill_mtfit(), gufuse);
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.gu[c].begin(), v2i.gu[c].end());
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.fused[c].begin(), v2i.fused[c].end());
         for (unsigned c = 0; c < 8; ++c) items2.insert(items2.end(), v2i.dn[c].begin(), v2i.dn[c].end());
-    } else {
-        fill_items(p, ws);
-        // Tables: groups, pairs, tokens, items (gate/up, then down tile 16, then down tile 64).
-        items = p.gu_items;
-        items.insert(items.end(), p.dn_items16.begin(), p.dn_items16.end());
-        items.insert(items.end(), p.dn_items64.begin(), p.dn_items64.end());
     }
     TableSlot* slot = table_ring() ? &next_table_slot(v.rows, i4 && !v.i4_all ? kI4GroupTableBytes : 0U) : nullptr;
     if (slot != nullptr && p.off_xt > slot->capacity) throw std::runtime_error("minimax prefill moe: table bound exceeded");
@@ -1214,8 +1853,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             copy(p.off_i4_groups, i4_groups.data(), i4_groups.size() * sizeof(i4_groups[0]), "iu4 groups");
             if (!v.i4_all) copy(p.off_items, items.data(), items.size() * sizeof(WItem), "iu4 EXL3 down items");
         }
-        else if (v2) copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
-        else copy(p.off_items, items.data(), items.size() * sizeof(WItem), "items");
+        else copy(p.off_items, items2.data(), items2.size() * sizeof(pfk::Item), "items");
         if (slot != nullptr) {
             ok(hipEventRecord(slot->copied, stream), "table copies event");
             slot->pending = true;
@@ -1240,29 +1878,34 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     t.rows = v.rows;
     t.shared_group = static_cast<unsigned>(p.groups.size() - 1);
     t.tpairs = p.tpairs;
-    t.fakeq = !i4 && core == 3 && prefill_fakeq_a4() ? 1U : 0U;
+    t.fakeq = !i4 && (v.fakeq_a4 == PrefillFakeq::on ||
+                     (v.fakeq_a4 == PrefillFakeq::environment && prefill_fakeq_a4())) ? 1U : 0U;
 #if STRIX_MMX_IU4_LIB
     if (i4) {
         mark("start", stream);
         launch_iu4(p, t, v, ws, workspace_bytes, stream);
+        // Shared route receipt: scope gate_up keeps the EXL3 down projection.
+        if (v.i4_all) strix::route::launched(strix::route::Product::moe, strix::route::Family::iu4, v.rows);
+        else {
+            strix::route::launched(strix::route::Product::moe_gate_up, strix::route::Family::iu4, v.rows);
+            strix::route::launched(strix::route::Product::moe_down, strix::route::Family::exact, v.rows);
+        }
         return;
     }
 #endif
-    const bool tiled = core == 3;
-    const auto* items_d = reinterpret_cast<const WItem*>(ws + p.off_items);
-    const auto n_gu = static_cast<unsigned>(p.gu_items.size()), n16 = static_cast<unsigned>(p.dn_items16.size()),
-               n64 = static_cast<unsigned>(p.dn_items64.size());
+    strix::route::launched(strix::route::Product::moe, strix::route::Family::exact, v.rows);  // host-planned EXL3 call
     mark("start", stream);
-    if (tiled && prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    else if (tiled) hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
-    else hipLaunchKernelGGL(gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    // The token gather implements A4 fake quant; force it for the shadow call
+    // even when the ordinary path selected the tiled gather.
+    if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) hipLaunchKernelGGL(gather_transform_token_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else hipLaunchKernelGGL(gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
-    if (v2) {
+    {
         const auto* it_d = reinterpret_cast<const pfk::Item*>(ws + p.off_items);
         std::size_t at = 0;
         // One stage's class launches; with the tail stream, classes 0..6 go to the side stream beside class 7.
-        const bool tail_stream = core == 3 && prefill_mtfit() && prefill_tail_stream();
+        const bool tail_stream = prefill_mtfit() && prefill_tail_stream();
         auto stage = [&](const std::vector<pfk::Item>* lists, const unsigned* ctas, const char* const* labels) {
             bool tails = false;
             for (unsigned c = 0; c < 7; ++c) tails = tails || !lists[c].empty();
@@ -1271,13 +1914,13 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             std::size_t c_at = at;
             try {
                 for (unsigned c = 0; c < 7 && side; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, g_tail_side, pair);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, g_tail_side, pair);
                     c_at += lists[c].size();
                 }
                 for (unsigned c = side ? 7U : 0U; c < 8; ++c) {
-                    launch_v2(it_d + c_at, lists[c], ctas[c], c, core, stream, pair);
+                    launch_v2(it_d + c_at, lists[c], ctas[c], c, stream, pair);
                     c_at += lists[c].size();
-                    if (!lists[c].empty()) mark(labels[core == 3 ? c : pfk::mt_of_class(c) - 1], stream);
+                    if (!lists[c].empty()) mark(labels[c], stream);
                 }
             } catch (...) {
                 if (side) tail_join(stream);  // side work stays inside the caller's completion chain
@@ -1298,8 +1941,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
             at += v2i.fused[c].size();
         }
         launched("gate/up v2");
-        if (tiled) hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
-        else hipLaunchKernelGGL(gate_up_finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
+        hipLaunchKernelGGL(gate_up_finish_tiled_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t, gufuse && !g_gufuse_producer_only, g_gufuse_intermediates);
         launched("gate/up finish");
         mark("finish", stream);
         stage(v2i.dn, v2i.dn_ctas, kDnLabel);
@@ -1307,34 +1949,12 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
         hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
         launched("down combine");
         mark("combine", stream);
-        return;
     }
-    const bool big = prefill_tile() == 128;  // every item then sits in the 'tile 64' list of the down stage
-    if (big) hipLaunchKernelGGL(wmma_grouped_kernel<128>, dim3(p.gu_ctas), dim3(128), 0, stream, items_d, n_gu);
-    else hipLaunchKernelGGL(wmma_grouped_kernel<16>, dim3(p.gu_ctas), dim3(128), 0, stream, items_d, n_gu);
-    launched("gate/up");
-    mark("gate_up", stream);
-    hipLaunchKernelGGL(gate_up_finish_kernel, dim3((t.pairs * kIB + 7) / 8), dim3(256), 0, stream, t);
-    launched("gate/up finish");
-    mark("finish", stream);
-    if (n16 > 0) {
-        hipLaunchKernelGGL(wmma_grouped_kernel<16>, dim3(p.dn_ctas16), dim3(128), 0, stream, items_d + n_gu, n16);
-        launched("down 16");
-    }
-    if (n64 > 0) {
-        if (big) hipLaunchKernelGGL(wmma_grouped_kernel<128>, dim3(p.dn_ctas64), dim3(128), 0, stream, items_d + n_gu + n16, n64);
-        else hipLaunchKernelGGL(wmma_grouped_kernel<64>, dim3(p.dn_ctas64), dim3(128), 0, stream, items_d + n_gu + n16, n64);
-        launched("down 64");
-    }
-    mark("down", stream);
-    hipLaunchKernelGGL(down_combine_kernel, dim3((v.rows * kHB + 7) / 8), dim3(256), 0, stream, t, v.out);
-    launched("down combine");
-    mark("combine", stream);
 }
 
 namespace {
-// Item list of one dense call: at most kMaxDenseJobs jobs x (main + tail) items.
-constexpr std::size_t kDenseItems = 2 * kMaxDenseJobs;
+// Item list of one dense call: at most kMaxDenseJobs jobs x (bands + main + tail) items.
+constexpr std::size_t kDenseItems = 3 * kMaxDenseJobs;
 struct DensePlan {
     unsigned k = 0, tpad = 0;
     unsigned splits[kMaxDenseJobs] = {};
@@ -1404,8 +2024,10 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     if (x == nullptr || workspace == nullptr || workspace_bytes < p.bytes)
         throw std::invalid_argument("minimax prefill dense: null input or workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
-    std::vector<pfk::Item> lists[8];
-    unsigned ctas[8] = {};
+    constexpr unsigned kBandClass = 8;  // tall bands (STRIX_MMX_PREFILL_DENSE_BAND), beside the eight row-tile classes
+    const unsigned band = prefill_dense_band();
+    std::vector<pfk::Item> lists[kBandClass + 1];
+    unsigned ctas[kBandClass + 1] = {};
     for (unsigned m = 0; m < count; ++m) {
         const Exl3& w = jobs[m].w;
         pfk::Item it{};
@@ -1426,13 +2048,19 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
             lists[c].push_back(it);
         };
         const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
-        if (fit.main != 0) emit(7, 0, fit.main);
+        const unsigned banded = band != 0 ? fit.main / band * band : 0U;  // 128-row tiles in full bands
+        if (banded != 0) {
+            it.gx = w.output / 32;
+            emit(kBandClass, 0, banded / band);
+            it.gx = w.output / 128;
+        }
+        if (fit.main != banded) emit(7, banded * 128, fit.main - banded);
         if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
     }
     std::lock_guard<std::mutex> staging(g_dense_mutex);
     DenseSlot& slot = next_dense_slot();
-    unsigned at[8] = {}, used = 0;
-    for (unsigned c = 0; c < 8; ++c) {
+    unsigned at[kBandClass + 1] = {}, used = 0;
+    for (unsigned c = 0; c <= kBandClass; ++c) {
         at[c] = used;
         for (const pfk::Item& it : lists[c]) slot.host[used++] = it;
     }
@@ -1457,8 +2085,13 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     }
     hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
+    if (!lists[kBandClass].empty()) {
+        const auto n = static_cast<unsigned>(lists[kBandClass].size());
+        if (band == 8) launch_band_class<8>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
+        else launch_band_class<4>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
+    }
     for (unsigned c = 0; c < 8; ++c)
-        if (!lists[c].empty()) launch_class<4>(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
+        if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");
     hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
     launched("dense finish");

@@ -24,7 +24,6 @@
           "STRIX_MMX_MOE_PIPE": "2",
           "STRIX_MM_DSPARK_ATTN": "2",
           "STRIX_MM_DRAFT_LIN": "opt",
-          "STRIX_MMX_PREFILL_CORE": "v4",
           "STRIX_MM_PF_MSA_BATCH": "1",
           "STRIX_MM_PF_ATTEND4": "1",
           "STRIX_MM_PF_ROUTER_BATCH": "1",

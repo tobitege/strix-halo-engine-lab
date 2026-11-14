@@ -1,4 +1,5 @@
 // F8 rows with 16-byte weight loads, one output row per wave; arithmetic of f16_rows (see hip_ds41_f8_rows_fast.hpp).
+#include "strix/env_flags.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 
 #include <hip/hip_runtime.h>
@@ -433,7 +434,7 @@ unsigned fast_mode() noexcept {
 }
 bool rn_on() noexcept {
     // on by default since P15 (P14: R6 -1.1 ms, same bits); STRIX_DS41_ENGRAM_RN=0 off
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_ENGRAM_RN"); return !(e && e[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_ENGRAM_RN", true);
     return on;
 }
 }  // namespace

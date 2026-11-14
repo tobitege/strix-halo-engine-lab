@@ -1,0 +1,135 @@
+[
+  {
+    "case": "cold",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello."
+        }
+      ],
+      "max_tokens": 12
+    }
+  },
+  {
+    "case": "warm-duplicate",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello."
+        }
+      ],
+      "max_tokens": 12
+    }
+  },
+  {
+    "case": "sampled",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Story."
+        }
+      ],
+      "max_tokens": 12,
+      "temperature": 0.7,
+      "seed": 5,
+      "top_k": 5,
+      "top_p": 0.9
+    }
+  },
+  {
+    "case": "thinking",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Think first."
+        }
+      ],
+      "max_tokens": 12,
+      "enable_thinking": true,
+      "thinking_budget": 3
+    }
+  },
+  {
+    "case": "stream",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Stream."
+        }
+      ],
+      "max_tokens": 4,
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      }
+    }
+  },
+  {
+    "case": "long",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "long sentence. long sentence. long sentence. long sentence. long sentence. long sentence. long sentence. long sentence. "
+        }
+      ],
+      "max_tokens": 5
+    }
+  },
+  {
+    "case": "mismatched-prefill",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "different arithmetic. different arithmetic. different arithmetic. different arithmetic. "
+        }
+      ],
+      "max_tokens": 5
+    },
+    "same": false
+  },
+  {
+    "case": "invalid",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Invalid."
+        }
+      ],
+      "max_tokens": 12,
+      "min_p": 0.1
+    }
+  },
+  {
+    "case": "failure",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Fail."
+        }
+      ],
+      "max_tokens": 4
+    },
+    "fail": true
+  },
+  {
+    "case": "after-failure",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Again."
+        }
+      ],
+      "max_tokens": 3
+    }
+  }
+]

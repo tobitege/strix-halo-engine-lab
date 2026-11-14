@@ -177,6 +177,29 @@ identity and one exact token prefix; the stored tokens are compared as well. Why
 - context size and layout fix the state geometry; the executable digest keeps a disk tier from
   serving a state that another build produced.
 
+### Prepared lookups
+
+A longest-prefix lookup has a part that depends only on the prompt and a part that depends on the cache.
+`PrefixStateCache::prepare_lookup()` does the first part and returns a `PrefixLookupTicket`: a copy of the
+tokens, the digest of every block and, with a disk tier, which blocks have a checkpoint file and of which
+class (legacy or certified). It takes no cache lock and changes nothing, so a caller can run it on any
+thread before the request is admitted. `find_longest(ticket)` then decides under the cache state of that
+moment and returns what the one-step `find_longest()` returns:
+
+- the host tier of every block is probed in one lock acquisition (the one-step form used one per block);
+- a host hit is still verified against the stored tokens, token by token, and an entry that does not
+  match is still removed; a hash never stands in for the comparison;
+- a disk checkpoint is still loaded by the lookup itself, where its payload buffers, budget credits and
+  certificate check belong: the ticket holds no payload, no lease and no reservation;
+- prepared disk metadata is used only while this cache has not published or removed a checkpoint file
+  since it was read. Otherwise the lookup probes the files as the one-step form does. A file published by
+  another cache object on the same directory after the ticket was prepared is seen by the next ticket.
+
+The one-step form is the same code with a ticket built on the spot and the disk tier probed during the
+walk. `strix-prefix-lookup-ticket-tests` runs a recorded sequence of lookups one-step against one cache
+and prepared against an identically filled cache and compares every hit and every counter; `--bench`
+prints the cost of both forms for 8K, 32K and 128K token prompts.
+
 ## Storage
 
 Host tier: pinned host memory, fair retention by default or explicit LRU within the byte budget.

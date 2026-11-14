@@ -1,4 +1,5 @@
 // Optional complete-workload gate. Real assets are explicit; never a ctest.
+#include "strix/device/hip_gate.hpp"
 #include "gemma4/engine/runtime.hpp"
 
 #include <chrono>
@@ -9,6 +10,10 @@ namespace e = strix::gemma4::engine;
 using Json = strix::serve::Json;
 using Clock = std::chrono::steady_clock;
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     try {
         const auto options = e::parse_options(argc,argv);
         if (options.help) {

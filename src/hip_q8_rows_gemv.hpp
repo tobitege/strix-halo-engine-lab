@@ -39,10 +39,13 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
+#include "core/gemv_rows.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -53,12 +56,14 @@
 #include "hip_q6p_weights.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
+#include "moe_core/dense_a8_small_layout.hpp"
+#include "strix/known_window_cohort.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
 // just before them (default on; STRIX_ANYORDER=0 keeps every launch barrier-ordered).
 inline bool strix_any_order_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_ANYORDER"); return !v || v[0] != '0'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_ANYORDER", true);
     return enabled;
 }
 }  // namespace strix
@@ -392,6 +397,77 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
                     for (unsigned l = 0; l < 8U; ++l) Site::fma(v[(o * Rows + r) * 8U + l], coefficient[o][l], x[l]);
             }
         }
+        reduce<Site, N, 8U>(v, lane);
+        store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+            if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
+        });
+    }
+}
+
+// Stepped: the block stages the rows in LDS one window of 256 * Span columns at
+// a time (core/gemv_rows.hpp: stage_window + stepped, double buffered), and its
+// eight waves share every window. Unlike Staged it has no bound on Rows * width,
+// so windows whose rows do not fit kStageBytes also read their rows once per
+// block instead of once per wave. Every (output, row, leaf) accumulator visits
+// the same columns in the same order with the same products as the direct form.
+template <class Site, unsigned Outs, unsigned Span>
+__global__ __launch_bounds__(kThreads) void project_rows_stepped_kernel(Site site) {
+    using Input = typename Site::Input;
+    using Format = RowsFormat<false>;
+    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, true>();
+    constexpr unsigned Columns = 256U * Span, Vectors = Columns * static_cast<unsigned>(sizeof(Input)) / 16U;
+    const unsigned lane = threadIdx.x & 31U;
+    const std::uint32_t width = site.width, groups = (site.outputs + Outs - 1U) / Outs;
+    const std::uint32_t total = width * static_cast<std::uint32_t>(sizeof(Input)) / 16U, steps = (width + Columns - 1U) / Columns;
+    const std::uint32_t g = blockIdx.x * kWaves + threadIdx.x / 32U;
+    const bool valid = g < groups;
+    auto* lds = reinterpret_cast<uint4*>(q8_rows_lds);
+    typename Format::Row w[Outs];
+    // A tail wave names a valid weight row; it never loads or stores through it.
+    Format::rows(site.segments, valid ? g : groups - 1U, site.outputs, width, w);
+    float v[N]{};
+    typename Format::template Fetch<Outs> next[Depth];
+    if (valid) {
+#pragma unroll
+        for (unsigned d = 0; d < Depth; ++d) if (8U * lane + 256U * d < width) next[d].load(w, 8U * lane + 256U * d);
+    }
+    strix::core::gemv_rows::stepped<2U>(steps,
+        [&](unsigned step, unsigned buffer) {
+            strix::core::gemv_rows::stage_window<Rows, Vectors, kThreads>(lds + buffer * (Rows * Vectors),
+                [&](unsigned r) { return static_cast<const uint4*>(site.input[r]); }, step, total,
+                strix::core::gemv_rows::RowRuns{Vectors});
+        },
+        [&](unsigned step, unsigned buffer) {
+            if (!valid) return;
+            const Input* window = reinterpret_cast<const Input*>(lds + buffer * (Rows * Vectors));
+#pragma unroll
+            for (unsigned s = 0; s < Span; ++s) {
+                const std::uint32_t local = 256U * s + 8U * lane, base = step * Columns + local;
+                if (base >= width) break;
+                const auto current = next[0];
+#pragma unroll
+                for (unsigned d = 1; d < Depth; ++d) next[d - 1U] = next[d];
+                if (base + 256U * Depth < width) next[Depth - 1U].load(w, base + 256U * Depth);
+                float coefficient[Outs][8];
+#pragma unroll
+                for (unsigned o = 0; o < Outs; ++o) {
+                    const std::uint64_t codes = Format::codes(current, o, base);
+#pragma unroll
+                    for (unsigned l = 0; l < 8U; ++l)
+                        coefficient[o][l] = Site::coefficient(Format::scale(current, o), static_cast<std::int8_t>(codes >> (8U * l)));
+                }
+#pragma unroll
+                for (unsigned r = 0; r < Rows; ++r) {
+                    float x[8];
+                    load8(window + r * Columns + local, x);
+#pragma unroll
+                    for (unsigned o = 0; o < Outs; ++o)
+#pragma unroll
+                        for (unsigned l = 0; l < 8U; ++l) Site::fma(v[(o * Rows + r) * 8U + l], coefficient[o][l], x[l]);
+                }
+            }
+        });
+    if (valid) {
         reduce<Site, N, 8U>(v, lane);
         store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
             if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
@@ -1671,18 +1747,34 @@ template <class Site> bool q6_site(const Site& site, Site& result) {
 // project_wide_rows_kernel), 1 (shared coefficients, C++ FMA chains) or 2 (default:
 // the VOPD kernels where the site allows them); STRIX_Q8_ROWS_WIDE_SUB = 2/4/8/16 rows
 // per wave for kernels 0 and 1; STRIX_Q8_ROWS_WIDE_STAGE=1 the LDS-staged kernel.
-inline unsigned env_unsigned(const char* name, unsigned fallback) {
-    const char* v = std::getenv(name);
-    return v ? static_cast<unsigned>(std::atoi(v)) : fallback;
+inline unsigned wide_sub() { static const unsigned sub = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_SUB", 0U); return sub; }
+inline unsigned wide_kernel() { static const unsigned kernel = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
+inline bool wide_stage() { static const bool stage = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
+// STRIX_Q8_ROWS_STEPPED: 0 = off, 1 = every window that the whole-row staging cannot hold
+// (three or more rows), unset = the measured geometry admission of stepped_span().
+inline int stepped_policy() { static const int policy = strix::envcfg::integer("STRIX_Q8_ROWS_STEPPED", -1); return policy; }
+// Columns of a stepped window in units of 256 (512 columns: 16 KiB of FP32 rows at eight rows, double buffered).
+constexpr unsigned kSteppedSpan = 2U;
+// Columns per staged window in units of 256 (0 = not admitted). The window of
+// every row, double buffered, must fit the LDS; rows must be 16-byte aligned.
+template <class Site> unsigned stepped_span(const Site& site) {
+    constexpr unsigned Span = kSteppedSpan;
+    if (stepped_policy() == 0 || Site::rows < 3U || Site::rows > 8U) return 0U;
+    if (2U * Site::rows * 256U * Span * sizeof(typename Site::Input) > strix::core::gemv_rows::lds_limit) return 0U;
+    for (unsigned r = 0; r < Site::rows; ++r)
+        if (reinterpret_cast<std::uintptr_t>(site.input[r]) % 16U) return 0U;
+    if (stepped_policy() == 1) return Span;
+    // Measured admission (cold weights, the decode regime, gfx1151): FP32 rows of the
+    // 6144 -> 2560 output projections at 3, 6 and 7 rows (4 and 8 keep the VOPD kernels;
+    // 5 rows and BF16 rows measured no gain).
+    return sizeof(typename Site::Input) == 4U && site.width == 6144U && site.outputs == 2560U &&
+        (Site::rows == 3U || Site::rows == 6U || Site::rows == 7U) ? Span : 0U;
 }
-inline unsigned wide_sub() { static const unsigned sub = env_unsigned("STRIX_Q8_ROWS_WIDE_SUB", 0U); return sub; }
-inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
-inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
-inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
+inline unsigned narrow_vopd() { static const unsigned vopd = strix::env_number<unsigned>("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
 // STRIX_Q8_ROWS_WIDE_FP32_MIN: narrowest FP32 input the wide (T >= 16) VOPD coefficient kernel takes.
 // 512 includes the shared down projection (640 wide): 130 -> 100 us per T=64 call after reduce_wide.
-inline unsigned wide_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_WIDE_FP32_MIN", 512U); return w; }
-inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
+inline unsigned wide_fp32_min_width() { static const unsigned w = strix::env_number<unsigned>("STRIX_Q8_ROWS_WIDE_FP32_MIN", 512U); return w; }
+inline unsigned narrow_fp32_min_width() { static const unsigned w = strix::env_number<unsigned>("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
 // Rows <= 8 whose quantized activations and chain slots fit one block's LDS quantize them in
 // the projection kernel (no quantizer launch; measured faster in 8-row MTP windows even at one
 // block per CU). STRIX_DENSE_A8_STAGE=0 never stages, =1 stages only up to kDenseA8StageBytes.
@@ -1703,18 +1795,18 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
     };
     constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
     // STRIX_DENSE_A8_TILE=11/12/21/22/41/42 (TM TN) forces one tile shape for every site (tuning).
-    static const unsigned forced = env_unsigned("STRIX_DENSE_A8_TILE", 0U);
+    static const unsigned forced = strix::env_number<unsigned>("STRIX_DENSE_A8_TILE", 0U);
     // Launches of 64k rows take the LDS-staged 4 x 2 form when it still has at least 40 blocks of 8
     // waves (one per CU): GDN/QSA input and the 256-row output launches; narrower launches (shared
     // expert gate/up, 64-row QSA output) keep the 4 x 1 form.
     // STRIX_DENSE_A8_LDS=0 never stages, =2 stages every 64k-row launch; STRIX_DENSE_A8_LDS_WAVES=4|8.
-    static const unsigned lds = env_unsigned("STRIX_DENSE_A8_LDS", 1U);
+    static const unsigned lds = strix::env_number<unsigned>("STRIX_DENSE_A8_LDS", 1U);
     if constexpr (Site::rows % 64U == 0U) {
         const auto lds_blocks = Site::rows / 64U * ((site.outputs + 255U) / 256U);
         if (!forced && (lds == 2U || (lds == 1U && lds_blocks >= 40U))) {
-            static const unsigned lds_waves = env_unsigned("STRIX_DENSE_A8_LDS_WAVES", 8U);
+            static const unsigned lds_waves = strix::env_number<unsigned>("STRIX_DENSE_A8_LDS_WAVES", 8U);
             const auto staged = [&]<unsigned Waves>() {
-                static const unsigned single = env_unsigned("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
+                static const unsigned single = strix::env_number<unsigned>("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
                 const auto launch = [&]<bool Single>() {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
                         dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
@@ -1841,6 +1933,8 @@ template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Sl
 // scratch slot (any-order when the caller allows it; it writes only the slot no queued
 // projection reads) and one barrier-ordered projection launch (dot4 rows <= 8, WMMA
 // 16/32/64).
+#include "moe_core/dense_a8_small.inc"
+
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows));
     if constexpr (dense_a8_width_of<Site>())
@@ -1871,6 +1965,20 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     // Rows <= 8 read the segments' Q6P32 copies when every one has a copy (same bits).
     Site q6 = site;
     const bool use_q6 = Site::rows <= 8U && q6_site(site, q6);
+    if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
+        if (dense_a8_small_enabled()) {
+            const auto slot = dense_a8_slot(a8_family_of<Site>());
+            const auto items = Site::rows * (site.width / 8U);
+            // Match the existing direct path: the dependent projection is ordered.
+            if (any_order)
+                hipExtLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+                    dim3(kThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, slot.codes, slot.deltas);
+            else hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads),
+                dim3(kThreads), 0, stream, site, slot.codes, slot.deltas);
+            launch_dense_a8_small(site, slot, stream);
+            return;
+        }
+    }
     if constexpr (Site::rows <= 8U) {
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
@@ -1925,6 +2033,9 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
         if constexpr (Site::rows <= 8U) { launch_dense_a8_gsq(site, slot, stream); return; }
         else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");
     }
+    if constexpr (Site::rows >= 2U && Site::rows <= 8U) {
+        if (dense_a8_small_enabled()) { launch_dense_a8_small(site, slot, stream); return; }
+    }
     if constexpr (Site::rows > 8U) { launch_dense_a8_projection(site, slot, stream); return; } else {
     constexpr unsigned Outs = dense_a8_outs_of<Site>();
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;
@@ -1943,7 +2054,7 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
 // pointers and shape: an engine's weights never change, and a prefill block runs a site's launches of
 // one layer back to back, so each matrix is repacked once per (layer, block). Code that rewrites weight
 // bytes in place (the projection probes) calls invalidate_lane_weights() first.
-inline bool lane_enabled() { static const bool on = env_unsigned("STRIX_Q8_ROWS_LANE", 1U) != 0U; return on; }
+inline bool lane_enabled() { static const bool on = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE", 1U) != 0U; return on; }
 inline std::atomic<unsigned>& lane_epoch() { static std::atomic<unsigned> epoch{0U}; return epoch; }
 inline void invalidate_lane_weights() { lane_epoch().fetch_add(1U, std::memory_order_relaxed); }
 template <class Site> constexpr bool lane_site() {
@@ -1952,7 +2063,7 @@ template <class Site> constexpr bool lane_site() {
 // Even chunk counts (two steps per asm block) and at least 32 output groups (one block per group: the
 // 1280-output shared gate/up launch, 20 blocks, is slower than the VOPD kernel; STRIX_Q8_ROWS_LANE_MIN_OUTPUTS).
 template <class Site> bool lane_admits(const Site& site) {
-    static const unsigned min_outputs = env_unsigned("STRIX_Q8_ROWS_LANE_MIN_OUTPUTS", 2048U);
+    static const unsigned min_outputs = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_MIN_OUTPUTS", 2048U);
     return lane_enabled() && site.width % 512U == 0U && site.outputs >= min_outputs;
 }
 struct LaneBuffer {
@@ -2011,8 +2122,8 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
     const unsigned blocks = (site.outputs + kLaneOutputs - 1U) / kLaneOutputs * (Site::rows / (kLaneRows * W));
     // STRIX_Q8_ROWS_LANE_STAGE = 2 | 4 | 8 (default) steps per barrier; STRIX_Q8_ROWS_LANE_PREFETCH=0 drops the
     // scalar-cache prefetch; STRIX_Q8_ROWS_LANE_EXP: timing ablations of builds with -DSTRIX_Q8_ROWS_LANE_ABLATIONS.
-    static const unsigned stage = env_unsigned("STRIX_Q8_ROWS_LANE_STAGE", 8U), prefetch = env_unsigned("STRIX_Q8_ROWS_LANE_PREFETCH", 1U);
-    static const unsigned exp = env_unsigned("STRIX_Q8_ROWS_LANE_EXP", 0U);
+    static const unsigned stage = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_STAGE", 8U), prefetch = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PREFETCH", 1U);
+    static const unsigned exp = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_EXP", 0U);
     const auto run = [&]<unsigned Exp>() {
         if (stage == 2U)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_wide_rows_lane_kernel<Site, W, 2U, Exp>), dim3(blocks), dim3(32U * W), 0, stream, site,
@@ -2041,7 +2152,7 @@ template <class Site, unsigned W> void launch_lane_waves(const Site& site, hipSt
 }
 // STRIX_Q8_ROWS_LANE_WAVES = 8 | 16 (default): waves per block (4 rows each) when the launch has rows for them.
 template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
-    static const unsigned waves = env_unsigned("STRIX_Q8_ROWS_LANE_WAVES", 16U);
+    static const unsigned waves = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_WAVES", 16U);
     if constexpr (Site::rows >= 64U) {
         if (waves == 8U) { launch_lane_waves<Site, 8U>(site, stream); return; }
     }
@@ -2172,7 +2283,19 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         // (GDN/QSA out at T=8: 129 -> 101 us cold); the per-output arithmetic is unchanged.
         constexpr unsigned Q6Outs = Site::rows > 4U ? 1U : Outs;
         if (q6_site(site, q6)) start(project_rows_kernel<Site, Q6Outs, false, true>, groups_for(Q6Outs, kWaves), kThreads, 0U, q6);
-        else start(project_rows_kernel<Site, Outs, false>, groups_for(Outs, kWaves), kThreads, 0U, site);
+        else {
+            bool stepped = false;
+            if constexpr (Site::rows >= 3U && Site::rows <= 8U) {
+                // Windows the whole-row staging cannot hold: one LDS window of the rows per block.
+                if (stepped_span(site)) {
+                    constexpr unsigned Span = kSteppedSpan, StagedOuts = outs_of<Site, true>();
+                    start(project_rows_stepped_kernel<Site, StagedOuts, Span>, groups_for(StagedOuts, kWaves), kThreads,
+                          2U * Site::rows * 256U * Span * static_cast<std::uint32_t>(sizeof(typename Site::Input)), site);
+                    stepped = true;
+                }
+            }
+            if (!stepped) start(project_rows_kernel<Site, Outs, false>, groups_for(Outs, kWaves), kThreads, 0U, site);
+        }
     }
 }
 

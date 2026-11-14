@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/mapped_model_file.hpp"
@@ -34,6 +35,10 @@ const char* storage_name(
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     if (argc < 3) {
         throw std::invalid_argument(
             "usage: strix-hip-model-residency MODEL.gguf register|copy "

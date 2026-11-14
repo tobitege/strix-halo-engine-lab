@@ -3,18 +3,20 @@
 #include <stdexcept>
 
 namespace strix::gemma4::engine {
-ChatJob::ChatJob(const gemma4::serve::Adapter& adapter, ChatRequest request, ChatSink sink)
+ChatJob::ChatJob(const gemma4::serve::Adapter& adapter, ChatRequest request, ChatSink sink,
+    std::optional<gemma4::serve::PreparedPrompt> prepared_prompt)
     : adapter_(adapter), request_(std::move(request)), sink_(std::move(sink)) {
     if (request_.generation.max_tokens > UINT32_MAX) throw std::invalid_argument("max_tokens exceeds chat limit");
     if (request_.thinking_budget && (!request_.input.enable_thinking || request_.thinking_budget >= request_.generation.max_tokens))
         throw std::invalid_argument("thinking_budget requires thinking and must be below max_tokens");
-    const auto prepared = adapter_.prepare(request_.input);
+    const auto prepared = prepared_prompt ? std::move(*prepared_prompt) : adapter_.prepare(request_.input);
     prompt_ = prepared.ids;
     stop_ids_ = prepared.stop_ids;
     starts_in_reasoning_ = prepared.starts_in_reasoning;
     draws_ = request_.generation.sampling.draws;
 }
 Request ChatJob::phase_request() {
+    complete_turn_ = false;control_output_ = false;
     auto job = request_.generation;
     job.prompt = prompt_; job.stop_ids = stop_ids_; job.sampling.draws = draws_;
     job.stop_ids.push_back(adapter_.tokenizer().find("<|tool_response>"));
@@ -26,7 +28,13 @@ Request ChatJob::phase_request() {
 }
 bool ChatJob::absorb(const Result& out) {
     while (!disconnected_ && sent_ < out.ids.size()) {
-        const auto delta = parser_->push(adapter_.tokenizer().token_bytes(out.ids[sent_++]));
+        const auto bytes=adapter_.tokenizer().token_bytes(out.ids[sent_++]);
+        // The parser exposes no open-channel fact for an empty thought. Keep a
+        // conservative admission fact on this existing consumption path: only
+        // ordinary bytes and whole terminal markers certify reusable output.
+        // No second parser, text reconstruction, or token selection is involved.
+        control_output_ |= bytes.find('<')!=std::string::npos && bytes!="<eos>" && bytes!="<turn|>";
+        const auto delta = parser_->push(bytes);
         if (sink_ && !sink_(delta)) disconnected_ = true;
     }
     return !disconnected_;
@@ -52,6 +60,11 @@ bool ChatJob::end_phase(const Result& out, strix::serve::Json receipt) {
     result_.output.stopped = parsed.stopped;
     result_.finish = disconnected_ ? "cancelled" : status_name(out.status);
     if (phase_ || !request_.thinking_budget || out.status != Status::length || disconnected_) {
+        complete_turn_ = !disconnected_ && (out.status == Status::stopped || out.status == Status::length) &&
+            out.error.empty() && !control_output_ && !parsed.unfinished_call && !parsed.unfinished_control &&
+            (!starts_in_reasoning_ || parsed.reasoning_complete) &&
+            (!request_.input.enable_thinking || phase_ || parsed.reasoning_complete) &&
+            (parsed.reasoning.empty() || parsed.reasoning_complete) && !parsed.tool_calls.size();
         if (result_.output.tool_calls.size() && result_.finish == "stop") result_.finish = "tool_calls";
         return false;
     }

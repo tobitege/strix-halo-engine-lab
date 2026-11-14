@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -2936,7 +2937,7 @@ void HipPleKnownWindow::preflight(std::span<const ExecutionDispatchContext> rows
 
 void HipPleKnownWindow::stage_serve(std::span<const ExecutionDispatchContext> rows) {
     auto& w=*impl_;
-    static const bool enabled=[] { const char* v=std::getenv("STRIX_PLE_STAGE_SERVE"); return !v || v[0]!='0'; }();
+    static const bool enabled=strix::envcfg::flag("STRIX_PLE_STAGE_SERVE", true);
     if(!enabled || !w.prefill || rows.size()<32U || ple_reclaim::active() || w.stage.active) return;
     const auto workers=ple_detail::serve_stage_workers(std::thread::hardware_concurrency());
     if(!workers) return;
@@ -2986,7 +2987,7 @@ void HipPleKnownWindow::stage_serve(std::span<const ExecutionDispatchContext> ro
 void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     auto& w = *impl_;
     const auto launch_start = std::chrono::steady_clock::now();
-    static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+    static const bool timing = strix::envcfg::flag("STRIX_PREFILL_TIMING", false);
     auto mark = std::chrono::steady_clock::now();
     const auto lap = [&](const char* name) {
         if (!timing || !w.prefill) return;
@@ -3254,14 +3255,14 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         // 64-row wide projections, then eight-row groups for the rest (the window path's arithmetic
         // per row). STRIX_PREFILL_PLE_WIDE=0 keeps eight-row groups; STRIX_PREFILL_PLE_WIDE_CHECK=1
         // also runs them over the wide rows and compares every projected value bitwise.
-        static const bool wide = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE"); return !v || v[0] != '0'; }();
-        static const bool check = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE_CHECK"); return v && v[0] == '1'; }();
+        static const bool wide = strix::envcfg::flag("STRIX_PREFILL_PLE_WIDE", true);
+        static const bool check = strix::envcfg::flag("STRIX_PREFILL_PLE_WIDE_CHECK", false);
         const auto at = [&](std::uint32_t first) {
             return reinterpret_cast<const std::uint16_t*>(static_cast<std::byte*>(device) + first * w.stride);
         };
         const auto total = static_cast<std::uint32_t>(rows.size());
         std::uint32_t first = 0;
-        static const bool batch = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_BATCH"); return v && v[0] == '1' && v[1] == '\0'; }();
+        static const bool batch = strix::envcfg::flag("STRIX_PREFILL_PLE_BATCH", false, strix::EnvFlagMatch::exact);
         if (wide && batch && !qpf2k::suppressed(qpf2k::Item::ple_batch) &&
             total >= kPleWideRows && w.project_rows_batch(prepared[0], at(0), total / kPleWideRows)) {
             static const bool witness = [] { std::fprintf(stderr, "qpf2k ple row batch active\n"); return true; }();
@@ -3298,8 +3299,8 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     // sequence instead of four launches per row, with the per-row arithmetic.
     // STRIX_PREFILL_PLE_ROWS=0 keeps the per-row launches; STRIX_PREFILL_PLE_ROWS_CHECK=1 runs both
     // from the same inputs and state and compares every output and the final state bitwise.
-    static const bool tail_rows = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_ROWS"); return !v || v[0] != '0'; }();
-    static const bool tail_check = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_ROWS_CHECK"); return v && v[0] == '1'; }();
+    static const bool tail_rows = strix::envcfg::flag("STRIX_PREFILL_PLE_ROWS", true);
+    static const bool tail_check = strix::envcfg::flag("STRIX_PREFILL_PLE_ROWS_CHECK", false);
     PleTailRows tail{};
     if (w.prefill && projected && tail_rows && w.tail_rows(prepared, tail)) {
         const auto n = static_cast<std::uint32_t>(rows.size());

@@ -80,6 +80,11 @@ __device__ __forceinline__ void pipe_pair_or_tail(const Item& it, unsigned bx, u
     return PipeCore<Packed>::template pipe_pair_or_tail<Bits, Simplify>(it, bx, by, bz, exchange);
 }
 
+template <int Bits, int W, bool Simplify, bool Packed = false>
+__device__ __forceinline__ void item_pipe_band(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
+    return PipeCore<Packed>::template item_pipe_band<Bits, W, Simplify>(it, bx, by, bz, exchange);
+}
+
 template <int Bits, int Core8>
 __device__ __forceinline__ void item_core8(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
     return Core::item_core8<Bits, Core8>(it, bx, by, bz, exchange);
@@ -123,6 +128,28 @@ __global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* item
         case 5: pipe_pair_or_tail<5, Simplify, Packed>(it, bx, by, bz, exchange); break;
         case 6: pipe_pair_or_tail<6, Simplify, Packed>(it, bx, by, bz, exchange); break;
         default: pipe_pair_or_tail<8, Simplify, Packed>(it, bx, by, bz, exchange); break;
+    }
+}
+
+// Tall bands: grid x = column pairs (32 outputs), grid y = bands of W full 128-row tiles.
+template <int W = 4, bool Simplify = false, bool Packed = false>
+__global__ __launch_bounds__(W * 32) void grouped_pipe_band_kernel(const Item* items, unsigned count) {
+    __shared__ Half16 exchange[64];  // 2 buffers x 2 decoded tiles x 16 columns
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: item_pipe_band<3, W, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 4: item_pipe_band<4, W, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 5: item_pipe_band<5, W, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 6: item_pipe_band<6, W, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        default: item_pipe_band<8, W, Simplify, Packed>(it, bx, by, bz, exchange); break;
     }
 }
 

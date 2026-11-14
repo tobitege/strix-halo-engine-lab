@@ -3,7 +3,13 @@
 // output. No normalization surrogate and no separate inverse pass are timed.
 struct RecomputeFixture {
     Fixture f;
-    static constexpr std::uint64_t ss = (kWidth + 64U) * 2U, hs = (kHidden + 32U) * 2U;
+    // STRIX_HC_RECOMPUTE_STREAM_STRIDE (bytes, >= 20480, multiple of 8): the stream row pitch of the timed fixture.
+    static inline const std::uint64_t ss = [] {
+        const char* v = std::getenv("STRIX_HC_RECOMPUTE_STREAM_STRIDE");
+        const std::uint64_t n = v ? std::strtoull(v, nullptr, 0) : 0U;
+        return n >= kWidth * 2U && n % 8U == 0U ? n : std::uint64_t{(kWidth + 64U) * 2U};
+    }();
+    static constexpr std::uint64_t hs = (kHidden + 32U) * 2U;
     Buffer hyper, streams, hidden, routed, combined, gates, norm, inverse;
     std::vector<std::uint16_t> hyper_host, hidden_host, routed_host;
     strix::HipHyperMixLauncherConfig c = config(true);
@@ -70,7 +76,10 @@ struct RecomputeFixture {
         }
         auto wide = f.views();
         if (on) {
-            wide.recompute_input = v.streams; wide.recompute_stride = ss;
+            // Aliasing pitch: the folded inject + norm mirrors the stream rows into the normalized workspace rows.
+            const bool mirror = kind != 0U && ss % 4096U == 0U;
+            wide.recompute_input = mirror ? static_cast<const void*>(f.normalized.p) : static_cast<const void*>(v.streams);
+            wide.recompute_stride = mirror ? std::uint64_t{kNormalizedStride} : ss;
             wide.recompute_inverse = v.recompute_inverse; wide.recompute_norm = v.norm;
         }
         if (output == 7U) { wide.output3_band = 16U; wide.low_band = low_band; }
@@ -102,11 +111,18 @@ struct RecomputeFixture {
             throw std::runtime_error("HC recompute byte mismatch at " + std::to_string(at));
         }
         // The normalized image must remain entirely unwritten in the ON arm.
+        // (with an aliasing stream pitch its first half holds the stream mirror and nothing else).
+        const bool mirror = kind != 0U && ss % 4096U == 0U;
+        const std::size_t kept = mirror ? kWidth * 2U : 0U;
+        const auto stream_rows = (in_place && kind ? hyper : streams).download();
         if (const auto n = f.normalized.download(); !n.empty())
-            for (unsigned r = 0; r < f.rows; ++r)
-                if (std::memcmp(n.data() + r * kNormalizedStride,
-                    f.normalized_host.data() + r * kNormalizedStride, kWidth * 4U))
+            for (unsigned r = 0; r < f.rows; ++r) {
+                if (mirror && std::memcmp(n.data() + r * kNormalizedStride, stream_rows.data() + r * ss, kept))
+                    throw std::runtime_error("HC recompute stream mirror differs from the stream rows");
+                if (std::memcmp(n.data() + r * kNormalizedStride + kept,
+                    f.normalized_host.data() + r * kNormalizedStride + kept, kWidth * 4U - kept))
                     throw std::runtime_error("HC recompute stored the normalized image");
+            }
         std::cout << "HC recompute EXACT rows " << f.rows << " site " << kind << " in_place " << in_place
                   << " output " << output << " lowband " << low_band << '\n';
     }
@@ -146,7 +162,8 @@ void fixtures_recompute_norm(hipStream_t stream) {
 void time_recompute_norm(unsigned kind, unsigned output, hipStream_t stream) {
     // Immutable inputs in the timed transaction: no reset/copy cost and no drift
     // between arms, including the combine variant. Every destination is overwritten.
-    RecomputeFixture f(16384U, kind, 0U, false, 1e-6F);
+    const unsigned timed_rows = [] { const char* v = std::getenv("STRIX_HC_RECOMPUTE_TIME_ROWS"); return v ? static_cast<unsigned>(std::atoi(v)) : 16384U; }();
+    RecomputeFixture f(timed_rows, kind, 0U, false, 1e-6F);
     const unsigned low_band = output == 7U ? 3U : 0U;
     f.compare(output, low_band, stream);
     f.reset();
@@ -166,7 +183,7 @@ void time_recompute_norm(unsigned kind, unsigned output, hipStream_t stream) {
         std::cout << "HC recompute pair " << pair << " OFF_ms " << off[pair] << " ON_ms " << on[pair] << '\n';
     }
     std::sort(off.begin(), off.end()); std::sort(on.begin(), on.end());
-    std::cout << "HC recompute T16384 site " << kind << " output " << output << " median_OFF_ms " << off[3]
+    std::cout << "HC recompute T" << timed_rows << " site " << kind << " output " << output << " median_OFF_ms " << off[3]
               << " median_ON_ms " << on[3] << " native_not_slower " << (on[3] <= off[3]) << '\n';
     check(hipEventDestroy(begin), "recompute begin destroy"); check(hipEventDestroy(end), "recompute end destroy");
 }

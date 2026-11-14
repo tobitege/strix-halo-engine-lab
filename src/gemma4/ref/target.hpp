@@ -21,6 +21,9 @@ class HostStream {
 public:
     explicit HostStream(const ModelConfig& config);
     ~HostStream();
+    // Full independent rollback copy, preserving contiguous storage and ring tags.
+    [[nodiscard]] std::unique_ptr<HostStream> snapshot() const;
+    [[nodiscard]] std::uint64_t retained_bytes() const;
     [[nodiscard]] std::unique_ptr<KvTxn> begin();
     [[nodiscard]] std::uint64_t frontier() const;
     // Canonical logical state, independent of ring addresses or unpublished candidates.

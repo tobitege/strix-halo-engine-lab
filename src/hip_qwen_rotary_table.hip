@@ -1,5 +1,6 @@
 #include "strix/startup_markers.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/model_content_hash.hpp"
 #include <hip/hip_runtime.h>
 #include <bit>
@@ -80,7 +81,7 @@ bool fail_reader(unsigned) { return false; }
 using Reader = std::shared_ptr<const HipQwenRotaryTable>;
 void release_reader(void* value) { delete static_cast<Reader*>(value); }
 void check(hipError_t error) {
-    if (error != hipSuccess) throw std::runtime_error(std::string("YaRN upload: ") + hipGetErrorString(error));
+    ::strix::hip_check(error, "YaRN upload");
 }
 }
 HipQwenRotaryTable::HipQwenRotaryTable(const RotaryDescriptor& descriptor) : descriptor_(descriptor) {

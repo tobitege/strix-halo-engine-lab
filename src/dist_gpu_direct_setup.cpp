@@ -1,4 +1,5 @@
 // Setup of the GPU-direct exchange over real USB4 streams in gpu_direct mode, and the DMA-BUF arenas.
+#include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 
@@ -161,9 +162,13 @@ OpenedLink open_link(const Usb4LayoutStream& stream, const Usb4AutoOptions& opti
     link.expected.ring_frames = q.ring_frames;
     link.expected.depth = setup.depth;
     link.expected.terminal = transport::GpuQueueTerminal::kernel_header;
-    // STRIX_DIST_GPU_QUEUE_LEAN=1: FD identity checked on session transitions only, no EVENT while nothing is
-    // in flight (default off: every PREPARE/SUBMIT/EVENT/RETIRE re-checks the descriptor, as before).
-    if (const char* v = std::getenv("STRIX_DIST_GPU_QUEUE_LEAN"); transport_has(options.transport_capabilities, gpu_queue_lean) && v && v[0] == '1') link.expected.lean = true;
+    // gpu-lean is an engine transport policy gate, not a driver feature; QUERY/QUEUE capability checks still apply.
+    // With exclusive descriptor ownership, FD and pool identity are checked at session transitions, on the next hot
+    // operation after 100 ms and before unexpected ioctl errors (except EAGAIN/EINTR); no EVENT is asked while nothing is
+    // in flight. Operation identity, fences and every reply field are checked on every call either way.
+    // STRIX_DIST_GPU_QUEUE_LEAN=0: every PREPARE/SUBMIT/EVENT/RETIRE re-checks the descriptor around the ioctl.
+    static const bool lean = envcfg::flag("STRIX_DIST_GPU_QUEUE_LEAN", true);
+    link.expected.lean = lean && transport_has(options.transport_capabilities, gpu_queue_lean);
     link.arena = export_gpu_direct_arena(std::size_t{q.ring_frames} * SGU_FRAME_BYTES, generation);
     return out;
 }

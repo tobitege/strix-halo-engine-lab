@@ -78,6 +78,8 @@
 //                               schats0b0 for the record), the other phases as --window says
 // The trace covers probe, fixed-window and compared (spec) phases only, never a timed controller arm; the survival table
 // is saved after the phase's last window is credited (outside every timed cycle).
+#include "strix/device/cuda_enumerator.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/ds41_replica_census.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/cuda_ds41_dspark.hpp"
@@ -352,6 +354,9 @@ static std::optional<strix::ds41::dspark::WindowController::Table> resolve_prior
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");
@@ -1373,10 +1378,7 @@ int main(int argc, char** argv) {
             ~HostRows() { if (p) cudaFreeHost(p); }
         } hidden_map;
         // STRIX_DS41_REPLICA_MAPPED_HIDDEN=1: the mapped capture also on one GPU (qualifies it in csmoke on a single GPU)
-        const bool force_mapped = [] {
-            const char* v = std::getenv("STRIX_DS41_REPLICA_MAPPED_HIDDEN");
-            return v && v[0] == '1';
-        }();
+        const bool force_mapped = strix::envcfg::flag("STRIX_DS41_REPLICA_MAPPED_HIDDEN", false);
         if ((load_drafter && ddev != target_device) || (force_mapped && (load_drafter || o.stream_hashes)))
             STRIX_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hidden_map.p), std::size_t{8} * 3U * shape.hidden * sizeof(float),
                                            cudaHostAllocPortable | cudaHostAllocMapped));

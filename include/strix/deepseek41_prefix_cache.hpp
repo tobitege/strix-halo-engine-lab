@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/deepseek41_attention_state.hpp"
+#include "strix/prefix_state_cache.hpp"
 
 #include <array>
 #include <cstdint>
@@ -57,6 +58,15 @@
 // exchange inventory() and keep the common entries (retain); a read that fails on either rank makes both forget() the
 // path and run the prompt as a miss (load() does not change the cache; use() does, after both ranks agree).
 namespace strix::deepseek41 {
+
+#ifdef STRIX_DS41_PREFIX_IO_TESTING
+namespace prefix_io_test {
+// Test closure only: copied at Writer construction, called before/after each real
+// job on that writer thread. Ordinary builds contain no hook or extra state.
+using WriterHook = void (*)(void*, bool before, const std::filesystem::path&, bool write) noexcept;
+void set_writer_hook(WriterHook, void*) noexcept;
+}
+#endif
 
 struct PrefixCacheOptions {
     std::uint32_t block = 256;            // tokens per block (multiple of 8 and of the compressor ratios)
@@ -126,7 +136,7 @@ struct PrefixLoadInfo {
 
 class PrefixCache {
 public:
-    explicit PrefixCache(const PrefixCacheOptions& options);
+    explicit PrefixCache(const PrefixCacheOptions& options, std::shared_ptr<PrefixStateCache> owner = {});
     ~PrefixCache();
     PrefixCache(const PrefixCache&) = delete;
     PrefixCache& operator=(const PrefixCache&) = delete;
@@ -173,26 +183,27 @@ public:
 
     // Complete generated conversations use the same attention-state adapter, in a separate versioned namespace.
     class Sessions;
-    struct Node;
     struct DiskEntry;
     struct Writer;
 
 private:
     PrefixCacheOptions options_;
-    std::unordered_map<std::uint64_t, std::unique_ptr<Node>> nodes_;
+    std::shared_ptr<PrefixStateCache> owner_;
+    std::uint64_t scope_ = 0;
     std::unordered_map<std::uint64_t, std::unique_ptr<DiskEntry>> disk_;
     std::unique_ptr<Writer> writer_;
     std::vector<AttentionLayerState> layout_;  // roles of each layer (owns_kv, owns_index, ratio), from the first insert
-    std::uint64_t clock_ = 0;
+    std::uint64_t clock_ = 0; // durable sequence only; RAM ordering belongs to owner_
     PrefixCacheStats stats_;
     PrefixLoadInfo last_load_;
     void set_layout(const AttentionState& s);
-    [[nodiscard]] const Node* ram_node(std::uint64_t key, std::uint32_t depth, std::span<const std::uint32_t> block_tokens) const;
+    [[nodiscard]] ModelContentIdentity ram_id(std::uint64_t key) const;
+    [[nodiscard]] std::shared_ptr<const PrefixCacheSegment> ram_node(std::uint64_t key, std::uint32_t depth, std::span<const std::uint32_t> block_tokens) const;
+    [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> ram_snapshot(std::uint64_t key, bool touch = false) const;
+    [[nodiscard]] const std::uint8_t* ram_layer(const PrefixCacheSegment&, std::size_t layer, bool index) const;
     [[nodiscard]] const DiskEntry* disk_entry(std::uint64_t key, std::uint64_t parent, std::uint32_t depth, std::span<const std::uint32_t> block_tokens) const;
     bool insert_ram(const AttentionState& s, std::uint64_t logits_fnv, std::uint32_t kv_from, const std::vector<std::uint64_t>& keys);
     bool insert_disk(const AttentionState& s, std::uint64_t logits_fnv, std::uint32_t kv_from, const std::vector<std::uint64_t>& keys);
-    void evict_one();
-    void prune(Node* n);
     void evict_disk_one();
     void prune_disk(std::uint64_t key);
     void remove_disk(std::uint64_t key);       // the entry and its files

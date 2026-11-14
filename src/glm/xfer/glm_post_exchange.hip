@@ -22,6 +22,7 @@ __device__ __forceinline__ void flag_if(unsigned* flag, float v) {
 
 // R17 for element d of row r: rank 0's partial first on both ranks.
 __device__ __forceinline__ float reduce(const float* local, const float* peer, unsigned rank, std::size_t k) {
+    if (local == nullptr) return peer[k];  // exchange row fold: `peer` is the folded slot (rank 0's + rank 1's partial)
     const float a = local[k], b = peer[k];
     return rank == 0 ? a + b : b + a;
 }

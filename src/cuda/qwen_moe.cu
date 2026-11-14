@@ -22,6 +22,7 @@
 //   u = (d*sc)*float(r) and v = (dm*mn)*s with d*sc and dm*mn precomputed: d is FP16 (11-bit significand) and sc, mn < 64,
 //   so d*sc and dm*mn are exact in FP32, and sc*r (< 2^23), mn*s (< 2^18) are exact too: both sides are the exact product
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_moe.hpp"
 #include "strix/cuda_qwen_quant.cuh"
 #include "strix/cuda_qwen_route_bf16.hpp"
@@ -585,7 +586,7 @@ __global__ __launch_bounds__(kDownThreads) void down_kernel(const std::uint8_t* 
 // down_kernel; the exact integer group dots come from dp4a over lane groups (integer adds, order-free).
 // STRIX_QRTX_DECODE_KERNELS=0 keeps the tiled kernels (reference seam).
 bool decode_rows_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(e && e[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS", true);
     return on;
 }
 constexpr unsigned kRowsMax = 8U;

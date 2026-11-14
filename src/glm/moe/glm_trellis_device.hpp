@@ -23,10 +23,6 @@ using strix::moe_core::TileStates;
 using strix::moe_core::reduce4;
 using strix::moe_core::Slot;
 using strix::moe_core::compute_slot;
-
-// GLM's inherited split policy (gemv_policy.hpp measured_vector_splits): no GLM
-// shape is special-cased. Keep this engine policy separate from the primitives.
-__host__ __device__ constexpr unsigned vector_splits(unsigned input, unsigned output) {
-    return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
-}
+// <= 8-row split policy: the one moe_core policy (gemv_policy.hpp measured_vector_splits); no GLM shape is special-cased.
+using strix::moe_core::vector_splits;
 }  // namespace strix::glm::moe::dev

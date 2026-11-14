@@ -6,6 +6,9 @@
 #include <winioctl.h>
 #endif
 using namespace strix::ds41::session;
+#ifdef NDEBUG
+#error CUDA DS41 host tests require active assertions
+#endif
 
 // The replaced global operator new/delete pair malloc/free; GCC cannot see that through the replacement.
 #if defined(__GNUC__) && !defined(__clang__)
@@ -63,9 +66,114 @@ static bool directory_alias(const fs::path& target,const fs::path& link) {
     std::cout<<"SKIP directory alias: "<<ec.message()<<"\n";return false;
 }
 
+// Operation faults execute inside actual shared IO, through actual Disk publication.
+static std::uint64_t physical_bytes(const fs::path& dir) {
+    std::uint64_t n=0;for(const auto& e:fs::recursive_directory_iterator(dir))
+        if(!e.is_symlink()&&e.is_regular_file())n+=e.file_size();
+    return n;
+}
+static void shared_fault_matrix(const fs::path& root) {
+    Snapshot old;old.compat=sha(bytes("fault-compat"));old.lineage="0123456789abcdef0123456789abcdef";
+    old.attention=bytes("attention-old");old.drafter=bytes("draft-old");old.committed_generation=7;
+    old.frontier.consumed=old.frontier.accepted=3;old.frontier.pending=17;old.frontier.turns=4;
+    auto next=old;next.attention=bytes("attention-new");next.drafter=bytes("draft-new");
+    next.committed_generation=8;next.frontier.pending=23;next.frontier.turns=5;
+    unsigned arm=0;
+    for(bool prior:{false,true})for(auto op:{io::Operation::create,io::Operation::write,io::Operation::sync,
+                                           io::Operation::replace,io::Operation::directory_sync}) {
+        const unsigned count=op==io::Operation::replace?6:op==io::Operation::directory_sync?7:5;
+        for(unsigned stage=0;stage<count;++stage) {
+            Config c;c.dir=root/("io-"+std::to_string(++arm));c.disk=true;c.disk_explicit=true;c.disk_bytes=1024*1024;
+            auto owner=std::make_unique<Disk>();owner->open(c,1024);check(owner->enabled());
+            if(prior)owner->put("A",old);
+            const auto name=c.dir/"A";const auto last=prior?read_file(pointer_path(name),65536):Bytes{};
+            // Compute per-byte offsets independently of the failing writer, for partial writes.
+            std::array<std::uint64_t,5> lengths{next.attention.size(),next.drafter.size(),next.frontier.encode().size(),0,0};
+            if(op==io::Operation::write) {
+                const auto reference=root/("length-"+std::to_string(arm));publish(reference,next);
+                lengths[3]=fs::file_size(reference/"manifest.bin");
+                lengths[4]=Pointer{"A","A.g1",next.lineage,sha(read_file(reference/"manifest.bin",65536)),next.committed_generation}.encode().size();
+            }
+            io::faults().fail=op;io::faults().skip=stage;
+            if(op==io::Operation::write) {
+                io::faults().max_write=1;io::faults().skip=1;
+                for(unsigned i=0;i<stage;++i)io::faults().skip+=static_cast<unsigned>(lengths[i]);
+            }
+            bool failed=false;std::vector<Disk::Point> points;
+            try{owner->put("A",next,[&](auto p){points.push_back(p);});}
+            catch(const Error& e){failed=true;check(e.operation==op);}
+            io::faults()={};check(failed);
+            // Only the final parent-sync arm can already have committed the pointer.
+            const bool uncertain=op==io::Operation::directory_sync&&stage==6;
+            if(prior||uncertain) {
+                const auto got=restore(name,old.compat,1024);
+                check(got.attention==(uncertain?next.attention:old.attention));
+                check(got.drafter==(uncertain?next.drafter:old.drafter));
+                check(got.frontier.encode()==(uncertain?next.frontier.encode():old.frontier.encode()));
+                check(got.committed_generation==(uncertain?8U:7U)&&got.lineage==old.lineage);
+                if(!uncertain)check(read_file(pointer_path(name),65536)==last);
+                if(prior&&uncertain)check(fs::is_directory(c.dir/"A.g1"));
+            } else {check(!owner->contains("A"));refuses([&]{(void)restore(name,old.compat,1024);});}
+            check(owner->used()==physical_bytes(c.dir)&&owner->used()<=c.disk_bytes);
+            if(op==io::Operation::replace&&stage==4)check(points==std::vector<Disk::Point>{Disk::Point::files_flushed});
+            if((op==io::Operation::replace&&stage==5)||uncertain)
+                check(std::find(points.begin(),points.end(),Disk::Point::pointer_flushed)!=points.end());
+            // Clear faults, restart cleanup, bounded retry, and complete restore.
+            owner.reset();Disk retry;retry.open(c,1024);check(retry.enabled());
+            auto later=next;if(uncertain)++later.committed_generation;
+            retry.put("A",later);const auto got=restore(name,old.compat,1024);
+            check(got.attention==later.attention&&got.drafter==later.drafter&&got.frontier.encode()==later.frontier.encode());
+            check(retry.used()==physical_bytes(c.dir));
+            for(const auto& e:fs::recursive_directory_iterator(c.dir))check(e.path().string().find(".tmp")==std::string::npos);
+        }
+    }
+    Config c;c.dir=root/"read-faults";c.disk=true;c.disk_explicit=true;c.disk_bytes=1024*1024;
+    Disk d;d.open(c,1024);d.put("A",old);
+    // Pointer, prechecked manifest, decoded manifest, attention, drafter, frontier.
+    for(auto op:{io::Operation::allocation,io::Operation::read})for(unsigned skip=0;skip<6;++skip) {
+        io::faults().fail=op;io::faults().skip=skip;bool failed=false;
+        try{(void)restore(d.path("A"),old.compat,1024);}catch(const Error& e){failed=true;check(e.operation==op);}
+        io::faults()={};check(failed);check(restore(d.path("A"),old.compat,1024).attention==old.attention);
+    }
+    const auto original=read_pointer(d.path("A"));
+    for(unsigned mutation=0;mutation<3;++mutation) {
+        auto changed=original;
+        if(mutation==0)++changed.generation;
+        if(mutation==1)changed.lineage="fedcba9876543210fedcba9876543210";
+        if(mutation==2)changed.directory="B.g1";
+        write_file(pointer_path(d.path("A")),changed.encode());
+        refuses([&]{(void)restore(d.path("A"),old.compat,1024);});
+        write_file(pointer_path(d.path("A")),original.encode());
+        check(restore(d.path("A"),old.compat,1024).attention==old.attention);
+    }
+    std::cout<<"RUN "<<arm<<" shared publication faults and 12 admitted read/allocation faults\n";
+}
+static void temporary_accounting(const fs::path& root) {
+    Snapshot s;s.compat=sha(bytes("quota"));s.attention=bytes("old");auto next=s;++next.committed_generation;
+    for(const char* spelling:{"A.current.tmp","A.current.tmp-123-456","A.g99.tmp"}) {
+        Config c;c.dir=root/spelling;c.disk=true;c.disk_explicit=true;c.disk_bytes=100000;
+        auto owner=std::make_unique<Disk>();owner->open(c,1024);check(owner->enabled());owner->put("A",s);
+        const auto lock=fs::last_write_time(c.dir/".session.lock");
+        const auto temp=c.dir/spelling;
+        if(std::string(spelling)=="A.g99.tmp") {fs::create_directory(temp);write_file(temp/"attention.bin.tmp-1-2",Bytes(70000));}
+        else write_file(temp,Bytes(70000));
+        write_file(c.dir/"unrelated",bytes("keep"));write_file(c.dir/"look.current.tmp-nope",bytes("keep"));
+        check(owner->used()>=70000);refuses([&]{owner->put("A",next);});
+        check(restore(owner->path("A"),s.compat,1024).attention==s.attention);
+        const auto unrelated=root/(std::string(spelling)+"-target");fs::create_directories(unrelated);
+        write_file(unrelated/"keep",bytes("symlink target"));
+        const bool alias=directory_alias(unrelated,c.dir/"Z.g77.tmp");
+        owner.reset();Disk retry;retry.open(c,1024);check(!fs::exists(temp));
+        if(alias)check(fs::exists(c.dir/"Z.g77.tmp")&&fs::exists(unrelated/"keep"));
+        check(fs::exists(c.dir/"unrelated")&&fs::exists(c.dir/"look.current.tmp-nope"));
+        check(fs::last_write_time(c.dir/".session.lock")==lock);retry.put("A",next);
+        check(restore(retry.path("A"),s.compat,1024).committed_generation==next.committed_generation);
+    }
+}
 int main(int argc,char** argv) {
     // Start before Config, paths or test fixtures. Trivial getenv/small strings
     // are allowed; no session I/O, resource construction or allocation >4 KiB.
+    const auto shared_start=io::activity();
     watch_allocations=true;
     try {
         Config startup;
@@ -76,6 +184,7 @@ int main(int argc,char** argv) {
         watch_allocations=false;
         check(startup_large_allocations==0&&startup_bytes<=4096);
         check(session_filesystem_operations==0&&session_system_queries==0&&resource_constructions==0);
+        check(io::activity()==shared_start);
         check(startup.ram==UINT64_MAX&&startup.dir.empty()&&!absent&&!startup_seed.materialized());
         const auto dir=fs::path(argc>1?argv[1]:"session-admission-test-output")/
             ("run-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -247,8 +356,11 @@ int main(int argc,char** argv) {
         // No-session startup configures policy only: even a missing nested
         // directory and its parent remain absent until ensure_open is called.
         Config lazy_config=config;lazy_config.dir=dir/"no-session"/"tier";
-        {Disk lazy;lazy.configure(lazy_config,1024);check(!lazy.opened()&&!lazy.enabled());
-         check(lazy.list().empty()&&lazy.used()==0&&!lazy.contains("A"));}
+        {const auto shared=io::activity(),family=session_filesystem_operations;
+         io::faults().fail=io::Operation::create;
+         Disk lazy;lazy.configure(lazy_config,1024);check(!lazy.opened()&&!lazy.enabled());
+         check(lazy.list().empty()&&lazy.used()==0&&!lazy.contains("A"));
+         check(io::activity()==shared&&session_filesystem_operations==family);io::faults()={};}
         check(!fs::exists(dir/"no-session"));
         Disk lazy;lazy.configure(lazy_config,1024);lazy.ensure_open();check(lazy.opened()&&lazy.enabled());
         check(fs::exists(lazy_config.dir/".session.lock"));
@@ -296,18 +408,25 @@ int main(int argc,char** argv) {
             watch_allocations=false;
             const auto ordinary=[&](const fs::path& path) {
                 std::vector<std::string> args{"--import-state",path.string()};
-                watch_allocations=true;const auto io0=session_filesystem_operations;
+                watch_allocations=true;const auto io0=session_filesystem_operations,shared0=io::activity();
+                io::faults().fail=io::Operation::read;
                 const auto command=parse(args);check(command.id.empty());
                 launch.before_replace(current,defaults.enabled,path);
                 session_io+=session_filesystem_operations-io0;watch_allocations=false;
+                check(io::activity()==shared0);io::faults()={};
                 // Model reload allocations are outside session accounting.
                 current.attention=read_file(path,65536);
                 launch.after_replace(path);
             };
             // Unnamed requests, same or other import argument: no session work at all.
             ordinary(launch_file);ordinary(launch_file);ordinary(alternate_file);ordinary(alternate_file);
+            defaults.off("baseline");ordinary(launch_file);ordinary(alternate_file);
             check(!launch.materialized()&&copies==0&&loads==0&&startup_large_allocations==large_before);
             check(session_io==0);
+            // Positive witness: the same shared fault/count seam sees a real read.
+            const auto witness=io::activity();io::faults().fail=io::Operation::read;
+            refuses([&]{(void)read_file(launch_file,65536);});io::faults()={};
+            check(io::activity()>witness);
             check(!ordinary_resources&&resource_constructions==constructions_before&&session_system_queries==queries_before);
             // First session use after another import reloads the launch argument.
             const auto& created=launch.materialize(current);
@@ -388,6 +507,20 @@ int main(int argc,char** argv) {
             auto crash_owner=std::make_unique<Disk>();auto& crash=*crash_owner;crash.open(crash_config,1024);crash.put("A",old);
             const auto old_pointer=read_pointer(crash.path("A"));bool crashed=false;std::uint64_t peak=0;
             try{crash.put("A",newer,[&](Disk::Point point) {
+                if(point==Disk::Point::files_flushed) {
+                    check(!fs::exists(crash_config.dir/"A.g2"));
+                    for(const char* section:{"attention.bin","drafter.bin","frontier.bin","manifest.bin"})
+                        check(fs::is_regular_file(crash_config.dir/"A.g2.tmp"/section));
+                }
+                if(point==Disk::Point::generation_published||point==Disk::Point::pointer_flushed) {
+                    check(fs::is_directory(crash_config.dir/"A.g2"));
+                    check(read_pointer(crash.path("A")).directory==old_pointer.directory);
+                }
+                if(point==Disk::Point::pointer_flushed) {
+                    unsigned staging=0;for(const auto& e:fs::directory_iterator(crash_config.dir))
+                        if(e.path().filename().string().starts_with("A.current.tmp-"))++staging;
+                    check(staging==1&&physical_bytes(crash_config.dir)<=crash.budget());
+                }
                 if(point==Disk::Point::pointer_committed) {
                     check(fs::exists(crash_config.dir/old_pointer.directory));
                     for(const auto& entry:fs::recursive_directory_iterator(crash_config.dir))if(entry.is_regular_file())peak+=entry.file_size();
@@ -493,6 +626,15 @@ int main(int argc,char** argv) {
             catch(const Error& e){check(e.code=="session_not_found"&&e.status==404);}
         }
 
+        {
+            Config inaccessible=config;inaccessible.dir=dir/"owner-open-error";
+            fs::create_directories(inaccessible.dir/".owner.lock");
+            Disk denied;denied.open(inaccessible,1024);check(!denied.enabled());
+            try{denied.require_available();check(false);}catch(const Error& e){check(e.code=="session_tier_unavailable"&&e.status==503);}
+            // The failed shared constructor released its handle; a repaired path retries with a fresh owner.
+            fs::remove(inaccessible.dir/".owner.lock");Disk repaired;repaired.open(inaccessible,1024);check(repaired.enabled());
+        }
+        shared_fault_matrix(dir/"shared-io");temporary_accounting(dir/"temp-quota");
         std::cout<<checks<<" admission checks passed\n";return 0;
     } catch(const std::exception& e) {std::cerr<<e.what()<<"\n";return 1;}
 }

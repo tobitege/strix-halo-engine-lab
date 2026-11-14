@@ -1,5 +1,6 @@
 #include "auto_policy.hpp"
 
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -158,25 +159,14 @@ strix::serve::Json AutoPolicy::receipt() const {
     }
     return result;
 }
-namespace {
-double env_number(const char* name, double fallback, double low, double high) {
-    const auto* v = std::getenv(name);
-    if (!v || !*v) return fallback;
-    char* end = nullptr;
-    const double x = std::strtod(v,&end);
-    if (end == v || *end || !std::isfinite(x) || x < low || x > high)
-        throw std::invalid_argument(std::string("invalid ")+name+"="+v);
-    return x;
-}
-}
 MultiStreamConfig MultiStreamConfig::from_environment() {
     MultiStreamConfig c;
     if (const auto* v = std::getenv("STRIX_G4_DRAFT_MULTI")) c.enabled = std::string(v) != "0";
-    const double k = env_number("STRIX_G4_DRAFT_MULTI_K",c.max_k,1,7);
+    const double k = strix::env_number<double>("STRIX_G4_DRAFT_MULTI_K",c.max_k,1,7);
     if (k != std::floor(k)) throw std::invalid_argument("STRIX_G4_DRAFT_MULTI_K must be an integer 1..7");
     c.max_k = std::uint32_t(k);
-    c.max_draft_share = env_number("STRIX_G4_DRAFT_MULTI_COST",c.max_draft_share,0,1);
-    c.min_gain = env_number("STRIX_G4_DRAFT_MULTI_GAIN",c.min_gain,1,4);
+    c.max_draft_share = strix::env_number<double>("STRIX_G4_DRAFT_MULTI_COST",c.max_draft_share,0,1);
+    c.min_gain = strix::env_number<double>("STRIX_G4_DRAFT_MULTI_GAIN",c.min_gain,1,4);
     return c;
 }
 strix::serve::Json MultiStreamConfig::json() const {
@@ -189,12 +179,12 @@ ConfidenceConfig ConfidenceConfig::from_environment() {
     if (v && (std::string(v) == "0" || std::string(v) == "off")) return c; // the OFF switch
     if (!v || !*v || std::string(v) == "auto") { c.tau = builtin_tau; c.source = Source::builtin; c.per_drafter = true; } // default ON, per drafter
     else {
-        c.tau = env_number("STRIX_G4_MTP_CONF",0,0,1);
+        c.tau = strix::env_number<double>("STRIX_G4_MTP_CONF",0,0,1);
         if (!(c.tau > 0)) return ConfidenceConfig{}; // "0.0": disabled, as "0"
         c.source = Source::env;
     }
     const auto integer = [](const char* name, std::uint32_t fallback) {
-        const double x = env_number(name,fallback,1,7);
+        const double x = strix::env_number<double>(name,fallback,1,7);
         if (x != std::floor(x)) throw std::invalid_argument(std::string(name)+" must be an integer 1..7");
         return std::uint32_t(x);
     };
@@ -203,9 +193,9 @@ ConfidenceConfig ConfidenceConfig::from_environment() {
     c.max_k = integer("STRIX_G4_MTP_CONF_K",c.max_k);
     c.first = integer("STRIX_G4_MTP_CONF_FIRST",c.first);
     c.step = integer("STRIX_G4_MTP_CONF_STEP",c.step);
-    c.min1 = env_number("STRIX_G4_MTP_CONF_MIN1",c.min1,0,1);
+    c.min1 = strix::env_number<double>("STRIX_G4_MTP_CONF_MIN1",c.min1,0,1);
     if (const auto* l = std::getenv("STRIX_G4_MTP_CONF_LONG"); l && *l && std::string(l) != "auto")
-        c.long_ratio = std::string(l) == "off" ? 0 : env_number("STRIX_G4_MTP_CONF_LONG",c.long_ratio,0,1);
+        c.long_ratio = std::string(l) == "off" ? 0 : strix::env_number<double>("STRIX_G4_MTP_CONF_LONG",c.long_ratio,0,1);
     return c;
 }
 const char* ConfidenceConfig::source_name(Source s) {

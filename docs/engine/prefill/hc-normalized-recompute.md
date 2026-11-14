@@ -149,3 +149,18 @@ timeout 480s bash -euc '
 Repeat with `--site 2` or `--output 7` in a separate ticket if the first route
 passes. Production resolver/fold coverage and model logits/state must also pass
 with only `STRIX_QPF2K_HC_RECOMPUTE_NORM` changed before default promotion.
+
+## Default, projection shape and stream mirror
+
+The route is the default with the WMMA HC output. `STRIX_QPF2K_HC_RECOMPUTE_NORM=0` restores the image; `=1` also
+admits the route with the lane-chain output forms.
+
+- The projection runs as one block per 64 rows over all 320 low outputs (`STRIX_QPF2K_HC_PROJ_TILE`, 0 selects the
+  five-column-block form). Accumulator order, injection chains and the epilogue are those of the base kernel.
+- A stream row pitch that is a multiple of 4096 bytes makes the rows of a block alias, because the consumers read
+  many rows at the same column. With the engine's 20480-byte pitch the recompute step measured 10.49 ms against
+  6.12 ms at 20608 bytes (8,192 rows). The folded inject + norm therefore also stores the stream row into the first
+  20480 bytes of the row in the normalized workspace (pitch 42240), and the consumers read that copy: 7.19 ms
+  against 8.29 ms for the image. Norm-only sites with an aliasing pitch keep the image.
+- Fixtures: `ctest -R "strix-hip-hc-recompute-(norm|mirror)-tests" --output-on-failure` (non-aliasing and aliasing
+  pitch; every written byte, and the mirror against the stream rows).

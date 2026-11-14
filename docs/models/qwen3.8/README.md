@@ -33,8 +33,11 @@ See [HTTP prefill](../../engine/serving/serving.md#default-prompt-prefill). See 
 [auto route and off switches](../../getting-started/engine-reference.md#command-line).
 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
-`generated_tokens` and timings. For the speeds above add the speculative options (MTP sidecar, verify windows
-2/4/8, draft vocabulary): the complete command is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
+`generated_tokens` and timings. The plain command decodes with exact MTP speculation when the
+[drafter bundle](../../engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle) (bundle JSON, distilled
+sidecar, draft vocabulary) is beside the model; `--no-mtp` or `STRIX_MTP=0` gives plain decode with the same
+tokens, and a missing bundle gives plain decode with one notice. Same binary, one node, plain (`--no-mtp`) against the default command, identical tokens: 22.1 -> 73.3 tok/s after a 1K prompt (300 tokens; 81.3 tok/s over 1,200 tokens) and 16.9 -> 62.8 tok/s after an 8K prompt (300 tokens). The explicit
+speculative command (every option spelled out) is in **[docs/getting-started/engine-reference.md → Command line](../../getting-started/engine-reference.md#command-line)**
 and [docs/engine/speculative/mtp-native-cli.md](../../engine/speculative/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
 prefix cache are in [docs/engine/serving/serving.md](../../engine/serving/serving.md); several requests in one process in
 [docs/engine/scheduling/multi-request-cohort.md](../../engine/scheduling/multi-request-cohort.md) (automatic per-cycle policy, on by default: 8 requests 69.3 tok/s aggregate, 62.9 tok/s before); sampling in
@@ -76,8 +79,8 @@ One switch selects a product profile for Qwen (CLI, `--http-serve` and the MTP r
   in progress. The receipt stamps `qualification in progress: moe_route_bf16` and marks the row `provisional`;
   one stderr line discloses the bit change and qualification status. Elsewhere, including HTTP and MTP,
   the row stays `pending` with the decline reason, keeps FP32 route storage and is not exported or stamped as applied.
-  Attention selection budget, FP16 chunked recurrence and FP16 output head remain pending and keep their builtin paths,
-  with one notice each; the FP16 chunked recurrence row is runnable (`--allow-pending` runs it, stamped `unqualified`).
+  The attention selection budget (1536) and the FP16 chunked recurrence (`STRIX_QPF2K_GDN_FP16_CHUNK=1`) are provisional
+  rows too and are applied the same way; the FP16 output head remains pending and keeps its builtin path, with one notice.
 - `quality`: there is no quality pack for this model, so it runs `default` and says so in the receipt.
 
 `--allow-pending` (or `STRIX_QWEN_PROFILE_ALLOW_PENDING=1`) runs genuinely pending options whose code is in
@@ -299,11 +302,17 @@ serial route, `--profile default` vs `--profile fast`, two interleaved pairs) pr
 (−2.9 %, 1,371 → 1,412 tok/s)**, every fast run faster than every default run; decode is unchanged. See the
 [catalog](../../optimizations.md#qwen-moe-route-bf16).
 
+**MoE route pruning — optional toggle, default OFF, in no profile.** `STRIX_QPF2K_MOE_ROUTE_PRUNE=cap9` (or
+`--prefill-moe-route-prune cap9`) drops the lowest-weight expert of every prefill row before the route plan is built:
+about 2 % less prefill time at 8,192 and 32,768 tokens, inside the composite FAST gate at both lengths. `cap8` gives
+4-5 % and leaves the gate at 32,768 tokens. It changes logits and adds `+rp<spec>` to the prefill identity; unset it and
+restart to roll back. Numbers and grammar: [moe-route-prune](../../engine/kernels/moe-route-prune.md).
+
 **Chunked GDN prefill on FP16 WMMA — opt-in candidate, pending qualification.** `STRIX_QPF2K_GDN_FP16_CHUNK=1`
 (or `--gdn-fp16-chunk 1`) runs the GDN layers' conv, recurrence and gated norm as 32-row chunks on FP16 WMMA with FP32
 accumulation and FP32 state (identity `qwen-gdn-fp16-chunk rev 2`; the input projection then writes its BF16-rounded
-values as BF16 rows). It is bit-changing, default OFF; `--profile fast` lists it as pending until it passes fidelity
-qualification (`--allow-pending` runs it, stamped `unqualified`). Same build, plain CLI, interleaved pairs: 4K
+values as BF16 rows). It is bit-changing, default OFF; `--profile fast` applies it as a provisional row
+(qualification in progress; 8K screen with the other fast rows: KL 0.0040, top-1 97.5 %). Same build, plain CLI, interleaved pairs: 4K
 **2.42 → 2.36 s (−2.6 %)**, 32K **19.61 → 18.81 s (−4.1 %)**, 262K **177.9 → 170.0 s (−4.5 %, 1,471 → 1,539 tok/s; one pair)**; the first generated tokens match the
 exact route. Unset or `=0` is the exact route. See the [catalog](../../optimizations.md#qwen-gdn-chunk).
 

@@ -4,6 +4,8 @@
 // butterfly v + shfl_xor(v, d), d = 16 ... 1. Only which wave owns which output, when the weights are loaded and
 // where the activations are read from change.
 
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/dist/staged_ready.hpp"
 
@@ -20,9 +22,7 @@
 namespace strix::ds41 {
 namespace {
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 void require(bool ok, const char* message) {
     if (!ok) throw std::invalid_argument(message);
 }
@@ -626,7 +626,7 @@ bool parse_shape(const char* e, RnWideShape& s) {
 } // namespace
 
 bool rn_wide_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_RN_WIDE"); return e && e[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_RN_WIDE", false);
     return on;
 }
 
@@ -709,7 +709,7 @@ void enqueue_q8_0_a8_rn(const Q8A8View& v, const RnWideShape& shape, void* strea
     else if (view.packed == 5U) ok = rn_dispatch_rows<5>(view, shape, q);
     else ok = rn_dispatch_rows<6>(view, shape, q);
     require(ok, "Q8_0 x A8 rn: shape not registered for this format");
-    check(hipGetLastError(), "Q8_0 x A8 rn launch");
+    hip_check(hipGetLastError(), "Q8_0 x A8 rn launch");
 }
 
 namespace {
@@ -743,7 +743,7 @@ bool enqueue_q8_0_a8_rn_ready(const Q8A8View& v, const RnWideShape& shape, dist:
     else if (v.packed == 4U) rn_ready_rows<4>(v, stage, q);
     else if (v.packed == 5U) rn_ready_rows<5>(v, stage, q);
     else rn_ready_rows<6>(v, stage, q);
-    check(hipGetLastError(), "Q8 x A8 RN ready epilogue launch");
+    hip_check(hipGetLastError(), "Q8 x A8 RN ready epilogue launch");
     return true;
 }
 

@@ -1,0 +1,4 @@
+# Model description of the example family. A real model lists its tensors,
+# quantisation formats, capabilities and deployment plans here.
+schema = 'strix-model/v1'
+name = 'skeleton'

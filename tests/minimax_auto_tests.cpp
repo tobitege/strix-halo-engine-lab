@@ -10,13 +10,17 @@ struct Peer {
     unsigned corrupt = 0, aborts = 0;
     strix::minimax::engine::PfProgress prefill_progress(bool = false) const { return {}; }
     void abort(const char*) { ++aborts; }
+    unsigned rank() const { return 0; }
     void exchange_bytes(const void* out, void* in, std::size_t bytes) const {
         std::memcpy(in, out, bytes);
         ms::Control c; std::memcpy(&c, in, sizeof c);
+        c.rank = 1U - c.rank;  // the echo answers as the other rank
         if (corrupt == 1) ++c.version;
         if (corrupt == 2) ++c.magic;
         if (corrupt == 3) ++c.active.generation;
         if (corrupt == 4) { c.command = 0; c.ack_round = 999; }
+        if (corrupt == 5) ++c.round;            // peer a round ahead (duplicated / dropped control)
+        if (corrupt == 6) c.rank = 0;           // both hosts started as rank 0
         std::memcpy(in, &c, sizeof c);
     }
 };
@@ -51,12 +55,12 @@ int main() {
         catch (const std::invalid_argument&) { rejected = true; }
         check(rejected, "invalid/conflicting admin mode rejected");
     }
-    for (unsigned corrupt = 0; corrupt <= 4; ++corrupt) {
+    for (unsigned corrupt = 0; corrupt <= 6; ++corrupt) {
         Peer peer; peer.corrupt = corrupt;
         ms::Control c; c.command = 8; c.round = 1;
         bool rejected = false;
         try { (void)ms::exchange(peer, c); } catch (const std::runtime_error&) { rejected = true; }
-        check(rejected == (corrupt != 0) && (corrupt == 0 || peer.aborts > 0), "control version/magic/checkpoint/ack validation");
+        check(rejected == (corrupt != 0) && (corrupt == 0 || peer.aborts > 0), "control version/magic/checkpoint/ack/round/rank validation");
     }
     ds::AutoAdmission a{ds::Mode::automatic, true, 0, false, 100, 4096, 256, true, ds::Prior::structural_v1, {}};
     const auto reason = [&](const char* expected) {

@@ -335,6 +335,57 @@ std::vector<std::uint8_t> read_bytes(const char* path, std::uint64_t offset, std
     return out;
 }
 
+// Dead n-gram positions (rows whose embedding was provided, e.g. image rows): a synthetic contract.
+void test_engram_dead() {
+    strix::deepseek41::EngramContract c;
+    c.layer_ids = {2, 5};
+    c.max_ngram_size = 3;
+    c.n_heads = 2;
+    c.primes = {101, 103, 107, 109, 113, 127, 131, 137};  // [layer][(n - 1) * heads]
+    c.rows = {101 + 103 + 107 + 109, 113 + 127 + 131 + 137};
+    c.multipliers = {3, 5, 7, 11, 13, 17};                // [layer][n]
+    c.token_map.resize(32);
+    for (std::uint32_t t = 0; t < 32; ++t) c.token_map[t] = (t * 5U + 1U) % 29U;
+    c.compressed_vocab_size = 29;
+    c.pad_id = 31;
+    const std::size_t per = 2U * c.rows_per_token();
+    const auto row = [&](const std::vector<std::uint64_t>& all, std::size_t t) {
+        return std::vector<std::uint64_t>(all.begin() + static_cast<std::ptrdiff_t>(t * per),
+                                          all.begin() + static_cast<std::ptrdiff_t>((t + 1) * per));
+    };
+    const std::uint32_t dead = strix::ds41::engram_dead_token(9);
+    EngramHasher h(c);
+    const std::vector<std::uint32_t> text{4, 9, 9, 7, 8, 3}, mixed{4, dead, dead, 7, 8, 3};
+    const auto plain = h.hash_sequence(text);
+    expect(h.hash_sequence(text) == plain, "Engram: a text sequence hashes as before");
+    const auto with = h.hash_sequence(mixed);
+    expect(h.positions() == 6, "Engram: dead positions count as positions");
+    expect(row(with, 0) == row(plain, 0), "Engram: rows before a dead position are unchanged");
+    expect(row(with, 5) == row(plain, 5), "Engram: a row whose n-grams end after the dead span is unchanged");
+    expect(row(with, 3) != row(plain, 3) && row(with, 4) != row(plain, 4), "Engram: n-grams do not read through a dead position");
+    // a dead position hashes padding only (whatever its token), and the first row after it sees padding behind it:
+    // the same rows as the start of a sequence
+    const auto start = h.hash_sequence(std::vector<std::uint32_t>{7, 8});
+    expect(row(with, 3) == row(start, 0), "Engram: the row after a dead span = a sequence start");
+    expect(row(with, 4) == row(start, 1), "Engram: the rows after a dead span continue as after a sequence start");
+    const auto other = h.hash_sequence(std::vector<std::uint32_t>{4, strix::ds41::engram_dead_token(1), dead, 7, 8, 3});
+    expect(other == with, "Engram: a dead row does not depend on its token");
+    expect(row(with, 1) == row(with, 2), "Engram: dead rows are all the padding row");
+    // truncate + push replays, the bit stays in the history
+    (void)h.hash_sequence(mixed);
+    h.truncate(3);
+    std::vector<std::uint64_t> again(per);
+    h.push(7, again);
+    expect(again == row(with, 3), "Engram: truncate keeps dead positions");
+    bool threw = false;
+    try {
+        h.push(strix::ds41::engram_dead_token(32), again);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    expect(threw, "Engram: a dead token is still checked against the vocabulary");
+}
+
 void test_real(const char* path) {
     const auto model = strix::deepseek41::validate_target(strix::deepseek41::read_file(path));
     EngramHasher hasher(model.engram);
@@ -390,6 +441,7 @@ int main() {
     test_projections(rng);
     test_argmax(rng);
     test_engram_gate(rng);
+    test_engram_dead();
     if (const char* path = std::getenv("STRIX_DEEPSEEK41_GGUF")) test_real(path);
     if (failures) {
         std::cerr << failures << " failure(s)\n";

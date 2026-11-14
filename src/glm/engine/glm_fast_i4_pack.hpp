@@ -92,7 +92,8 @@ struct Pack {
     double read_seconds = 0, write_seconds = 0;
     unsigned read_layers = 0, written_layers = 0;
 
-    static Pack open(const std::string& model_dir, unsigned rank, unsigned world, unsigned slice_i, unsigned matrices, const std::string& smooth) {
+    static Pack open(const std::string& model_dir, unsigned rank, unsigned world, unsigned slice_i, unsigned matrices, const std::string& smooth,
+                     const std::string& scale = std::string()) {  // scale: empty = the legacy rule (headers unchanged)
         Pack p;
         const char* d = std::getenv("STRIX_GLM_FAST_I4_PACK");
         auto flag = [](const char* name, bool dflt) {
@@ -113,7 +114,8 @@ struct Pack {
         std::ostringstream h;
         h << "format glm-fast-i4-pack 1\nmodel " << hex(model_digest(model_dir)) << "\nrank " << rank << " world " << world
           << " routed-slice I " << slice_i << " offset " << rank * slice_i << "\ngroup 64\nmatrices "
-          << (matrices == 3U ? "gate,up,down" : "gate,up") << "\nsmooth " << smooth << "\nconverter " << kConverter << "\n";
+          << (matrices == 3U ? "gate,up,down" : "gate,up") << "\nsmooth " << smooth << "\nconverter " << kConverter
+          << (scale.empty() ? std::string() : ";scale=" + scale) << "\n";
         p.header = h.str();
         std::ifstream in(p.dir + "/manifest.txt");
         if (!in) {

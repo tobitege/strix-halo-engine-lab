@@ -12,7 +12,9 @@ __device__ __forceinline__ void da16_down_item(const unsigned char* weights,cons
 #define STRIX_DA16_BATCH_TILE const unsigned batch=p1_batch,tile=p1_tile;
 #define STRIX_DA16_GUARD
 #define STRIX_DA16_LDS(S,R) S* const sb=p1_sb; R& rows=p1_rows;
+#define STRIX_DA16_UNIFORM_A false
 #include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
 #undef STRIX_DA16_LDS

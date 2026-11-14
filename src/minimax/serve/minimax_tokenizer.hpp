@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/serve/bpe_tokenizer.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -33,6 +35,11 @@ public:
     ~MinimaxTokenizer();
 
     [[nodiscard]] std::vector<std::uint32_t> encode(std::string_view text, bool parse_special = true) const;
+    // encode() that also appends its restart points (strix::serve::EncodeMark): the end of every added token
+    // that became an id. mark_lookahead() is the longest added token, the window a restart point needs.
+    [[nodiscard]] std::vector<std::uint32_t> encode_marked(std::string_view text, bool parse_special,
+                                                           std::vector<strix::serve::EncodeMark>& marks) const;
+    [[nodiscard]] std::size_t mark_lookahead() const noexcept;
     [[nodiscard]] std::string decode(std::span<const std::uint32_t> ids, bool skip_special = false) const;
 
     // ID of an added token's content or of a vocabulary token (byte-level form, e.g. "Ġthe"), or UINT32_MAX.
@@ -60,6 +67,7 @@ private:
     MinimaxTokenizer();
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::vector<std::uint32_t> encode_marks(std::string_view text, bool parse_special, std::vector<strix::serve::EncodeMark>* marks) const;
 };
 
 }  // namespace strix::minimax::serve

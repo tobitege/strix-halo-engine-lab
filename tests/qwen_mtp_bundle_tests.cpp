@@ -139,6 +139,27 @@ int main(int argc,char** argv) try {
     require(!parse(native).mtp.enabled,"explicit rotary off ignores bundle");
     native.pop_back();native.push_back("4");native.push_back("--baseline");
     require(!parse(native).mtp.enabled,"baseline ignores automatic bundle");
+    {
+        // The plain production command selects the adjacent bundle; one opt-out flag and one environment switch.
+        std::vector<std::string> nd_plain{"decode",(dir/"target.gguf").string()};
+        for(int token=1;token<=17;++token)nd_plain.push_back(std::to_string(token));
+        nd_plain.insert(nd_plain.end(),{"--generate","8"});
+        const auto nd_selected=parse(nd_plain);
+        require(nd_selected.mtp.enabled && nd_selected.mtp_native_bundle && nd_selected.mtp.calibration_rows==16U &&
+            !nd_selected.route_owned_beyond_mtp,"plain command selects the adjacent bundle");
+        auto nd_opted_out=nd_plain;nd_opted_out.push_back("--no-mtp");
+        require(!parse(nd_opted_out).mtp.enabled,"--no-mtp keeps plain decode");
+        env("STRIX_MTP","0");require(!parse(nd_plain).mtp.enabled,"STRIX_MTP=0 keeps plain decode");env("STRIX_MTP","");
+        auto nd_owned=nd_plain;nd_owned.push_back("--gpu-greedy-token");
+        require(!parse(nd_owned).mtp.enabled,"a route option keeps plain decode");
+        const auto nd_moved=dir/"nd_moved.json";std::filesystem::rename(bundle,nd_moved);
+        std::ostringstream nd_line;auto* nd_previous=std::cerr.rdbuf(nd_line.rdbuf());
+        const auto nd_fallback=parse(nd_plain);std::cerr.rdbuf(nd_previous);
+        std::filesystem::rename(nd_moved,bundle);
+        const auto nd_text=nd_line.str();
+        require(!nd_fallback.mtp.enabled && nd_text.starts_with("MTP default (qwen) unavailable; using plain decode: ") &&
+            std::count(nd_text.begin(),nd_text.end(),'\n')==1,"missing bundle is one notice and plain decode");
+    }
     write(sidecar,"bad");refuses([&]{parse(base);});
     const auto cache=dir/"cache";int dumps=0;
     const auto fake=[&](const std::filesystem::path& temp){
@@ -263,7 +284,7 @@ int main(int argc,char** argv) try {
         std::cerr.rdbuf(saved);
         require(status && *status==17 && attempts==1,"one serial retry returns its status");
         const auto notice_text=notices.str();
-        require(notice_text.starts_with("YaRN MTP bundle setup unavailable; using serial decode: ") &&
+        require(notice_text.starts_with("MTP bundle setup unavailable; using serial decode: ") &&
             std::count(notice_text.begin(),notice_text.end(),'\n')==1,"one fallback notice");
         state.target_mutated=true;
         require(!retry_mtp_bundle_setup(state,error,[]{return 1;}),"post-mutation error keeps refusal");

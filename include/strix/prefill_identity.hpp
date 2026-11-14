@@ -8,9 +8,11 @@
 // Environment and startup restrictions combine monotonically. The active set names the prefill identity (prefill_identity_name/hash),
 // which receipts and the serving capability endpoint report.
 
+#include "strix/env_flags.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/qsa_prefill_budget.hpp"
+#include "strix/moe_route_prune.hpp"
 #include <array>
 #include <charconv>
 #include <cstdint>
@@ -140,7 +142,7 @@ inline std::uint32_t qsa_union_cap_active() {
         const char* value = std::getenv("STRIX_QPF2K_QSA_UNION_CAP");
         return parse_qsa_union_cap(value ? value : "");
     }();
-    static const bool exact = [] { const char* v = std::getenv("STRIX_PREFILL_EXACT_FP16"); return v && v[0] == '1'; }();
+    static const bool exact = strix::envcfg::flag("STRIX_PREFILL_EXACT_FP16", false);
     return exact || detail::prefill_identity_override().exact ? 0U : cap;
 }
 
@@ -152,6 +154,12 @@ inline std::uint32_t qsa_prefill_budget_active() {
         return parse_qsa_prefill_budget(value ? value : "");
     }();
     return budget;
+}
+
+// One effective draft policy for both arithmetic binding and native submission.
+inline moe_core::RoutePrune prefill_route_prune_active() {
+    static const bool exact = envcfg::flag("STRIX_PREFILL_EXACT_FP16", false);
+    return exact || detail::prefill_identity_override().exact ? moe_core::RoutePrune{} : moe_core::route_prune_active();
 }
 
 // Budget and union cap are explicit drafts outside READY. Bind their values after the governed tags; zero preserves old bytes.
@@ -166,6 +174,9 @@ inline std::string prefill_identity_name(unsigned mask, std::uint32_t qsa_budget
         }
     if (qsa_budget) name += "+qsab" + std::to_string(qsa_budget);
     if (union_cap) name += "+qsauc" + std::to_string(union_cap);
+    // RoutePrune draft: its spec is part of the identity; off preserves the old bytes.
+    if (const auto prune = moe_core::route_prune_tag(prefill_route_prune_active()); !prune.empty())
+        name += "+rp" + prune;
     return name;
 }
 inline std::string prefill_identity_name() { return prefill_identity_name(prefill_options_active()); }

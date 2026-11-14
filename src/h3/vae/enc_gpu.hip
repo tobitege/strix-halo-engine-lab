@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "h3/vae/enc_gpu.hpp"
 
 #include <hip/hip_runtime.h>
@@ -310,7 +311,7 @@ namespace {
 // STRIX_H3_VAE_ENC_IMPLICIT=0: the per-output-frame im2col + GEMM form (same bits); set_implicit_conv() for tests
 int implicit_override = -1;
 bool implicit_conv() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_H3_VAE_ENC_IMPLICIT"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_H3_VAE_ENC_IMPLICIT", true);
     return implicit_override < 0 ? on : implicit_override != 0;
 }
 struct Scratch3 {

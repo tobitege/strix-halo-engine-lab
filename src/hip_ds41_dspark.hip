@@ -1,8 +1,12 @@
 #pragma clang fp contract(off)
+#include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include "moe_core/route.hpp"
 
 #include "strix/hip_ds41_formats.hpp"
 
@@ -23,7 +27,7 @@ namespace strix::ds41::dspark {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("ds41 dspark: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("ds41 dspark: ", status, what);
 }
 namespace mc = ::strix::dspark::markov_cand;
 static_assert(block_size <= mc::kMaxRows && markov_rank == mc::kRank);
@@ -210,27 +214,18 @@ __global__ __launch_bounds__(256) void markov_bias_kernel(const std::uint16_t* e
     }
 }
 __global__ __launch_bounds__(1024) void argmax_kernel(const float* logits, unsigned step, std::uint32_t* tokens) {
-    __shared__ float values[1024];
-    __shared__ unsigned indices[1024];
+    // Ordering stays the host/device better() shared with the CPU reference (float compare: NaN never
+    // wins); the block tree is the shared argmax core (R2-07).
+    struct Best { float value; unsigned index; };
+    __shared__ Best values[1024];
     const float* l = logits + static_cast<std::size_t>(step) * vocab;
-    float best = -__builtin_huge_valf();
-    unsigned best_index = vocab;
+    Best best{-__builtin_huge_valf(), vocab};
     for (unsigned v = threadIdx.x; v < vocab; v += 1024U)
-        if (better(l[v], v, best, best_index)) { best = l[v]; best_index = v; }
-    values[threadIdx.x] = best;
-    indices[threadIdx.x] = best_index;
-    __syncthreads();
-    for (unsigned half = 512; half != 0U; half /= 2U) {
-        if (threadIdx.x < half) {
-            const unsigned o = threadIdx.x + half;
-            if (better(values[o], indices[o], values[threadIdx.x], indices[threadIdx.x])) {
-                values[threadIdx.x] = values[o];
-                indices[threadIdx.x] = indices[o];
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0U) tokens[step + 1U] = indices[0];
+        if (better(l[v], v, best.value, best.index)) best = Best{l[v], v};
+    best = strix::argmax::block_reduce<1024>(values, threadIdx.x, best, [](const Best& a, const Best& b) {
+        return better(b.value, b.index, a.value, a.index) ? b : a;
+    });
+    if (threadIdx.x == 0U) tokens[step + 1U] = best.index;
 }
 __global__ __launch_bounds__(32) void confidence_kernel(const float* weight, const float* x, const float* markov, float* out) {
     const unsigned lane = threadIdx.x, r = blockIdx.x;
@@ -255,40 +250,32 @@ __global__ __launch_bounds__(256) void draft_router_scores_kernel(const float* x
     acc = butterfly(acc);
     if (lane == 0U) scores[static_cast<std::size_t>(r) * experts + e] = router_score(acc);
 }
+struct DraftRoutePolicy {
+    static constexpr unsigned threads = 128, max_top_k = top_k, expert_count = experts;
+    const float* sc;
+    float biased;
+    std::uint32_t* ids;
+    float* weights;
+    __device__ unsigned get_experts() const { return expert_count; }
+    __device__ unsigned get_top_k() const { return max_top_k; }
+    __device__ float score(unsigned e) const { return sc[e]; }
+    __device__ void seed(unsigned t, unsigned k, const unsigned* chosen, float& value, unsigned& index) const {
+        bool taken = false;
+        for (unsigned j = 0; j < k; ++j) taken = taken || chosen[j] == t;
+        value = biased;
+        index = taken ? get_experts() : t;
+    }
+    __device__ void write(unsigned r, unsigned k, unsigned id, float denominator) const {
+        ids[r * get_top_k() + k] = id;
+        weights[r * get_top_k() + k] = sc[id] / denominator * route_scale;
+    }
+};
+
 __global__ __launch_bounds__(128) void draft_router_select_kernel(const float* scores, const float* bias, std::uint32_t* ids, float* weights) {
-    __shared__ float value[128];
-    __shared__ unsigned index[128];
-    __shared__ unsigned chosen[top_k];
     const unsigned r = blockIdx.x, t = threadIdx.x;
     const float* sc = scores + static_cast<std::size_t>(r) * experts;
     const float biased = sc[t] + bias[t];
-    for (unsigned k = 0; k < top_k; ++k) {
-        bool taken = false;
-        for (unsigned j = 0; j < k; ++j) taken = taken || chosen[j] == t;
-        value[t] = biased;
-        index[t] = taken ? experts : t;
-        __syncthreads();
-        for (unsigned h = 64; h != 0U; h /= 2U) {
-            if (t < h) {
-                const float ov = value[t + h];
-                const unsigned oi = index[t + h];
-                const bool take = oi != experts && (index[t] == experts || ov > value[t] || (ov == value[t] && oi < index[t]));
-                if (take) { value[t] = ov; index[t] = oi; }
-            }
-            __syncthreads();
-        }
-        if (t == 0U) chosen[k] = index[0];
-        __syncthreads();
-    }
-    if (t == 0U) {
-        float sum = 0.0F;
-        for (unsigned k = 0; k < top_k; ++k) sum = sum + sc[chosen[k]];
-        const float denominator = sum + 1e-20F;
-        for (unsigned k = 0; k < top_k; ++k) {
-            ids[r * top_k + k] = chosen[k];
-            weights[r * top_k + k] = sc[chosen[k]] / denominator * route_scale;
-        }
-    }
+    strix::moe_core::route_block_topk(DraftRoutePolicy{sc, biased, ids, weights}, r, t);
 }
 
 // ---- MoE routes built on the device (build_window_routes of ds41_moe.hpp, one thread) ----
@@ -563,7 +550,7 @@ struct DeviceStage {
 // STRIX_DS41_DSPARK_MEMLOG=1: the amdgpu GTT in use (sysfs mem_info_gtt_used of the first GPU) at each stage of the
 // drafter's setup, against the bytes it allocates there (DeviceDrafter::footprint's parts). Diagnostics only.
 bool memlog_on() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_DSPARK_MEMLOG"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_DSPARK_MEMLOG", false);
     return on;
 }
 std::uint64_t gtt_used() {

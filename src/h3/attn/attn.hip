@@ -10,8 +10,10 @@
 // consecutive keys (dims) of one query. P^T (B: lane = query, 16 keys) is assembled from the packed bf16 P of the
 // two half-waves with ds_swizzle broadcasts.
 #include "h3/attn/attn.hpp"
+#include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <cstdlib>
 #include <initializer_list>
@@ -444,34 +446,24 @@ __global__ __launch_bounds__(256) void transpose_kernel(const std::uint16_t* v, 
     }
 }
 
-// Strict environment switches: unset -> default; otherwise the value must be exactly one of the documented decimal
-// strings, else std::invalid_argument at first use (before anything is enqueued). No partial parsing or masking.
-int env_choice(const char* name, int dflt, std::initializer_list<int> allowed) {
-    const char* v = std::getenv(name);
-    if (!v) return dflt;
-    std::string list;
-    for (const int a : allowed) {
-        if (std::to_string(a) == v) return a;
-        list += (list.empty() ? "" : ", ") + std::to_string(a);
-    }
-    throw std::invalid_argument(std::string("h3 attn: ") + name + "='" + v + "' is not one of {" + list + "}");
-}
+// Strict environment switches (strix::env_choice): unset -> default; otherwise the value must be exactly one of the
+// documented decimal strings, else std::invalid_argument at first use (before anything is enqueued).
 // STRIX_H3_ATTN_WAVES: 16 = 256-row query tiles (the default: +4 % median in a paired per-block bench at the 2-node
 // per-block shape; 226 VGPRs -> 6 waves/SIMD is the register-derived ceiling, not a measured residency), 8 = 128-row
 // tiles (the previous default). Same bits either way.
 unsigned g_waves = 0;  // 0: from the environment
 int g_early = -1;      // -1: from the environment (default on; STRIX_H3_ATTN_EARLY=0 restores the late schedule)
 bool early_loads() {
-    static const bool env = env_choice("STRIX_H3_ATTN_EARLY", 1, {0, 1}) == 1;
+    static const bool env = strix::env_choice("STRIX_H3_ATTN_EARLY", 1, {"0", "1"}) == 1;
     return g_early < 0 ? env : g_early == 1;
 }
 unsigned waves_per_wg() {
-    static const unsigned env = static_cast<unsigned>(env_choice("STRIX_H3_ATTN_WAVES", 16, {8, 16}));
+    static const unsigned env = strix::env_choice("STRIX_H3_ATTN_WAVES", 1, {"8", "16"}) == 1 ? 16U : 8U;
     return g_waves ? g_waves : env;
 }
 int g_persist = -1;  // -1: from the environment (STRIX_H3_ATTN_PERSIST=1)
 bool persistent() {
-    static const bool env = env_choice("STRIX_H3_ATTN_PERSIST", 0, {0, 1}) == 1;
+    static const bool env = strix::env_choice("STRIX_H3_ATTN_PERSIST", 0, {"0", "1"}) == 1;
     return g_persist < 0 ? env : g_persist == 1;
 }
 template <class K> unsigned resident_groups(K kernel, unsigned threads) {
@@ -484,7 +476,7 @@ template <class K> unsigned resident_groups(K kernel, unsigned threads) {
 }
 int g_pingpong = -1;  // -1: from the environment (STRIX_H3_ATTN_PINGPONG=1)
 bool pingpong() {
-    static const bool env = env_choice("STRIX_H3_ATTN_PINGPONG", 0, {0, 1}) == 1;
+    static const bool env = strix::env_choice("STRIX_H3_ATTN_PINGPONG", 0, {"0", "1"}) == 1;
     return g_pingpong < 0 ? env : g_pingpong == 1;
 }
 template <unsigned D, bool Fused, bool Early, unsigned W, bool PP> void launch_flash_wp(const Args& a, unsigned nblocks, hipStream_t s) {
@@ -500,7 +492,7 @@ template <unsigned D, bool Fused, bool Early, unsigned W, bool PP> void launch_f
 }
 int g_tune = -1;  // -1: from the environment (STRIX_H3_ATTN_TUNE = bit mask, default 0)
 unsigned tune() {
-    static const unsigned env = static_cast<unsigned>(env_choice("STRIX_H3_ATTN_TUNE", 0, {0, 1, 2, 3, 4}));
+    static const unsigned env = static_cast<unsigned>(strix::env_choice("STRIX_H3_ATTN_TUNE", 0, {"0", "1", "2", "3", "4"}));
     return g_tune < 0 ? env : static_cast<unsigned>(g_tune);
 }
 template <unsigned D, bool Fused, bool Early, unsigned W> void launch_flash_ww(const Args& a, unsigned nblocks, hipStream_t s) {
@@ -528,7 +520,7 @@ template <unsigned D, bool Fused> void launch_flash(const Args& a, unsigned nblo
 }
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 attn ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 attn ", e, what);
 }
 bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U; }
 // Head dims qualified against a host reference: 128 only (the D64 kernels are built but rejected until a
@@ -557,7 +549,10 @@ void set_tune(int mask) { g_tune = mask < 0 || mask > 4 ? -1 : mask; }
 constexpr unsigned kHeadSplitKeys = 24576;
 static int g_head_split = -2;  // -2: environment (STRIX_H3_ATTN_HEAD_SPLIT=0/1; unset = automatic), -1 automatic, 0 off, 1 on
 static bool head_split(const KeyBlock* blocks, unsigned nblocks) {
-    static const int env = env_choice("STRIX_H3_ATTN_HEAD_SPLIT", -1, {0, 1});
+    static const int env = [] {
+        const std::size_t i = strix::env_choice("STRIX_H3_ATTN_HEAD_SPLIT", 2, {"0", "1"});  // 2 = unset = automatic
+        return i == 2U ? -1 : static_cast<int>(i);
+    }();
     const int mode = g_head_split == -2 ? env : g_head_split;
     if (mode >= 0) return mode == 1;
     for (unsigned b = 0; b < nblocks; ++b)

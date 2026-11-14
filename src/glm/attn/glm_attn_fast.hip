@@ -3,6 +3,7 @@
 // host loop it reproduces and how the lanes map onto the declared reduction (R1 chains, R2 halving trees).
 // Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/attn/glm_attn_fast.hpp"
+#include "attn_core/select.hpp"
 #include "glm/attn/glm_dsa_policy.hpp"
 #include "glm/common/glm_dsa_pool.hpp"
 #include "glm/kernels/glm_tree.hpp"
@@ -62,31 +63,6 @@ template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float 
     return r;
 }
 
-// Block-wide exclusive scan of one unsigned per thread (blockDim.x = 1024, wave32). Two barriers inside; callers may
-// call it repeatedly (it begins with a barrier that protects the shared totals).
-__device__ __forceinline__ unsigned block_excl_scan_1024(unsigned v, unsigned* wsum) {
-    const unsigned l = threadIdx.x, lane = l & 31U, w = l >> 5U;
-    unsigned x = v;
-#pragma unroll
-    for (unsigned off = 1; off < 32; off <<= 1U) {
-        const unsigned y = __shfl_up(x, off, 32);
-        if (lane >= off) x += y;
-    }
-    __syncthreads();
-    if (lane == 31) wsum[w] = x;
-    __syncthreads();
-    if (w == 0) {
-        unsigned s = wsum[lane];
-#pragma unroll
-        for (unsigned off = 1; off < 32; off <<= 1U) {
-            const unsigned y = __shfl_up(s, off, 32);
-            if (lane >= off) s += y;
-        }
-        wsum[lane] = s;  // inclusive totals per wave
-    }
-    __syncthreads();
-    return (w ? wsum[w - 1] : 0U) + x - v;
-}
 
 // ---------------------------------------------------------------- R1 dense chains (F16)
 // Host: dense() = chain_dot over i ascending, acc = fmaf(x[i], W[o][i], acc). One lane per output o; the R rows' chains
@@ -1062,63 +1038,9 @@ __global__ __launch_bounds__(1024) void idx_select_kernel(DsaRows d, const std::
     const unsigned t = d.tpos[r], P = (t + 1) / kKpool, k = P < kIdxPools ? P : kIdxPools;
     const std::uint32_t* kr = keys + static_cast<std::size_t>(r) * key_stride;
     std::uint32_t* tok = tokens + static_cast<std::size_t>(r) * kTokStride;
-    if (k == P) {  // every visible pool is selected
-        for (unsigned i = l; i < P * kKpool; i += 1024) tok[i] = i;
-    } else {
-        unsigned prefix = 0, mask = 0, rem = k;
-        for (int shift = 24; shift >= 0; shift -= 8) {
-            __syncthreads();
-            if (shift == 24) {
-                if (l < 256) hist[l] = hist0[r * 256 + l];
-            } else {
-                if (l < 256) hist[l] = 0;
-                __syncthreads();
-                for (unsigned p = l; p < P; p += 1024) {
-                    const std::uint32_t key = kr[p];
-                    if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255U], 1U);
-                }
-            }
-            __syncthreads();
-            const unsigned v = l < 256 ? hist[255 - l] : 0U;  // digits from the top
-            const unsigned above = block_excl_scan_1024(v, wsum);  // keys (under the prefix) with a larger digit
-            if (l < 256 && above < rem && above + v >= rem) {
-                sh_prefix = prefix | (static_cast<unsigned>(255 - l) << shift);
-                sh_rem = rem - above;
-            }
-            __syncthreads();
-            prefix = sh_prefix;
-            rem = sh_rem;
-            mask |= 255U << shift;
-        }
-        const unsigned kstar = prefix, take_eq = rem;
-        const unsigned seg = (P + 1023) / 1024, b0 = l * seg < P ? l * seg : P, b1 = b0 + seg < P ? b0 + seg : P;
-        unsigned ce = 0;
-        for (unsigned p = b0; p < b1; ++p) ce += kr[p] == kstar ? 1U : 0U;
-        const unsigned eq_base = block_excl_scan_1024(ce, wsum);
-        unsigned cs = 0, er = eq_base;
-        for (unsigned p = b0; p < b1; ++p) {
-            const std::uint32_t key = kr[p];
-            const bool eq = key == kstar;
-            cs += (key > kstar || (eq && er < take_eq)) ? 1U : 0U;
-            er += eq ? 1U : 0U;
-        }
-        unsigned o = block_excl_scan_1024(cs, wsum);
-        er = eq_base;
-        for (unsigned p = b0; p < b1; ++p) {
-            const std::uint32_t key = kr[p];
-            const bool eq = key == kstar;
-            if (key > kstar || (eq && er < take_eq)) {
-                for (unsigned j = 0; j < kKpool; ++j) tok[o * kKpool + j] = p * kKpool + j;
-                ++o;
-            }
-            er += eq ? 1U : 0U;
-        }
-    }
-    if (l == 0) {  // tail: positions 4P .. t
-        unsigned n = k * kKpool;
-        for (unsigned pos = P * kKpool; pos <= t; ++pos) tok[n++] = pos;
-        n_out[r] = n;
-    }
+    strix::attn_core::select::select_row<strix::attn_core::select::SegmentPolicy<kKpool>>(
+        kr, P, t, k, l, tok, n_out + r,
+        strix::attn_core::select::SegmentStorage{hist, wsum, sh_prefix, sh_rem}, hist0, r);
 }
 
 // ---------------------------------------------------------------- MLA (R13)

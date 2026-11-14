@@ -52,7 +52,7 @@ mismatch. `0` restores the legacy path. Restart both ranks after a change.
 `0` or `1`.
 
 Prefill kernel variant selectors (`STRIX_GLM_PF_HC`, `_MLA`, `_IDX`, `_SELECT`, `_OBAR`, `_MLA_GEMM`, `_SCORES`,
-`_KDA_SCAN`, `_DENSE_ROWS`) share one table used by the engine and by `--print-effective-config`. Unset selects
+`_KDA_SCAN`, `_DENSE_ROWS`, `_DENSE_FORM`) share one table used by the engine and by `--print-effective-config`. Unset selects
 the default; any set value, empty included, must be a listed variant or startup is refused with
 `ENV='v' is not a known variant (allowed: ...; unset = D)`. The effective-config line reports the variant that
 runs.
@@ -67,7 +67,8 @@ runs.
 | `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
 | `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
 | `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
-| `STRIX_GLM_PF_DENSE_ROWS` | 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_ROWS` | 4, 3, 2, 1 |
+| `STRIX_GLM_PF_DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (physical form of version 4; 0 = automatic per shape) |
 
 With `STRIX_XPORT_TRACE=1`, the prefill exchange prints
 `xport prefill bytes=... copied=... messages=... reuse_dependencies=...` when it closes. `reuse_dependencies`
@@ -104,7 +105,7 @@ and read the tokenizer from `MODEL_DIR/tokenizer.json`:
 
 Defaults: 8 request slots (`--slots`, at most 8), 8192 positions per slot (`--capacity`), exact MTP self-speculation
 with one request in flight, batched MTP verify with more (`STRIX_GLM_SERVE_G2=0` = batched plain steps), decode-first
-chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). `--serial` admits one
+chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). The chunk is resolved by the same route policy as the CLI: both ranks print `effective serve-prefill-chunk=...` with the dense core its calls take, and the reason whenever a chunk declines the large-call core. `--serial` admits one
 request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
@@ -198,6 +199,8 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 | Exact chunked prefill, dense rows v2 (default; `STRIX_GLM_PF_DENSE_ROWS=1` restores v1) | 1K / 8K benchmark prompts (1,024 / 8,192 tokens), interleaved v2 / v1 arms | TTFT 8K **15.06 → 14.92 s** (−0.9 %, 544 → 549 tok/s), 1K warm **2.80 → 2.75 s** (−1.9 %, 366 → 372 tok/s); every v2 arm faster than every v1 arm; KDA f_b / g_b kernels (128 → 4096) **1.19–1.21×** at 8,192 rows. Roofline: at 14.92 s for 8,192 tokens (549 tok/s) the exact pair prefill runs at about 16 % of its linears-only compute floor (31.8 GFLOP/token on 2 x 54 TF = 2.4 s); the binding limit is the exact kernel schedule rather than memory bandwidth or the cable: the MoE and dense linears run on FP32 VALU tiles to keep the bitwise identity, and this change only shortens the dense-row part of that schedule. | logits and state bitwise equal v1 on both ranks (same per-output ascending FMA chain); device gate 80/80 bitwise; the 16,384-long chains of the legacy mHC path keep the v1 tile |
 | Exact chunked prefill, mHC mix collapse + norm in one kernel (default; `STRIX_GLM_PF_MIXNORM=0` restores the two kernels) | 8K / 32K benchmark prompts (8,192 / 32,768 tokens), alternating on / off arms | TTFT 8K **15.07 → 14.95 s** (−0.8 %, 544 → 548 tok/s), 32K **63.23 → 62.23 s** (−1.6 %, 518 → 527 tok/s, against the mean of the bracketing off arms). Roofline: at 14.95 s for 8,192 tokens (548 tok/s) and 62.23 s for 32,768 tokens (527 tok/s) the exact pair prefill runs at about 16 % / 15 % of its linears-only compute floor (31.8 GFLOP/token on 2 x 54 TF = 2.4 s at 8K, 9.6 s at 32K); the binding limit is the exact kernel schedule rather than memory bandwidth or the cable: the MoE and dense linears run on FP32 VALU tiles to keep the bitwise identity, and this change only removes one memory round trip per hyper-connection site. | logits bitwise equal the anchors on the pair at 1K, 8K and 32K; device gate bitwise over 1 to 4096 rows and special values (only propagated NaN payloads may differ) |
 | FAST WMMA prefill linear cores (`glm-pf-wmma-x`, opt-in `STRIX_GLM_PF_WMMA=1`) | 8K / 32K benchmark prompts, 8,192-row chunks, fresh process per arm | TTFT **15.45 → 12.94 s (−16.3 %)** at 8K and **62.3 → 51.2 s (−17.8 %)** at 32K (mean of both run orders); rank-0 linear kernels at 8K: MoE 5.15 → 3.42 s, dense X3 2.61 → 1.71 s | FAST, not bitwise the exact prefill: pre-registered quality-parity check passed at 1K / 8K / 32K; off (`STRIX_GLM_PF_WMMA=0` or unset, the default) equals the exact logits anchors on both ranks |
+| FAST KDA plain-weight projections on WMMA (`glm-pf-kda-wmma-v1`, on with `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_KDA_WMMA=0` turns it off) | 8K / 32K benchmark prompts, fresh process per arm, against FAST without it | Prefill 8K **9.25 → 9.05 s (−2.1 %)** (2 alternating pairs), 32K **37.74 → 37.13 s (−1.6 %)** (2 off / 3 on runs; one disturbed run of each arm discarded) | FAST, not bitwise: teacher-forced 3 × 256 positions KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change −0.006 / +0.001 / +0.002; off keeps the previous bytes |
+| FAST fused MLA/DSA attention core (`glm-pf-attn-wmma`, on with `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_ATTN_WMMA=0` turns it off) | 8K / 32K benchmark prompts, 8,192-row chunks, fresh process per arm, against FAST without the core | Prefill 8K **10.600 → 9.695 s (−8.5 %)** (2 alternating pairs), 32K **44.30 → 40.26 s (−9.1 %)** (one off / on / off set); layer bench: scores + softmax + o-bar 2.6× / 3.2× faster at the 8K / 32K positions | FAST, not bitwise: prefill-logits KL 7.8e-4 nats at 8K, top-1 and greedy equal over 8 decode steps; exact mode unchanged (logits equal the anchors on both ranks); teacher-forced check over 3 prompts pending |
 | Exact chunked prefill, mHC expand + norm two rows per block (default; `STRIX_GLM_PF_HC_EXPAND_ROWS=1` restores one row per block) | 8K benchmark prompt (8,192 tokens), alternating on / off arms, other exact prefill levers of that build enabled | TTFT 8K **13.671 → 13.611 s** (−0.44 %, above the 0.024 s spread within an arm) | logits bitwise equal the anchors on both ranks at 8K; host and device gates bitwise against the one-row kernel |
 | Exact / FAST chunked prefill, token-ordered MoE gate/up input transform (default; `STRIX_GLM_PF_IN_TOKEN=0` restores the tile-ordered transform) | 8K / 32K benchmark prompts, on / off arms in both orders, fresh process per arm | FAST 8K TTFT **10.55 → 10.21 s** (median of 4 pairs); exact 8K 13.195 → 12.868 s; FAST 32K 43.49 → 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce). | logits and state digests identical in every arm on both ranks; full logits files identical in the exact arms |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |

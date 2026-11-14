@@ -36,6 +36,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "strix/pair/producer_publish.hpp"
+
 namespace strix::glm::moe {
 
 inline constexpr unsigned kHidden = 4096, kInter = 1024 /* per rank */, kExperts = 288, kTopE = 8, kMaxRows = 8;
@@ -95,6 +97,9 @@ struct MoeView {
     // fast_i4: routed gate/up/down on the W4A16 core (int4 weights, FP16 activations, F32 accumulation, per-group
     // scale); the shared expert, router, transforms, R15 and R16 stay as above. Not bitwise to the EXL3 identity.
     I4Experts i4{};
+    // Producer publication (pair decode): `out` is the channel's TX slot and the down kernel raises the TX flag after its
+    // last R16 store (strix/pair/producer_publish.hpp). Off (default): nothing is published.
+    strix::pair::ProducerPublish publish{};
 };
 // Both throw std::invalid_argument on unsupported shapes (shared other than K4/K6 at the GLM shapes, rows outside
 // 1..8, null pointers). Routed expert slices must be K4 at the GLM shapes (device array, not checked on the host).

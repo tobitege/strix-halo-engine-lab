@@ -34,6 +34,9 @@ struct Limits {
     std::uint32_t max_tensor_dimensions = 4;
     // Top-level numeric arrays up to this length keep their values (0: summaries only, the default).
     std::uint64_t max_retained_array_elements = 0;
+    // Metadata keys are lower-case snake case separated by dots. Some converted files prefix their keys with a
+    // hyphenated architecture name; a caller that admits such a file opts in here.
+    bool allow_hyphen_in_keys = false;
 };
 
 struct MetadataEntry {

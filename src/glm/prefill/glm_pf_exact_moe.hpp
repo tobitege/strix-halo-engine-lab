@@ -70,12 +70,22 @@ struct Scratch {          // device, per call: quantised activations and the til
 // host_table: [288] routed experts (device trellis/suh/svh pointers). Synchronous (returns after the stream drains).
 // The same conversion into caller-owned buffers: q.wq / q.ws sized as convert() allocates them, q.svh device [288]
 // tables (filled here from host_table's svh). Synchronous. Returns the device seconds.
-double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream);
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream, int scale_rule = 0);
 constexpr std::size_t weight_bytes() { return std::size_t{288} * 4096U * 1024U / 2U; }  // per matrix (all three equal)
 constexpr std::size_t scale_bytes(unsigned m) { return std::size_t{288} * (m == 2U ? 4096U * (1024U / 64U) : 1024U * (4096U / 64U)) * 2U; }
 std::size_t scratch_bytes(unsigned max_rows);
 Scratch make_scratch(unsigned max_rows);
 void release(Scratch& scratch);
+// Full INT4 chain (STRIX_MOE_I4_CHAIN=1), gate-scratch policy. The process policy is resolved once from
+// STRIX_MOE_I4_CHAIN_GSAVE (shared switch, default on) and STRIX_GLM_I4_CHAIN_GSAVE (lend the call's gate/up rows,
+// default off). Qualification fixtures pass an explicit policy instead of changing the environment between calls
+// (nullptr restores the process policy).
+struct ChainPolicy { bool shared_gsave = true, lend = false; };
+void set_chain_policy_for_test(const ChainPolicy* policy);
+// Plan the last full-chain call was enqueued on (0 BM32, 1 BM64, 2 BM128) and whether the paired GEMM kept its gate
+// in the lent scratch; valid is false before the first chain call. A resource fallback shows here, not in the bits.
+struct ChainRun { bool valid = false; int paired = 0, down = 0; bool gsave = false; };
+ChainRun last_chain_run();
 }  // namespace iu4
 // Device plan: the same pairs/tiles/groups bytes as enqueue() built on the GPU from device ids, without the route
 // download, host grouping or plan upload (no host synchronization). table: device [289] (entry 288 = shared expert).

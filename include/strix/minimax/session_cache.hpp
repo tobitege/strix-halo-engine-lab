@@ -3,6 +3,8 @@
 // representation.
 #include <cstdint>
 #include "strix/file_snapshot.hpp"
+#include "strix/session_state_cache.hpp"
+#include "strix/session/prefix_cache.hpp"
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -35,24 +37,21 @@ PrewarmReceipt prewarm(const std::filesystem::path &model,
                       const std::filesystem::path &executable,
                       const std::vector<std::string> &extra_files = {});
 void validate_id(const std::string &);
-struct Frontier {
-  std::uint64_t consumed = 0, emitted = 0, accepted = 0, drafter = 0,
-                control = 0;
-  std::uint32_t pending = 0;
-  bool pending_valid = true, drafter_ready = false;
-  std::string sampling = "greedy", lineage = "minimax-single-row-committed-v1";
-};
-struct Section {
-  std::string name;
-  bool replicated = false;
-  Bytes bytes;
-};
-struct Checkpoint {
-  std::string id, generation, compat;
-  std::uint32_t rank = 0, world = 2;
-  Frontier frontier;
-  std::vector<std::uint32_t> history;
-  std::vector<Section> sections;
+using Frontier = ::strix::SessionFrontier;
+using Section = ::strix::SessionSection;
+inline Frontier initial_frontier() {
+  Frontier f; f.pending = 0; f.lineage = "minimax-single-row-committed-v1"; return f;
+}
+// LEGACY CODEC/accessor adapter only. All state is in the shared base envelope.
+// References bind to this object's base on copy/move; no second history/compat store.
+struct Checkpoint : ::strix::SessionCheckpoint {
+  std::string& compat = compatibility.record;
+  std::vector<std::uint32_t>& history = frontier.tokens;
+  Checkpoint() { compatibility.family = "minimax"; world = 2; frontier = initial_frontier(); }
+  Checkpoint(const Checkpoint& c) : ::strix::SessionCheckpoint(c) {}
+  Checkpoint(Checkpoint&& c) noexcept : ::strix::SessionCheckpoint(std::move(c)) {}
+  Checkpoint& operator=(const Checkpoint& c) { ::strix::SessionCheckpoint::operator=(c); return *this; }
+  Checkpoint& operator=(Checkpoint&& c) noexcept { ::strix::SessionCheckpoint::operator=(std::move(c)); return *this; }
 };
 // Section ordering follows the existing engine cache-row byte ordering.
 std::vector<Section> split_state(std::span<const std::uint8_t>,
@@ -84,7 +83,8 @@ public:
   Cache(std::string compat, std::uint32_t rank, std::uint32_t world,
         std::uint64_t budget, std::filesystem::path directory,
         Exchange exchange, std::uint64_t max_parked = 8,
-        std::uint64_t disk_budget = UINT64_MAX);
+        std::uint64_t disk_budget = UINT64_MAX,
+        std::shared_ptr<PrefixStateCache> owner = {});
   void prepare_capture(
       std::uint64_t payload_bytes); // evict LRU before reserving peak
   void admit(std::uint64_t payload_bytes)
@@ -100,21 +100,19 @@ public:
   std::vector<std::string> list() const;
   Stats stats() const;
   std::vector<Summary> describe(bool include_disk = true) const;
-  bool in_ram(const std::string& id) const { return entries_.count(id) != 0; }
+  bool in_ram(const std::string& id) const { return ram_.find(id) != nullptr; }
   bool on_disk(const std::string& id) const;
+  const std::shared_ptr<PrefixStateCache>& owner() const noexcept { return ram_.owner(); }
 
 private:
-  struct Entry {
-    Bytes bytes;
-    std::uint64_t touched;
-  };
   std::string compat_;
   std::uint32_t rank_, world_;
   std::uint64_t max_parked_, disk_budget_;
-  std::uint64_t budget_, clock_ = 0, evictions_ = 0;
+  std::uint64_t budget_, evictions_ = 0;
   std::filesystem::path directory_;
   Exchange exchange_;
-  std::map<std::string, Entry> entries_;
+  strix::session::NamedStateCache ram_;
+  PrefixStateCache::Reservation working_;
   void identify(Checkpoint &);
   void erase_locked(const std::string &);
 };

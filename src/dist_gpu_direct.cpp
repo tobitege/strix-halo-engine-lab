@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/gpu_direct.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct_copy.hpp"
 
 #include <algorithm>
@@ -30,7 +32,7 @@ using transport::GpuQueueOperation;
 using transport::LinuxGpuQueue;
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("gpu-direct: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("gpu-direct: ", status, what);
 }
 inline void relax() noexcept {
 #if defined(__x86_64__)
@@ -88,11 +90,11 @@ long long rx_lead_us() {
 // controllers (measured: 9-15 per 3000 back-to-back exchanges without, none with). The next exchange's geometry comes
 // from the communicator's hint (expect_next).
 bool prepost_rx() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_PREPOST"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_PREPOST", true);
     return on;
 }
 bool lazy_tx() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_LAZY_TX"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_LAZY_TX", true);
     return on;
 }
 
@@ -198,7 +200,7 @@ constexpr std::uint64_t failed_flag = ~std::uint64_t{0};
 
 // STRIX_DIST_GPU_DEBUG=1: one line per step of every exchange on stderr.
 bool debug() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_GPU_DEBUG"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_GPU_DEBUG", false);
     return on;
 }
 void trace(const char* what, std::uint64_t sequence, std::size_t extra = 0) {
@@ -357,6 +359,7 @@ public:
         return g;
     }
     void expect_next(std::size_t bytes, unsigned rings) override { hint_bytes_ = bytes; hint_rings_ = rings; }
+    bool use_direction(ExchangeDirection direction) override { next_direction_ = direction; return true; }
     void quiesce(hipStream_t stream) override {
         check_failure();
         if (started_) throw std::logic_error("gpu-direct: quiesce() while an exchange is in flight");
@@ -386,30 +389,39 @@ public:
             throw std::invalid_argument("gpu-direct: exchange of " + std::to_string(bytes) + " bytes (capacity " + std::to_string(capacity()) + ")");
         const unsigned rings = next_rings_;
         next_rings_ = 0;
-        const std::size_t hint_bytes = hint_bytes_;
+        const ExchangeDirection direction = next_direction_;
+        next_direction_ = ExchangeDirection::both;
+        const bool one_way = direction != ExchangeDirection::both;
+        if (direction != ExchangeDirection::receive && !local) throw std::invalid_argument("gpu-direct: start() needs the send buffer");
+        // A one-way transfer posts no early receive: the receiver submits its RX when it starts and the sender's TX
+        // waits for it on the rings' flow control, so a wrong guess can never cost a scratch exchange here.
+        const std::size_t hint_bytes = one_way ? 0U : hint_bytes_;
         const unsigned hint_rings = hint_rings_;
         hint_bytes_ = 0;
         // The previous exchange's job (its RX and TX completions) has finished before this one is posted.
         collect();
         const Geometry g = geometry(bytes, rings);
-        if (prepost_.valid && prepost_.index == next_ && !prepost_.geometry.same(g)) {
+        if (prepost_.valid && prepost_.index == next_ && (one_way || !prepost_.geometry.same(g))) {
             // The guess was wrong: both ranks made the same guess and see the same exchange, so both first complete an
-            // internal exchange with the guessed geometry (scratch buffers), which posts this exchange's RX early.
+            // internal exchange with the guessed geometry (scratch buffers), which posts this exchange's RX early
+            // (a symmetric one's; a one-way transfer never has an early receive).
             ++stats_.prepost_misses;
-            dummy(stream, &g);
+            dummy(stream, one_way ? nullptr : &g);
         }
         std::optional<Geometry> next;
         if (hint_bytes && hint_bytes <= capacity()) next = geometry(hint_bytes, hint_rings);
-        begin(stream, local, g, identity, next ? &*next : nullptr, entry);
+        begin(stream, local, g, identity, next ? &*next : nullptr, entry, direction);
     }
     // Posts the job of exchange next_ with geometry `g`; `next`: the following exchange's (its RX goes before this TX).
     void begin(hipStream_t stream, const void* local, const Geometry& g, const ExchangeIdentity& identity, const Geometry* next,
-               std::uint64_t entry) {
+               std::uint64_t entry, ExchangeDirection direction = ExchangeDirection::both) {
         const std::uint64_t k = next_++;
         const std::uint32_t slot = static_cast<std::uint32_t>(k % depth_);
         const std::size_t used = g.used, bytes = g.bytes;
         current_ = Exchange{k, k + 1U, slot, used, bytes, g.parts, g.wire, {}};
         current_.identity = GpuDirectIdentity{k + 1U, identity.plan, identity.request, bytes, identity.tag, identity.layer};
+        current_.tx = direction != ExchangeDirection::receive;
+        current_.rx = direction != ExchangeDirection::send;
         if (prepost_rx() && depth_ >= 2U && next) {
             current_.has_next = true;
             current_.next = *next;
@@ -443,18 +455,20 @@ public:
             if (!poisoned_) { poisoned_ = true; poison_ = e.what(); }
             throw;
         }
-        GpuDirectParts parts;
-        parts.count = static_cast<unsigned>(used);
-        for (std::size_t j = 0; j < used; ++j) {
-            parts.slot[j] = links_[j].tx + std::size_t{slot} * capacity_;
-            parts.offset[j] = current_.parts[j].first;
-            parts.bytes[j] = current_.parts[j].second;
+        if (current_.tx) {
+            GpuDirectParts parts;
+            parts.count = static_cast<unsigned>(used);
+            for (std::size_t j = 0; j < used; ++j) {
+                parts.slot[j] = links_[j].tx + std::size_t{slot} * capacity_;
+                parts.offset[j] = current_.parts[j].first;
+                parts.bytes[j] = current_.parts[j].second;
+            }
+            if (timing_) check(hipEventRecord(t_scatter0_, stream), "timing event");
+            enqueue_scatter(parts, local, current_.identity, scratch_, produced_device_, stream);
+            if (timing_) check(hipEventRecord(t_scatter1_, stream), "timing event");
+            check(hipEventRecord(send_ready_[slot], stream), "producer event");
+            trace("start: scatter enqueued, streams", current_.sequence, used);
         }
-        if (timing_) check(hipEventRecord(t_scatter0_, stream), "timing event");
-        enqueue_scatter(parts, local, current_.identity, scratch_, produced_device_, stream);
-        if (timing_) check(hipEventRecord(t_scatter1_, stream), "timing event");
-        check(hipEventRecord(send_ready_[slot], stream), "producer event");
-        trace("start: scatter enqueued, streams", current_.sequence, used);
         started_ = true;
         const Exchange x = current_;
         progress_.post([this, x] {
@@ -472,6 +486,16 @@ public:
         if (!started_) throw std::logic_error("gpu-direct: finish() without start()");
         started_ = false;
         const auto& x = current_;
+        ++stats_.exchanges;
+        stats_.bytes += x.bytes;
+        if (x.tx) stats_.bytes_tx += x.bytes;
+        if (x.rx) stats_.bytes_rx += x.bytes;
+        if (!x.tx || !x.rx) ++stats_.one_way;
+        pending_job_ = true;
+        // One-way send: nothing lands here. The receiver's GPU checks the header; this rank's TX completion is
+        // consumed by the progress job or by the next use of the slot.
+        if (!x.rx) return;
+        if (!remote) throw std::invalid_argument("gpu-direct: finish() needs the receive buffer");
         trace("finish: wait + gather enqueued", x.sequence);
         // The stream waits until the progress thread has seen every RX part land (the flag is monotonic).
         check(hipStreamWaitValue64(stream, flag_device_, x.sequence, hipStreamWaitValueGte, ~std::uint64_t{0}),
@@ -485,13 +509,10 @@ public:
         }
         if (timing_) check(hipEventRecord(t_gather0_, stream), "timing event");
         enqueue_gather(parts, remote, x.identity, scratch_ + 1, flag_device_, error_device_, stream);
-        if (timing_) { check(hipEventRecord(t_gather1_, stream), "timing event"); timed_pending_ = true; }
+        if (timing_) { check(hipEventRecord(t_gather1_, stream), "timing event"); timed_pending_ = x.tx; }
         check(hipEventRecord(recv_done_[x.slot], stream), "consumer event");
         recv_pending_[x.slot] = true;
-        if (trace_) trace_pending_ = true;
-        ++stats_.exchanges;
-        stats_.bytes += x.bytes;
-        pending_job_ = true;
+        if (trace_ && x.tx) trace_pending_ = true; // the trace line needs both the scatter and the gather events
     }
 
     // ---- bootstrap steps (before the first exchange; the caller's thread, the progress thread is idle)
@@ -682,6 +703,7 @@ private:
         bool preposted = false; // its RX were submitted by the previous exchange's job (STRIX_DIST_GPU_PREPOST)
         bool has_next = false;  // the next exchange's geometry is known: its RX is posted before this TX
         Geometry next{};
+        bool tx = true, rx = true; // a one-way transfer has only its own direction's operation, scatter or gather
     };
     struct Prepost {
         bool valid = false;
@@ -792,7 +814,7 @@ private:
         trace("transfer: begin", x.sequence);
         for (auto& link : links_) while (auto c = link.queue->poll()) handle(link, c->operation); // earlier TX completions
         // RX first (same sequence and size as the peer's TX), then TX once the producer copy is complete.
-        if (!x.preposted)
+        if (x.rx && !x.preposted)
             for (std::size_t j = 0; j < x.used; ++j) {
                 auto& link = links_[j];
                 const auto op = link.queue->prepare(SGU_DIRECTION_RX, x.slot, x.ring_sequence[j], x.wire[j].second, terminal_);
@@ -807,13 +829,15 @@ private:
         // TX: the producer copy is complete as seen by the CPU before the controller may read the slot.
         const auto t0 = std::chrono::steady_clock::now();
         // Poll the scatter's host-mapped record (no HIP call), then confirm with the producer event (C-1 witness).
-        while (__atomic_load_n(produced_, __ATOMIC_ACQUIRE) < x.sequence) {
-            if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("gpu-direct: the producer copy did not complete in time");
-            relax();
+        if (x.tx) {
+            while (__atomic_load_n(produced_, __ATOMIC_ACQUIRE) < x.sequence) {
+                if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("gpu-direct: the producer copy did not complete in time");
+                relax();
+            }
+            if (trace_) times_.produced = trace_wall_ns();
+            spin_event(send_ready_[x.slot], "the producer copy", deadline);
+            trace("transfer: producer copy complete", x.sequence);
         }
-        if (trace_) times_.produced = trace_wall_ns();
-        spin_event(send_ready_[x.slot], "the producer copy", deadline);
-        trace("transfer: producer copy complete", x.sequence);
         if (x.has_next) {
             // The next exchange's RX before this TX. Its slot's previous RX (depth exchanges ago) is retired once its
             // gather is done (enqueued before this exchange's scatter on the same stream, so normally complete here).
@@ -840,7 +864,7 @@ private:
         const auto t1 = std::chrono::steady_clock::now();
         stats_.producer_wait += std::chrono::duration<double>(t1 - t0).count();
         const auto t_witness = std::chrono::steady_clock::now();
-        for (std::size_t j = 0; j < x.used; ++j) {
+        for (std::size_t j = 0; x.tx && j < x.used; ++j) {
             auto& link = links_[j];
             link.tx_free[x.slot].store(false, std::memory_order_release);
             const auto op = link.queue->prepare(SGU_DIRECTION_TX, x.slot, x.ring_sequence[j], x.wire[j].second, terminal_);
@@ -860,8 +884,8 @@ private:
             for (std::size_t j = 0; j < x.used; ++j) {
                 auto& link = links_[j];
                 while (auto done = link.queue->poll()) handle(link, done->operation);
-                all_rx = all_rx && rx_landed_[x.slot][j];
-                all_tx = all_tx && !link.tx_ops[x.slot];
+                all_rx = all_rx && (!x.rx || rx_landed_[x.slot][j]);
+                all_tx = all_tx && (!x.tx || !link.tx_ops[x.slot]);
             }
             if (all_rx && !flagged) {
                 // Every part is in device memory: release the stream waiting in finish().
@@ -926,6 +950,7 @@ private:
     Exchange current_;
     hipStream_t boot_stream_ = nullptr;
     unsigned next_rings_ = 0;
+    ExchangeDirection next_direction_ = ExchangeDirection::both; // of the next start() (use_direction), one shot
     std::size_t hint_bytes_ = 0;
     unsigned hint_rings_ = 0;
     void* dummy_local_ = nullptr;  // internal exchange after a wrong guess (allocated at the first one)

@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/q6p_registry.hpp"
@@ -11,9 +12,7 @@
 
 namespace strix {
 namespace {
-void check(hipError_t rc, const char* what) {
-    if (rc != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(rc));
-}
+using strix::hip_check;
 }
 HipQwenRouterBf16::~HipQwenRouterBf16() {
     for (const auto& c : copies) {
@@ -66,7 +65,7 @@ std::shared_ptr<const HipQwenRouterBf16> load_hip_qwen_router_bf16(const MappedM
         }
         void* device = nullptr;
         const auto bytes = t.byte_size / 2U;
-        check(hipMalloc(&device, bytes), "router BF16 allocation");
+        hip_check(hipMalloc(&device, bytes), "router BF16 allocation");
         owner->copies.push_back({original, device, bytes, next_uma_owner_view_identity()});
         for (std::uint64_t offset = 0; offset < bytes; ) {
             const auto count = std::min<std::uint64_t>(staging.size(), (bytes - offset) / 2U);
@@ -75,7 +74,7 @@ std::shared_ptr<const HipQwenRouterBf16> load_hip_qwen_router_bf16(const MappedM
                 std::memcpy(&bits, source + offset * 2U + j * 4U, 4U);
                 staging[j] = static_cast<std::uint16_t>(bits >> 16U);
             }
-            check(hipMemcpy(static_cast<unsigned char*>(device) + offset, staging.data(), count * 2U,
+            hip_check(hipMemcpy(static_cast<unsigned char*>(device) + offset, staging.data(), count * 2U,
                 hipMemcpyHostToDevice), "router BF16 upload");
             offset += count * 2U;
         }

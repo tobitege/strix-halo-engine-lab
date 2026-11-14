@@ -2,8 +2,10 @@
 {"decode-layout", 'a', "model+slot+position+prefix", "msa_fused_tests.hip:run_case fused vs current; rows == alone hardware gate for 1..8 rows", ""},
 // src/minimax/engine/engine.hip:1456
 {"msa-dense", 'a', "model+position+prefix; 128-key blocks", "msa_fused_tests.hip:run_case dense v3/v4 and n4-mixed/n8-mixed; prefill_batch_cases", ""},
-// src/minimax/attn/index_proj.hip:341
+// src/minimax/attn/index_proj.hip:399
 {"index-proj", 'a', "index projection FP32 chain", "index_proj_tests.hip; split/ring/LDS bitwise gates", ""},
+// Former opt-in was removed with its split launcher; retain the mismatch until the native split-vs-unsplit cache gate is restored.
+{"index-split-retirement", 'c', "former STRIX_MMATTN_INDEX_SPLIT=1 / mf::set_index_split(true); default was OFF; index-score and cache-store order", "UNCOVERED: current msa_fused_tests.hip exercises only the unsplit launcher; restore native split-vs-unsplit full score/cache bytes and graph-replay gate before treating explicit-on behavior as equivalent", "first changed decode index score/cache byte at index_kernel"},
 // src/minimax/engine/engine.hip:1372
 {"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip; minimax_index_layout_tests.cpp ownership/admission/refusal (native load-change equality pending)", ""},
 // src/minimax/moe/mmx_moe.hip:1128
@@ -33,7 +35,6 @@
 // src/minimax/moe/mmx_prefill.hip:1197
 {"prefill-tail-stream", 'a', "matrix+fixed splits+per-row WMMA chain; tail classes write disjoint partials, joined before the stage consumer", "hip_mmx_moe_bench.hip check_prefill_core8 tail stream cells (partials/xt/at/output bitwise); --ab pftails PAIR state/final rows", ""},
 // src/minimax/moe/mmx_prefill.hip:573
-{"prefill-core", 'a', "matrix+fixed splits+per-row WMMA chain", "mm_defaults.cpp pf_core_v4; every split partial bitwise gate", ""},
 // src/minimax/moe/mmx_prefill.hip:710
 {"prefill-pipe", 'a', "matrix+fixed splits+WMMA chain", "mm_defaults.cpp pf_moe_pipe bitwise gate; source core8 comments; nondefault combinations need same-partial gate", ""},
 // src/minimax/moe/mmx_prefill.hip: gather_transform_token_kernel
@@ -46,6 +47,8 @@
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
+// src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
+{"prefill-index-wmma-exact", 'a', "fixed row+index head; selected block set of the VALU index kernels (WMMA scores, exact rescoring of the cut-off band)", "hip_idx_wmma_tests.hip exact selection at 2K/8K/32K positions; pair state and final-row hashes equal to STRIX_IDX_WMMA=0", ""},
 // src/minimax/moe/mmx_prefill.hip:647
 {"prefill-fuse", 'a', "single-split WMMA+epilogue contract", "prefill gufuse intermediate/producer debug gate in hip-mmx-moe-bench; default OFF; combinations outside gate remain unqualified", ""},
 // src/minimax/moe/mmx_prefill.hip:416
@@ -129,6 +132,8 @@
 {"draft-auto", 'a', "target identity+unchanged OFF prefill plan+greedy verify; frozen structural-v1 or unqualified-v1", "CPU features/admission and Lead traces: prose == OFF, structural C1 uses legacy controller, C2 retires; GPU tokens/logits/committed-state and paired json/code/long/story/prose-es receipts pending", ""},
 // src/minimax/session/runtime.cpp; src/minimax/serve/minimax_lead.hpp
 {"session-producer", 'b', "model+numerical environment+geometry+single-row suffix+fixed-width-one verification", "session_cache_gate.sh A/L/B IDs, every FP32 row and complete-state digest on both ranks; UNCOVERED native and complete-workload qualification", ""},
+// serve defaults to direct transport, which the session resolver refuses pending its own route qualification.
+{"session-direct-transport", 'b', "Cli{app=serve,transport=usb4gpu}; negotiated transport is the construction input", "route_identity_tests.cpp session_direct_transport_boundary; session_cache_gate.sh A/L/B currently covers usb4-auto only; UNCOVERED direct-route native state and complete-workload gate", ""},
 // src/minimax/session/session_cache.cpp; include/strix/file_snapshot.hpp
 {"session-restore", 'b', "loader-fd asset identities+executable+runtime+schema+frontier+rank-group digest", "minimax_session_cache_tests.cpp envelope/transaction/retarget negatives; session_cache_gate.sh fresh restore and never-saved control; UNCOVERED GPU state equality", ""},
 // src/minimax/moe/mmx_moe.hip: moe_grid_slots / launch_experts4_grid
@@ -139,3 +144,13 @@
 {"decode-warm-o", 'a', "cache state only (side-stream reads, sink store); no consumer of its data", "rank --xb-check cfg o vs -: decode logits bitwise N1/N4/N8 + verify window; --ab xbwarmo matched replay; mm_defaults.cpp xb_warm_o", ""},
 // src/minimax/serve/minimax_lead.hpp: lookup_start / lookup_commit / cycle prompt lookup
 {"serve-prompt-lookup", 'a', "draft source only (rank 0 chooses window rows from strix_lookup); greedy verify decides every token", "minimax_lead_tests prompt lookup emits the tokens of lookup off; serve A/B ids_fnv per workload with STRIX_MM_LOOKUP=0", ""},
+// src/minimax/engine/engine.hip: xb_fold; src/xport/row_fold.hpp. kFoldRows = 0 (minimax_traits.hpp): the exchange has no
+// fold slots unless STRIX_MMX_FOLD=rows is set, so the default route is unchanged.
+{"decode-xport-row-fold", 'a', "STRIX_MMX_FOLD=rows fold slots on the exchange module (default 0 = off)+rows <= slots; the pair sum p0 + p1 moves from the consumer kernel to the channel's progress thread, one IEEE binary32 addition per element", "row_fold.hpp sum_f32 contract (one addition, no contraction); rank --ab xbfold matched replay; UNCOVERED native decode-logit receipt in this census", ""},
+// src/minimax/engine/engine.hip: pf_msa_flash / pf_msa_flash_layers; src/minimax/attn/msa_flash_policy.hpp
+{"prefill-msa-flash", 'b', "STRIX_MM_PF_MSA_FLASH=1|2 (default 0 = off)+STRIX_MM_PF_MSA_FLASH_LAYERS; prefill MSA windows > 8 rows on the BF16 WMMA key-split form", "FAST, lossy, opt-in: a different identity from the exact prefill, never selected by default; msa_fused_tests.hip STRIX_MSA_TEST_FLASH arm; UNCOVERED engine-level quality gate", ""},
+// src/minimax/engine/engine.hip: pf_moe_group (strix/pair/prefill_group.hpp moe_width)
+{"prefill-moe-group", 'a', "STRIX_MM_PF_MOE_GROUP (0 = automatic, 1 = one call per chunk)+group members+start-up buffer cap; chunks per group-wide EXL3 MoE call", "per-row arithmetic independent of the call width (same kernels, row-local chains); UNCOVERED native width-vs-width prefill state receipt in this census", ""},
+// src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
+// boolean is read once per call and passed to the shared plan policy.
+{"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},

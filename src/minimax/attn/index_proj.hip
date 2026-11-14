@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 index projections in one launch, exact dense_t order (src/minimax/attn/index_proj.hpp).
 #include "index_proj.hpp"
@@ -217,9 +218,65 @@ __global__ __launch_bounds__(kWaves * 32) void proj_tiled_kernel(IndexProjView v
         if (tb == t0 || tb + t >= t0) store_out(v, tb + t, o, acc[t]);  // a shifted wave stores only rows >= t0
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
+// Prefill, slab form (exact, same chains): the block of proj_tiled_kernel with R token chains per lane, and
+//   - the wave index made wave-uniform (readfirstlane), so the wave's activations are scalar loads of XW inputs per
+//     token (one load per XW MACs) and SGPR operands of the FMAs, instead of one per-lane load per MAC;
+//   - the weight stage widened F16 -> F32 once by the thread that stages it (8 conversions per stage and thread, not
+//     8 per chunk), double buffered in LDS (2 x 8 KB): one barrier per stage, the next stage is written while slow
+//     waves still read the current one.
+// R = 8, XW = 8: 64 tokens x 32 outputs per block, 512 FMAs of a stage in 344 instructions (dual-issue pairs), 65
+// scalar loads and 16 LDS reads; 25 VGPRs (tiled: 107, 128 per-lane loads per stage). Measured (literal A B A x3, 60
+// weight sets): 4096 rows 4092 -> 2744 us, 8192 rows 7587 -> 5085 us, 1024 rows 988 -> 691 us (0.67-0.70).
+// (measurement: R = 16, XW = 4, 128 tokens per block, was 1.26-1.47x slower than the tiled kernel: 256 scalar
+// loads per stage.)
+template <unsigned R, unsigned XW> __global__ __launch_bounds__(kWaves * 32) void proj_slab_kernel(IndexProjView v) {
+    using XV = float __attribute__((ext_vector_type(XW)));
+    __shared__ float4 slab[2][kStage][2][32];
+    const unsigned tid = threadIdx.x, lane = tid & 31U;
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid >> 5U)));
+    const unsigned og = blockIdx.x, o = og * 32 + lane;
+    const unsigned t0 = blockIdx.y * (kWaves * R) + wave * R;
+    // Rows past v.rows: the wave reads the last R valid rows instead (results not stored); needs rows >= R.
+    const unsigned tb = t0 + R <= v.rows ? t0 : v.rows - R;
+    const float* __restrict__ xr = v.x + static_cast<std::size_t>(tb) * kProjIn;
+    float acc[R];
+#pragma unroll
+    for (unsigned t = 0; t < R; ++t) acc[t] = 0.0F;
+    const unsigned pk = tid >> 5U;  // this thread's piece of a stage: chunk pk, output og*32+lane
+    const Rsrc rs = make_rsrc(v.w);
+    const unsigned poff = o * 16U;
+    uint4 next = load_chunk(rs, pk, poff);
+    for (unsigned s = 0; s < kChunks / kStage; ++s) {
+        const unsigned b = s & 1U;
+        // Buffer b was last read for stage s - 2, finished by every wave before the previous barrier.
+        slab[b][pk][0][lane] = make_float4(h2f(next.x & 0xFFFFU), h2f(next.x >> 16U), h2f(next.y & 0xFFFFU), h2f(next.y >> 16U));
+        slab[b][pk][1][lane] = make_float4(h2f(next.z & 0xFFFFU), h2f(next.z >> 16U), h2f(next.w & 0xFFFFU), h2f(next.w >> 16U));
+        __syncthreads();
+        next = load_chunk(rs, (s + 1 < kChunks / kStage ? s + 1 : s) * kStage + pk, poff);
+#pragma unroll
+        for (unsigned k = 0; k < kStage; ++k) {
+            const float4 w0 = slab[b][k][0][lane], w1 = slab[b][k][1][lane];
+            const float wf[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            const float* __restrict__ xc = xr + (s * kStage + k) * 8;
+#pragma unroll
+            for (unsigned h = 0; h < 8; h += XW) {
+                XV xv[R];
+#pragma unroll
+                for (unsigned t = 0; t < R; ++t) __builtin_memcpy(&xv[t], xc + t * kProjIn + h, sizeof(XV));
+#pragma unroll
+                for (unsigned j = 0; j < XW; ++j)
+#pragma unroll
+                    for (unsigned t = 0; t < R; ++t) acc[t] = __builtin_fmaf(xv[t][j], wf[h + j], acc[t]);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned t = 0; t < R; ++t)
+        if (tb == t0 || tb + t >= t0) store_out(v, tb + t, o, acc[t]);  // a shifted wave stores only rows >= t0
 }
+
+using strix::hip_check;
 
 template <unsigned D> void launch_decode(const IndexProjView& v, unsigned rpw, hipStream_t stream) {
     if (rpw == 2 && v.rows > 2) {  // row split: pairs of rows per wave
@@ -295,7 +352,7 @@ void enqueue_index_proj_decode(const IndexProjView& v, unsigned ring, hipStream_
     case 48: launch_decode<48>(v, rows_per_wave, stream); break;
     default: throw std::invalid_argument("index_proj decode: ring must be 8, 16, 32 or 48");
     }
-    check(hipGetLastError(), "index_proj decode");
+    hip_check(hipGetLastError(), "index_proj decode");
 }
 
 void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t stream) {
@@ -315,20 +372,27 @@ void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t strea
         default: hipLaunchKernelGGL((proj_decode_kernel<2, 16, 0>), g2, dim3(32), 0, stream, v); break;
         }
     }
-    check(hipGetLastError(), "index_proj diag");
+    hip_check(hipGetLastError(), "index_proj diag");
 }
 
 void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < 2 || v.rows > 8) throw std::invalid_argument("index_proj decode lds: rows must be 2..8");
     hipLaunchKernelGGL(proj_decode_lds_kernel, dim3(kProjOut / 32), dim3(kLdsWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "index_proj decode lds");
+    hip_check(hipGetLastError(), "index_proj decode lds");
 }
 
 void enqueue_index_proj_tiled(const IndexProjView& v, hipStream_t stream) {
     if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj tiled: rows must be >= 8 (use the decode kernel)");
     const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
     hipLaunchKernelGGL(proj_tiled_kernel, grid, dim3(kWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "index_proj tiled");
+    hip_check(hipGetLastError(), "index_proj tiled");
+}
+
+void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream) {
+    if (v.rows < kTokPerWave) throw std::invalid_argument("index_proj slab: rows must be >= 8 (use the decode kernel)");
+    const dim3 grid(kProjOut / 32, (v.rows + kWaves * kTokPerWave - 1) / (kWaves * kTokPerWave));
+    hipLaunchKernelGGL((proj_slab_kernel<kTokPerWave, 8>), grid, dim3(kWaves * 32), 0, stream, v);
+    hip_check(hipGetLastError(), "index_proj slab");
 }
 
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
@@ -341,18 +405,18 @@ void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
     const auto choice = route::index_route(v.rows, ring, split, lds);
     if (choice.lds) enqueue_index_proj_decode_lds(v, stream);
     else if (!choice.tiled) enqueue_index_proj_decode(v, choice.ring, stream, choice.rows_per_wave);
-    else enqueue_index_proj_tiled(v, stream);
+    else enqueue_index_proj_slab(v, stream);  // same bits as enqueue_index_proj_tiled
 }
 
 void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked) {
-    check(hipEventRecord(forked, main), "index_proj fork record");
-    check(hipStreamWaitEvent(side, forked, 0), "index_proj fork wait");
+    hip_check(hipEventRecord(forked, main), "index_proj fork record");
+    hip_check(hipStreamWaitEvent(side, forked, 0), "index_proj fork wait");
     enqueue_index_proj(v, side);
 }
 
 void index_proj_join(hipStream_t main, hipStream_t side, hipEvent_t joined) {
-    check(hipEventRecord(joined, side), "index_proj join record");
-    check(hipStreamWaitEvent(main, joined, 0), "index_proj join wait");
+    hip_check(hipEventRecord(joined, side), "index_proj join record");
+    hip_check(hipStreamWaitEvent(main, joined, 0), "index_proj join wait");
 }
 
 }  // namespace strix::minimax::attn

@@ -1,10 +1,6 @@
-__device__ __forceinline__ void f16_barrier(){__asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");}
-// 16-byte global (not flat) load: flat loads also count in lgkmcnt and would end at f16_barrier.
-typedef unsigned f16_u32x4 __attribute__((ext_vector_type(4)));
-__device__ __forceinline__ uint4 f16_load(const void* p) {
-    const f16_u32x4 v=*reinterpret_cast<const __attribute__((address_space(1))) f16_u32x4*>(reinterpret_cast<std::uintptr_t>(p));
-    return uint4{v.x,v.y,v.z,v.w};
-}
+// The barrier and the global-address loads live in moe_core/grouped_f16.hpp (GroupedF16Issue); these are the Qwen names.
+__device__ __forceinline__ void f16_barrier(){strix::moe_core::GroupedF16Issue::barrier();}
+__device__ __forceinline__ uint4 f16_load(const void* p){return strix::moe_core::GroupedF16Issue::load16<uint4>(p);}
 // One K64 step of a CTA: s.a holds the batch rows (64 x K64), s.b 256 B columns (x K64). A wave
 // owns two B columns tiles (cols[0], cols[1]) and every 16-row tile below mb: the B fragments are
 // read once per K16 plane and reused by up to four row tiles. K16 planes ascend.

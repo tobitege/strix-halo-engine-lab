@@ -120,3 +120,40 @@ CLI, extraction, stderr digests and invalid input. Synthetic stderr includes the
 `rank R prefill [mla] identity ...`, build and startup witness forms. Synthetic
 stdout includes Qwen, DeepSeek and MiniMax receipt keys. These checks execute host
 fixtures; they do not execute any engine binary.
+
+## FAST logit gate: `fast_logit_gate.py`
+
+A FAST identity (one that changes result bits) is qualified against the exact identity on
+teacher-forced logits. `fast_logit_gate.py` (Python 3.9+, numpy) is the shared reducer; the
+engine-specific part is only the launcher that runs one arm and the dump hooks of that engine.
+
+```sh
+# on each node, right after the arm's engine process exits (one fresh directory per run)
+python tools/strix-gate/fast_logit_gate.py seal --dir RUN --rank 0 --arm X --run-id ID \
+    --binary BIN --rows 256 --prompt chat=chat.u32 --env MODE=fast --select --attest sel_mode=3 \
+    --not-before START_UNIX
+# anywhere, with every rank's dumps and manifests in one directory per arm
+python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 1 --tokens chat=chat.u32
+python tools/strix-gate/fast_logit_gate.py compare REF REF2 --ranks 0 1 --tokens chat=chat.u32 --expect-identical
+```
+
+`seal` refuses a missing, short, stale (older than `--not-before`), nonfinite or already sealed
+dump and otherwise writes `manifest-r<rank>.json`: run id, arm, rank, binary sha256, the
+launch environment, each prompt's token-file sha256 and each dump's size, sha256 and width.
+`--attest sel_mode=N` must equal the mode the engine itself wrote into its selection dump, so an
+arm whose switch was not applied cannot be sealed under the wrong name.
+
+`compare` re-hashes every dump against its manifest, requires different run ids for the two
+arms and the same prompts, rows and vocabulary slices, then prints per prompt and pooled
+KL(ref || cand), top-1 agreement and the NLL change on the real next tokens. The default rule
+is pooled KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 (`--max-kl`, `--min-top1`, `--max-dnll`).
+`--expect-identical` is the control for two runs of one identity: any logit or selection
+difference fails. Exit 0 = pass, 1 = fail, 2 = identity or input defect (no verdict).
+
+When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
+with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
+layer, the (row, head) slots whose selected block set differs and the first layer and position
+where the arms part. This is a cross-run comparison: after the first difference the arms see
+different activations, so later differences include propagation, not only local rounding.
+
+`python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.

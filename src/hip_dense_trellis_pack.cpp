@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_content_hash.hpp"
@@ -14,7 +15,7 @@ namespace {
 constexpr std::uint64_t transform_bytes = 8ULL * 2560U * 4U;
 constexpr std::uint64_t partial_bytes = 4ULL * 8U * 12288U * 4U;
 constexpr unsigned stream_slots = 32U;
-void check(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }
+using strix::hip_check;
 void require(bool value, const char* message) { if (!value) throw std::invalid_argument(message); }
 std::string text(const gguf::FileInfo& info, const std::string& key) {
     const auto* entry = info.find_metadata(key);
@@ -136,8 +137,8 @@ std::shared_ptr<const HipDenseTrellisPack> load_hip_dense_trellis_pack(const std
     // borrow distinct preallocated slots; first binding only mutates host maps.
     state.assigned.reserve(stream_slots);
     for (auto& slot : state.slots) {
-        check(hipMalloc(reinterpret_cast<void**>(&slot.transformed), transform_bytes));
-        check(hipMalloc(reinterpret_cast<void**>(&slot.partials), partial_bytes));
+        hip_check(hipMalloc(reinterpret_cast<void**>(&slot.transformed), transform_bytes));
+        hip_check(hipMalloc(reinterpret_cast<void**>(&slot.partials), partial_bytes));
     }
     pack->workspace_bytes = stream_slots * (transform_bytes + partial_bytes);
     pack->tensors = state.tensors.size(); pack->mix = "G1";

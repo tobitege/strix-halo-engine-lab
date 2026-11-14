@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
@@ -34,9 +35,7 @@ void view(HipMtpInputFusionView v,std::uint64_t bytes,unsigned align) {
 bool overlaps(HipMtpInputFusionView a,HipMtpInputFusionView b) {
     return a.address<b.address+b.bytes && b.address<a.address+a.bytes;
 }
-void check(hipError_t e,const char* where) {
-    if(e!=hipSuccess)throw std::runtime_error(std::string(where)+": "+hipGetErrorString(e));
-}
+using strix::hip_check;
 __device__ float load_value(std::uintptr_t p,unsigned i,HipMtpInputStorage storage) {
     return storage==HipMtpInputStorage::bf16?
         __uint_as_float(static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(p)[i])<<16U):
@@ -350,23 +349,23 @@ void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_str
     preflight_hip_mtp_input_fusion(r);
     if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
     const auto stream=static_cast<hipStream_t>(raw_stream);
-    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(stream,&capture),"MTP input fusion capture query");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;hip_check(hipStreamIsCapturing(stream,&capture),"MTP input fusion capture query");
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP input fusion is eager only");
-    check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<256U>),dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    hip_check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<256U>),dim3(2U),dim3(256U),0U,stream,r);hip_check(hipGetLastError(),"MTP input norms launch");
     const unsigned jobs=r.hidden_size;
     if(r.hidden_size%kStagedColumns==0U && r.projection_row_stride_bytes%8U==0U && r.packed_projection.address%8U==0U)
         hipLaunchKernelGGL(mtp_input_projections_staged,dim3(r.hidden_size/kStagedRows),dim3(kStagedRows*(1U+r.hc_count)),0U,stream,r);
     else hipLaunchKernelGGL(mtp_input_projections,dim3((jobs+127U)/128U),dim3(128U),0U,stream,r);
-    check(hipGetLastError(),"MTP split projection launch");
+    hip_check(hipGetLastError(),"MTP split projection launch");
     const unsigned outputs=r.hidden_size*r.hc_count;
-    hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);check(hipGetLastError(),"MTP broadcast add launch");
+    hipLaunchKernelGGL(mtp_input_broadcast_add,dim3((outputs+127U)/128U),dim3(128U),0U,stream,r);hip_check(hipGetLastError(),"MTP broadcast add launch");
 }
 void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* raw_stream) {
     preflight_hip_mtp_input_fusion(r);
     if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
     const auto stream=static_cast<hipStream_t>(raw_stream);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<1024U>),dim3(2U),dim3(1024U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<1024U>),dim3(2U),dim3(1024U),0U,stream,r);hip_check(hipGetLastError(),"MTP input norms launch");
     const auto* q8=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
     const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8));
     // STRIX_MTP_PROJ_ROWS=1|2|4: output rows per wave (each row's arithmetic is unchanged).
@@ -381,7 +380,7 @@ void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* r
     else if(r.hc_count==4U && rows_per_wave==2U) rows.template operator()<2U>();
     else if(q4) hipLaunchKernelGGL(mtp_input_projections_wave<true>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q4);
     else hipLaunchKernelGGL(mtp_input_projections_wave<false>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q8);
-    check(hipGetLastError(),"MTP draft fused projection launch");
+    hip_check(hipGetLastError(),"MTP draft fused projection launch");
 }
 void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest> requests,void* raw_stream) {
     if(requests.empty() || requests.size()>8U || !raw_stream)throw std::invalid_argument("MTP input fusion batch size/stream is invalid");
@@ -407,7 +406,7 @@ void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionReq
     const auto stream=static_cast<hipStream_t>(raw_stream);
     const auto n=static_cast<unsigned>(requests.size());
     hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms_rows<1024U>),dim3(2U,n),dim3(1024U),0U,stream,r,rows);
-    check(hipGetLastError(),"MTP input norms batch launch");
+    hip_check(hipGetLastError(),"MTP input norms batch launch");
     // STRIX_MTP_DRAFT_BATCH_PROJ_GROUP=1|2|4: tokens per block (default 2).
     static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_PROJ_GROUP");
         const unsigned g=v?static_cast<unsigned>(std::atoi(v)):2U;return g==1U||g==4U?g:2U;}();
@@ -416,6 +415,6 @@ void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionReq
     if(g==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,1U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
     else if(g==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,2U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,4U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
-    check(hipGetLastError(),"MTP draft fused projection batch launch");
+    hip_check(hipGetLastError(),"MTP draft fused projection batch launch");
 }
 } // namespace strix

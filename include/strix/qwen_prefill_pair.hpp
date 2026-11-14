@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/qwen_prefill_pipeline.hpp"
 #include "strix/pair/pipe.hpp"
+#include "strix/dist/pipeline_timeline.hpp"
 #include <array>
 #include <algorithm>
 #include <memory>
@@ -29,21 +30,31 @@ using pair::seam_piece_bytes;
 using pair::SeamCrc;
 using pair::PipeStaging;
 using pair::PipeFrame;
+// STRIX_PAIR_TIMING=1 columns (one row per chunk; the state handoff is row `count`).
+// chunk: whole chunk on the compute thread; seam-*: the seam call (acquire wait, producer fence, pack/load);
+// d2h-wait/crc/wire/ack-wait/header-wait/h2d-wait: progress thread; handoff: post-prefill state transfer.
+enum PairTimingColumn : std::size_t { pt_chunk, pt_seam_wait, pt_seam_fence, pt_seam_pack, pt_d2h_wait, pt_crc, pt_wire,
+    pt_ack_wait, pt_header_wait, pt_h2d_wait, pt_handoff, pt_columns };
+inline std::vector<const char*> pair_timing_columns() {
+    return {"chunk", "seam-wait", "seam-fence", "seam-pack", "d2h-wait", "crc", "wire", "ack-wait", "header-wait", "h2d-wait", "handoff"};
+}
 std::shared_ptr<PipeStaging> make_hip_pipe_staging(std::size_t capacity);
 class Pipe : public pair::Pipe {
 public:
     Pipe(unsigned rank, std::uint64_t count, Send send, Receive receive, std::function<void()> abort,
-        std::uint32_t cut = 24, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {},
-        TransferPiece transfer_piece = {})
+        pair::StageCut cut = 24U, std::function<std::shared_ptr<PipeStaging>()> staging = {}, Checksum checksum = {},
+        TransferPiece transfer_piece = {}, dist::PipelineTimeline* timeline = nullptr)
         : pair::Pipe(rank, count, std::move(send), std::move(receive), std::move(abort),
-              options(checked_cut(cut), count), std::move(staging), std::move(checksum), std::move(transfer_piece)) {}
+              options(checked_cut(cut), count, timeline), std::move(staging), std::move(checksum), std::move(transfer_piece)) {}
 private:
-    static std::uint32_t checked_cut(std::uint32_t cut) {
-        if (cut == 0U || cut >= 48U) throw std::invalid_argument("pair prefill invalid cut");
-        return cut;
+    static std::uint64_t checked_cut(pair::StageCut cut) {
+        if (cut.layer == 0U || cut.layer >= 48U) throw std::invalid_argument("pair prefill invalid cut");
+        return cut.wire();
     }
-    static pair::PipeOptions options(std::uint32_t cut, std::uint64_t count) {
+    static pair::PipeOptions options(std::uint64_t cut, std::uint64_t count, dist::PipelineTimeline* timeline) {
         pair::PipeOptions value;
+        value.timeline = timeline;
+        value.timing = {pt_d2h_wait, pt_crc, pt_wire, pt_ack_wait, pt_header_wait, pt_h2d_wait};
         value.profile_label = "qwen-pair-profile";
         value.profile = pipe_profile_enabled();
         value.validate = [cut, count](const pair::PipeHeader& header, std::uint64_t sequence) {
@@ -63,6 +74,8 @@ struct PipeContext {
     std::uint64_t sequence = 0;
     std::uint64_t identity = 0;
     std::uint32_t cut = 24;
+    dist::PipelineTimeline* timeline = nullptr; // STRIX_PAIR_TIMING=1 only
+    bool half = false; // half-layer cut: stage A also runs the attention sub-block of layer `cut`
 };
 inline PipeContext pipe_context;
 inline std::uint64_t token_hash(std::span<const std::uint32_t> tokens) {

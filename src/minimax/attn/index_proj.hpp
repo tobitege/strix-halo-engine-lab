@@ -5,8 +5,8 @@
 // dense_t16 (src/minimax/engine/mm_kernels.hpp), only faster:
 //   decode (rows <= 8): one thread per output keeps every row's chain; its weights stream from a packed chunk-major
 //     layout through a register ring (loads issued kRing chunks ahead), the activations are wave-uniform operands;
-//   prefill (any rows): blocks of 32 outputs x 64 tokens, the weight tile staged once in LDS for 8 waves, each lane
-//     8 token chains of one output.
+//   prefill (any rows): blocks of 32 outputs x 64 tokens, the weight stage widened to F32 once in LDS for 8 waves,
+//     each lane 8 token chains of one output, the wave's activations scalar operands.
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -32,11 +32,14 @@ struct IndexProjView {
     std::uint32_t rows;
 };
 // Picks the decode kernel for rows <= 8 (ring 32 for one row, ring 16 + row pairs per wave above: measured) and the
-// tiled kernel above (all exact). STRIX_MMATTN_PROJ_RING / STRIX_MMATTN_PROJ_SPLIT=0 override for benches.
+// slab kernel above (all exact). STRIX_MMATTN_PROJ_RING / STRIX_MMATTN_PROJ_SPLIT=0 override for benches.
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream);
 // rows <= 8; rows_per_wave 0 = every row in each wave, 2 = row pairs over grid.y (more waves, weights re-read from L2)
 void enqueue_index_proj_decode(const IndexProjView& v, unsigned ring, hipStream_t stream, unsigned rows_per_wave = 0);
 void enqueue_index_proj_tiled(const IndexProjView& v, hipStream_t stream);                  // rows >= 8
+// The tiled block with wave-uniform scalar activation loads and an F32 weight slab staged once per stage (double
+// buffered LDS); rows >= 8. Exact, same bits as the tiled kernel, 0.67-0.70x its time: the prefill default.
+void enqueue_index_proj_slab(const IndexProjView& v, hipStream_t stream);
 // rows 2..8: 4-wave blocks sharing each weight chunk through an LDS ring. Exact but slower (measurement, cause in
 // index_proj.hip); not used by enqueue_index_proj unless STRIX_MMATTN_PROJ_LDS=1.
 void enqueue_index_proj_decode_lds(const IndexProjView& v, hipStream_t stream);

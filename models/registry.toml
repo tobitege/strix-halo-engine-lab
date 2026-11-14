@@ -1,8 +1,8 @@
 # Model registry: one row per model with a description file. Registering descriptive metadata for an
 # already supported compiled contract takes models/<name>.toml and one [models.<id>] table below.
 # These files do not add inference support for a new size or checkpoint contract; a changed contract
-# still requires family adapter/engine work and qualification. Pure data: nothing reads it at run time
-# and it changes no default. tests/model_registry_tests.cpp checks names, that every listed file
+# still requires family adapter/engine work and qualification. The shared serve shell reads it for
+# selection, without changing defaults. tests/model_registry_tests.cpp checks names, that every listed file
 # exists and that every models/*.toml has a row; it does not prove support.
 schema = "strix-registry/v1"
 

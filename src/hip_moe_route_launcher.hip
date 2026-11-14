@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "moe_core/route.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -281,6 +283,37 @@ __device__ bool better(
             left_index < right_index);
 }
 
+struct InsertRoutePolicy {
+    static constexpr std::uint32_t max_top_k = kMaxTopK;
+    __device__ static bool better(float lv, std::uint32_t li, float rv, std::uint32_t ri) {
+        return strix::better(lv, li, rv, ri);
+    }
+};
+
+struct WaveRoutePolicy : InsertRoutePolicy {
+    static constexpr std::uint32_t candidates = kWaveCandidates, wave = kRouterWave;
+    template <class T>
+    __device__ static T xor32(T value, int mask) { return strix::qwen_dpp::xor32(value, mask); }
+};
+
+struct BlockWaveRoutePolicy : WaveRoutePolicy {
+    std::uint32_t lane, expert_count;
+    float* best_values;
+    std::uint32_t* best_indices;
+    __device__ void record(std::uint32_t slot, bool has, float best, std::uint32_t index) const {
+        if (lane == 0) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : expert_count; }
+    }
+};
+
+struct LaneWaveRoutePolicy : WaveRoutePolicy {
+    std::uint32_t lane, expert_count;
+    float& mine;
+    std::uint32_t& mine_index;
+    __device__ void record(std::uint32_t slot, bool has, float best, std::uint32_t index) const {
+        if (lane == slot) { mine = has ? best : -INFINITY; mine_index = has ? index : expert_count; }
+    }
+};
+
 template <
     typename Activation,
     RouterWeightKind WeightKind>
@@ -331,151 +364,8 @@ __global__ void moe_route_kernel(
     }
     __syncthreads();
 
-    float local_max =
-        -INFINITY;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        local_max =
-            fmaxf(
-                local_max,
-                logits[expert]);
-    }
-    scratch[lane] = local_max;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] =
-                fmaxf(
-                    scratch[lane],
-                    scratch[
-                        lane + stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum =
-        scratch[0];
-    // Every wave must retain the maximum before lane zero reuses scratch[0]
-    // for its contribution to the denominator reduction.
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        const float probability =
-            expf(
-                logits[expert] -
-                maximum);
-        logits[expert] =
-            probability;
-        local_sum += probability;
-    }
-    scratch[lane] = local_sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] +=
-                scratch[lane + stride];
-        }
-        __syncthreads();
-    }
-    const float denominator =
-        scratch[0];
-
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        logits[expert] /=
-            denominator;
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float best_values[kMaxTopK];
-        std::uint32_t best_indices[
-            kMaxTopK];
-
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            best_values[slot] =
-                -INFINITY;
-            best_indices[slot] =
-                expert_count;
-        }
-
-        for (std::uint32_t expert = 0;
-             expert < expert_count;
-             ++expert) {
-            const float probability =
-                logits[expert];
-
-            for (std::uint32_t slot = 0;
-                 slot < top_k;
-                 ++slot) {
-                if (!better(
-                        probability,
-                        expert,
-                        best_values[slot],
-                        best_indices[slot])) {
-                    continue;
-                }
-
-                for (std::uint32_t move =
-                         top_k - 1U;
-                     move > slot;
-                     --move) {
-                    best_values[move] =
-                        best_values[
-                            move - 1U];
-                    best_indices[move] =
-                        best_indices[
-                            move - 1U];
-                }
-                best_values[slot] =
-                    probability;
-                best_indices[slot] =
-                    expert;
-                break;
-            }
-        }
-
-        float selected_sum = 0.0F;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_sum +=
-                best_values[slot];
-        }
-        if (!normalize_selected) {
-            selected_sum = 1.0F;
-        }
-
-        const auto output_base =
-            static_cast<std::uint64_t>(
-                row) *
-            top_k;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_indices[
-                output_base + slot] =
-                best_indices[slot];
-            selected_weights[
-                output_base + slot] =
-                best_values[slot] /
-                selected_sum;
-        }
-    }
+    moe_core::route_softmax_insert<InsertRoutePolicy>(logits, scratch, row, lane,
+        expert_count, top_k, normalize_selected, selected_indices, selected_weights);
 }
 
 constexpr std::uint32_t kRouterExpertsPerBlock = 8;
@@ -586,151 +476,8 @@ __device__ __forceinline__ void parallel_moe_route_select_row(
         logits[expert] = workspace[static_cast<std::uint64_t>(row) * expert_count + expert];
     __syncthreads();
 
-    float local_max =
-        -INFINITY;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        local_max =
-            fmaxf(
-                local_max,
-                logits[expert]);
-    }
-    scratch[lane] = local_max;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] =
-                fmaxf(
-                    scratch[lane],
-                    scratch[
-                        lane + stride]);
-        }
-        __syncthreads();
-    }
-    const float maximum =
-        scratch[0];
-    // Every wave must retain the maximum before lane zero reuses scratch[0]
-    // for its contribution to the denominator reduction.
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        const float probability =
-            expf(
-                logits[expert] -
-                maximum);
-        logits[expert] =
-            probability;
-        local_sum += probability;
-    }
-    scratch[lane] = local_sum;
-    __syncthreads();
-
-    for (std::uint32_t stride =
-             blockDim.x / 2U;
-         stride > 0;
-         stride >>= 1U) {
-        if (lane < stride) {
-            scratch[lane] +=
-                scratch[lane + stride];
-        }
-        __syncthreads();
-    }
-    const float denominator =
-        scratch[0];
-
-    for (std::uint32_t expert = lane;
-         expert < expert_count;
-         expert += blockDim.x) {
-        logits[expert] /=
-            denominator;
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float best_values[kMaxTopK];
-        std::uint32_t best_indices[
-            kMaxTopK];
-
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            best_values[slot] =
-                -INFINITY;
-            best_indices[slot] =
-                expert_count;
-        }
-
-        for (std::uint32_t expert = 0;
-             expert < expert_count;
-             ++expert) {
-            const float probability =
-                logits[expert];
-
-            for (std::uint32_t slot = 0;
-                 slot < top_k;
-                 ++slot) {
-                if (!better(
-                        probability,
-                        expert,
-                        best_values[slot],
-                        best_indices[slot])) {
-                    continue;
-                }
-
-                for (std::uint32_t move =
-                         top_k - 1U;
-                     move > slot;
-                     --move) {
-                    best_values[move] =
-                        best_values[
-                            move - 1U];
-                    best_indices[move] =
-                        best_indices[
-                            move - 1U];
-                }
-                best_values[slot] =
-                    probability;
-                best_indices[slot] =
-                    expert;
-                break;
-            }
-        }
-
-        float selected_sum = 0.0F;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_sum +=
-                best_values[slot];
-        }
-        if (!normalize_selected) {
-            selected_sum = 1.0F;
-        }
-
-        const auto output_base =
-            static_cast<std::uint64_t>(
-                row) *
-            top_k;
-        for (std::uint32_t slot = 0;
-             slot < top_k;
-             ++slot) {
-            selected_indices[
-                output_base + slot] =
-                best_indices[slot];
-            selected_weights[
-                output_base + slot] =
-                best_values[slot] /
-                selected_sum;
-        }
-    }
+    moe_core::route_softmax_insert<InsertRoutePolicy>(logits, scratch, row, lane,
+        expert_count, top_k, normalize_selected, selected_indices, selected_weights);
 }
 
 __device__ __forceinline__ void ranked_parallel_moe_route_select_row(
@@ -956,31 +703,8 @@ __device__ __forceinline__ void wave_parallel_moe_route_select_row(
             values[i] = expert < expert_count ? logits[expert] : 0.0F;
             if (expert < expert_count && values[i] == values[i]) available |= 1U << i;
         }
-        for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-            bool has = false;
-            float best = -INFINITY;
-            std::uint32_t index = expert_count;
-#pragma unroll
-            for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
-                if ((available & (1U << i)) != 0) {
-                    const auto expert = lane + kRouterWave * i;
-                    if (!has || better(values[i], expert, best, index)) {
-                        has = true; best = values[i]; index = expert;
-                    }
-                }
-            }
-#pragma unroll
-            for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-                const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
-                const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
-                const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
-                if (other_has != 0 && (!has || better(other, other_index, best, index))) {
-                    has = true; best = other; index = other_index;
-                }
-            }
-            if (lane == 0) { best_values[slot] = has ? best : -INFINITY; best_indices[slot] = has ? index : expert_count; }
-            if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
-        }
+        moe_core::route_wave_topk(values, available, expert_count, top_k, lane,
+            BlockWaveRoutePolicy{{}, lane, expert_count, best_values, best_indices});
     }
     // All eight waves participate; no early return may bypass this barrier.
     __syncthreads();
@@ -1101,31 +825,8 @@ __device__ __forceinline__ void wave_route_select_row(const float* workspace, st
     }
     float mine = -INFINITY;
     std::uint32_t mine_index = expert_count;
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-        bool has = false;
-        float best = -INFINITY;
-        std::uint32_t index = expert_count;
-#pragma unroll
-        for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
-            if ((available & (1U << i)) != 0) {
-                const auto expert = lane + kRouterWave * i;
-                if (!has || better(values[i], expert, best, index)) {
-                    has = true; best = values[i]; index = expert;
-                }
-            }
-        }
-#pragma unroll
-        for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
-            const float other = strix::qwen_dpp::xor32(best, static_cast<int>(mask));
-            const auto other_index = strix::qwen_dpp::xor32(index, static_cast<int>(mask));
-            const int other_has = strix::qwen_dpp::xor32(static_cast<int>(has), static_cast<int>(mask));
-            if (other_has != 0 && (!has || better(other, other_index, best, index))) {
-                has = true; best = other; index = other_index;
-            }
-        }
-        if (lane == slot) { mine = has ? best : -INFINITY; mine_index = has ? index : expert_count; }
-        if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
-    }
+    moe_core::route_wave_topk(values, available, expert_count, top_k, lane,
+        LaneWaveRoutePolicy{{}, lane, expert_count, mine, mine_index});
     float selected_sum = 0.0F;
     for (std::uint32_t slot = 0; slot < top_k; ++slot) selected_sum += __shfl(mine, static_cast<int>(slot), kRouterWave);
     if (!normalize_selected) selected_sum = 1.0F;
@@ -2077,7 +1778,7 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
             return n == 64U || n == 256U ? n : 128U;
         }();
         // STRIX_ROUTER_STAGED=0: the lanes form below for the 2560-wide router as well (same chains).
-        static const bool staged = [] { const char* v = std::getenv("STRIX_ROUTER_STAGED"); return !v || v[0] != '0'; }();
+        static const bool staged = strix::envcfg::flag("STRIX_ROUTER_STAGED", true);
         // A registered BF16 copy of the (BF16-exact) F32 weights replaces them: same coefficients and chains.
         const auto* bf16 = q6p::find(weights);
         const bool half = bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count &&
@@ -2085,7 +1786,7 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
         const auto lanes = [&]<std::uint32_t R>() {
             // Twice as many independent blocks for the 512-expert single-session router.
             // Each (row, expert) retains the ascending fused chain and the same loader ring depth.
-            static const bool small = [] { const char* v = std::getenv("STRIX_QKERN_ROUTER8"); return v && v[0] == '1'; }();
+            static const bool small = strix::envcfg::flag("STRIX_QKERN_ROUTER8", false);
             if (small && staged && config.hidden_size == 20U * 128U) {
                 constexpr unsigned experts = 8U, loaders = 4U;
                 const auto grid8 = dim3((config.expert_count + experts - 1U) / experts);
@@ -2106,7 +1807,7 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
                 static const unsigned stage_mode = [] { const char* v = std::getenv("STRIX_ROUTER_STAGE_ACT"); return !v || !*v ? 2U :
                     v[0] == '1' || v[0] == '2' ? static_cast<unsigned>(v[0] - '0') : 0U; }();
                 const bool stage_act = stage_mode == 1U ? R == 1U : stage_mode == 2U && R <= 4U;
-                static const bool chunk256 = [] { const char* v = std::getenv("STRIX_ROUTER_CHUNK256"); return v && v[0] == '1'; }();
+                static const bool chunk256 = strix::envcfg::flag("STRIX_ROUTER_CHUNK256", false);
                 if constexpr (R == 1U) if (stage_act && chunk256) {   // fixture: the staged forms win at one row only
                     if (half)
                         hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, true, experts, true, 256U>),
@@ -2171,7 +1872,7 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
     check_hip(hipGetLastError(), "known-window router rows logits launch");
     // STRIX_WINDOW_ROUTER_SELECT=1: the window's rows in one block, one wave per row (wave_rows_route_select_kernel, same bits
     // as the block-per-row wave form).
-    static const bool window_wave_rows = [] { const char* v = std::getenv("STRIX_WINDOW_ROUTER_SELECT"); return v && v[0] == '1'; }();
+    static const bool window_wave_rows = strix::envcfg::flag("STRIX_WINDOW_ROUTER_SELECT", false);
     if (config.wave_topk && window_wave_rows && p.rows <= 8U && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterRowsArgs>),
             dim3(p.rows), dim3(kRouterWave), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected, p.rows);
@@ -2329,7 +2030,7 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         // STRIX_PREFILL_ROUTER_CHECK=1 (diagnostic, synchronizes): also runs logits_kernel<2> on the same rows and prints the
         // number of logits whose bits differ.
         static const unsigned router_tune = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_TUNE"); return v ? static_cast<unsigned>(std::atoi(v)) : 2U; }();
-        static const bool router_check = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_CHECK"); return v && v[0] == '1'; }();
+        static const bool router_check = strix::envcfg::flag("STRIX_PREFILL_ROUTER_CHECK", false);
         const std::uint32_t total = tiles * 8U, experts = config.expert_count;
         const dim3 grid((total + router_fast::kM - 1U) / router_fast::kM, experts / router_fast::kN);
         const auto original = [&] {
@@ -2367,7 +2068,7 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
             hipLaunchKernelGGL(router_fast::split_weights, dim3(static_cast<unsigned>(std::min<std::size_t>((weights + 255U) / 256U, 4096U))),
                 dim3(256U), 0, stream, f32, split, split + weights, static_cast<std::uint32_t>(weights));
             check_hip(hipGetLastError(), "router weight split launch");
-            static const bool fuse = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_FUSE"); return v && v[0] == '1'; }();
+            static const bool fuse = strix::envcfg::flag("STRIX_PREFILL_ROUTER_FUSE", false);
             if (fuse && presplit_n == 128U && !router_check && experts <= kMaxExperts && config.top_k <= kRouterWave) {
                 static unsigned* counters = nullptr;
                 static std::uint32_t counter_capacity = 0;
@@ -2412,7 +2113,7 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
     check_hip(hipGetLastError(), "router prefill rows logits launch");
     // STRIX_PREFILL_ROUTER_SELECT=1: one wave per row, 8 rows per block (wave_rows_route_select_kernel, same bits).
     // Default ON (bitwise; =0 restores the block-per-row form).
-    static const bool wave_rows_select = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_SELECT"); return !v || v[0] != '0'; }();
+    static const bool wave_rows_select = strix::envcfg::flag("STRIX_PREFILL_ROUTER_SELECT", true);
     if (wave_rows_select && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
             dim3(1U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected, 8U);
@@ -2636,7 +2337,7 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     auto workspace=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::router_workspace).address);
     const auto hidden0=c.resources->view(HipMtpBuffer::hidden0).address;
     // The one-row staged chains (same bits as parallel_moe_route_logits_kernel); STRIX_ROUTER_STAGED=0: off.
-    static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
+    static const bool staged=strix::envcfg::flag("STRIX_ROUTER_STAGED", true);
     const auto* bf16 = q6p::find(reinterpret_cast<const void*>(c.tensors->router.runtime->address));
     if (bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == e && bf16->cols == h) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(parallel_moe_route_logits_kernel<std::uint16_t,RouterWeightKind::bf16>),
@@ -2645,10 +2346,10 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
             bf16->base,h,e,workspace);
     } else if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
         RouterRowsArgs args{};args.hidden[0]=reinterpret_cast<const void*>(hidden0);args.workspace[0]=workspace;
-        static const bool stage_act=[]{const char* v=std::getenv("STRIX_ROUTER_STAGE_ACT");return !v||v[0]!='0';}();   // default ON
-        static const bool chunk256=[]{const char* v=std::getenv("STRIX_ROUTER_CHUNK256");return v&&v[0]=='1';}();
+        static const bool stage_act=strix::envcfg::flag("STRIX_ROUTER_STAGE_ACT", true);   // default ON
+        static const bool chunk256=strix::envcfg::flag("STRIX_ROUTER_CHUNK256", false);
         // STRIX_ROUTER_LOADERS16=1 (with STAGE_ACT=1): 16 loader waves, ring depth 16 (4 MiB lookahead).
-        static const bool loaders16=[]{const char* v=std::getenv("STRIX_ROUTER_LOADERS16");return v&&v[0]=='1';}();
+        static const bool loaders16=strix::envcfg::flag("STRIX_ROUTER_LOADERS16", false);
         if(stage_act&&loaders16)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,16U,false,16U,true>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+16U)),0,reinterpret_cast<hipStream_t>(stream),args,
@@ -2683,7 +2384,7 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
 // across each other), so the live rows run as groups of 8, 4, 2 and 1; the selection runs once per row with
 // the one-token kernel's row body (rows_moe_route_select_kernel<wave>). Only the staged production branch.
 bool hip_mtp_route_rows_supported() {
-    static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
+    static const bool staged=strix::envcfg::flag("STRIX_ROUTER_STAGED", true);
     return staged;
 }
 void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* raw_stream) {

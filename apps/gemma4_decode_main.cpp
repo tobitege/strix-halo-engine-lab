@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "gemma4/engine/runtime.hpp"
 #include "gemma4/ref/npz.hpp"
 #include "gemma4_prefill_ab.hpp"
@@ -28,6 +29,10 @@ void emit(const e::Options& options, const e::Runtime& runtime, std::span<const 
 }
 }
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     for (int i = 1; i < argc; ++i) if (std::string_view(argv[i]) == "--ab-switch") return prefill_ab::run(argc, argv);
     try {
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND

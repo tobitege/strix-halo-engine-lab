@@ -110,12 +110,15 @@ class PinnedBuffer {
         if (data_)
             throw std::runtime_error("pinned staging already allocated");
         hip_checked(hipHostMalloc(&data_, bytes, hipHostMallocDefault));
+        bytes_ = bytes;
     }
     [[nodiscard]] void* data() const { return data_; }
+    [[nodiscard]] std::size_t size() const { return bytes_; }
     template <class T> [[nodiscard]] T* as() const { return static_cast<T*>(data_); }
 
   private:
     void* data_ = nullptr;
+    std::size_t bytes_ = 0;
 };
 void expect(LinearView v, unsigned outputs, unsigned inputs) {
     if (!v.data || v.outputs != outputs || v.inputs != inputs ||
@@ -554,6 +557,50 @@ const HostWeights& DeviceTarget::borrow_device_weights() const { return impl_->w
 const DeviceStats& DeviceTarget::stats() const {
     return impl_->stats;
 }
+std::optional<memory::Work> DeviceTarget::cache_work_bound() const {
+#if !defined(_MSC_VER) && !defined(__GLIBCXX__)
+    return {};
+#else
+    const auto& b=*impl_;const auto& c=b.w.config;
+    // Resolved fields, not environment labels. Chunk decode has private packing/
+    // streaming modes; graphs have driver-private allocation sizes. Refuse both
+    // without changing them. Exact eight-row linears allocate no private buffers.
+    if(b.options.graphs || b.options.profile || b.options.graph_timing || !b.graphs.empty() ||
+       b.fast_decode || b.stats.a8 || b.stats.chunk_decode || b.stats.streaming_weights ||
+       b.stats.identity!=arithmetic_id || !c.max_positions || c.max_positions>UINT32_MAX-(attention_chunk-1)) return {};
+    try {
+        memory::Work n;
+        // Existing buffer payload only: weights are counted by their unique
+        // uploaded owner (embedding/head aliases are not charged twice).
+        for(const auto& w:b.weights) memory::add(n.active.device,w.size());
+        for(const auto* p:{&b.sliding,&b.global,&b.residual,&b.x,&b.q,&b.k,&b.v,&b.att,&b.out,
+            &b.gate,&b.up,&b.ple,&b.logits,&b.taps,&b.format_scratch,&b.tokens,&b.positions,&b.reads,
+            &b.writes,&b.scores,&b.maxima,&b.partials,&b.failure,&b.candidates,&b.winners,&b.tickets,
+            &b.attention_counters}) memory::add(n.active.device,p->size());
+        for(const auto* p:{&b.host_tokens,&b.host_positions,&b.host_reads,&b.host_writes,&b.host_failure,
+            &b.host_logits,&b.host_taps,&b.host_winners,&b.host_hidden}) memory::add(n.active.pinned,p->size());
+        const auto scratch=memory::attention(c.max_positions,c.heads,8,attention_chunk);
+        // Buffer::resize allocates new BEFORE releasing old. Additional holds
+        // the full new arrays, not new-minus-old, for simultaneous growth.
+        if(scratch.scores>b.scores.size()) memory::add(n.additional.device,scratch.scores);
+        if(scratch.maxima>b.maxima.size()) memory::add(n.additional.device,scratch.maxima);
+        if(scratch.partials>b.partials.size()) memory::add(n.additional.device,scratch.partials);
+        // Both returned outputs and pageable export staging can coexist. 2x
+        // vector capacity each; fixed pinned exports were allocated at startup.
+        memory::add(n.additional.host,memory::product(8,std::uint64_t(c.vocab)+6ULL*c.hidden),4*sizeof(float));
+        memory::add(n.additional.host,8,4*sizeof(Candidate)+2*sizeof(std::uint32_t)+2*sizeof(std::uint64_t)+2*sizeof(RowPlan*));
+        memory::add(n.additional.host,c.layers,16*(sizeof(KvRead)+sizeof(KvWrite)));
+        // ForwardPlan output set + target outputs set, transaction rows map,
+        // owner map, planner work vectors: <=8 nodes per container. The 64-byte
+        // node envelope covers reviewed MSVC/libstdc++ tree links/alignment.
+        memory::add(n.additional.host,8,2*(sizeof(std::uint64_t)+64)+
+            sizeof(std::pair<const void*,std::vector<std::uint64_t>>)+64+
+            sizeof(std::pair<const void*,std::pair<std::uint64_t,std::uint64_t>>)+64+
+            2*sizeof(std::uint64_t)+sizeof(RowPlan)+sizeof(ForwardResult));
+        (void)n.active.total();(void)n.additional.total();return n;
+    } catch(const std::overflow_error&) {return {};}
+#endif
+}
 namespace {
 // STRIX_G4_DECODE_EXPORT (read per pass; unset or 1 = on, 0 = off): logits and
 // taps reach the host only when a row of the pass exports them; every pass
@@ -667,9 +714,9 @@ ForwardResult DeviceTarget::forward_rows(std::span<const RowPlan> plans) {
             if (tx->stream->writer_queue) tx->stream->queue = b.queue;
             for (std::size_t l = 0; l < tx->overlay.size(); ++l) {
                 const auto bytes = (tx->stream->pooled ? 8ULL : tx->rows) * tx->stream->cache[l].width * sizeof(float);
-                if (!tx->reserved && (!tx->stream->pooled || bytes > tx->overlay[l].k.size())) {
-                    tx->overlay[l].k.resize(bytes);
-                    tx->overlay[l].v.resize(bytes);
+                if (!tx->reserved) {
+                    if(!tx->stream->pooled || bytes>tx->overlay[l].k.size()) tx->overlay[l].k.resize(bytes);
+                    if(!tx->stream->pooled || bytes>tx->overlay[l].v.size()) tx->overlay[l].v.resize(bytes);
                 }
             }
         }

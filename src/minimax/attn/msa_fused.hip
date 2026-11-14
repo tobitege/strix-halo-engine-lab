@@ -1,10 +1,16 @@
+#include "strix/hip_check.hpp"
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 MSA decode, fused and batched (src/minimax/attn/msa_fused.hpp). Every arithmetic step is the one of
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
 #include "msa_fused.hpp"
 #include "msa_inblock_layout.hpp"
+#include "msa_select_dump.hpp"
+#include "attn_core/index_score_band.hpp"
+#include "attn_core/index_score_wmma.hpp"
+#include "attn_core/sparse_flash_keysplit.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -12,6 +18,7 @@
 
 namespace strix::minimax::msa::fused {
 namespace {
+namespace aidx = strix::attn_core::idx;
 
 constexpr unsigned kIdxThreads = kBlock;    // index launch: thread = position of a 128-position key block
 constexpr unsigned kPhases = 16;             // per attend block: 8 wall-clock stamps, then 8 shader-cycle stamps
@@ -470,6 +477,120 @@ __global__ __launch_bounds__(kIdxThreads) void prefill_index_q64_kernel(PrefillV
         }
     }
 }
+
+// ---------------------------------------------------------------- WMMA index scores (STRIX_IDX_WMMA)
+// Adapter of the shared core (src/attn_core/index_score_wmma.hpp): work-group = 64 query rows x 2 index heads
+// (query vector q = row * 2 + head, the iq layout), key tile = one 128-position block (global block j). The
+// normed + roped FP32 query is rounded to BF16 once; the BF16 keys are the cache bits. Per (row, head, block) the
+// score is max over the visible positions of the WMMA dot, times kScale: the select kernels are unchanged.
+// Split (STRIX_IDX_WMMA=bf16x2): work-group = 32 rows x 2 heads; query fragment 0 holds the rounded query, fragment 1
+// the BF16 rounding of its residual (x - hi is exact in FP32), and the two WMMA dots of a (query, key) pair are added.
+template <bool Split> struct IdxWmmaPolicyT {
+    using Args = PrefillView;
+    static constexpr aidx::Operand kOp = aidx::Operand::bf16;
+    static constexpr unsigned kParts = Split ? 2U : 1U;           // operand fragments per query vector
+    static constexpr unsigned kRowFrags = aidx::kFrags / kParts;  // query fragments that hold distinct rows
+    static constexpr unsigned kWaveRows = kRowFrags * 8U, kRows = aidx::kWaves * kWaveRows, kWindows = kRows / kMaxRows;
+    struct Ctx {
+        DecodeView v;
+        unsigned W;
+        std::uint64_t first, last;  // visible positions of the first and the last row
+    };
+    struct State {
+        float m[kRowFrags][8];
+        std::uint32_t d[kRowFrags][8];    // row's visible positions - first (rows >= W: 0, never written)
+        std::uint32_t vis[kRowFrags][8];  // visible keys of the current block, 0..128
+        bool full;
+    };
+    __device__ static bool begin(const PrefillView& input, Ctx& c) {
+        const unsigned r0 = (input.first_window + blockIdx.y * kWindows) * kMaxRows;
+        if (r0 >= input.rows) return false;
+        c.v = kernel_view(input, blockIdx.y * kWindows);
+        c.W = input.rows - r0 < kRows ? input.rows - r0 : kRows;
+        c.first = c.v.pos[0] + 1;
+        c.last = c.v.pos[c.W - 1] + 1;
+        return true;
+    }
+    __device__ static void stage_queries(const PrefillView&, const Ctx& c, std::uint16_t* tile) {
+        const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+        auto* t2 = reinterpret_cast<uint2*>(tile);
+        for (unsigned q = wave; q < aidx::kQueries; q += aidx::kWaves) {
+            uint2 packed = make_uint2(0U, 0U);
+            // Slot q = wave * 32 + fragment * 16 + i. Split: i = (row in wave) * 2 + head, fragment = hi / lo part.
+            const unsigned src = Split ? ((q / 32U) * kWaveRows + (q % 16U) / 2U) * 2U + q % 2U : q;  // iq vector = row * 2 + head
+            if (src / 2U < c.W) {
+                float x[kDimsPerLane];
+                load4(x, c.v.iq + static_cast<std::size_t>(src) * kIdxDim, lane);
+                norm_rope_lane(x, c.v.iq_w, c.v.rope[src / 2U], lane);
+                if (Split && (q / 16U) % 2U != 0) {
+#pragma unroll
+                    for (unsigned j = 0; j < kDimsPerLane; ++j)
+                        x[j] -= __builtin_bit_cast(float, static_cast<std::uint32_t>(float_to_bf16(x[j])) << 16U);
+                }
+                packed = pack4(x);
+            }
+            t2[aidx::piece_slot(q, lane / 2U) * 2U + lane % 2U] = packed;
+        }
+    }
+    __device__ static void init(const PrefillView&, const Ctx& c, State& st) {
+        const unsigned wave = threadIdx.x >> 5U;
+#pragma unroll
+        for (unsigned f = 0; f < kRowFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const unsigned rr = wave * kWaveRows + f * 8U + e;
+                st.d[f][e] = rr < c.W ? static_cast<std::uint32_t>(c.v.pos[rr] + 1 - c.first) : 0U;
+            }
+    }
+    __device__ static unsigned tiles(const PrefillView&, const Ctx& c) { return c.v.max_blocks; }
+    __device__ static bool live(const PrefillView&, const Ctx& c, unsigned kt) { return std::uint64_t{kt} * kBlock < c.last; }
+    __device__ static uint4 key_piece(const PrefillView&, const Ctx& c, unsigned kt, unsigned key, unsigned piece) {
+        const std::uint64_t t = std::uint64_t{kt} * kBlock + key;
+        if (t >= c.last) return make_uint4(0U, 0U, 0U, 0U);
+        return reinterpret_cast<const uint4*>(c.v.ik_cache[0])[t * (kIdxDim / 8U) + piece];
+    }
+    __device__ static void tile_begin(const PrefillView&, const Ctx& c, State& st, unsigned kt) {
+        const std::uint64_t base = std::uint64_t{kt} * kBlock;
+        st.full = base + kBlock <= c.first;
+#pragma unroll
+        for (unsigned f = 0; f < kRowFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const std::uint64_t count = c.first + st.d[f][e];
+                st.vis[f][e] = count <= base ? 0U : (count - base >= kBlock ? kBlock : static_cast<std::uint32_t>(count - base));
+                st.m[f][e] = -__builtin_inff();
+            }
+    }
+    __device__ static void fragment(const PrefillView&, const Ctx&, State& st, unsigned, unsigned kf, const aidx::Acc (&acc)[aidx::kFrags]) {
+        const unsigned key = kf * 16U + (threadIdx.x & 15U);
+#pragma unroll
+        for (unsigned f = 0; f < kRowFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const float dot = Split ? acc[0][e] + acc[aidx::kFrags - 1U][e] : acc[f][e];
+                const float x = st.full || key < st.vis[f][e] ? dot : -__builtin_inff();
+                st.m[f][e] = max_of(st.m[f][e], x);
+            }
+    }
+    __device__ static void tile_end(const PrefillView&, const Ctx& c, State& st, unsigned kt) {
+        const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U, li = lane & 15U;
+        float out = 0.0F;
+        std::uint32_t vis = 0;
+#pragma unroll
+        for (unsigned f = 0; f < kRowFrags; ++f)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                float m = st.m[f][e];
+                for (unsigned d = 8; d >= 1; d >>= 1U) m = max_of(m, __shfl_xor(m, static_cast<int>(d), 32));
+                if (f * 8U + e == li) { out = m; vis = st.vis[f][e]; }
+            }
+        const unsigned rr = wave * kWaveRows + li, h = lane / 16U;  // row of (f, e) = (li / 8, li % 8)
+        if (li < kWaveRows && rr < c.W && vis != 0)
+            c.v.scores[(static_cast<std::size_t>(rr) * c.v.idx_heads + h) * c.v.max_blocks + kt] = out * kScale;
+    }
+};
+static_assert(IdxWmmaPolicyT<false>::kRows == 64U && IdxWmmaPolicyT<true>::kRows == 32U && kMaxRows == 16U,
+              "work-group = 64 rows x 2 index heads, or 32 rows x 2 heads x 2 query parts");
 
 // ---------------------------------------------------------------- attend launch (K3 + K4 + combine)
 
@@ -1216,6 +1337,65 @@ __host__ __device__ std::uint64_t prefill_chunk_prefix(std::uint64_t end) {
     const std::uint64_t dense = end < limit ? end : limit;
     const std::uint64_t blocks = dense / kBlock, tail = dense % kBlock;
     return kBlock * blocks * (blocks + 1) / 2 + tail * (blocks + 1) + (end - dense) * kTopK;
+}
+
+// ---------------------------------------------------------------- exact selection through the WMMA scores
+// STRIX_IDX_WMMA=exact: after the split-query WMMA scores (IdxWmmaPolicyT<true>), one work-group per (row, index head)
+// finds the cut-off of the selection (the 15th largest score of the blocks before the newest one), and rescores the
+// blocks within 2 delta of it with the exact kernel's arithmetic (dot128_packed * kScale, max over the visible
+// positions). By the band rule (src/attn_core/index_score_band.hpp) prefill_select_kernel then picks the exact set.
+// delta: |q|_2 <= sqrt(128) max|1 + iq_w| and |k|_2 <= sqrt(128) max|1 + ik_w| (1 + 2^-8) after norm, RoPE and the
+// BF16 key rounding, so delta = kSplitDotRelError * 128 * 1.01 * max|1 + iq_w| * max|1 + ik_w| * kScale.
+constexpr unsigned kRefineExtra = (kIdxDim * 4U + 64U + 15U) / 16U;  // LDS before the selection view: query, 16 slots
+__global__ __launch_bounds__(256) void prefill_index_refine_kernel(PrefillView p) {
+    const DecodeView v = kernel_view(p, blockIdx.z);
+    const unsigned rg = blockIdx.x, r = rg / v.idx_heads, tid = threadIdx.x, lane = tid & 31U;
+    if (r >= v.rows_per_seq) return;
+    const std::uint64_t count = v.pos[r] + 1;
+    const unsigned nb = static_cast<unsigned>(block_count(count));
+    if (nb <= kTopK) return;  // every block is selected
+    extern __shared__ uint4 refine_mem[];
+    float* q = reinterpret_cast<float*>(refine_mem);
+    float* fslot = q + kIdxDim;
+    std::uint32_t* uslot = reinterpret_cast<std::uint32_t*>(fslot + 8);
+    SelView<256> sel(refine_mem + kRefineExtra, v.max_blocks);
+    const unsigned rest = nb - 1;
+    float* sc = v.scores + static_cast<std::size_t>(rg) * v.max_blocks;
+    if (tid < 32) {
+        float x[kDimsPerLane];
+        load4(x, v.iq + static_cast<std::size_t>(rg) * kIdxDim, lane);
+        norm_rope_lane(x, v.iq_w, v.rope[r], lane);
+        *reinterpret_cast<float4*>(q + lane * kDimsPerLane) = make_float4(x[0], x[1], x[2], x[3]);
+    }
+    for (unsigned b = tid; b < rest; b += 256) sel.keys[b] = order_key(sc[b]);
+    __syncthreads();
+    const auto fmax = [](float a, float b) { return a > b ? a : b; };
+    const auto fmin = [](float a, float b) { return a < b ? a : b; };
+    const auto umin = [](std::uint32_t a, std::uint32_t b) { return a < b ? a : b; };
+    const float wq = aidx::group_reduce(tid < kIdxDim ? __builtin_fabsf(1.0F + v.iq_w[tid]) : 0.0F, fslot, fmax);
+    const float wk = aidx::group_reduce(tid < kIdxDim ? __builtin_fabsf(1.0F + v.ik_w[tid]) : 0.0F, fslot, fmax);
+    const float delta = aidx::kSplitDotRelError * (static_cast<float>(kIdxDim) * 1.01F) * wq * wk * kScale;
+    choose_topk<256>(sel.keys, rest, kTopK - 1, sel.chosen, sel.hist, sel.wave_tot, sel.sh);
+    __syncthreads();
+    float mine = __builtin_inff();
+    for (unsigned b = tid; b < rest; b += 256)
+        if (sel.chosen[b] != 0U) mine = fmin(mine, sc[b]);
+    const float cut = aidx::group_reduce(mine, fslot, fmin);
+    const std::uint32_t* keys = reinterpret_cast<const std::uint32_t*>(v.ik_cache[0]);
+#pragma unroll 1
+    for (unsigned cursor = 0;;) {
+        std::uint32_t next = rest;
+        for (unsigned b = tid; b < rest; b += 256)
+            if (b >= cursor && aidx::in_band(sc[b], cut, delta)) { next = b; break; }
+        next = aidx::group_reduce(next, uslot, umin);
+        if (next >= rest) break;  // uniform
+        float s = -__builtin_inff();
+        const std::uint64_t t = std::uint64_t{next} * kBlock + tid;
+        if (tid < kBlock && t < count) s = dot128_packed(q, keys + t * (kIdxDim / 2U)) * kScale;
+        s = aidx::group_reduce(s, fslot, [](float a, float b) { return max_of(a, b); });
+        if (tid == 0) sc[next] = s;
+        cursor = next + 1U;
+    }
 }
 
 // One selection per (row, KV group), with IDs emitted in ascending block order.
@@ -2042,6 +2222,8 @@ __global__ __launch_bounds__(1024) void prefill_r16_kernel(PrefillView input) {
 // done by one 256-thread block per (row, KV head) instead of by every chunk block. Same order keys, same choose_topk,
 // same ascending compaction with the newest block last, so idx / idx_count are the bytes the attend launch writes
 // with select; the attend launch then runs with select = false.
+#include "minimax/attn/msa_flash_policy.hpp"
+
 template <unsigned NT> __global__ __launch_bounds__(NT) void select_kernel(DecodeView v) {
     extern __shared__ uint4 dyn_smem[];
     SelView<NT> sel(dyn_smem, v.max_blocks);
@@ -2073,9 +2255,7 @@ template <unsigned NT> __global__ __launch_bounds__(NT) void select_kernel(Decod
     }
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 }  // namespace
 
@@ -2098,7 +2278,7 @@ void enqueue_index(const DecodeView& v, hipStream_t stream) {
     const unsigned cap = index_grid_cap(), grid = items == 0 ? 1U : items < cap ? items : cap;  // >= 1: K/V rows
     const std::size_t lds = kChunks16 * sizeof(uint4) + static_cast<std::size_t>(rows) * v.idx_heads * kIdxDim * sizeof(float);
     hipLaunchKernelGGL((index_kernel<DecodeView>), dim3(grid), dim3(kIdxThreads), lds, stream, v);
-    check(hipGetLastError(), "minimax fused index");
+    hip_check(hipGetLastError(), "minimax fused index");
 }
 
 unsigned attend_heads(const DecodeView& v) {
@@ -2125,7 +2305,7 @@ template <bool DENSE> void launch_attend(const DecodeView& v, bool select, hipSt
         case 4: hipLaunchKernelGGL((attend4_kernel<4, DENSE>), grid4, dim3(4 * 32), lds4, stream, v, sel4); break;
         default: throw std::invalid_argument("minimax fused attend: heads_per_wave must be 1, 2 or 4");
         }
-        check(hipGetLastError(), "minimax fused attend v4");
+        hip_check(hipGetLastError(), "minimax fused attend v4");
         return;
     }
     const dim3 grid(rows * v.kv_heads * (kGroup / hw), kMaxChunks);
@@ -2150,7 +2330,7 @@ template <bool DENSE> void launch_attend(const DecodeView& v, bool select, hipSt
     case 43: hipLaunchKernelGGL((attend2_kernel<4, DENSE, true>), grid, dim3(4 * 32), lds, stream, v, sel); break;
     default: throw std::invalid_argument("minimax fused attend: heads_per_block must be 4, 8 or 16");
     }
-    check(hipGetLastError(), "minimax fused attend");
+    hip_check(hipGetLastError(), "minimax fused attend");
 }
 
 void enqueue_attend(const DecodeView& v, bool select, hipStream_t stream) {
@@ -2176,10 +2356,22 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         if constexpr (!DENSE) {
             hipLaunchKernelGGL(prefill_select_kernel, dim3(kMaxRows * v.kv_heads, 1, windows), dim3(256),
                                sel_bytes(v.max_blocks, 256), stream, scheduled);
-            check(hipGetLastError(), "minimax prefill shared selection");
+            hip_check(hipGetLastError(), "minimax prefill shared selection");
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 11 || p.msa_rework == 12) {
+            // FAST: BF16 WMMA key-split flash on the shared core, one block per (row, group); same grid and block
+            // lists as mode 10. 11 = one-term operands, 12 = two-term (hi + lo) queries and probabilities. Not
+            // bit-identical to the exact modes (quality gated by the engine's FAST profile).
+            namespace ks = strix::attn_core::sparse;
+            const dim3 grid((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), block(ks::KeySplit<kGroup, kHeadDim>::kThreads);
+            const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
+            if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
+            else hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, false>), grid, block, 0, stream, args);
+            hip_check(hipGetLastError(), "minimax prefill flash attend");
+            return;
+        }
         if (p.msa_rework == 10) {
             // Mode 8 producer/combine in one block per (row, group); v2 uses
             // reserved numerator scratch and LDS scalar partials/IDs.
@@ -2187,7 +2379,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, false, 1, true>),
                                dim3((scheduled.rows - p.first_window * kMaxRows) * v.kv_heads), dim3(256),
                                InblockLayout::kSharedBytes, stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill in-block attend");
+            hip_check(hipGetLastError(), "minimax prefill in-block attend");
             return;
         }
         if (p.msa_rework == 8 || p.msa_rework == 9) {
@@ -2201,7 +2393,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
                 hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, true, 2>),
                                    dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                    4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill fused tree partial producers");
+            hip_check(hipGetLastError(), "minimax prefill fused tree partial producers");
             return;
         }
         if (p.msa_rework == 7) {
@@ -2211,7 +2403,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true, true, true>),
                                dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
-            check(hipGetLastError(), "minimax prefill fused partial producers");
+            hip_check(hipGetLastError(), "minimax prefill fused partial producers");
             return;
         }
         if (p.msa_rework == 4) {
@@ -2242,10 +2434,10 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
                                dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                                kChunks16 * sizeof(uint4), stream, scheduled, 0);
         }
-        check(hipGetLastError(), "minimax prefill partial producers");
+        hip_check(hipGetLastError(), "minimax prefill partial producers");
         hipLaunchKernelGGL((prefill_combine_kernel<DENSE>), dim3(kMaxRows, v.q_heads / 8, windows),
                            dim3(256), 0, stream, scheduled);
-        check(hipGetLastError(), "minimax prefill separate combine");
+        hip_check(hipGetLastError(), "minimax prefill separate combine");
         return;
     }
     const dim3 grid(kMaxRows * v.kv_heads, kMaxChunks, windows);
@@ -2260,7 +2452,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         if (g_attend_lds_min > lds) lds = g_attend_lds_min;
         hipLaunchKernelGGL((attend2_kernel<16, DENSE, true, PrefillView>), grid, dim3(16 * 32), lds, stream, p, select);
     }
-    check(hipGetLastError(), "minimax batched prefill attend");
+    hip_check(hipGetLastError(), "minimax batched prefill attend");
 }
 }  // namespace
 
@@ -2312,7 +2504,7 @@ template <bool DENSE> void launch_prefill_partials(const PrefillView& p, unsigne
                            dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
                            4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, p, 0);
     }
-    check(hipGetLastError(), "minimax prefill diagnostic partial producers");
+    hip_check(hipGetLastError(), "minimax prefill diagnostic partial producers");
 }
 }  // namespace
 
@@ -2367,8 +2559,13 @@ void enqueue_prefill_selection(const PrefillView& p, hipStream_t stream) {
     scheduled.first_window = dense;
     hipLaunchKernelGGL(prefill_select_kernel, dim3(kMaxRows * p.window.kv_heads, 1, windows - dense),
                        dim3(256), sel_bytes(p.window.max_blocks, 256), stream, scheduled);
-    check(hipGetLastError(), "minimax prefill diagnostic selection");
+    hip_check(hipGetLastError(), "minimax prefill diagnostic selection");
 }
+
+namespace {
+void launch_prefill_index_exact(const PrefillView& p, hipStream_t stream);
+void audit_prefill_index(const PrefillView& p, hipStream_t stream);
+}  // namespace
 
 void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
     const DecodeView& v = p.window;
@@ -2382,6 +2579,31 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
         p.rows > std::uint64_t{v.max_blocks} * kBlock - p.pos0 ||
         v.phase_index != nullptr || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64))
         throw std::invalid_argument("minimax prefill index: bad view");
+    const unsigned sparse = windows - p.first_window;
+    // Default: "exact" (WMMA scores + exact rescoring of the cut-off band, the exact selection). STRIX_IDX_WMMA=0
+    // runs the VALU kernels below; bf16 / bf16x2 are FAST identities (opt-in).
+    if (const unsigned mode = aidx::wmma_mode(aidx::kModeExact); mode != aidx::kModeOff) {
+        if (mode == aidx::kModeF16) throw std::invalid_argument("STRIX_IDX_WMMA=f16: the MiniMax index keys are BF16 (bf16 or bf16x2)");
+        if (mode == aidx::kModeBf16x2 || mode == aidx::kModeExact)
+            aidx::launch<IdxWmmaPolicyT<true>>(p, aidx::wmma_split(v.max_blocks), (sparse + 1U) / 2U, stream);
+        else
+            aidx::launch<IdxWmmaPolicyT<false>>(p, aidx::wmma_split(v.max_blocks), (sparse + 3U) / 4U, stream);
+        hip_check(hipGetLastError(), "minimax prefill index wmma");
+        if (mode == aidx::kModeExact) {  // rescore the cut-off band: the selection is the exact one
+            hipLaunchKernelGGL(prefill_index_refine_kernel, dim3(kMaxRows * v.idx_heads, 1, sparse), dim3(256),
+                               kRefineExtra * sizeof(uint4) + sel_bytes(v.max_blocks, 256), stream, p);
+            hip_check(hipGetLastError(), "minimax prefill index refine");
+        }
+        if (aidx::audit_enabled()) audit_prefill_index(p, stream);
+        return;
+    }
+    launch_prefill_index_exact(p, stream);
+}
+
+namespace {
+void launch_prefill_index_exact(const PrefillView& p, hipStream_t stream) {
+    const DecodeView& v = p.window;
+    const unsigned windows = (p.rows - 1) / kMaxRows + 1;
     const unsigned query_rows = p.index_rows;
     const unsigned sparse = windows - p.first_window;
     const unsigned grid = v.max_blocks < index_grid_cap() ? v.max_blocks : index_grid_cap();
@@ -2399,12 +2621,77 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
     } else {
         hipLaunchKernelGGL((index_kernel<PrefillView>), dim3(grid, sparse), dim3(kIdxThreads), lds, stream, p);
     }
-    check(hipGetLastError(), "minimax batched prefill index");
+    hip_check(hipGetLastError(), "minimax batched prefill index");
+}
+
+// STRIX_IDX_WMMA_AUDIT=1 (diagnostic, synchronous): rescore the batch with the exact kernel into a scratch copy and
+// compare the per-(row, head) selection sets (top kTopK - 1 of the blocks before the newest one, as
+// prefill_select_kernel takes them) with the FAST scores. One cumulative stderr line per call.
+void audit_prefill_index(const PrefillView& p, hipStream_t stream) {
+    static aidx::Audit audit;
+    static unsigned calls = 0;
+    const DecodeView& v = p.window;
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0;
+    const std::size_t n = rows * v.idx_heads * v.max_blocks, off = r0 * v.idx_heads * v.max_blocks;
+    float* exact = nullptr;
+    hip_check(hipMalloc(&exact, (off + n) * sizeof(float)), "minimax idx audit alloc");
+    PrefillView q = p;
+    q.window.scores = exact;
+    launch_prefill_index_exact(q, stream);
+    std::vector<float> a(n), b(n);
+    std::vector<std::uint64_t> pos(rows);
+    hip_check(hipStreamSynchronize(stream), "minimax idx audit sync");
+    hip_check(hipMemcpy(a.data(), exact + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit exact");
+    hip_check(hipMemcpy(b.data(), v.scores + off, n * sizeof(float), hipMemcpyDeviceToHost), "minimax idx audit fast");
+    hip_check(hipMemcpy(pos.data(), v.pos + r0, rows * sizeof(std::uint64_t), hipMemcpyDeviceToHost), "minimax idx audit pos");
+    hip_check(hipFree(exact), "minimax idx audit free");
+    for (std::size_t r = 0; r < rows; ++r)
+        for (unsigned h = 0; h < v.idx_heads; ++h) {
+            const std::size_t o = (r * v.idx_heads + h) * v.max_blocks;
+            const std::uint64_t blocks = (pos[r] + kBlock) / kBlock;
+            audit.add(a.data() + o, b.data() + o, v.max_blocks, kTopK - 1, [&](std::size_t j) { return j + 1 < blocks; });
+        }
+    std::fprintf(stderr, "%s (call %u)\n", audit.line("minimax").c_str(), ++calls);
+}
+}  // namespace
+
+namespace {
+std::FILE* g_select_dump = nullptr;
+
+// One record per sparse batch (msa_select_dump.hpp): the ids the attend launch selected for [first_window * 16, rows).
+void dump_prefill_select(const PrefillView& p, hipStream_t stream) {
+    const DecodeView& v = p.window;
+    const std::size_t r0 = std::size_t{p.first_window} * kMaxRows, rows = p.rows - r0, rg = rows * v.kv_heads;
+    std::vector<std::uint32_t> cnt(rg), ids(rg * kTopK);
+    hip_check(hipStreamSynchronize(stream), "minimax select dump sync");
+    hip_check(hipMemcpy(cnt.data(), v.idx_count + r0 * v.kv_heads, rg * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump counts");
+    hip_check(hipMemcpy(ids.data(), v.idx + r0 * v.kv_heads * kTopK, rg * kTopK * sizeof(std::uint32_t), hipMemcpyDeviceToHost),
+          "minimax select dump ids");
+    const std::uint64_t pos = p.pos0 + r0;
+    const std::uint32_t head[8] = {0x444C4553U, 1U, aidx::wmma_mode(aidx::kModeExact), static_cast<std::uint32_t>(pos),
+                                   static_cast<std::uint32_t>(pos >> 32), static_cast<std::uint32_t>(rows), v.kv_heads, kTopK};
+    if (std::fwrite(head, sizeof(head), 1, g_select_dump) != 1 ||
+        std::fwrite(cnt.data(), sizeof(std::uint32_t), cnt.size(), g_select_dump) != cnt.size() ||
+        std::fwrite(ids.data(), sizeof(std::uint32_t), ids.size(), g_select_dump) != ids.size())
+        throw std::runtime_error("minimax select dump: short write");
+}
+}  // namespace
+
+void set_select_dump(const char* path) {
+    if (g_select_dump != nullptr) {
+        std::FILE* const f = g_select_dump;
+        g_select_dump = nullptr;
+        if (std::fclose(f) != 0) throw std::runtime_error("minimax select dump: close failed");
+    }
+    if (path == nullptr) return;
+    g_select_dump = std::fopen(path, "wb");
+    if (g_select_dump == nullptr) throw std::runtime_error(std::string("minimax select dump: cannot write ") + path);
 }
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 10 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 12 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||
@@ -2422,7 +2709,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
     const unsigned prep_grid = index_grid_cap();
     if (marker != nullptr) marker(user, "msa-prep", true);
     hipLaunchKernelGGL(prefill_prep_kernel, dim3(prep_grid), dim3(kIdxThreads), 0, stream, p);
-    check(hipGetLastError(), "minimax batched prefill prep");
+    hip_check(hipGetLastError(), "minimax batched prefill prep");
     if (marker != nullptr) marker(user, "msa-prep", false);
     const unsigned windows = (p.rows - 1) / kMaxRows + 1;
     const unsigned batch_cap = p.scratch_windows < 65535U ? p.scratch_windows : 65535U;
@@ -2441,6 +2728,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             if (marker != nullptr) marker(user, "attend", true);
             launch_prefill_attend<false>(batch, sparse, stream);
             if (marker != nullptr) marker(user, "attend", false);
+            if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);
@@ -2463,7 +2751,7 @@ void enqueue_decode(const DecodeView& v, hipStream_t stream) {
         if (rows == 0 || rows > kMaxRows || v.max_blocks > kMaxBlocks || v.idx_heads != v.kv_heads || v.shard_count != 1)
             throw std::invalid_argument("minimax fused select: bad view (context-parallel views select by candidates/merge)");
         hipLaunchKernelGGL((select_kernel<256>), dim3(rows * v.kv_heads), dim3(256), sel_bytes(v.max_blocks, 256), stream, v);
-        check(hipGetLastError(), "minimax fused select");
+        hip_check(hipGetLastError(), "minimax fused select");
         enqueue_attend(v, false, stream);
         return;
     }

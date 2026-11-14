@@ -1,7 +1,9 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_token_sampling_device.hpp"
 #include "strix/hip_token_sampling.hpp"
 
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -985,9 +987,7 @@ __global__ void sample_nonfinite_kernel(Scratch s, Result* results, unsigned row
     if (row < rows && (s.state[row].flags & flag_nonfinite)) results[row] = {0U, flag_nonfinite};
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 void require(bool ok, const char* message) { if (!ok) throw std::invalid_argument(message); }
 
 // Scratch for `max_rows` rows of at most `capacity` entries, and the kernel sequence.
@@ -1005,7 +1005,7 @@ struct Engine {
             o_cand = take(sizeof(Candidate) * kMaxRows * kCand), o_state = take(sizeof(RowState) * kMaxRows),
             o_rvals = take(8ULL * rows * c), o_qhist = take(16ULL * kMaxRows * kBlocks * 256U),
             o_qtie = take(16ULL * kMaxRows * kBlocks);
-        check(hipMalloc(&device_memory, at), "device token sampler scratch");
+        hip_check(hipMalloc(&device_memory, at), "device token sampler scratch");
         auto* base = static_cast<unsigned char*>(device_memory);
         scratch.block_max = reinterpret_cast<float*>(base + o_max);
         scratch.block_count = reinterpret_cast<std::uint32_t*>(base + o_count);
@@ -1034,7 +1034,7 @@ struct Engine {
         // sampling-v1 step 2: the cutoff of z.
         p.cutoff = -40.0;
         if (policy.min_p > 0.0F) p.cutoff = std::max(p.cutoff, std::log(static_cast<double>(policy.min_p)));
-        check(hipMemsetAsync(scratch.state, 0, sizeof(RowState) * kMaxRows, stream), "device sampler state reset");
+        hip_check(hipMemsetAsync(scratch.state, 0, sizeof(RowState) * kMaxRows, stream), "device sampler state reset");
         for (unsigned i = 0; i < count; ++i) results[i] = {0U, 0U};
         const dim3 grid(kBlocks, count);
         if (p.top_k > 0U && p.top_k <= kTopkOnePass) {
@@ -1083,18 +1083,14 @@ struct Engine {
             }
         }
         hipLaunchKernelGGL(sample_nonfinite_kernel, dim3(1), dim3(kMaxRows), 0, stream, scratch, results, count);
-        check(hipGetLastError(), "device token sampling launch");
+        hip_check(hipGetLastError(), "device token sampling launch");
     }
 };
 
 Result* pinned_results(std::uint32_t count) {
     Result* out = nullptr;
-    check(hipHostMalloc(reinterpret_cast<void**>(&out), sizeof(Result) * count, hipHostMallocDefault), "device token sampler results");
+    hip_check(hipHostMalloc(reinterpret_cast<void**>(&out), sizeof(Result) * count, hipHostMallocDefault), "device token sampler results");
     return out;
-}
-bool env_is(const char* name, const char* value) {
-    const char* v = std::getenv(name);
-    return v && std::strcmp(v, value) == 0;
 }
 
 } // namespace
@@ -1102,8 +1098,10 @@ bool env_is(const char* name, const char* value) {
 TokenSamplingPath token_sampling_path(const TokenSamplingPolicy& policy) noexcept {
     // -1 auto, else the forced path.
     static const int forced = [] {
-        if (env_is("STRIX_SAMPLE_HOST", "1") || env_is("STRIX_SAMPLE_PATH", "host")) return 1;
-        if (env_is("STRIX_SAMPLE_PATH", "device")) return 0;
+        // unknown STRIX_SAMPLE_PATH throws (std::terminate here: noexcept); 2 = auto (also unset)
+        const std::size_t path = strix::env_choice("STRIX_SAMPLE_PATH", 2, {"device", "host", "auto"});
+        if (strix::env_flag_default_off("STRIX_SAMPLE_HOST") || path == 1) return 1;
+        if (path == 0) return 0;
         return -1;
     }();
     if (forced >= 0) return forced ? TokenSamplingPath::host : TokenSamplingPath::device;
@@ -1114,7 +1112,7 @@ TokenSamplingPath token_sampling_path(const TokenSamplingPolicy& policy) noexcep
     return TokenSamplingPath::device;
 }
 bool device_draft_sampling_enabled(const TokenSamplingPolicy& policy) noexcept {
-    static const bool draft_host = env_is("STRIX_SAMPLE_DRAFT_HOST", "1");
+    static const bool draft_host = strix::env_flag_default_off("STRIX_SAMPLE_DRAFT_HOST");
     return !draft_host && device_token_sampling_enabled(policy);
 }
 
@@ -1139,10 +1137,10 @@ struct HipTokenSamplerDevice::Impl {
         auto& b = q[row];
         const auto n = static_cast<std::uint32_t>(d.tokens().size());
         if (b.capacity < n) {
-            if (b.tokens) { check(hipHostFree(b.tokens), "free draft tokens"); check(hipHostFree(b.probs), "free draft probabilities"); }
+            if (b.tokens) { hip_check(hipHostFree(b.tokens), "free draft tokens"); hip_check(hipHostFree(b.probs), "free draft probabilities"); }
             const auto cap = std::max<std::uint32_t>(n, 4096U);
-            check(hipHostMalloc(reinterpret_cast<void**>(&b.tokens), 4ULL * cap, hipHostMallocDefault), "draft tokens");
-            check(hipHostMalloc(reinterpret_cast<void**>(&b.probs), 8ULL * cap, hipHostMallocDefault), "draft probabilities");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&b.tokens), 4ULL * cap, hipHostMallocDefault), "draft tokens");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&b.probs), 8ULL * cap, hipHostMallocDefault), "draft probabilities");
             b.capacity = cap;
         }
         std::vector<std::uint32_t> order(n);
@@ -1161,14 +1159,14 @@ struct HipTokenSamplerDevice::Impl {
     }
     void run(const Rows& r, unsigned count, const TokenSamplingPolicy& policy, hipStream_t stream) {
         const bool timed = sample_timing_enabled();
-        if (timed && !start) { check(hipEventCreate(&start), "sampler timing event"); check(hipEventCreate(&stop), "sampler timing event"); }
-        if (timed) check(hipEventRecord(start, stream), "sampler timing start");
+        if (timed && !start) { hip_check(hipEventCreate(&start), "sampler timing event"); hip_check(hipEventCreate(&stop), "sampler timing event"); }
+        if (timed) hip_check(hipEventRecord(start, stream), "sampler timing start");
         engine.enqueue(r, count, vocab, policy, results, stream);
-        if (timed) check(hipEventRecord(stop, stream), "sampler timing stop");
-        check(hipStreamSynchronize(stream), "device token sampling completion");
+        if (timed) hip_check(hipEventRecord(stop, stream), "sampler timing stop");
+        hip_check(hipStreamSynchronize(stream), "device token sampling completion");
         if (timed) {
             float ms = 0.0F;
-            check(hipEventElapsedTime(&ms, start, stop), "sampler timing");
+            hip_check(hipEventElapsedTime(&ms, start, stop), "sampler timing");
             record_sample_timing(SampleTimingKind::kernels, count, 0.0, static_cast<double>(ms) * 1e-3, count);
         }
     }
@@ -1185,9 +1183,9 @@ TokenDraft host_token_draft(const TokenDraft& draft, void* stream) {
     std::vector<std::uint32_t> tokens(n);
     std::vector<double> probs(n);
     const auto s = static_cast<hipStream_t>(stream);
-    check(hipMemcpyAsync(tokens.data(), draft.device.tokens, 4ULL * n, hipMemcpyDeviceToHost, s), "draft tokens readback");
-    check(hipMemcpyAsync(probs.data(), draft.device.probabilities, 8ULL * n, hipMemcpyDeviceToHost, s), "draft probabilities readback");
-    check(hipStreamSynchronize(s), "draft distribution readback");
+    hip_check(hipMemcpyAsync(tokens.data(), draft.device.tokens, 4ULL * n, hipMemcpyDeviceToHost, s), "draft tokens readback");
+    hip_check(hipMemcpyAsync(probs.data(), draft.device.probabilities, 8ULL * n, hipMemcpyDeviceToHost, s), "draft probabilities readback");
+    hip_check(hipStreamSynchronize(s), "draft distribution readback");
     TokenDraft out;
     out.position = draft.position; out.token = draft.token;
     out.distribution = make_token_distribution_from_probabilities(tokens, probs);
@@ -1258,10 +1256,10 @@ struct HipTokenDraftSamplerDevice::Impl {
     Impl(std::uint32_t c, std::uint32_t steps)
         : capacity(c), max_steps(steps), engine(c, 1U), results(pinned_results(std::max<std::uint32_t>(steps, 1U))), positions(steps) {
         require(steps > 0U, "device draft sampler needs a step");
-        check(hipMalloc(reinterpret_cast<void**>(&order), 4ULL * c), "device draft order");
-        check(hipMalloc(reinterpret_cast<void**>(&sorted_ids), 4ULL * c), "device draft ids");
-        check(hipMalloc(reinterpret_cast<void**>(&q), 8ULL * c * steps), "device draft distributions");
-        check(hipHostMalloc(reinterpret_cast<void**>(&staging), 8ULL * c, hipHostMallocDefault), "device draft staging");
+        hip_check(hipMalloc(reinterpret_cast<void**>(&order), 4ULL * c), "device draft order");
+        hip_check(hipMalloc(reinterpret_cast<void**>(&sorted_ids), 4ULL * c), "device draft ids");
+        hip_check(hipMalloc(reinterpret_cast<void**>(&q), 8ULL * c * steps), "device draft distributions");
+        hip_check(hipHostMalloc(reinterpret_cast<void**>(&staging), 8ULL * c, hipHostMallocDefault), "device draft staging");
     }
     ~Impl() {
         if (results) (void)hipHostFree(results);
@@ -1275,15 +1273,15 @@ struct HipTokenDraftSamplerDevice::Impl {
         rows = n;
         if (n == uploaded) return;
         // The staging copy of the previous upload must be complete before it is rewritten.
-        check(hipStreamSynchronize(stream), "device draft vocabulary staging");
+        hip_check(hipStreamSynchronize(stream), "device draft vocabulary staging");
         std::uint32_t* perm = staging;
         std::uint32_t* sorted = staging + capacity;
         std::iota(perm, perm + n, 0U);
         if (!ids.empty()) std::sort(perm, perm + n, [&](std::uint32_t x, std::uint32_t y) { return ids[x] < ids[y]; });
         for (std::uint32_t i = 0; i < n; ++i) sorted[i] = ids.empty() ? perm[i] : ids[perm[i]];
         for (std::uint32_t i = 1; i < n; ++i) require(sorted[i - 1U] != sorted[i], "token distribution ids must be distinct");
-        check(hipMemcpyAsync(order, perm, 4ULL * n, hipMemcpyHostToDevice, stream), "device draft order upload");
-        check(hipMemcpyAsync(sorted_ids, sorted, 4ULL * n, hipMemcpyHostToDevice, stream), "device draft ids upload");
+        hip_check(hipMemcpyAsync(order, perm, 4ULL * n, hipMemcpyHostToDevice, stream), "device draft order upload");
+        hip_check(hipMemcpyAsync(sorted_ids, sorted, 4ULL * n, hipMemcpyHostToDevice, stream), "device draft ids upload");
         uploaded = n;
     }
     void step(const TokenSamplingPolicy& policy, std::uint32_t k, const float* logits, double u, std::uint32_t* slot,
@@ -1298,12 +1296,12 @@ struct HipTokenDraftSamplerDevice::Impl {
         if (timed && starts.empty()) {
             starts.resize(max_steps); stops.resize(max_steps);
             for (std::uint32_t i = 0; i < max_steps; ++i) {
-                check(hipEventCreate(&starts[i]), "draft timing event"); check(hipEventCreate(&stops[i]), "draft timing event");
+                hip_check(hipEventCreate(&starts[i]), "draft timing event"); hip_check(hipEventCreate(&stops[i]), "draft timing event");
             }
         }
-        if (timed) check(hipEventRecord(starts[k], stream), "draft timing start");
+        if (timed) hip_check(hipEventRecord(starts[k], stream), "draft timing start");
         engine.enqueue(r, 1U, rows, policy, results + k, stream);
-        if (timed) check(hipEventRecord(stops[k], stream), "draft timing stop");
+        if (timed) hip_check(hipEventRecord(stops[k], stream), "draft timing stop");
     }
     TokenDraft draft(std::uint32_t k) const {
         const auto result = results[k];
@@ -1337,7 +1335,7 @@ void HipTokenDraftSamplerDevice::finish(TokenSampler& sampler, std::uint32_t ste
         out.push_back(impl_->draft(k)); sampler.count_draft();
         if (!impl_->starts.empty()) {
             float ms = 0.0F;
-            check(hipEventElapsedTime(&ms, impl_->starts[k], impl_->stops[k]), "draft timing");
+            hip_check(hipEventElapsedTime(&ms, impl_->starts[k], impl_->stops[k]), "draft timing");
             record_sample_timing(SampleTimingKind::draft_kernels, 1U, 0.0, static_cast<double>(ms) * 1e-3, 1U);
         }
     }
@@ -1351,9 +1349,9 @@ TokenDecision hip_decide_token_for_testing(std::span<const float> logits, const 
     std::vector<void*> allocations;
     const auto upload = [&](const void* data, std::uint64_t bytes) {
         void* p = nullptr;
-        check(hipMalloc(&p, bytes), "testing allocation");
+        hip_check(hipMalloc(&p, bytes), "testing allocation");
         allocations.push_back(p);
-        check(hipMemcpy(p, data, bytes, hipMemcpyHostToDevice), "testing upload");
+        hip_check(hipMemcpy(p, data, bytes, hipMemcpyHostToDevice), "testing upload");
         return p;
     };
     struct Free { std::vector<void*>& v; ~Free() { for (void* p : v) (void)hipFree(p); } } free_all{allocations};
@@ -1405,17 +1403,17 @@ TokenDraft hip_draft_for_testing(std::span<const float> logits, std::span<const 
     HipTokenDraftSamplerDevice::Impl impl(n, 1U);
     float* device_logits = nullptr;
     std::uint32_t* slot = nullptr;
-    check(hipMalloc(reinterpret_cast<void**>(&device_logits), 4ULL * n), "testing draft logits");
-    check(hipMalloc(reinterpret_cast<void**>(&slot), 4ULL), "testing draft slot");
+    hip_check(hipMalloc(reinterpret_cast<void**>(&device_logits), 4ULL * n), "testing draft logits");
+    hip_check(hipMalloc(reinterpret_cast<void**>(&slot), 4ULL), "testing draft slot");
     struct Free { float* l; std::uint32_t* s; ~Free() { (void)hipFree(l); (void)hipFree(s); } } free_all{device_logits, slot};
-    check(hipMemcpy(device_logits, logits.data(), 4ULL * n, hipMemcpyHostToDevice), "testing draft logits upload");
+    hip_check(hipMemcpy(device_logits, logits.data(), 4ULL * n, hipMemcpyHostToDevice), "testing draft logits upload");
     impl.set_vocabulary(ids, n, nullptr);
     impl.positions[0] = 0U;
     impl.step(policy, 0U, device_logits, u, slot, nullptr);
-    check(hipStreamSynchronize(nullptr), "testing draft step");
+    hip_check(hipStreamSynchronize(nullptr), "testing draft step");
     auto d = impl.draft(0U);
     std::uint32_t written = 0;
-    check(hipMemcpy(&written, slot, 4ULL, hipMemcpyDeviceToHost), "testing draft slot readback");
+    hip_check(hipMemcpy(&written, slot, 4ULL, hipMemcpyDeviceToHost), "testing draft slot readback");
     require(written == d.token, "device draft slot differs from the reported token");
     return host_token_draft(d, nullptr);
 }

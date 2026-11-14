@@ -18,6 +18,8 @@ namespace strix::deepseek41 {
 
 // Retain the numeric metadata arrays this model needs (the compressed-token map has one entry per token).
 [[nodiscard]] gguf::Limits reader_limits() noexcept;
+// The vision file's metadata keys carry its hyphenated architecture name (`deepseek4-vision.*`).
+[[nodiscard]] gguf::Limits vision_reader_limits() noexcept;
 [[nodiscard]] gguf::FileInfo read_file(const std::filesystem::path& path);
 
 struct RopeScaling {
@@ -118,6 +120,35 @@ struct ExpectedTensor {
 [[nodiscard]] TargetModel validate_target(const gguf::FileInfo& info);
 [[nodiscard]] DraftModel validate_draft(const gguf::FileInfo& info, const Config& target);
 
+// The image tower file (`general.architecture = deepseek4-vision`): a pre-norm ViT (RMSNorm, fused qkv with bias,
+// gated SwiGLU without bias, 2D rotary positions, final norm), a pixel-unshuffle + two-linear aligner into the
+// language width and three learned rows (image start, row end, image end). Everything here is read from the file.
+struct VisionConfig {
+    std::uint32_t num_hidden_layers = 0, hidden_size = 0, num_attention_heads = 0, intermediate_size = 0;
+    std::uint32_t patch_size = 0, downsample_ratio = 0, projection_size = 0;
+    std::uint32_t max_image_tokens = 0, min_pixels = 0, max_wh_ratio = 0;  // max_wh_ratio 0: unlimited
+    std::uint32_t image_token_id = 0;
+    std::uint32_t language_layers = 0, language_experts = 0;  // the language model this tower was released with
+    double rope_theta = 0.0, rms_norm_eps = 0.0;
+    std::string checkpoint_variant, source_revision;
+    [[nodiscard]] std::uint32_t head_dim() const noexcept { return num_attention_heads ? hidden_size / num_attention_heads : 0U; }
+    [[nodiscard]] std::uint32_t patch_features() const noexcept { return 3U * patch_size * patch_size; }
+    [[nodiscard]] std::uint32_t aligner_inputs() const noexcept { return hidden_size * downsample_ratio * downsample_ratio; }
+    [[nodiscard]] std::uint32_t cell() const noexcept { return patch_size * downsample_ratio; }  // pixels per image row side
+};
+
+struct VisionModel {
+    VisionConfig config;
+    ModelManifest manifest;
+};
+
+[[nodiscard]] std::vector<ExpectedTensor> expected_vision_tensors(const VisionConfig& config);
+// Strict: architecture, every metadata key with its type, value ranges, the pinned source revision and the exact
+// BF16 tensor inventory. Throws std::invalid_argument naming the first violation.
+[[nodiscard]] VisionModel validate_vision(const gguf::FileInfo& info);
+// The tower must belong to the admitted language model: image token id, width, layer and expert counts.
+void require_vision_matches_target(const VisionConfig& vision, const Config& target);
+
 enum class PinnedFileKind : std::uint8_t { target_q2, draft_mxfp4, vision_bf16 };
 
 struct PinnedFile {
@@ -128,6 +159,7 @@ struct PinnedFile {
 };
 
 // The 1017 release (general.source.revision 1bae0e1088993b9b82de08f59de5be5a34e42170) as converted to GGUF.
+inline constexpr std::string_view pinned_source_revision = "1bae0e1088993b9b82de08f59de5be5a34e42170";
 inline constexpr std::array<PinnedFile, 3> pinned_files{{
     {PinnedFileKind::target_q2, "DeepSeek-V4.1-Flash-1017-Q2.gguf", 365'713'686'528ULL,
      "5365629079214ff28becbbab7c0900ef9865b79c0f0c64d951924bb362ae5b67"},

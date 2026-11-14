@@ -696,6 +696,22 @@ std::shared_ptr<const MinimaxTokenizer> MinimaxTokenizer::load(const std::string
 }
 
 std::vector<std::uint32_t> MinimaxTokenizer::encode(std::string_view text, bool parse_special) const {
+    return encode_marks(text, parse_special, nullptr);
+}
+
+std::vector<std::uint32_t> MinimaxTokenizer::encode_marked(std::string_view text, bool parse_special,
+                                                           std::vector<strix::serve::EncodeMark>& marks) const {
+    return encode_marks(text, parse_special, &marks);
+}
+
+std::size_t MinimaxTokenizer::mark_lookahead() const noexcept {
+    std::size_t longest = 0;
+    for (const auto& a : impl_->added) longest = std::max(longest, a.content.size());
+    return longest;
+}
+
+std::vector<std::uint32_t> MinimaxTokenizer::encode_marks(std::string_view text, bool parse_special,
+                                                          std::vector<strix::serve::EncodeMark>* marks) const {
     const auto& impl = *impl_;
     std::vector<std::uint32_t> out;
     out.reserve(text.size() / 3U + 4U);
@@ -712,6 +728,7 @@ std::vector<std::uint32_t> MinimaxTokenizer::encode(std::string_view text, bool 
         out.push_back(best->id);
         i += best->content.size();
         start = i;
+        if (marks) marks->push_back({i, out.size()});
     }
     impl.encode_text(text.substr(start), out);
     return out;

@@ -1,11 +1,19 @@
 #include "strix/mtp_selection_transaction.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/serve/constraint_selection.hpp"
+#include "strix/env_flags.hpp"
 
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -698,8 +706,406 @@ void argmax_first() {
     check(known_answer > 100 && known_forced > 10 && known_reasoning > 100 && known_declined > 1000, "argmax-first coverage");
 }
 
+// Mask-ahead: the worker only changes who walks a mask. Three executors cover the three ways a row meets its
+// slot: built before the row (inline executor), never started (dropped job: the row builds it), and a real
+// thread racing the rows.
+// A schema that compiles within its evaluation budget but whose state after `[{` exhausts it on a quote
+// (the "candidate traversal" fixture of the constraint tests): every transition up to `[{` is cheap.
+std::shared_ptr<const ConstraintProgram> budgeted_program() {
+    Json properties = Json::object(), required = Json::array();
+    for (unsigned i = 0; i < 128; ++i) {
+        char index[4]; std::snprintf(index, sizeof(index), "%03u", i);
+        const auto name = std::string(50, 'a') + index;
+        properties.set(name, true); required.push(name);
+    }
+    Json object = Json::object(); object.set("type", "object"); object.set("properties", properties);
+    object.set("required", required); object.set("additionalProperties", false);
+    Json choices = Json::array(), arrays = Json::array();
+    for (int i = 0; i < 8; ++i) {
+        Json choice = Json::object(); choice.set("$ref", "#/$defs/Required"); choice.set("minItems", i);
+        choices.push(choice);
+    }
+    for (int i = 0; i < 512; ++i) {
+        Json array = Json::object(); array.set("type", "array"); array.set("minItems", i);
+        array.set("items", parse_json(R"({"$ref":"#/$defs/Choices"})")); arrays.push(array);
+    }
+    Json choice_schema = Json::object(); choice_schema.set("anyOf", choices);
+    Json defs = Json::object(); defs.set("Required", object); defs.set("Choices", choice_schema);
+    Json branched = Json::object(); branched.set("$defs", defs); branched.set("anyOf", arrays);
+    ConstraintLimits limits; limits.compilation_steps = 400000; limits.max_output_bytes = 16 * 1048576;
+    return std::make_shared<ConstraintProgram>(compile_json_schema(branched, limits));
+}
+// What a selection did with a row: the token, or the text of its refusal.
+template<class F> std::string outcome(F&& f) {
+    try { return "token " + std::to_string(f()); } catch (const std::exception& e) { return std::string("error ") + e.what(); }
+}
+void speculation_and_limits() {
+    const std::vector<std::string> vocab{"[", "{", "\"", "]", " ", "z", "b"};
+    const std::uint32_t open = 0, brace = 1, quote = 2, close = 3, space = 4, eos = 5, letter = 6;
+    Fixture f(vocab);
+    const std::array<std::uint32_t, 1> excluded{eos};
+    f.trie = std::make_shared<TokenByteTrie>(*f.tokenizer, excluded);
+    ConstraintSpec spec; spec.eos_ids = {eos}; spec.program = budgeted_program();
+    const auto favor = [&](std::uint32_t first, std::uint32_t second) {
+        std::vector<float> row(vocab.size(), -1.0F); row[second] = 1.0F; row[first] = 2.0F; return row;
+    };
+    const std::string limit = "error constraint key candidate resource limit";
+    // The state after `[{`: a quote exhausts the evaluation budget, a full mask walk therefore refuses the row.
+    {
+        auto plain = f.selection(copy_spec(spec)); plain->set_argmax_first(false);
+        plain->commit(plain->select_row(favor(open, open), plain->state()));
+        check(outcome([&] { return plain->select_row(favor(close, close), plain->state()).token; }) == "token " + std::to_string(close), "plain row closes the array");
+        plain->commit(plain->select_row(favor(brace, brace), plain->state()));
+        check(outcome([&] { return plain->select_row(favor(quote, quote), plain->state()).token; }) == limit, "plain row after [{ exhausts the budget");
+    }
+    // A draft chain that would run into the exhausting transition: planning it must not fail the window, whose
+    // rows never get there (the target closes the array instead of following the drafts).
+    for (unsigned executor = 0; executor < 2; ++executor) for (unsigned follow = 0; follow < 2; ++follow) {
+        auto plain = f.selection(copy_spec(spec)), windowed = f.selection(copy_spec(spec));
+        plain->set_argmax_first(false); windowed->set_argmax_first(false);
+        std::uint64_t jobs = 0;
+        windowed->set_mask_ahead([&, executor](std::function<void()> job) { ++jobs; if (executor == 0) job(); });
+        auto t = windowed->window_transaction();
+        t->reset();
+        check(t->select(favor(open, open)) == open, "window opens the array");
+        t->seal()->publish();
+        plain->commit(plain->select_row(favor(open, open), plain->state()));
+        const std::array<std::uint32_t, 3> drafts{brace, quote, quote};
+        t->reset();
+        check(outcome([&] { t->expect(drafts); return 0; }) == "token 0", "planning a draft chain past an exhausting transition does not fail");
+        check(jobs == 2, "the safe part of the chain is still planned");
+        if (!follow) {
+            const auto row = favor(close, space);
+            const auto want = outcome([&] { return plain->select_row(row, plain->state()).token; });
+            check(want == "token " + std::to_string(close) && outcome([&] { return t->select(row); }) == want, "a rejected draft leaves the row as the plain row");
+            t->seal()->publish();
+        } else {
+            // The drafts are taken: the row that reaches the exhausting walk refuses exactly as the plain row.
+            const auto row = favor(brace, space);
+            const auto staged = plain->select_row(row, plain->state());
+            check(t->select(row) == staged.token && staged.token == brace, "a taken draft selects as the plain row");
+            plain->commit(staged);
+            const auto next = favor(quote, space);
+            const auto want = outcome([&] { return plain->select_row(next, plain->state()).token; });
+            check(want == limit && outcome([&] { return t->select(next); }) == want, "a reached exhausting walk refuses as the plain row");
+        }
+    }
+    // Argmax-first with the maximum refused (`b`): the row walks the full mask, whose quote exhausts the budget.
+    // The default must keep that refusal; ranked membership (opt-in) checks the next-best logit instead.
+    {
+        const auto at_object = [&](const std::shared_ptr<ConstraintSelection>& s) {
+            s->commit(s->select_row(favor(open, open), s->state())); s->commit(s->select_row(favor(brace, brace), s->state()));
+        };
+        const auto row = favor(letter, space);
+        auto before = f.selection(copy_spec(spec)), standard = f.selection(copy_spec(spec)), ranked = f.selection(copy_spec(spec));
+        before->set_argmax_first(true); before->set_ranked(0); standard->set_argmax_first(true);
+        ranked->set_argmax_first(true); ranked->set_ranked(32);
+        at_object(before); at_object(standard); at_object(ranked);
+        const auto want = outcome([&] { return before->select_row(row, before->state()).token; });
+        check(want == limit, "argmax-first refuses a row whose mask walk exhausts the budget");
+        check(outcome([&] { return standard->select_row(row, standard->state()).token; }) == want, "default selection keeps the mask-walk refusal");
+        check(outcome([&] { return ranked->select_row(row, ranked->state()).token; }) == "token " + std::to_string(space), "opt-in ranked membership takes the next-best admitted logit");
+        check(standard->verdict("stop", "test").profile_ranked_rows == 0 && ranked->verdict("stop", "test").profile_ranked_rows == 1, "ranked rows are counted only when opted in");
+    }
+}
+void mask_ahead() {
+    const std::vector<std::string> vocab{"{", "}", "\"a\"", ":", "12", ",", "\"", "{\"", "\":", "z", "x", "1}", "a"};
+    const std::uint32_t eos = 9, end_thinking = 10, n = static_cast<std::uint32_t>(vocab.size());
+    Fixture f(vocab);
+    const std::array<std::uint32_t, 1> excluded{eos};
+    f.trie = std::make_shared<TokenByteTrie>(*f.tokenizer, excluded);
+    const std::array<const char*, 3> schemas{"", "{\"const\":{}}", "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}"};
+    constexpr std::array<float, 7> values{-1, -0.0F, 0.0F, 1, 2, 2, 3};
+    std::uint64_t seed = 777;
+    const auto next = [&] { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return static_cast<std::uint32_t>(seed >> 33); };
+    const auto random_row = [&] { std::vector<float> row(n); for (auto& v : row) v = values[next() % values.size()]; return row; };
+    const auto lowest_max = [](const std::vector<float>& row) {
+        std::uint32_t g = 0;
+        for (std::uint32_t i = 1; i < row.size(); ++i) if (row[i] > row[g]) g = i;
+        return g;
+    };
+    struct Worker {
+        std::mutex m; std::condition_variable cv; std::deque<std::function<void()>> q; bool stop = false; std::thread t;
+        Worker() : t([this] {
+            for (;;) {
+                std::function<void()> job;
+                { std::unique_lock lock(m); cv.wait(lock, [this] { return stop || !q.empty(); }); if (q.empty()) return; job = std::move(q.front()); q.pop_front(); }
+                job();
+            }
+        }) {}
+        ~Worker() { { std::lock_guard lock(m); stop = true; } cv.notify_all(); t.join(); }
+        void submit(std::function<void()> job) { { std::lock_guard lock(m); q.push_back(std::move(job)); } cv.notify_one(); }
+    } worker;
+    std::uint64_t jobs = 0, windows = 0, rows_checked = 0, serial_rows = 0, ranked_rows = 0;
+    std::array<std::uint64_t, 3> ahead_rows{}, ahead_masks{};
+    for (unsigned executor = 0; executor < 3; ++executor) for (unsigned program = 0; program < 3; ++program)
+    for (unsigned policy = 0; policy < 3; ++policy) for (unsigned thinking = 0; thinking < 2; ++thinking) for (unsigned argmax = 0; argmax < 3; ++argmax) {
+        // argmax 0: every answer row walks a mask; 1: argmax-first with two ranked candidates (the rest falls to
+        // the mask); 2: argmax-first, ranked membership off.
+        const unsigned ranked = argmax == 1 ? 2U : 0U;
+        ConstraintSpec spec; spec.eos_ids = {eos}; spec.end_thinking_id = end_thinking;
+        spec.program = std::make_shared<ConstraintProgram>(program ? compile_json_schema(parse_json(schemas[program])) : compile_json_object());
+        spec.logprobs = policy == 1; spec.top_logprobs = 3;
+        if (policy == 2) spec.transform.bias = {{1, 0.5}};
+        if (thinking) { spec.starts_in_reasoning = true; spec.thinking = ThinkingPolicy{0, 0, 3, {end_thinking, 5}}; }
+        const ConstraintAheadSubmit submit = [&, executor](std::function<void()> job) {
+            ++jobs;
+            if (executor == 0) job(); else if (executor == 2) worker.submit(std::move(job));
+        };
+        for (unsigned walk = 0; walk < 24; ++walk) {
+            // Windows: plain serial selection against a window whose drafts are sometimes wrong.
+            const auto serial_spec = copy_spec(spec), window_spec = copy_spec(spec);
+            auto serial = f.selection(serial_spec), windowed = f.selection(window_spec);
+            serial->set_argmax_first(false); windowed->set_argmax_first(argmax != 0); windowed->set_ranked(ranked);
+            windowed->set_mask_ahead(submit);
+            auto t = windowed->window_transaction();
+            for (unsigned window = 0; window < 6 && !serial->state().terminal; ++window) {
+                std::vector<std::vector<float>> rows; std::vector<ConstraintSelection::Staged> want; std::vector<std::uint32_t> drafts;
+                auto state = serial->state();
+                bool refused = false;
+                for (unsigned r = 0; r < 5 && !state.terminal; ++r) {
+                    rows.push_back(random_row());
+                    try { want.push_back(serial->select_row(rows.back(), state)); } catch (const ConstraintError&) { rows.pop_back(); refused = true; break; }
+                    state = want.back().state;
+                    drafts.push_back(next() % 4 ? want.back().token : next() % n);
+                }
+                if (want.empty()) { check(refused, "an empty window is a refusal"); break; }
+                if (next() % 3 == 0 && drafts.size() > 1) drafts.pop_back();   // the last row may have no draft
+                t->reset(); t->expect(drafts); ++windows;
+                std::size_t taken = 0;
+                for (std::size_t r = 0; r < want.size(); ++r) {
+                    std::uint32_t id = 0;
+                    if (next() % 2) { auto k = t->select_known(lowest_max(rows[r]), 0); id = k ? *k : t->select(rows[r]); }
+                    else id = t->select(rows[r]);
+                    check(id == want[r].token, "mask-ahead window row equals serial row");
+                    ++taken; ++rows_checked;
+                    if (r >= drafts.size() || drafts[r] != id) break;
+                }
+                auto receipt = t->seal();
+                check(receipt->size() == taken, "mask-ahead window receipt size");
+                receipt->publish();
+                for (std::size_t r = 0; r < taken; ++r) serial->commit(want[r]);
+                check(same_state(windowed->state(), serial->state(), spec, *f.trie), "mask-ahead window equals serial frontier");
+            }
+            scores_equal(window_spec->scores->tokens, serial_spec->scores->tokens);
+            const auto v = windowed->verdict("stop", "test");
+            ahead_rows[executor] += v.profile_ahead_rows;
+            // Serial rows: the committed state is planned at prepare(), taken at select().
+            const auto plain_spec = copy_spec(spec), row_spec = copy_spec(spec);
+            auto plain = f.selection(plain_spec), ahead = f.selection(row_spec);
+            plain->set_argmax_first(false); ahead->set_argmax_first(argmax != 0); ahead->set_ranked(ranked); ahead->set_mask_ahead(submit);
+            ranked_rows += v.profile_ranked_rows;
+            ConstraintRowSelection route(ahead);
+            for (unsigned r = 0; r < 12 && !plain->state().terminal; ++r) {
+                const auto row = random_row();
+                std::optional<ConstraintSelection::Staged> want;
+                try { want = plain->select_row(row, plain->state()); } catch (const ConstraintError&) {}
+                route.prepare();
+                if (next() % 5 == 0) route.prepare();   // a replanned row drops its first plan
+                std::optional<std::uint32_t> got;
+                try { got = route.select(row); } catch (const ConstraintError&) {}
+                check(want.has_value() == got.has_value(), "mask-ahead serial row refuses exactly when the plain row does");
+                if (!want) break;
+                check(*got == want->token, "mask-ahead serial row equals the plain row");
+                plain->commit(*want); route.commit(); ++serial_rows;
+                check(same_state(ahead->state(), plain->state(), spec, *f.trie), "mask-ahead serial frontier");
+            }
+            scores_equal(row_spec->scores->tokens, plain_spec->scores->tokens);
+            const auto rv = ahead->verdict("stop", "test");
+            ahead_rows[executor] += rv.profile_ahead_rows;
+            if (executor != 2) ahead_masks[executor] += v.profile_ahead_masks + rv.profile_ahead_masks;
+        }
+    }
+    check(jobs > 1000 && windows > 1000 && rows_checked > 3000 && serial_rows > 1000 && ranked_rows > 200, "mask-ahead and ranked coverage");
+    check(ahead_rows[0] > 500 && ahead_masks[0] >= ahead_rows[0], "inline executor: rows take worker-built masks");
+    check(ahead_rows[1] == 0 && ahead_masks[1] == 0, "dropped jobs: every row builds its own mask");
+    // No submit callback: no plan.
+    ConstraintSpec spec; spec.eos_ids = {eos}; spec.program = std::make_shared<ConstraintProgram>(compile_json_object());
+    auto off = f.selection(copy_spec(spec));
+    check(!off->plan_ahead(off->state(), {}), "mask-ahead is off without a submit callback");
+}
+
+// Worker threads for the overlap cases: jobs run in submission order on `threads` threads; drain() returns
+// when every submitted job has finished.
+struct WalkPool {
+    std::mutex m; std::condition_variable cv, idle; std::deque<std::function<void()>> q; bool stop = false; unsigned busy = 0;
+    std::vector<std::thread> threads;
+    explicit WalkPool(unsigned count) {
+        for (unsigned i = 0; i < count; ++i) threads.emplace_back([this] {
+            for (;;) {
+                std::function<void()> job;
+                { std::unique_lock lock(m); cv.wait(lock, [this] { return stop || !q.empty(); }); if (q.empty()) return; job = std::move(q.front()); q.pop_front(); ++busy; }
+                job();
+                { std::lock_guard lock(m); --busy; }
+                idle.notify_all();
+            }
+        });
+    }
+    ~WalkPool() { { std::lock_guard lock(m); stop = true; } cv.notify_all(); for (auto& t : threads) t.join(); }
+    void submit(std::function<void()> job) { { std::lock_guard lock(m); q.push_back(std::move(job)); } cv.notify_one(); }
+    // Bounded: a lost job or notification fails the test instead of hanging it.
+    void drain() {
+        std::unique_lock lock(m);
+        if (!idle.wait_for(lock, std::chrono::seconds(120), [this] { return q.empty() && busy == 0; })) throw std::runtime_error("walk pool did not drain in time");
+    }
+};
+void wait_for(const std::atomic<int>& value, int target) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (value.load() < target) {
+        if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("walk gate not reached in time");
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+// Opens a gate when the scope ends, so held workers are released (and their pool can join) on a failed check too.
+struct OpenGate {
+    std::atomic<int>& gate;
+    ~OpenGate() { gate.store(1); gate.notify_all(); }
+};
+// The worker / selector interleavings of mask-ahead, each forced with gates instead of left to the scheduler:
+// two workers walking at once, a row arriving while its walk is in flight, a plan retired under its walkers, and
+// a walk error produced on the worker and raised by the row.
+void mask_ahead_overlap() {
+    const std::vector<std::string> vocab{"{", "}", "\"a\"", ":", "12", ",", "\"", "{\"", "\":", "z", "x", "1}", "a"};
+    const std::uint32_t eos = 9, n = static_cast<std::uint32_t>(vocab.size());
+    Fixture f(vocab);
+    const std::array<std::uint32_t, 1> excluded{eos};
+    f.trie = std::make_shared<TokenByteTrie>(*f.tokenizer, excluded);
+    ConstraintSpec spec; spec.eos_ids = {eos};
+    spec.program = std::make_shared<ConstraintProgram>(compile_json_schema(parse_json("{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}")));
+    const auto favor = [&](std::uint32_t id) { std::vector<float> row(n, -1.0F); row[id] = 2.0F; return row; };
+    // claimed: walks a worker has started; gate 0 holds every started walk before its first step. waited: rows
+    // that found their walk in flight; the first of them opens the gate, from inside the wait branch.
+    std::atomic<int> claimed{0}, built{0}, abandoned{0}, gate{0}, waited{0};
+    {
+        WalkPool pool(2);
+        OpenGate open_gate{gate};
+        auto serial = f.selection(copy_spec(spec)), windowed = f.selection(copy_spec(spec));
+        serial->set_argmax_first(false); windowed->set_argmax_first(false);
+        windowed->set_mask_ahead([&](std::function<void()> job) { pool.submit(std::move(job)); });
+        windowed->set_ahead_observer([&](int phase) {
+            if (phase == 1) { claimed.fetch_add(1); gate.wait(0); }
+            else if (phase == 4) { waited.fetch_add(1); gate.store(1); gate.notify_all(); }
+            else if (phase == 2) built.fetch_add(1);
+            else abandoned.fetch_add(1);
+        });
+        auto t = windowed->window_transaction();
+        const auto window = [&](std::initializer_list<std::uint32_t> ids) {
+            std::vector<std::vector<float>> rows; std::vector<ConstraintSelection::Staged> want;
+            auto state = serial->state();
+            for (const auto id : ids) { rows.push_back(favor(id)); want.push_back(serial->select_row(rows.back(), state)); state = want.back().state; }
+            return std::pair{std::move(rows), std::move(want)};
+        };
+        // Two walks in flight at once, and the row of each arriving while its walk is held.
+        {
+            auto [rows, want] = window({0, 2, 3});
+            const std::array<std::uint32_t, 2> drafts{want[0].token, want[1].token};
+            t->reset(); t->expect(drafts);
+            wait_for(claimed, 2);
+            check(claimed.load() == 2 && built.load() == 0 && abandoned.load() == 0, "two workers hold a walk each at the same time");
+            // Slot 0 is worker-owned and held at the gate: only the row's own wait branch opens it, so the row
+            // cannot return without having waited for the in-flight walk.
+            check(t->select(rows[0]) == want[0].token, "a row that waited for an in-flight walk equals the serial row");
+            check(waited.load() == 1, "the row entered the wait for its in-flight walk");
+            check(t->select(rows[1]) == want[1].token && t->select(rows[2]) == want[2].token, "rows after concurrent walks equal the serial rows");
+            auto receipt = t->seal(); check(receipt->size() == 3, "overlap window receipt size"); receipt->publish();
+            for (const auto& staged : want) serial->commit(staged);
+            check(same_state(windowed->state(), serial->state(), spec, *f.trie), "overlap window equals the serial frontier");
+            pool.drain();
+            const auto v = windowed->verdict("stop", "test");
+            check(v.profile_ahead_rows >= 2 && v.profile_ahead_rows <= 3, "the gated rows took worker-built masks");
+            check(built.load() == claimed.load() && abandoned.load() == 0 && v.profile_ahead_masks == static_cast<std::uint64_t>(built.load()), "every started walk completed");
+        }
+        // A plan retired while both workers hold a walk: the walks are abandoned and the next attempt, which
+        // has no plan, still equals the serial rows.
+        {
+            auto [rows, want] = window({4, 1});
+            const std::array<std::uint32_t, 2> drafts{want[0].token, want[1].token};
+            const int before = claimed.load(), finished = built.load(), waits = waited.load();
+            gate.store(0);
+            t->reset(); t->expect(drafts);
+            wait_for(claimed, before + 2);
+            t->reset();
+            gate.store(1); gate.notify_all();
+            pool.drain();
+            check(claimed.load() == before + 2 && abandoned.load() == 2 && built.load() == finished && waited.load() == waits, "walks of a retired plan are abandoned");
+            check(t->select(rows[0]) == want[0].token && t->select(rows[1]) == want[1].token, "rows after a retired plan equal the serial rows");
+            t->seal()->publish();
+            for (const auto& staged : want) serial->commit(staged);
+            check(same_state(windowed->state(), serial->state(), spec, *f.trie), "retired plan leaves the serial frontier");
+        }
+    }
+    // A walk that fails on the worker: the error is stored with the slot and raised by the row that takes it.
+    {
+        const std::vector<std::string> budget_vocab{"[", "{", "\"", "]", " ", "z", "b"};
+        Fixture b(budget_vocab);
+        const std::array<std::uint32_t, 1> budget_excluded{5};
+        b.trie = std::make_shared<TokenByteTrie>(*b.tokenizer, budget_excluded);
+        ConstraintSpec budget; budget.eos_ids = {5}; budget.program = budgeted_program();
+        const auto row = [&](std::uint32_t id) { std::vector<float> r(budget_vocab.size(), -1.0F); r[id] = 2.0F; return r; };
+        WalkPool pool(1);
+        std::atomic<int> walked{0};
+        auto plain = b.selection(copy_spec(budget)), windowed = b.selection(copy_spec(budget));
+        plain->set_argmax_first(false); windowed->set_argmax_first(false);
+        windowed->set_mask_ahead([&](std::function<void()> job) { pool.submit(std::move(job)); });
+        windowed->set_ahead_observer([&](int phase) { if (phase == 2) walked.fetch_add(1); });
+        auto t = windowed->window_transaction();
+        t->reset(); check(t->select(row(0)) == 0, "budgeted window opens the array"); t->seal()->publish();
+        plain->commit(plain->select_row(row(0), plain->state()));
+        const std::array<std::uint32_t, 1> drafts{1};
+        t->reset(); t->expect(drafts);
+        pool.drain();
+        check(walked.load() == 2, "the worker finished both walks, one of them with an error");
+        const auto staged = plain->select_row(row(1), plain->state());
+        check(t->select(row(1)) == staged.token, "row before the failed walk equals the plain row");
+        plain->commit(staged);
+        const auto want = outcome([&] { return plain->select_row(row(2), plain->state()).token; });
+        check(want == "error constraint key candidate resource limit" && outcome([&] { return t->select(row(2)); }) == want,
+              "a walk error from the worker is raised by the row that takes it");
+        check(windowed->verdict("stop", "test").profile_ahead_rows == 1, "only the completed row counts as served by the worker");
+    }
+}
+// The two selection levers resolve through the shared registry: strict numbers, recorded values.
+void selection_policy() {
+    const auto put = [](const char* key, const char* value) {
+#ifdef _WIN32
+        check(_putenv_s(key, value ? value : "") == 0, "set test environment");
+#else
+        check((value ? ::setenv(key, value, 1) : ::unsetenv(key)) == 0, "set test environment");
+#endif
+    };
+    constexpr const char* ahead = "STRIX_CONSTRAINT_MASK_AHEAD";
+    constexpr const char* ranked = "STRIX_CONSTRAINT_RANKED";
+    put(ahead, nullptr); put(ranked, nullptr);
+    auto policy = constraint_selection_policy_from_environment();
+    check(policy.mask_ahead && policy.ranked == 0, "selection policy defaults: mask-ahead on, ranked membership off");
+    const auto recorded = [&](const char* name, const char* value, bool set) {
+        for (const auto& entry : envcfg::registered()) if (entry.name == name) return entry.value == value && entry.set == set;
+        return false;
+    };
+    check(recorded(ahead, "1", false) && recorded(ranked, "0", false), "selection policy defaults are recorded");
+    put(ahead, "0"); put(ranked, "32");
+    policy = constraint_selection_policy_from_environment();
+    check(!policy.mask_ahead && policy.ranked == 32, "selection policy reads both settings");
+    check(recorded(ahead, "0", true) && recorded(ranked, "32", true), "selection policy settings are recorded");
+    put(ahead, "1"); put(ranked, "4096");
+    policy = constraint_selection_policy_from_environment();
+    check(policy.mask_ahead && policy.ranked == 4096, "selection policy upper bound");
+    for (const char* bad : {"12x", "-1", "4097", " 5", "0x10", "1e2", "many"}) {
+        put(ranked, bad);
+        bool rejected = false;
+        try { (void)constraint_selection_policy_from_environment(); }
+        catch (const std::invalid_argument& e) { rejected = std::string(e.what()).find(ranked) != std::string::npos; }
+        check(rejected, "a ranked setting that is not a number in range is rejected by name");
+    }
+    put(ahead, nullptr); put(ranked, nullptr);
+}
+
 int main() try {
     argmax_first();
+    speculation_and_limits();
+    selection_policy();
+    mask_ahead();
+    mask_ahead_overlap();
     selection_failures(); routes_and_reuse(); boundaries(); allocation_failures(); masks_and_cohorts(); enumeration(); masked_enumeration(); grammar_and_thinking();
     // A four-row window can reject comparisons at rows 0..2; row 3 is bonus.
     check(rejection_rows[0] && rejection_rows[1] && rejection_rows[2], "rejection coverage");

@@ -3,11 +3,13 @@
 #include "gpu_queue_driver_bridge/bridge.h"
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
 #include <poll.h>
 #include <sys/socket.h>
@@ -21,16 +23,17 @@ bool lean_mode() { const char* v=std::getenv("STRIX_TEST_GPU_QUEUE_LEAN");return
 struct Fixture {
     std::shared_ptr<void> driver;
     bool gpu_idle=true,change_identity=false,auto_complete=false;
-    int mutate_event=0,submit_again=0;unsigned long mutate_cleanup=0;
+    int mutate_event=0,submit_again=0,event_error=0;unsigned long mutate_cleanup=0;
     unsigned ioctls=0,owned_ioctls=0,events=0,identity_checks=0; bool corrupt_reset=false;
     std::unique_ptr<LinuxGpuQueue> queue;
     Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false,bool lean=lean_mode()) {
         driver={queue_fixture_create(frames),queue_fixture_destroy};
         GpuQueueExpected expected;expected.local.fill(0x11);expected.peer.fill(0x22);expected.depth=depth;expected.ring_frames=frames;
         if(reverse){queue_fixture_reverse_endpoints(driver.get());std::swap(expected.local,expected.peer);}
-        expected.lean=lean;
+        expected.lean=lean;expected.identity_interval=std::chrono::hours(1); // cases choose their own re-check interval
         const auto call=[this](unsigned long command,void* argument){
             ++ioctls;events+=command==SGU_IOC_EVENT;
+            if(command==SGU_IOC_EVENT&&event_error){const int error=event_error;event_error=0;return GpuQueueSyscall{-1,error};}
             if(command==SGU_IOC_SUBMIT&&submit_again){--submit_again;return GpuQueueSyscall{-1,EAGAIN};}
             if(command==SGU_IOC_EVENT&&auto_complete)queue_fixture_complete_pending(driver.get());
             int result=queue_fixture_ioctl(driver.get(),command,argument);
@@ -160,6 +163,82 @@ void lean() {
     rejects([&]{static_cast<void>(f.queue->stats());});
     assert(!f.queue->release()&&f.queue->failed());f.change_identity=false;assert(f.queue->release());
 }
+// What one exchange costs around its ioctls: four empty polls, then prepare / submit / poll / completion / poll /
+// consume / poll. Printed for both modes (an identity check is one fstat and two fcntl on the real descriptor).
+void counts() {
+    unsigned full_checks=0;
+    for(const bool lean_path:{false,true}) {
+        Fixture f(8,32,false,lean_path);f.start();
+        const auto checks=f.identity_checks,ioctls=f.ioctls,events=f.events;
+        for(unsigned n=0;n<4;++n)assert(!f.queue->poll());
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        static_cast<void>(f.queue->poll());const auto e=f.finish(op);assert(e.operation==op);
+        static_cast<void>(f.queue->poll());f.consume(op);static_cast<void>(f.queue->poll());
+        std::cout<<"COUNT lean="<<lean_path<<" identity_checks="<<f.identity_checks-checks<<" ioctls="<<f.ioctls-ioctls
+                 <<" events="<<f.events-events<<std::endl;
+        if(lean_path)assert(f.identity_checks==checks&&full_checks>0);else full_checks=f.identity_checks-checks;
+        assert(f.queue->release());
+    }
+}
+// Expired intervals check ownership; malformed successful replies still fail validation.
+void lean_recheck() {
+    {
+        Fixture f(8,32,false,true);
+        GpuQueueExpected expected;expected.local.fill(0x11);expected.peer.fill(0x22);expected.depth=8;expected.ring_frames=32;
+        expected.lean=true;expected.identity_interval=std::chrono::milliseconds(0);
+        const auto call=[&f](unsigned long command,void* argument){
+            ++f.ioctls;int result=queue_fixture_ioctl(f.driver.get(),command,argument);
+            return GpuQueueSyscall{result<0?-1:result,result<0?-result:0};
+        };
+        GpuQueueIo io{f.driver,call,[&f]{++f.identity_checks;if(f.change_identity)throw std::runtime_error("injected owner replacement");},
+            [&f]{return queue_fixture_fd(f.driver.get());},call};
+        f.queue=std::make_unique<LinuxGpuQueue>(std::move(io),expected);f.start();
+        const auto checks=f.identity_checks;
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.identity_checks>checks); // interval 0: every hot operation
+        f.change_identity=true;rejects([&]{static_cast<void>(f.queue->submit(op));});
+        f.change_identity=false;assert(f.queue->release());
+    }
+    {
+        Fixture f(8,32,false,true);f.start(); // interval one hour: successful malformed replies do not re-check
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        const auto checks=f.identity_checks;
+        f.mutate_event=8;queue_fixture_complete(f.driver.get(),op.direction,op.slot); // a foreign reply: no ioctl error, no re-check
+        rejects([&]{static_cast<void>(f.queue->poll());});assert(f.identity_checks==checks&&f.queue->failed());
+        static_cast<void>(f.queue->release());
+    }
+}
+void lean_ioctl_errors() {
+    for(const bool replaced:{false,true}) {
+        Fixture f(8,32,false,true);f.start(); // one hour: exercise only the error-triggered check
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        const auto checks=f.identity_checks,events=f.events;
+        f.change_identity=replaced;f.event_error=EBADF;
+        bool caught=false;
+        try { static_cast<void>(f.queue->poll()); }
+        catch(const std::system_error& error) {
+            assert(!replaced);
+            assert(error.code()==std::error_code(EBADF,std::generic_category()));
+            caught=true;
+        }
+        catch(const std::runtime_error& error) {
+            assert(replaced&&std::string(error.what())=="injected owner replacement");
+            caught=true;
+        }
+        assert(caught&&f.identity_checks>checks&&f.queue->failed());
+        assert(f.events==events+1&&f.event_error==0);
+        f.change_identity=false;assert(f.queue->release());
+    }
+    for(const int error:{EAGAIN,EINTR}) {
+        Fixture f(8,32,false,true);f.start();
+        auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+        const auto checks=f.identity_checks,events=f.events;
+        f.change_identity=true;f.event_error=error;
+        assert(!f.queue->poll());
+        assert(f.identity_checks==checks&&!f.queue->failed());
+        assert(f.events==events+1&&f.event_error==0);
+        f.change_identity=false;f.finish(op);f.consume(op);assert(f.queue->release());
+    }
+}
 void wire() {
     GpuQueuePeerFrame a;a.campaign.fill(1);a.local.fill(2);a.peer.fill(3);a.device_instance.fill(4);
     a.epoch=1;a.import_generation=2;a.pool_identity=3;a.first_sequence=1;a.payload_bytes=4097;
@@ -285,7 +364,8 @@ int main(int argc,char** argv) {
     else if(name=="failed_dependency")failed_dependency();else if(name=="recovery")recovery();else if(name=="stop_retention")stop_retention();
     else if(name.starts_with("ambiguous"))ambiguous_cleanup(name);
     else if(name.starts_with("paired"))paired(name);
-    else if(name=="identity")identity();else if(name=="lean")lean();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
+    else if(name=="lean_ioctl_errors")lean_ioctl_errors();
+    else if(name=="identity")identity();else if(name=="lean")lean();else if(name=="lean_recheck")lean_recheck();else if(name=="counts")counts();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
     else if(name.starts_with("corruption"))corruption(std::stoi(name.substr(10)));else assert(false);
     std::cout<<"PASS "<<name<<'\n';
 }

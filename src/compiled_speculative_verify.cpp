@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include <sstream>
@@ -562,7 +563,7 @@ bool window_routed_union_types(const ModelManifest& manifest, const ExecutionTen
             "known window routed expert shape differs from canonical operands");
         const auto type=tensor.ggml_type;
         // STRIX_GSQ_WINDOW_EXPERTS=0 (diagnostic): GSQ routed experts stay out of windows (per-op serial fallback).
-        static const bool gsq_window_experts=[]{const char* v=std::getenv("STRIX_GSQ_WINDOW_EXPERTS");return !v || v[0]!='0';}();
+        static const bool gsq_window_experts=strix::envcfg::flag("STRIX_GSQ_WINDOW_EXPERTS", true);
         const bool q20=profile.a8 && moe_q4k_a8::q20_a8_enabled() && gsq_window_experts;
         const bool admitted=down ? type==7U || (profile.q80 && type==8U) || (q20 && profile.q80 && gsq_a8::down_type(type)) :
             (type==12U || (profile.q5k && type==13U) || (q20 && gsq_a8::gate_type(type))) && (!gate_type || type==gate_type);
@@ -621,7 +622,7 @@ bool window_matrix(const ManifestTensor& tensor, std::uint64_t width, std::uint6
     if (tensor.ggml_type != 8U) {
         // GSQ-RCO files (STRIX_GSQ_Q20_A8=1): the dense A8 typed segments run these matrices at R rows.
         // STRIX_GSQ_WINDOW_DENSE=0 (diagnostic): GSQ dense matrices stay out of windows (per-op serial fallback).
-        static const bool gsq_window_dense=[]{const char* v=std::getenv("STRIX_GSQ_WINDOW_DENSE");return !v || v[0]!='0';}();
+        static const bool gsq_window_dense=strix::envcfg::flag("STRIX_GSQ_WINDOW_DENSE", true);
         if (!moe_q4k_a8::q20_a8_enabled() || !gsq_window_dense || !gsq_a8::dense_type(tensor.ggml_type) ||
             width % gsq_a8::dense_block_elements(tensor.ggml_type))
             return false; // Explicit per-op serial fallback.

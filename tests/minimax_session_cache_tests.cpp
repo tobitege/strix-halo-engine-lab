@@ -22,7 +22,10 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <atomic>
+#include <random>
 #ifndef _WIN32
 #include <sys/file.h>
 #include <sys/wait.h>
@@ -30,6 +33,38 @@
 #include <unistd.h>
 #endif
 using namespace strix::minimax::session;
+class FixtureDirectory {
+public:
+  FixtureDirectory() {
+    const auto base = std::filesystem::temp_directory_path();
+    static std::atomic<std::uint64_t> serial{0};
+    std::random_device random;
+    for (unsigned attempt = 0; attempt != 128; ++attempt) {
+      const auto nonce = (static_cast<std::uint64_t>(random()) << 32) ^ random() ^
+                         serial.fetch_add(1, std::memory_order_relaxed);
+      const auto candidate = base / ("mmcache-" + std::to_string(nonce));
+      if (candidate.native().size() > 240)
+        throw std::runtime_error("cache fixture exceeds supported path boundary");
+      std::error_code error;
+      if (std::filesystem::create_directory(candidate, error)) {
+        path_ = candidate;
+        return;
+      }
+      if (error && error != std::errc::file_exists)
+        throw std::filesystem::filesystem_error("create cache fixture", candidate, error);
+    }
+    throw std::runtime_error("unable to allocate unique cache fixture");
+  }
+  FixtureDirectory(const FixtureDirectory&) = delete;
+  FixtureDirectory& operator=(const FixtureDirectory&) = delete;
+  ~FixtureDirectory() {
+    std::error_code ignored;
+    if (!path_.empty()) std::filesystem::remove_all(path_, ignored);
+  }
+  const std::filesystem::path& path() const noexcept { return path_; }
+private:
+  std::filesystem::path path_;
+};
 void check(bool x, const char *why) {
   if (!x)
     throw std::runtime_error(why);
@@ -193,15 +228,41 @@ int main() {
     check(*start_runtime([] { return std::make_unique<int>(1); }, true, log) == 1,
           "runtime startup failed");
     check(startup_log == "session cache: on (runtime live)", "missing live receipt");
-    auto dir = std::filesystem::current_path() / "minimax-session-cpu-fixture";
-    check(!std::filesystem::exists(dir),
-          "fixture directory already exists; move it before testing");
-    std::filesystem::create_directories(dir);
+    FixtureDirectory fixture;
+    auto dir = fixture.path();
+    check(dir.native().size() <= 240, "fixture path boundary");
+    check((dir / "rank1" / "A.group").native().size() <= 240,
+          "durable manifest path remains inside the bounded path budget");
+    std::filesystem::path failed_fixture;
+    try {
+      FixtureDirectory failure_scope;
+      failed_fixture = failure_scope.path();
+      throw std::runtime_error("injected fixture-scope failure");
+    } catch (const std::runtime_error& e) {
+      check(std::string_view(e.what()) == "injected fixture-scope failure",
+            "failure cleanup injection reached after fixture creation");
+    }
+    check(!failed_fixture.empty() && !std::filesystem::exists(failed_fixture),
+          "fixture cleanup after failure");
+    {
+      FixtureDirectory concurrent_fixture;
+      check(concurrent_fixture.path() != dir && concurrent_fixture.path().native().size() <= 240,
+            "cache fixtures are unique and bounded while coexisting");
+    }
     check(
         sha(Bytes{'a', 'b', 'c'}) ==
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         "SHA vector");
     auto c = sample();
+    check(&c.history == &c.frontier.tokens && &c.compat == &c.compatibility.record,
+          "legacy accessors refer to shared envelope");
+    {
+      auto wrong_rank = c; wrong_rank.sections[0].rank = 1;
+      refuses([&] { (void)encode(wrong_rank); });
+      auto wrong_schema = c; wrong_schema.compatibility.format_version = 2;
+      refuses([&] { (void)encode(wrong_schema); });
+    }
+
     auto bytes = encode(c);
     auto restored = decode(bytes, c.compat, 0, 1, bytes.size());
     check(encode(restored) == bytes, "round trip");
@@ -326,6 +387,13 @@ int main() {
                                          dir / ("rank" + std::to_string(r)),
                                          pair.at(r));
     pair_run([&](unsigned r) { ranks[r]->checkpoint(sample(r, 2)); });
+    for (unsigned r = 0; r < 2; ++r)
+      for (const auto& entry : std::filesystem::directory_iterator(dir / ("rank" + std::to_string(r)))) {
+        auto temporary = entry.path();
+        temporary += ".tmp-" + std::string(64, '0');
+        check(temporary.native().size() <= 240,
+              "actual durable temporary path stays below the platform boundary");
+      }
     pair_run([&](unsigned r) {
       auto got = ranks[r]->resume("A", true);
       check(got.sections[0].bytes[0] == r, "rank shard");
@@ -799,8 +867,6 @@ int main() {
     check(checkpoint_refused && delete_refused, "interprocess flock honored");
     contender.checkpoint(sample());
 #endif
-    // Remove only the fixture created above in this invocation.
-    std::filesystem::remove_all(dir);
     std::cout << "MiniMax session CPU tests PASS: exe numerics full-model "
                  "both-rank-refusals operational-restore corrupt-section truncated enlarged missing-rank generation DSpark-map "
                  "peak LRU\n";

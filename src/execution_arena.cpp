@@ -1,7 +1,10 @@
 #include "strix/execution_arena.hpp"
 #include "strix/known_prefill_limits.hpp"
 
+#include "core/row_layout.hpp"
+
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
@@ -300,7 +303,8 @@ ExecutionArenaPlan build_serial_execution_arena_plan(
 namespace {
 KnownWindowArena build_known_rows_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true, std::uint64_t compact_qsa_output_savings = 0) {
+    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true, std::uint64_t compact_qsa_output_savings = 0,
+    const core::RowLayoutPolicy& layout = core::row_layout_policy()) {
     if (!serial.alignment || !alignment || alignment % serial.alignment != 0 ||
         !serial.total_bytes || serial.allocations.empty()) {
         throw std::invalid_argument("known window requires a complete aligned serial arena");
@@ -344,7 +348,10 @@ KnownWindowArena build_known_rows_arena(
             if (allocation.bytes<=removed) throw std::invalid_argument("score-free QSA workspace is undersized");
             allocation.bytes-=removed;
         }
-        const auto stride = align_up(allocation.bytes, alignment);
+        // The shared row layout policy decides the physical stride: the payload rounded to the arena alignment,
+        // moved off page multiples for row counts that kernels walk in lockstep (core/row_layout.hpp).
+        const auto stride = core::physical_row_stride(layout, align_up(allocation.bytes, alignment), logical_rows,
+            alignment < core::kRowAlignment ? core::kRowAlignment : alignment);
         allocation.bytes = 0;
         for(std::uint32_t row=0;row<logical_rows;++row) allocation.bytes=checked_add(allocation.bytes,stride);
         allocation.offset = 0;
@@ -390,6 +397,8 @@ KnownWindowArena build_known_rows_arena(
         result.physical.allocations.push_back(terminal);
     }
     if(materialize_views) result.row_view.assign(logical_rows,result.physical);
+    // STRIX_ROW_LAYOUT_VERBOSE=1: one line per row buffer (payload, physical stride, rows until a page offset repeats).
+    static const bool layout_verbose = envcfg::flag("STRIX_ROW_LAYOUT_VERBOSE", false);
     for (std::size_t i = 0; i < result.physical.allocations.size(); ++i) {
         const auto& physical = result.physical.allocations[i];
         const auto* original = find_arena_allocation(serial, physical.use);
@@ -397,6 +406,11 @@ KnownWindowArena build_known_rows_arena(
         const bool terminal_use=terminal_logits && execution_use_is_logits(physical.use);
         const auto stride = terminal_use?0U:physical.bytes / logical_rows;
         result.row_stride.push_back(stride);
+        if (layout_verbose)
+            std::fprintf(stderr, "row layout: rows %u class %u slot %u payload %llu stride %llu page-period %llu\n",
+                logical_rows, static_cast<unsigned>(physical.use.buffer.buffer_class), physical.use.buffer.slot,
+                static_cast<unsigned long long>(original->bytes), static_cast<unsigned long long>(stride),
+                static_cast<unsigned long long>(core::row_alias_period(stride)));
         for (std::size_t row = 0; row < result.row_view.size(); ++row) {
             auto& allocation = result.row_view[row].allocations[i];
             allocation.offset = checked_add(physical.offset, static_cast<std::uint64_t>(row)*stride);
@@ -417,10 +431,12 @@ KnownWindowArena build_known_window_arena(
 }
 KnownWindowArena build_known_prefill_arena(
     const ExecutionArenaPlan& serial,std::uint64_t alignment,std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views, std::uint64_t compact_qsa_output_savings) {
+    std::uint64_t external_qsa_score_bytes, bool terminal_logits, bool materialize_views, std::uint64_t compact_qsa_output_savings,
+    const core::RowLayoutPolicy* row_layout) {
     if(logical_rows<16U||logical_rows>known_prefill_max_rows)
         throw std::invalid_argument("known prefill rows must be within "+known_prefill_rows_range());
-    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views,compact_qsa_output_savings);
+    return build_known_rows_arena(serial,alignment,logical_rows,external_qsa_score_bytes,terminal_logits,materialize_views,compact_qsa_output_savings,
+        row_layout ? *row_layout : core::row_layout_policy());
 }
 
 namespace {

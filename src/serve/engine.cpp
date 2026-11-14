@@ -11,6 +11,13 @@ namespace {
 using SteadyClock = std::chrono::steady_clock;
 constexpr auto kNever = SteadyClock::time_point::max();
 
+bool publish_tokens(const std::shared_ptr<GenerationTicket>& ticket,
+    const std::shared_ptr<GenerationOutput>& output, std::span<const std::uint32_t> tokens) {
+    const bool keep = !output || !output->consume_tokens || output->consume_tokens(tokens);
+    // Published IDs remain accounted even when the presentation requests stop.
+    return ticket->publish(tokens) && keep;
+}
+
 // The process-wide arming state (HTTP side and the expiry thread only), on its own cache line (written on every arming
 // request, unlike the period word the engine threads read). One lock orders the arming requests and the expiry, so an
 // arming request never loses its period to an expiry decided before it. The expiry thread is started by the first
@@ -95,11 +102,18 @@ void GenerationTicket::notify() {
 
 std::vector<std::uint32_t> GenerationTicket::wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel) {
     std::unique_lock lock(mutex_);
-    changed_.wait_for(lock, timeout, [&] { return done_ || !pending_.empty() || (wake_on_cancel && cancelled_.load()); });
+    changed_.wait_for(lock, timeout, [&] { return done_ || woken_ || !pending_.empty() || (wake_on_cancel && cancelled_.load()); });
+    woken_ = false;
     std::vector<std::uint32_t> out;
     out.swap(pending_);
     done = done_;
     return out;
+}
+
+void GenerationTicket::wake() {
+    const std::lock_guard lock(mutex_);
+    woken_ = true;
+    changed_.notify_all();
 }
 
 bool GenerationTicket::wait_admission(std::chrono::milliseconds timeout) {
@@ -152,6 +166,7 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     auto ticket = std::make_shared<GenerationTicket>();
     const std::lock_guard lock(mutex_);
     if (stopping_ || draining_ || entries_.size() >= max_queued_) return nullptr;
+    ticket->output_ = job.output;
     ticket->submitted_queue_position_ = entries_.size();
     ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
@@ -204,7 +219,9 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
         const auto started = std::chrono::steady_clock::now();
         if (ticket->cancelled()) stats.finish = "cancelled";
         else {
-            entry.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
+            entry.job.on_tokens = [ticket, output = entry.job.output](std::span<const std::uint32_t> tokens) {
+                return publish_tokens(ticket, output, tokens);
+            };
             try { stats = engine.generate(entry.job); }
             catch (const GenerationRequestError& e) { stats = e.stats; error = e.what(); }
             catch (const std::exception& e) { error = e.what(); }
@@ -216,7 +233,10 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
             stats.constraint->reason = "cancelled";
         }
         stats.queue_ms = std::chrono::duration<double, std::milli>(started - entry.submitted).count();
-        const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const auto ended = std::chrono::steady_clock::now();
+        stats.exec_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(started.time_since_epoch()).count();
+        stats.exec_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ended.time_since_epoch()).count();
+        const auto busy = std::chrono::duration<double>(ended - started).count();
         const bool observed = still_observed(*ticket);
         ObserveDelta delta;
         if (observed) {  // computed before the lock, which only adds it
@@ -240,6 +260,34 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
     }
 }
 
+std::optional<TakenJob> GenerationQueue::take_serial(bool wait) {
+    Entry entry;
+    {
+        std::unique_lock lock(mutex_);
+        if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
+        if (entries_.empty() && control_pending_ && !stopping_) {
+            control_pending_ = false;
+            lock.unlock();
+            if (idle_control_) idle_control_();
+            return std::nullopt;
+        }
+        if (entries_.empty()) return std::nullopt;
+        entry = std::move(entries_.front());
+        entries_.pop_front();
+        entry.ticket->queue_position_.store(0);
+        --totals_.queued;
+        ++totals_.running;
+        std::uint64_t position = 0;
+        for (auto& waiting : entries_) waiting.ticket->queue_position_.store(position++);
+    }
+    TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now()};
+    auto ticket = taken.ticket;
+    taken.job.on_tokens = [ticket, output = taken.job.output](std::span<const std::uint32_t> tokens) {
+        return publish_tokens(ticket, output, tokens);
+    };
+    return taken;
+}
+
 std::optional<TakenJob> GenerationQueue::take(bool wait, bool short_first) {
     return take_selected(wait, short_first, false, false);
 }
@@ -252,11 +300,19 @@ std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selectio
     return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible, reorder, timed_eligible, overtake_blocked);
 }
 
+std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selection,
+    const std::function<bool(const GenerationJob&)>& eligible,
+    const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
+    const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
+    const std::function<void()>& overtake_blocked, bool* blocked) {
+    return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible, reorder, timed_eligible, overtake_blocked, blocked);
+}
+
 std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
     const std::function<bool(const GenerationJob&)>& eligible,
     const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
     const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
-    const std::function<void()>& overtake_blocked) {
+    const std::function<void()>& overtake_blocked, bool* blocked) {
     std::size_t remaining = 0;
     bool first = true;
     for (;;) {
@@ -264,6 +320,7 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
         bool reordered = false;
         {
             std::unique_lock lock(mutex_);
+            if (blocked) *blocked = false;
 #ifdef STRIX_SERVE_QUEUE_TEST
             ++work.take_locks;
 #endif
@@ -301,7 +358,10 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
                         if (!admitted && ordered && e.overtakes >= kMaxQueueOvertakes && overtake_blocked) overtake_blocked();
                         return admitted;
                     });
-                if (pick == remaining) return std::nullopt;
+                if (pick == remaining) {
+                    if (blocked) *blocked = true;
+                    return std::nullopt;
+                }
                 it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
             }
             reordered = it != entries_.begin();
@@ -322,13 +382,15 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
             continue;
         }
         auto ticket = taken.ticket;
-        taken.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
+        taken.job.on_tokens = [ticket, output = taken.job.output](std::span<const std::uint32_t> tokens) {
+            return publish_tokens(ticket, output, tokens);
+        };
         return taken;
     }
 }
 
 void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string error,
-    const std::function<void(const GenerationStats&)>& observe) {
+    const std::function<void(const GenerationStats&)>& observe, QueueCompletion protocol) {
     if (job.ticket->cancelled() && error.empty()) stats.finish = "cancelled";
     if (stats.finish == "cancelled" && stats.constraint) {
         stats.constraint->status = "incomplete";
@@ -336,10 +398,16 @@ void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string e
     }
     stats.queue_ms = std::chrono::duration<double, std::milli>(job.started - job.submitted).count();
     // Batched jobs overlap: busy time adds each job's own service time.
-    const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started).count();
+    const auto ended = std::chrono::steady_clock::now();
+    stats.exec_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(job.started.time_since_epoch()).count();
+    stats.exec_end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ended.time_since_epoch()).count();
+    const auto busy = std::chrono::duration<double>(ended - job.started).count();
     const bool observed = still_observed(*job.ticket);
     ObserveDelta delta;
-    if (observed) delta = observe_delta(stats, error);  // before the lock, which only adds it
+    if (observed) {
+        if (protocol == QueueCompletion::serial && stats.first_token_ms) *stats.first_token_ms += stats.queue_ms;
+        delta = observe_delta(stats, error); // before the lock, which only adds it
+    }
     {
         const std::lock_guard lock(mutex_);
         --totals_.running;
@@ -466,6 +534,12 @@ bool GenerationQueue::has_waiting(const std::function<bool(const GenerationJob&,
 
 bool GenerationQueue::has_queued_work() const {
     std::lock_guard lock(mutex_);
+    return !stopping_ && !entries_.empty();
+}
+
+bool GenerationQueue::wait_work_until(std::chrono::steady_clock::time_point deadline) const {
+    std::unique_lock lock(mutex_);
+    ready_.wait_until(lock, deadline, [&] { return stopping_ || !entries_.empty(); });
     return !stopping_ && !entries_.empty();
 }
 

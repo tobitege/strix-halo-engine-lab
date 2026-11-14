@@ -1,7 +1,10 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -48,9 +51,7 @@
 // (--state-in of the whole prompt): equal hashes = prefill and decode agree at that length.
 namespace {
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 struct Args {
     std::string model, prompt_path, transport, state_in, state_out, tokens_out, logits_out;
@@ -75,7 +76,7 @@ double since(std::chrono::steady_clock::time_point t0) { return std::chrono::dur
 // Device memory used / total (GiB) and the host's MemAvailable (GiB): one line per stage.
 void memory_line(const char* who, const char* stage) {
     std::size_t free_b = 0, total_b = 0;
-    check(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
+    hip_check(hipMemGetInfo(&free_b, &total_b), "hipMemGetInfo");
     double avail = 0.0;
     std::ifstream mi("/proc/meminfo");
     for (std::string k; mi >> k;) {
@@ -110,35 +111,14 @@ void barrier(strix::dist::Communicator* comm, std::uint32_t round) {
     if (comm == nullptr) return;
     void* buffers = nullptr;
     hipStream_t stream = nullptr;
-    check(hipMalloc(&buffers, 8), "barrier");
-    check(hipStreamCreate(&stream), "barrier");
-    check(hipMemsetAsync(buffers, 0, 8, stream), "barrier");
+    hip_check(hipMalloc(&buffers, 8), "barrier");
+    hip_check(hipStreamCreate(&stream), "barrier");
+    hip_check(hipMemsetAsync(buffers, 0, 8, stream), "barrier");
     comm->exchange(stream, buffers, static_cast<char*>(buffers) + 4, 4,
                    strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 7U, round});
-    check(hipStreamSynchronize(stream), "barrier");
+    hip_check(hipStreamSynchronize(stream), "barrier");
     (void)hipStreamDestroy(stream);
     (void)hipFree(buffers);
-}
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    const std::chrono::seconds limit(timeout);
-    const auto colon = spec.find(':');
-    const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
-    if (kind == "tcp-listen") return strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(rest)), limit);
-    if (kind == "tcp-connect") {
-        const auto c2 = rest.rfind(':');
-        return strix::dist::tcp_connect(rest.substr(0, c2), static_cast<std::uint16_t>(std::stoul(rest.substr(c2 + 1))), limit);
-    }
-    if (kind == "usb4-auto" || kind == "usb4auto") {  // every live host-mode stream, paired by handshake
-        strix::dist::Usb4AutoOptions o;
-        o.rank = rank;
-        o.timeout = std::chrono::milliseconds(std::uint64_t{timeout} * 1000U);
-        strix::dist::Usb4Topology topology;
-        auto t = strix::dist::usb4_host_auto(o, &topology);
-        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
-        return t;
-    }
-    throw std::invalid_argument("unknown transport " + spec);
 }
 
 struct RankResult {
@@ -329,6 +309,10 @@ RankResult run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uin
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -401,9 +385,11 @@ int main(int argc, char** argv) try {
         return same ? 0 : 1;
     }
     ::alarm(a.connect_timeout + 30U);  // a stream on a dead USB4 link blocks open(): the alarm ends the process
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout)});
     ::alarm(0);
-    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, kPlan}, std::move(transport), std::size_t{22} << 20U);
+    if (!opened.receipt.empty()) std::printf("usb4 topology: %s\n", opened.receipt.c_str());
+    strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, kPlan}, std::move(opened.host), std::move(opened.direct),
+                                   std::size_t{22} << 20U);
     std::printf("connected (%s)\n", comm.transport_name().c_str());
     run(a, prompt, a.rank, &comm, true);
     return 0;

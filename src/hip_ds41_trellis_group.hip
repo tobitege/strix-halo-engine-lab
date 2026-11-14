@@ -1,5 +1,6 @@
 // Grouped trellis linears with strided input/output (ds41_trellis_group.hpp): the o_a groups of a layer.
 #include "strix/ds41_trellis_group.hpp"
+#include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -34,7 +35,7 @@ int trellis_oa_group_mode() {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("ds41 trellis group: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("ds41 trellis group: ", e, what);
 }
 void lib_check(strix_status s, const std::string& what) {
     if (s != STRIX_SUCCESS) throw std::runtime_error("ds41 trellis group: " + what + ": " + strix_status_string(s));

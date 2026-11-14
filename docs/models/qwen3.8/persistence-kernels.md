@@ -4,6 +4,17 @@ These independent runtime switches default to OFF. They do not inherit
 `STRIX_DISPATCH_FUSE` and do not change a numerical profile, model asset,
 selection budget, acceptance rule or persistent state layout.
 
+Exception by window size: the two verify-window tails (`STRIX_QPERSIST_QSA_TAIL`,
+`STRIX_QPERSIST_GDN_TAIL`) are bit-identical to the separate launches but not
+faster at every size. With the variable unset they follow the decode cycle's
+dispatch-fuse resolution (`STRIX_DISPATCH_FUSE`) at the sizes where the fused
+kernel costs less than the launches it replaces: the GDN tail in 2-row
+windows, the QSA tail in 2- and 4-row windows. `=1` takes every admitted
+size, any other value none. Kernel trace, fused versus separate launches
+(us per layer): GDN tail 36.4 vs 37.5 (2 rows), 47.6 vs 43.3 (4), 84.0 vs
+60.1 (8); QSA tail 64.1 vs 66.8 (2), 64.2 vs 73.0 (4), 117.6 vs 86.9 (8).
+The draft-side uses of `STRIX_QPERSIST_QSA_TAIL` stay opt-in.
+
 | Switch | Candidate behavior |
 | --- | --- |
 | `STRIX_QPERSIST_DRAFT_SCORE=1` | Runs the MTP single-row QK score, including draft and teacher forward, with the existing window wave kernel: four selected slots per wave, eight waves per workgroup. |

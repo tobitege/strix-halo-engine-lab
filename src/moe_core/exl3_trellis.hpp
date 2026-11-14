@@ -14,45 +14,23 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "../core/hadamard.hpp"
+#include "../core/trellis_codec.hpp"
+
 namespace strix::moe_core {
 
-using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+using core::trellis::Half2;
 
 // strix-trellis split policy for <= 8 rows (gemv_policy.hpp measured_vector_splits; no MiniMax shape is special-cased).
 __host__ __device__ constexpr unsigned vector_splits(unsigned input, unsigned output) {
     return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
 }
 
-// RN32 boundary before a later RN16 conversion (hadamard.hpp materialize_fp32).
-__device__ __forceinline__ float materialize(float v) {
-    asm volatile("" : "+v"(v));
-    return v;
-}
+// RN32 boundary before a later RN16 conversion: the one core/hadamard.hpp materialize_fp32.
+__device__ __forceinline__ float materialize(float v) { return strix::core::materialize_fp32(v); }
 
-// H32 over 128 values held as lane + 32 j (hadamard.hpp hadamard128): strides 1..16 across lanes, 32 and 64 in
-// registers, then one multiply by RN32(1/sqrt(128)).
-__device__ __forceinline__ void hadamard128(float (&v)[4], unsigned lane) {
-#pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float peer = __shfl_xor(v[j], stride, 32);
-            v[j] = (lane & static_cast<unsigned>(stride)) ? peer - v[j] : v[j] + peer;
-        }
-    }
-#pragma unroll
-    for (int stride = 1; stride < 4; stride *= 2) {
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            if (!(j & stride)) {
-                const float l = v[j], r = v[j + stride];
-                v[j] = l + r;
-                v[j + stride] = l - r;
-            }
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = materialize(v[j] * 0x1.6a09e6p-4F);
-}
+// H32 over 128 values held as lane + 32 j: the one core/hadamard.hpp hadamard128 (lane overload).
+using strix::core::hadamard128;
 
 __device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
@@ -105,102 +83,19 @@ __device__ __forceinline__ void transform_values(const float* x, const std::uint
     hadamard128(v, lane);
 }
 
-// ---------------------------------------------------------------- mul1 decode (packed_decoder.hpp, qualified bitwise
-// against trellis_optimized.hpp mul1_half2)
-template <std::uint32_t Multiplier> __host__ __device__ __forceinline__ std::uint32_t hash16(std::uint32_t state) {
-#if defined(__HIP_DEVICE_COMPILE__)
-    constexpr std::uint32_t adjusted = Multiplier - 1U;
-    constexpr std::uint32_t upper = (adjusted & 0xffff0000U) | 1U;
-    constexpr std::uint32_t lower = adjusted & 65535U;
-    std::uint32_t high, result;
-    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel:[0,0] op_sel_hi:[0,1]" : "=v"(high) : "v"(state), "s"(upper));
-    asm("v_mad_u32_u16 %0, %1, %2, %1" : "=v"(result) : "v"(high), "s"(lower));
-    return result;
-#else
-    // Emulate the low-u16 operands of the two packed ISA instructions.
-    return (state & 65535U) * Multiplier;
-#endif
-}
-__host__ __device__ __forceinline__ Half2 mul1_pair(std::uint32_t first, std::uint32_t second) {
-    const std::uint32_t a = hash16<0x83dcd12dU>(first), b = hash16<0x83dcd12dU>(second);
-#if defined(__HIP_DEVICE_COMPILE__)
-    std::uint32_t low, both;
-    constexpr std::uint32_t seed = 0x64006400U;
-    asm("v_sad_u8 %0, %1, 0, %2" : "=v"(low) : "v"(a), "s"(seed));
-    asm("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(both) : "v"(b), "v"(low));
-    const __half2 d = __hfma2(__builtin_bit_cast(__half2, both), __builtin_bit_cast(__half2, 0x1eee1eeeU),
-                              __builtin_bit_cast(__half2, 0xc931c931U));
-    return __builtin_bit_cast(Half2, d);
-#else
-    const auto packed_input = [](std::uint32_t product) {
-        const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
-                             ((product >> 16U) & 255U) + (product >> 24U);
-        return __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(0x6400U + sum));
-    };
-    const float scale = static_cast<float>(__builtin_bit_cast(_Float16, std::uint16_t{0x1eee}));
-    const float bias = static_cast<float>(__builtin_bit_cast(_Float16, std::uint16_t{0xc931}));
-    // Both FP16 multiplicands have <=11 significant bits. Their exact product
-    // and this bounded sum fit FP32, so RN16(fmaf) emulates packed RN16 FMA.
-    return Half2{static_cast<_Float16>(fmaf(static_cast<float>(packed_input(a)), scale, bias)),
-                 static_cast<_Float16>(fmaf(static_cast<float>(packed_input(b)), scale, bias))};
-#endif
-}
+// ---------------------------------------------------------------- mul1 decode (shared codec)
+using core::trellis::hash16;
+using core::trellis::mul1_pair;
 
-// Per-lane constants of the aligned 16x16 tile reader (trellis_optimized.hpp AlignedLane<Bits, true>): the lane owns
-// eight consecutive states starting at bit ((lane * 8 + 1) * Bits - 16) of the tile's Bits * 8-word ring.
-template <int Bits> struct LaneGeom {
-    std::uint32_t oa, ob, oc;  // byte offsets of the three source words inside the tile
-    std::uint32_t align;       // 32 - shift (shift is never 0 for integer Bits in 1..8)
-    __device__ explicit LaneGeom(unsigned lane) {
-        constexpr int count = Bits * 8;
-        const int start = (static_cast<int>(lane) * 8 + 1) * Bits + 256 * Bits - 16;
-        const int index = start / 32 - count, shift = start & 31;
-        const int ia = index < 0 ? index + count : index;
-        const int ib = index + 1 >= count ? index + 1 - count : index + 1;
-        const int ic = index + 2 >= count ? index + 2 - count : index + 2;
-        oa = static_cast<std::uint32_t>(ia) * 4U;
-        ob = static_cast<std::uint32_t>(ib) * 4U;
-        oc = static_cast<std::uint32_t>(ic) * 4U;
-        align = 32U - static_cast<std::uint32_t>(shift);
-    }
-};
-
-// Explicit address spaces: pointers read from memory (the Exl3 tables) are generic to the compiler, which would emit
-// flat loads (64-bit lane addresses, and counted on the LDS counter too).
-using GlobalU32 = const std::uint32_t __attribute__((address_space(1)));
-using LocalU32 = const std::uint32_t __attribute__((address_space(3)));
-// Wave-uniform copy of a pointer (scalar registers), so global loads take the saddr form.
-__device__ __forceinline__ unsigned uni(unsigned v) {  // wave-uniform value -> scalar register
-    return static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(v)));
-}
-template <class T> __device__ __forceinline__ const T* uniform(const T* p) {
-    const auto v = reinterpret_cast<std::uintptr_t>(p);
-    const auto lo = static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(static_cast<std::uint32_t>(v))));
-    const auto hi = static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(static_cast<std::uint32_t>(v >> 32U))));
-    return reinterpret_cast<const T*>((static_cast<std::uintptr_t>(hi) << 32U) | lo);
-}
-__device__ __forceinline__ std::uint32_t load_u32(const unsigned char* base, std::uint32_t offset) {
-    asm("" : "+v"(offset));  // keep a 32-bit VGPR offset on a wave-uniform base (saddr form)
-    return *(GlobalU32*)(base + offset);
-}
-
-template <int Bits> struct TileStates {
-    std::uint32_t high, low, tail;
-    TileStates() = default;
-    __device__ __forceinline__ TileStates(const unsigned char* tile, const LaneGeom<Bits>& g) {
-        const std::uint32_t a = load_u32(tile, g.oa), b = load_u32(tile, g.ob), c = load_u32(tile, g.oc);
-        high = __builtin_amdgcn_alignbit(a, b, g.align);  // (a << shift) | (b >> (32 - shift))
-        low = __builtin_amdgcn_alignbit(b, c, g.align);
-        tail = c << (32U - g.align);
-    }
-    template <int J> __device__ __forceinline__ std::uint32_t state() const {
-        constexpr int offset = J * Bits;
-        if constexpr (offset <= 16) return (high >> (16 - offset)) & 65535U;
-        else if constexpr (offset < 32) return ((high << (offset - 16)) | (low >> (48 - offset))) & 65535U;
-        else if constexpr (offset <= 48) return (low >> (48 - offset)) & 65535U;
-        else return ((low << (offset - 48)) | (tail >> (80 - offset))) & 65535U;
-    }
-};
+// Aligned 16x16 tile reader of the shared codec: the lane owns eight consecutive states starting at bit
+// ((lane * 8 + 1) * Bits - 16) of the tile's Bits * 8-word ring.
+using core::trellis::LaneGeom;
+using core::trellis::GlobalU32;
+using core::trellis::LocalU32;
+using core::trellis::uni;
+using core::trellis::uniform;
+using core::trellis::load_u32;
+using core::trellis::TileStates;
 
 // Activation pairs of one k-tile for one row: channels k * 16 + 2 (lane & 3) (+ 8).
 __device__ __forceinline__ void load_act(const _Float16* row, unsigned k, unsigned lane, Half2& a0, Half2& a1) {
@@ -526,64 +421,16 @@ __device__ __forceinline__ void stream_column(const std::uint32_t* trellis, unsi
 }
 
 
-// EXL3 mul1 weight decode and its normalized packed-stream geometry.
+// EXL3 mul1 weight decode: the shared codec (core/trellis_codec.hpp) plus this library's input transform.
 // Input/output transforms retain explicit RN32/RN16 boundaries in the device helpers.
-template <int Bits>
-struct Window {
-    static constexpr int kWords = Bits * 8;                   // one 16 x 16 tile
-    static constexpr int kNW = (78 + 27 * Bits) / 32 + 1;     // words a lane reads
-    // Stream bit offset of the window start, relative to word w0 = s0 / 32 - 1 (32..63), for h = column / 8.
-    static constexpr int off(int h) { return 32 + ((4 * Bits * h + 257 * Bits - 16) & 31); }
-    static constexpr int delta(int r) { return 8 * ((r & 7) >> 1) + (r & 1) + 2 * (r >> 3); }
-    static constexpr int last_word(int h, int r) { return (off(h) + 15 + delta(r) * Bits) >> 5; }
-    static constexpr unsigned shift(int h, int r) { return static_cast<unsigned>((32 - ((off(h) + 16 + delta(r) * Bits) & 31)) & 31); }
-    __device__ static int first_word(int c) {
-        const int base = 32 * (c & 7) + 4 * (c >> 3);
-        return (((base + 1) * Bits - 16 + 256 * Bits) >> 5) - 1;
-    }
-};
+template <int Bits> using Window = core::trellis::Window<Bits>;
+template <int Bits> using Norm = core::trellis::Norm<Bits>;
+using Mul1 = core::trellis::Mul1;
+template <int Bits> using Mul1PairDecode = core::trellis::PairDecode8<Bits, core::trellis::Mul1>;
 
-template <int Bits>
-struct Norm {
-    static constexpr int kWords = Bits * 8;
-    static constexpr int kNL = ((47 + 27 * Bits) >> 5) + 2;  // loaded words; kNL - 1 normalized words
-    static constexpr int e(int r) { return 48 + Window<Bits>::delta(r) * Bits; }
-    static constexpr int g(int r) { return (e(r) - 1) >> 5; }
-    static constexpr unsigned shift(int r) { return static_cast<unsigned>((32 - (e(r) & 31)) & 31); }
-};
-
-struct Mul1 {};
-
-template <int Bits> struct Mul1PairDecode {
-    static constexpr bool kPacked = true;
-    static __host__ __device__ __forceinline__ void decode8(const std::uint32_t (&st)[8], Half2 (&out)[4]) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) out[i] = mul1_pair(st[2 * i], st[2 * i + 1]);
-    }
-};
-
-template <int Bits> struct Exl3Trellis {
-    using Window = moe_core::Window<Bits>;
-    using Norm = moe_core::Norm<Bits>;
+template <int Bits> struct Exl3Trellis : core::trellis::Codec<Bits, core::trellis::Mul1> {
     using InputTransform = Exl3Trellis<Bits>;
-    static __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) {
-  // library mul1 codebook (gemm.hip)
-    const std::uint32_t product = state * 0x83dcd12dU;
-#if defined(__HIP_DEVICE_COMPILE__)
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-#else
-    const unsigned sum = (product & 255U) + ((product >> 8U) & 255U) +
-                         ((product >> 16U) & 255U) + (product >> 24U);
-#endif
-    return __half2float(__float2half_rn(fmaf(static_cast<float>(1024 + sum), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-    }
-static __device__ __forceinline__ float codebook_value_v2(std::uint32_t state) {
-    const std::uint32_t product = state * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    return __half2float(__float2half_rn(fmaf(__uint_as_float(0x44800000U | (sum << 13)), __half2float(__ushort_as_half(0x1eee)),
-                                             __half2float(__ushort_as_half(0xc931)))));
-}
+    static __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) { return Mul1::value(state); }
     static __device__ __forceinline__ void input_block(const float* x, const std::uint16_t* suh, _Float16* out,
                                                       unsigned begin, unsigned lane) {
         transform_block(x, suh, out, begin, lane);
@@ -591,18 +438,6 @@ static __device__ __forceinline__ float codebook_value_v2(std::uint32_t state) {
     static __device__ __forceinline__ void h128(float (&v)[4], unsigned lane) { hadamard128(v, lane); }
     static __device__ __forceinline__ float scale(float x, std::uint16_t sign) {
         return materialize(x * half_bits(sign));
-    }
-    static __device__ __forceinline__ std::uint32_t pipe_product(std::uint32_t state) {
-        std::uint32_t lo, hi, product;
-        asm("v_mul_u32_u24 %0, %1, 0xdcd12d" : "=v"(lo) : "v"(state));
-        asm("v_mul_u32_u24 %0, %1, 0x83" : "=v"(hi) : "v"(state));
-        asm("v_lshl_add_u32 %0, %1, 24, %2" : "=v"(product) : "v"(hi), "v"(lo));
-        return product;
-    }
-    static __device__ __forceinline__ float pipe_codebook(std::uint32_t state) {
-        const auto product = pipe_product(state);
-        const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-        return __half2float(__float2half_rn(fmaf(static_cast<float>(sum), 887.0f / 131072.0f, -3.453125f)));
     }
 };
 

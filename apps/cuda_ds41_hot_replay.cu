@@ -17,6 +17,7 @@
 // Dynamic slots (--dyn-gib): split over layers in proportion to static experts + 1; source: the warmest non-static
 // experts of the non-test sequences, --source-gib of pinned host memory (or the placement's pc-ram lists if any).
 
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_core.hpp"
 #include "strix/cuda_ds41_hot_residency.hpp"
 #include "strix/cuda_ds41_parts_host_driver.hpp"
@@ -112,6 +113,9 @@ double mean(const std::vector<double>& v) { return v.empty() ? 0.0 : std::accumu
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     std::string model, placement_path, routes, connect, token_file, out_path, timeline_path, seqs_arg, seqmod, budgets_arg, dense_arg, layers_arg;
     double connect_wait_s = 30.0;
     std::uint32_t tokens_per_seq = 0, dyn_budget = 16, warmup = 4;

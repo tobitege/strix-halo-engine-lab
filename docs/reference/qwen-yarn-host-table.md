@@ -135,7 +135,6 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_DENSE` | No | Dense projections |
 | `STRIX_QPF2K_GDN` | No | Gated recurrence |
 | `STRIX_QPF2K_GDN_GATES_BATCH` | No | Batched recurrence gates |
-| `STRIX_QPF2K_GDN_CORE16` | No | Recurrence core |
 | `STRIX_QPF2K_HC` | No | Hyper-connection mix |
 | `STRIX_QPF2K_HC_MASK` | No | Hyper-connection selection |
 | `STRIX_QPF2K_HC_OUTPUT3` | No | Hyper-connection output |
@@ -160,6 +159,7 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_MOE_MC` | No | Expert merge/commit |
 | `STRIX_QPF2K_MOE_HDR` | No | Expert dispatch headers |
 | `STRIX_QPF2K_MOE_XOR64` | No | Expert LDS row layout |
+| `STRIX_QPF2K_MOE_DA16_ISSUE` | No | Expert down activation load issue order |
 | `STRIX_QPF2K_QSA` | Yes | B3 sites A-F below |
 | `STRIX_QPF2K_QSA_MASK` | Yes | B3 sites A-F below, including grouped/batched alternatives |
 | `STRIX_QSA_NORM_GROUP` | Yes | B3 sites B, C, E below |

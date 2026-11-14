@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
@@ -21,7 +22,7 @@ inline bool moe_route_bf16_environment_requested(const char* request, const char
         !(baseline && std::string_view(baseline) == "1") && !(defaults && defaults[0] == '0');
 }
 inline bool moe_route_i8_enabled() {
-    static const bool enabled=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_ROUTE_I8");return v&&v[0]=='1'&&v[1]=='\0';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_PREFILL_MOE_ROUTE_I8", false, strix::EnvFlagMatch::exact);
     return enabled;
 }
 // Codes and exponents are hot; the cold, fixed BF16 fallback plane fits the reserved FP32 row.

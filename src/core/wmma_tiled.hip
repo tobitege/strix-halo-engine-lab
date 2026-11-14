@@ -8,8 +8,7 @@
 // Explicit PackedIU4 FAST v1 instead rescales signed I32 sums at every K64
 // boundary in ascending group order. It never enters the default resolver.
 #include "wmma_tiled.hpp"
-#include "trellis_device.hpp"
-#include "packed_decoder.hpp"
+#include "trellis_codec.hpp"
 #include "hadamard.hpp"
 #include <atomic>
 #include <cstdlib>
@@ -223,7 +222,7 @@ template<int Tile, bool Transform> hipError_t launch_grouped(const IU4GroupedOpe
     gp.a_mul = o.a_mul; gp.a_add = o.a_add; gp.o_mul = o.o_mul; gp.o_add = o.o_add;
     grouped_kernel<Tile, Transform>()<<<dim3{unsigned(blocks)}, G::threads, 0, stream>>>(
         reinterpret_cast<const uint32_t*>(o.w_q), nullptr, Transform ? nullptr : output, inputs, outputs, 0, 1,
-        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{});
+        nullptr, nullptr, Transform ? output : nullptr, 1.f, 0.f, 1, o.a_q, o.a_scale, o.w_scale, nullptr, gp, NoAdapter{}, NoChain{});
     return hipGetLastError();
 }
 // EXL3 -> IU4 g64 pack (the engines' iu4_convert_kernel with the shared requantisation).
@@ -232,7 +231,8 @@ template<int Tile, bool Transform> hipError_t launch_grouped(const IU4GroupedOpe
 // four K16 tiles. s = FP16(max|w| / 7) (1 when all zero, floored at 2^-24); q = iu4_requant(w, 1/s).
 template<int Bits>
 __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* const* trellis, int inputs, int outputs,
-    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert) {
+    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, int scale_rule) {
+    const bool full = scale_rule == iu4_scale_rule_fast_full;
     const int lane = int(threadIdx.x & 31U), item = int(blockIdx.x) * 8 + int(threadIdx.x >> 5U), ntiles = outputs / 16;
     const int expert = int(blockIdx.y);
     const uint32_t* src = trellis[expert];
@@ -268,7 +268,22 @@ __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* c
             for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(v[u][4 * half + j]));
         amax = fmaxf(amax, __shfl_xor(amax, 1));
         amax = fmaxf(amax, __shfl_xor(amax, 2));
-        const _Float16 s = _Float16(amax == 0.0f ? 1.0f : fmaxf(amax / 7.0f, 0x1p-24f));
+        _Float16 s = _Float16(amax == 0.0f ? 1.0f : fmaxf(amax / 7.0f, 0x1p-24f));
+        if (full) {  // fast full range: the group's positive and negative extremes (the quad's four lanes hold its 64 values)
+            float pos = 0.0f, neg = 0.0f;
+            #pragma unroll
+            for (int u = 0; u < 4; ++u)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    pos = fmaxf(pos, v[u][4 * half + j]);
+                    neg = fmaxf(neg, -v[u][4 * half + j]);
+                }
+            pos = fmaxf(pos, __shfl_xor(pos, 1));
+            pos = fmaxf(pos, __shfl_xor(pos, 2));
+            neg = fmaxf(neg, __shfl_xor(neg, 1));
+            neg = fmaxf(neg, __shfl_xor(neg, 2));
+            s = _Float16(iu4_fast_full_scale(pos, neg));
+        }
         const float inv = 1.0f / float(s);
         if (q == 0) sbase[size_t(n) * size_t(groups) + size_t(g)] = s;
         if (!base) continue;
@@ -276,7 +291,9 @@ __global__ __launch_bounds__(256) void exl3_iu4_convert_kernel(const uint32_t* c
         for (int u = 0; u < 4; ++u)
             #pragma unroll
             for (int pp = 0; pp < 2; ++pp) {
-                const int lo = iu4_requant(v[u][4 * half + 2 * pp], inv), hi = iu4_requant(v[u][4 * half + 2 * pp + 1], inv);
+                const float w0 = v[u][4 * half + 2 * pp], w1 = v[u][4 * half + 2 * pp + 1];
+                const int lo = full ? iu4_requant_full(w0, inv) : iu4_requant(w0, inv),
+                          hi = full ? iu4_requant_full(w1, inv) : iu4_requant(w1, inv);
                 const int k = (g * 4 + u) * 16 + 8 * pp + 2 * q;
                 base[iu4_weight_byte(k, n, outputs)] = uint8_t((uint32_t(lo) & 15U) | ((uint32_t(hi) & 15U) << 4U));
             }
@@ -427,19 +444,20 @@ hipError_t launch_wmma_tiled_iu4_grouped(const IU4GroupedOperands& o,
     return launch_grouped_bits(o, tiles, ntiles, max_tiles, output, inputs, outputs, stream, tile);
 }
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,
-    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream) {
-    if (!trellis || bits < 2 || bits > 8 || experts <= 0 || inputs <= 0 || inputs % 64 || outputs <= 0 || outputs % 16 || !ws)
+    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream, int scale_rule) {
+    if (!trellis || bits < 2 || bits > 8 || experts <= 0 || inputs <= 0 || inputs % 64 || outputs <= 0 || outputs % 16 || !ws ||
+        !iu4_scale_rule_valid(scale_rule))
         return hipErrorInvalidValue;
     const size_t items = size_t(inputs / 64) * size_t(outputs / 16);
     const dim3 grid(unsigned((items + 7U) / 8U), unsigned(experts));
     switch (bits) {  // every EXL3 width an engine stores (MiniMax: routed experts 3-bit, shared expert 5-bit)
-        case 2: wmma_tiled::exl3_iu4_convert_kernel<2><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        case 3: wmma_tiled::exl3_iu4_convert_kernel<3><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        case 4: wmma_tiled::exl3_iu4_convert_kernel<4><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        case 5: wmma_tiled::exl3_iu4_convert_kernel<5><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        case 6: wmma_tiled::exl3_iu4_convert_kernel<6><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        case 7: wmma_tiled::exl3_iu4_convert_kernel<7><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
-        default: wmma_tiled::exl3_iu4_convert_kernel<8><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert); break;
+        case 2: wmma_tiled::exl3_iu4_convert_kernel<2><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 3: wmma_tiled::exl3_iu4_convert_kernel<3><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 4: wmma_tiled::exl3_iu4_convert_kernel<4><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 5: wmma_tiled::exl3_iu4_convert_kernel<5><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 6: wmma_tiled::exl3_iu4_convert_kernel<6><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        case 7: wmma_tiled::exl3_iu4_convert_kernel<7><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
+        default: wmma_tiled::exl3_iu4_convert_kernel<8><<<grid, 256, 0, stream>>>(trellis, inputs, outputs, wq, ws, wq_expert, ws_expert, scale_rule); break;
     }
     return hipGetLastError();
 }

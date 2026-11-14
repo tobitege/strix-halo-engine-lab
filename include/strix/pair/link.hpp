@@ -55,10 +55,12 @@ inline unsigned env_rank(std::string_view prefix) {
         throw std::invalid_argument("pair prefill requires --rank 0|1");
     return value[0] == '0' ? 0U : 1U;
 }
-// transport: usb4auto (default; the striped USB4 host path) or tcp (rank 0 listens on port, rank 1
-// connects to peer), opened by the single shared opener (strix/dist/open_transport.hpp), host path.
-// Both ranks block here until the peer appears: the first common point of a pair run.
-inline std::unique_ptr<dist::Transport> open_link(unsigned rank, std::string_view prefix, std::uint16_t port) {
+// transport: usb4auto (default; the striped USB4 host path), usb4gpu (the same control path plus the
+// device exchange, for a link that moves seam pieces device to device: xport/pair_device_link.hpp) or
+// tcp (rank 0 listens on port, rank 1 connects to peer), opened by the single shared opener
+// (strix/dist/open_transport.hpp). Both ranks block here until the peer appears: the first common
+// point of a pair run.
+inline dist::OpenedTransport open_device_link(unsigned rank, std::string_view prefix, std::uint16_t port, bool device = true) {
     const std::string base(prefix);
     const char* transport_env = std::getenv((base + "_TRANSPORT").c_str());
     std::string spec = transport_env ? transport_env : "usb4auto";
@@ -70,7 +72,15 @@ inline std::unique_ptr<dist::Transport> open_link(unsigned rank, std::string_vie
             throw std::invalid_argument("pair prefill TCP rank 1 requires --peer HOST (port " + std::to_string(port) + ")");
         spec = rank == 0U ? "tcp-listen:" + std::to_string(port) : "tcp-connect:" + std::string(peer) + ":" + std::to_string(port);
         options.usb.timeout = std::chrono::milliseconds(120000);
-    } else if (spec != "usb4auto") throw std::invalid_argument("pair prefill transport must be usb4auto or tcp");
-    return dist::open_transport(spec, options).host;
+    } else if (device && spec == "usb4gpu") {
+        options.spellings = {"usb4auto", "usb4gpu", "usb4-auto", false, false, false};
+    } else if (spec != "usb4auto")
+        throw std::invalid_argument(device ? "pair prefill transport must be usb4auto, usb4gpu or tcp"
+                                           : "pair prefill transport must be usb4auto or tcp");
+    return dist::open_transport(spec, options);
+}
+// The host path only (usb4auto or tcp).
+inline std::unique_ptr<dist::Transport> open_link(unsigned rank, std::string_view prefix, std::uint16_t port) {
+    return open_device_link(rank, prefix, port, false).host;
 }
 } // namespace strix::pair

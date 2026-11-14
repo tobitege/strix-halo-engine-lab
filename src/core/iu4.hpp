@@ -35,6 +35,32 @@ inline int iu4_requant(float w, float inv) {
 #endif
     return q < -7 ? -7 : (q > 7 ? 7 : q);
 }
+// Scale rules of the load-time converter. Legacy: s = max|w| / 7, nibbles in [-7, 7]. Fast full range: one
+// scale s = 0.9 max(max(w, 0) / 7, max(-w, 0) / 8) (0.9 of the largest scale at which [-8, 7] does not clip),
+// nibbles RNE in [-8, 7]; no search, the cost of the legacy rule. Gaussian g64 groups, MSE / energy: legacy
+// 0.0116, fast full range 0.0096.
+inline constexpr int iu4_scale_rule_legacy = 0;
+inline constexpr int iu4_scale_rule_fast_full = 2001;
+inline constexpr bool iu4_scale_rule_valid(int rule) { return rule == iu4_scale_rule_legacy || rule == iu4_scale_rule_fast_full; }
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline float iu4_fast_full_scale(float positive, float negative) {
+    const float a = positive / 7.0f, b = negative / 8.0f, base = a > b ? a : b, raw = 0.9f * base;
+    return base == 0.0f ? 1.0f : (raw > 0x1p-24f ? raw : 0x1p-24f);
+}
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline int iu4_requant_full(float w, float inv) {
+    float x = w * inv;
+    x = x < -8.0f ? -8.0f : (x > 7.0f ? 7.0f : x);
+#if defined(__HIP_DEVICE_COMPILE__)
+    return static_cast<int>(__builtin_rintf(x));
+#else
+    return static_cast<int>(std::nearbyint(x));
+#endif
+}
 template<int Bits, int CB> struct TrellisF16 {
     static constexpr int element_bits = 16, stage_tiles = 2;
     static constexpr int bits = Bits, codebook = CB;

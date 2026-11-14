@@ -3,6 +3,7 @@
 #include "gemma4/kernels/rows_linear.hpp"
 #include "gemma4/kernels/internal.hpp"
 #include "fixture.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
@@ -63,12 +64,34 @@ void compare(const Matrix& w, const Matrix* up, unsigned rows, unsigned seed) {
     const std::vector<float> poison(count, bit_cast<float>(0x7fc0dead));
     reference.upload(poison.data(), reference.size());
     failure.zero();
-    if (up)
-        gate_up_rows(w.view, up->view, dx.as<float>(), rows, reference.as<float>(), nullptr, failure.as<unsigned>(), false);
-    else
-        linear_rows(w.view, dx.as<float>(), rows, reference.as<float>(), nullptr, failure.as<unsigned>(), false);
+    // Explicit slices of at most eight rows through the g4-v1 passes.
+    for (unsigned r = 0; r < rows; r += 8U) {
+        const auto n = std::min(8U, rows - r);
+        if (up)
+            gate_up(w.view, up->view, dx.as<float>() + std::size_t(r) * inputs_count, n,
+                    reference.as<float>() + std::size_t(r) * outputs, true, nullptr, failure.as<unsigned>());
+        else
+            linear(w.view, dx.as<float>() + std::size_t(r) * inputs_count, n, reference.as<float>() + std::size_t(r) * outputs,
+                   true, nullptr, failure.as<unsigned>());
+    }
     synchronize();
     const auto expected = read(reference, count);
+    // Without the many-row tiles: one staged pass up to sixteen rows where admitted, else the slices.
+    {
+        candidate.upload(poison.data(), candidate.size());
+        if (up)
+            gate_up_rows(w.view, up->view, dx.as<float>(), rows, candidate.as<float>(), nullptr, failure.as<unsigned>(), false);
+        else
+            linear_rows(w.view, dx.as<float>(), rows, candidate.as<float>(), nullptr, failure.as<unsigned>(), false);
+        synchronize();
+        const auto got = read(candidate, count);
+        if (std::memcmp(got.data(), expected.data(), count * sizeof(float))) {
+            std::cerr << "mismatch " << name(w.view.format) << (up ? " gate_up" : " linear") << " outputs " << outputs
+                      << " inputs " << inputs_count << " rows " << rows << " staged or sliced\n";
+            bytes(got, expected);
+        }
+        ++cases;
+    }
     unsigned flag = 1;
     failure.download(&flag, sizeof(flag));
     CHECK(flag == 0);
@@ -113,7 +136,7 @@ void host_identity(const Matrix& w, unsigned rows) {
     ++cases;
 }
 void tests(bool full) {
-    const std::vector<unsigned> many = {1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 47, 64, 65, 100, 129, 255, 257, 511, 512};
+    const std::vector<unsigned> many = {1, 2, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 31, 32, 33, 47, 64, 65, 100, 129, 255, 257, 511, 512};
     const std::vector<unsigned> few = {9, 17, 33, 100, 512};
     for (const auto f : {WeightFormat::bf16, WeightFormat::f32, WeightFormat::q8_0, WeightFormat::q4_k, WeightFormat::q6_k}) {
         const bool dense = f == WeightFormat::bf16 || f == WeightFormat::f32;

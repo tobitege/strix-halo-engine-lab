@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/qpf2k_defaults.hpp"
 
 #include <cstdlib>
@@ -14,7 +15,7 @@ namespace strix {
 // step as one-row persistent launches.
 // Every fused form keeps the expressions and operation order of the separate launches (bit-identical).
 inline bool strix_dispatch_fuse_enabled() noexcept {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DISPATCH_FUSE"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DISPATCH_FUSE", false);
     return !qpf2k::suppressed(qpf2k::Item::dispatch_fuse) && on;
 }
 // Cache only the raw tri-state. Owner filtering must run at every invocation,

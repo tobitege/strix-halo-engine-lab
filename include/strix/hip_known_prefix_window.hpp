@@ -183,9 +183,10 @@ public:
         std::span<HipKnownPrefixWindow* const> primaries, std::span<const std::size_t> chunk_members,
         std::span<const HipKnownPrefixCohortMember> members);
     // Segmented tiled prefill (several requests' prompt blocks in one run): segment s is a block of
-    // members[s].tokens rows of members[s].session, which must equal the rows of members[s].own (that
+    // members[s].tokens rows of members[s].session: the rows of members[s].own, or the first 16..T rows of it in
+    // multiples of 8 (a partial block, as execute_partial runs alone); own is that
     // session's own idle tiled owner of the block, whose resources, profile and lineage identity the segment
-    // uses). The segments occupy consecutive rows of this owner's arena (an idle tiled prefill owner of the
+    // uses. The segments occupy consecutive rows of this owner's arena (an idle tiled prefill owner of the
     // same execution whose T covers them all). Row-independent steps (STRIX_PROMPT_BATCH_SHARED) run once
     // for every segment's rows; every other step runs per segment exactly as the segment's block alone.
     // head: the segment's last row computes its logits (results[s].logits). observer: like

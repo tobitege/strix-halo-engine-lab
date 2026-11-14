@@ -1,7 +1,9 @@
 #include "strix/deepseek41_prefix_cache.hpp"
 
 #include "strix/ds41_attention.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/session/checkpoint_io.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -150,109 +152,33 @@ bool parse_header(const std::vector<std::uint8_t>& file, std::size_t size, std::
     return h.payload_checksum == checksum(file.data() + kHeaderBytes, size - kHeaderBytes);
 }
 
-// ---- file I/O ----
-#if defined(__unix__)
-void sync_dir(const fs::path& dir) {
-    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd >= 0) {
-        (void)::fsync(fd);
-        ::close(fd);
+// ---- file I/O: codecs and scheduling stay here; mechanics are shared ----
+namespace io = session::checkpoint_io;
+void sync_dir(const fs::path& dir) { io::sync_directory(dir); }
+
+bool write_file(const fs::path& path, const std::vector<std::uint8_t>& data, bool drop) noexcept {
+    try {
+        io::Options options;
+        options.permissions = 0644;
+        options.drop_page_cache = drop;
+        options.temporary_suffix = ".tmp"; // existing quota and restart cleanup count this extension
+        io::atomic_write(path, std::as_bytes(std::span(data)), options);
+        return true;
+    } catch (...) {
+        // Also contains allocation/filesystem errors on the existing asynchronous worker.
+        // A post-replacement sync failure is visible with uncertain durability, not rollback.
+        return false;
     }
 }
 
-bool write_file(const fs::path& path, const std::vector<std::uint8_t>& data, bool drop) {
-    const fs::path tmp = path.string() + ".tmp";
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return false;
-    std::size_t at = 0;
-    bool ok = true;
-    while (at < data.size()) {
-        const auto n = ::write(fd, data.data() + at, data.size() - at);
-        if (n <= 0) {
-            ok = false;
-            break;
-        }
-        at += static_cast<std::size_t>(n);
-    }
-    ok = ok && ::fdatasync(fd) == 0;
-    if (ok && drop) (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    ::close(fd);
-    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0) {
-        (void)::unlink(tmp.c_str());
-        return false;
-    }
-    sync_dir(path.parent_path());
-    return true;
+bool read_file(const fs::path& path, std::vector<std::uint8_t>& out, std::size_t& size, bool direct) noexcept {
+    try {
+        // Historically buffered reads drop pages even when direct reads are disabled.
+        io::read(path, out, direct ? io::DirectIo::automatic : io::DirectIo::buffered, true);
+        size = out.size();
+        return true;
+    } catch (...) { return false; }
 }
-
-// The whole file into `out` (resized to a multiple of 4096 for O_DIRECT; `size` = the file's bytes). False on error.
-bool read_file(const fs::path& path, std::vector<std::uint8_t>& out, std::size_t& size, bool direct) {
-    int fd = direct ? ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT) : -1;
-    bool is_direct = fd >= 0;
-    if (fd < 0) fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    struct stat st {};
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
-        return false;
-    }
-    size = static_cast<std::size_t>(st.st_size);
-    const std::size_t padded = (size + 4095U) / 4096U * 4096U + 4096U;
-    // an aligned window inside `out` for O_DIRECT: the data are moved to the front afterwards
-    out.resize(padded + 4096U);
-    auto* base = out.data();
-    const auto misalign = reinterpret_cast<std::uintptr_t>(base) % 4096U;
-    std::uint8_t* dst = base + (misalign == 0U ? 0U : 4096U - misalign);
-    std::size_t at = 0;
-    bool ok = true;
-    while (at < size) {
-        const std::size_t want = std::min<std::size_t>(std::size_t{16} << 20U, (size - at + 4095U) / 4096U * 4096U);
-        const auto n = ::pread(fd, dst + at, want, static_cast<off_t>(at));
-        if (n < 0 && is_direct && at == 0U) {  // a file system without O_DIRECT: read it buffered
-            ::close(fd);
-            fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-            if (fd < 0) return false;
-            is_direct = false;
-            continue;
-        }
-        if (n <= 0) {
-            ok = false;
-            break;
-        }
-        at += static_cast<std::size_t>(n);
-    }
-    if (!is_direct) (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    ::close(fd);
-    if (!ok) return false;
-    if (dst != base) std::memmove(base, dst, size);
-    out.resize(size);
-    return true;
-}
-#else
-void sync_dir(const fs::path&) {}
-bool write_file(const fs::path& path, const std::vector<std::uint8_t>& data, bool) {
-    const fs::path tmp = path.string() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-        if (!f) return false;
-    }
-    std::error_code ec;
-    fs::rename(tmp, path, ec);
-    return !ec;
-}
-bool read_file(const fs::path& path, std::vector<std::uint8_t>& out, std::size_t& size, bool) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.seekg(0, std::ios::end);
-    size = static_cast<std::size_t>(f.tellg());
-    f.seekg(0);
-    out.resize(size);
-    f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
-    return static_cast<bool>(f);
-}
-#endif
 
 // Runs fn(i) for i in [0, n) on up to `threads` threads.
 template <typename F>
@@ -278,26 +204,6 @@ std::string hex16(std::uint64_t v) {
 }
 
 }  // namespace
-
-struct PrefixCache::Node {
-    std::uint64_t key = 0;
-    Node* parent = nullptr;
-    std::uint32_t depth = 0;  // blocks up to and including this one
-    std::uint32_t children = 0;
-    std::vector<std::uint32_t> tokens;                       // the block's tokens
-    std::vector<std::vector<std::uint8_t>> kv, idx;          // per layer (empty outside the KV sources): the block's entries
-    struct Snapshot {
-        std::vector<std::vector<std::uint8_t>> rings;        // per layer
-        std::vector<std::vector<float>> carries;             // per layer (ratio-2 sources)
-        std::vector<char> carry_valid;
-        std::uint32_t next_token = 0;
-        std::uint64_t logits_fnv = 0;
-        std::uint64_t last_use = 0;
-        std::uint64_t bytes = 0;
-    };
-    std::unique_ptr<Snapshot> snapshot;
-    std::uint64_t bytes = 0;  // the block's own bytes (without the snapshot)
-};
 
 // A block (and maybe a snapshot) of the disk tier: what lookups need is kept in memory, the data stay in the files.
 struct PrefixCache::DiskEntry {
@@ -420,6 +326,16 @@ private:
 };
 
 // The writer thread: file writes and deletions in call order (a deletion after a write of the same file wins).
+#ifdef STRIX_DS41_PREFIX_IO_TESTING
+namespace prefix_io_test {
+namespace {
+thread_local WriterHook hook = nullptr;
+thread_local void* hook_context = nullptr;
+}
+void set_writer_hook(WriterHook value, void* context) noexcept { hook = value; hook_context = context; }
+}
+#endif
+
 struct PrefixCache::Writer {
     struct Job {
         fs::path path;
@@ -474,6 +390,9 @@ private:
                 queue_.pop_front();
                 busy_ = true;
             }
+#ifdef STRIX_DS41_PREFIX_IO_TESTING
+            if (hook_) hook_(hook_context_, true, job.path, bool(job.data));
+#endif
             if (job.data) {
                 const auto t0 = Clock::now();
                 if (write_file(job.path, *job.data, drop_)) {
@@ -487,6 +406,9 @@ private:
                 std::error_code ec;
                 fs::remove(job.path, ec);
             }
+#ifdef STRIX_DS41_PREFIX_IO_TESTING
+            if (hook_) hook_(hook_context_, false, job.path, bool(job.data));
+#endif
             {
                 const std::lock_guard lock(mutex_);
                 if (job.data) {
@@ -506,6 +428,11 @@ private:
     std::condition_variable cv_, idle_;
     std::deque<Job> queue_;
     bool stop_ = false, busy_ = false;
+#ifdef STRIX_DS41_PREFIX_IO_TESTING
+    // Copied at construction; fault setup/observation executes on this SAME worker.
+    prefix_io_test::WriterHook hook_ = prefix_io_test::hook;
+    void* hook_context_ = prefix_io_test::hook_context;
+#endif
     std::thread thread_;
 };
 
@@ -574,7 +501,7 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     std::string t = "ds41-prefix-ns=1;";
     const auto overlay = env_or("STRIX_DS41_OVERLAY");
     t += "overlay=" + (overlay.empty() ? std::string("-") : path_digest(overlay)) + ";";
-    t += "cb4=" + std::string(!overlay.empty() && env_or("STRIX_DS41_CB4") == "1" ? "1" : "0") + ";";
+    t += "cb4=" + std::string(!overlay.empty() && strix::env_flag_default_off("STRIX_DS41_CB4") ? "1" : "0") + ";";
     const auto trellis = env_or("STRIX_DS41_TRELLIS");
     const auto sites = env_or("STRIX_DS41_TRELLIS_SITES");
     const auto mix = env_or("STRIX_DS41_TRELLIS_MIX");
@@ -582,32 +509,32 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     t += "trellis=" + (trellis_on ? path_digest(trellis) : std::string("-")) + ";";
     t += "trellis_sites=" + (trellis_on ? sites : std::string("-")) + ";";
     t += "trellis_mix=" + (trellis_on && !mix.empty() ? (fs::exists(mix) ? path_digest(mix) : mix) : std::string("-")) + ";";
-    t += "shexp_tp=" + std::string(trellis_on && env_or("STRIX_DS41_SHEXP_TP") == "1" ? "1" : "0") + ";";
+    t += "shexp_tp=" + std::string(trellis_on && strix::env_flag_default_off("STRIX_DS41_SHEXP_TP") ? "1" : "0") + ";";
     const auto ep_map = env_or("STRIX_DS41_EP_MAP");
     t += "ep_map=" + (ep_map.empty() ? std::string("-") : path_digest(ep_map)) + ";";
     t += "prefill=ep;";
     // Approximate prefill states must never alias the incumbent namespace.
-    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1") t += "prefill_attention=bf16-hilo-v1;";
-    else if (env_or("STRIX_DS41_FAST_ATTN") == "1") t += "prefill_attention=f16wmma-v1;";
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN")) t += "prefill_attention=bf16-hilo-v1;";
+    else if (strix::env_flag_default_off("STRIX_DS41_FAST_ATTN")) t += "prefill_attention=f16wmma-v1;";
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
-    if (env_or("STRIX_DS41_FAST_MOE") == "1") t += "prefill_moe=relaxed-v1;";
-    if (env_or("STRIX_DS41_FAST_I4") == "1") {
-        if (env_or("STRIX_DS41_FAST_MOE") == "1")
+    if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE")) t += "prefill_moe=relaxed-v1;";
+    if (strix::env_flag_default_off("STRIX_DS41_FAST_I4")) {
+        if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE"))
             throw std::invalid_argument("FAST_I4 and FAST_MOE are distinct policies");
         const auto scope = env_or("STRIX_DS41_FAST_I4_SCOPE");
         if (!scope.empty() && scope != "all" && scope != "gu")
             throw std::invalid_argument("STRIX_DS41_FAST_I4_SCOPE must be all or gu");
         t += "prefill_moe=gguf-iu4-direct-v1:" + (scope.empty() ? std::string("all") : scope) + ";";
     }
-    if (env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1") {
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE")) {
         const auto picks = env_or("STRIX_DS41_FP16_CACHE");
-        if (picks.empty() || env_or("STRIX_DS41_FP16_CACHE_READONLY") != "1")
+        if (picks.empty() || !strix::env_flag_default_off("STRIX_DS41_FP16_CACHE_READONLY"))
             throw std::invalid_argument("FP16 prefill prefix cache requires a frozen solution cache (STRIX_DS41_FP16_CACHE_READONLY=1)");
         t += "prefill_dense=fp16-lt-v1:" + path_digest(picks) + ";";
     }
     // every knob that changes an approximate prefill's arithmetic (unset in the exact default: no change to its namespace)
-    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1" || env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1" || env_or("STRIX_DS41_FAST_ATTN") == "1")
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN") || strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE") || strix::env_flag_default_off("STRIX_DS41_FAST_ATTN"))
         for (const char* k : {"STRIX_DS41_PREFILL_APPROX_LAYERS", "STRIX_DS41_BF16_ATTN_VARIANT", "STRIX_DS41_PREFILL_FP16_PROJ",
                               "STRIX_DS41_PREFILL_FP16_MIN_ROWS", "STRIX_DS41_PREFILL_FP16_A8", "STRIX_DS41_PREFILL_FP16_FAST",
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})
@@ -716,13 +643,23 @@ PrefillRunPlan select_prefix_prefill_plan(std::uint32_t resume, std::uint32_t sh
     return {plan_prefill_pieces(resume, shared, total, block, max_rows, min_rows, before_tail), {}};
 }
 
-PrefixCache::PrefixCache(const PrefixCacheOptions& options) : options_(options) {
+PrefixCache::PrefixCache(const PrefixCacheOptions& options, std::shared_ptr<PrefixStateCache> owner) : options_(options), owner_(std::move(owner)) {
     if (options.block == 0U || options.block % 8U != 0U) throw std::invalid_argument("deepseek41 prefix cache: block must be a positive multiple of 8");
+    if (!owner_) {
+        PrefixStateCachePolicy policy;
+        policy.host_byte_budget=options.budget_bytes ? options.budget_bytes : UINT64_MAX;
+        policy.retention=PrefixCacheRetention::lru;
+        owner_=std::make_shared<PrefixStateCache>(policy,[](std::uint64_t n) {
+            return PrefixCacheBuffer{std::shared_ptr<std::byte>(new std::byte[static_cast<std::size_t>(n)],std::default_delete<std::byte[]>()),n};
+        });
+    }
+    scope_=owner_->new_scope();
     if (has_disk()) open_disk();
 }
 
 PrefixCache::~PrefixCache() {
     if (writer_) writer_->flush();
+    clear_ram();
 }
 
 fs::path PrefixCache::block_path(std::uint64_t key) const { return options_.dir / ("b-" + hex16(key) + ".blk"); }
@@ -733,8 +670,7 @@ void PrefixCache::flush() {
 }
 
 void PrefixCache::clear_ram() {
-    nodes_.clear();
-    stats_.bytes = stats_.blocks = stats_.snapshots = 0;
+    owner_->remove(scope_,[](const auto&) { return true; });
 }
 
 void PrefixCache::clear() {
@@ -750,6 +686,9 @@ void PrefixCache::clear() {
 
 PrefixCacheStats PrefixCache::stats() const {
     auto s = stats_;
+    const auto ram=owner_->chain_stats(scope_);
+    s.bytes=ram.bytes; s.blocks=ram.blocks; s.snapshots=ram.snapshots;
+    s.evicted_snapshots=ram.evicted_snapshots; s.evicted_blocks=ram.evicted_blocks;
     if (writer_) {
         s.written_files = writer_->files.load();
         s.written_bytes = writer_->bytes.load();
@@ -774,13 +713,32 @@ void PrefixCache::set_layout(const AttentionState& s) {
     }
 }
 
-const PrefixCache::Node* PrefixCache::ram_node(std::uint64_t key, std::uint32_t depth, std::span<const std::uint32_t> block_tokens) const {
-    const auto it = nodes_.find(key);
-    if (it == nodes_.end()) return nullptr;
-    const Node& n = *it->second;
-    if (n.depth != depth || !std::equal(block_tokens.begin(), block_tokens.end(), n.tokens.begin(), n.tokens.end())) return nullptr;
-    if (depth > 1U && (n.parent == nullptr || n.parent->depth != depth - 1U)) return nullptr;
-    return &n;
+ModelContentIdentity PrefixCache::ram_id(std::uint64_t key) const {
+    ModelContentIdentity id;
+    std::memcpy(id.bytes.data(),&scope_,8);
+    std::memcpy(id.bytes.data()+8,&key,8);
+    id.bytes.back()=0xd4;
+    return id;
+}
+std::shared_ptr<const PrefixCacheSegment> PrefixCache::ram_node(std::uint64_t key, std::uint32_t depth, std::span<const std::uint32_t> tokens) const {
+    auto n=owner_->chain_segment(scope_,ram_id(key));
+    if(!n || n->block_index+1!=depth || !std::equal(tokens.begin(),tokens.end(),n->tokens.begin(),n->tokens.end())) return {};
+    if(depth>1 && (!n->ancestor || n->ancestor->block_index+2!=depth)) return {};
+    return n;
+}
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixCache::ram_snapshot(std::uint64_t key, bool touch) const {
+    return owner_->chain_checkpoint(scope_,ram_id(key),touch);
+}
+const std::uint8_t* PrefixCache::ram_layer(const PrefixCacheSegment& n, std::size_t layer, bool index) const {
+    std::size_t at=0;
+    for(std::size_t l=0;l<layer;++l) if(layout_[l].owns_kv)
+        at+=std::size_t{options_.block/layout_[l].ratio}*(ds41::attn::kKvEntryBytes+ds41::attn::kIdxEntryBytes);
+    if(index) at+=std::size_t{options_.block/layout_[layer].ratio}*ds41::attn::kKvEntryBytes;
+    return reinterpret_cast<const std::uint8_t*>(n.payload.data.get())+at;
+}
+namespace {
+std::uint32_t ram_next(const PrefixCacheCheckpoint& c) { std::uint32_t v; std::memcpy(&v,c.fixed.data.get(),4); return v; }
+std::uint64_t ram_logits(const PrefixCacheCheckpoint& c) { std::uint64_t v; std::memcpy(&v,c.fixed.data.get()+8,8); return v; }
 }
 
 const PrefixCache::DiskEntry* PrefixCache::disk_entry(std::uint64_t key, std::uint64_t parent, std::uint32_t depth,
@@ -801,20 +759,21 @@ PrefixLookup PrefixCache::lookup(std::span<const std::uint32_t> tokens, std::uin
         const auto piece = tokens.subspan(std::size_t{k} * B, B);
         const std::uint64_t parent = key;
         key = chain(key, piece);
-        const Node* n = ram_node(key, k + 1U, piece);
+        const auto n = ram_node(key, k + 1U, piece);
+        const auto snap = n ? ram_snapshot(key) : nullptr;
         const DiskEntry* d = disk_.empty() ? nullptr : disk_entry(key, parent, k + 1U, piece);
         if (n == nullptr && d == nullptr) break;
         if (n == nullptr) disk_bytes += d->block_bytes;
         out.shared = (k + 1U) * B;
         const std::size_t left = tokens.size() - out.shared;
-        const bool ram_snap = n != nullptr && n->snapshot;
+        const bool ram_snap = bool(snap);
         const bool disk_snap = d != nullptr && d->snapshot;
-        const bool whole = left == 0U && (ram_snap || disk_snap) && (ram_snap ? n->snapshot->next_token : d->next_token) != kPrefixUnknownNextToken;
+        const bool whole = left == 0U && (ram_snap || disk_snap) && (ram_snap ? ram_next(*snap) : d->next_token) != kPrefixUnknownNextToken;
         if ((ram_snap || disk_snap) && (whole || left >= min_rows)) {
             out.resume = out.shared;
             out.key = key;
-            out.next_token = ram_snap ? n->snapshot->next_token : d->next_token;
-            out.logits_fnv = ram_snap ? n->snapshot->logits_fnv : d->logits_fnv;
+            out.next_token = ram_snap ? ram_next(*snap) : d->next_token;
+            out.logits_fnv = ram_snap ? ram_logits(*snap) : d->logits_fnv;
             out.disk_bytes = disk_bytes + (ram_snap ? 0U : d->snap_bytes);
             out.disk = out.disk_bytes != 0U;
         }
@@ -848,7 +807,7 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
     if (position == 0U || position % B != 0U || position > tokens.size()) fail("state: not a block boundary of the prompt");
     const std::uint32_t D = position / B;
     // the path: per depth the RAM node, else the disk entry
-    std::vector<const Node*> ram(D, nullptr);
+    std::vector<std::shared_ptr<const PrefixCacheSegment>> ram(D);
     std::vector<const DiskEntry*> dsk(D, nullptr);
     std::uint64_t k_key = 0;
     for (std::uint32_t k = 0; k < D; ++k) {
@@ -860,8 +819,8 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
         if (ram[k] == nullptr && dsk[k] == nullptr) fail("state: missing block " + std::to_string(k));
     }
     if (k_key != key) fail("state: the key does not match the prompt");
-    const Node* leaf = ram[D - 1U];
-    const bool ram_snap = leaf != nullptr && leaf->snapshot;
+    const auto snap = ram[D-1U] ? ram_snapshot(key) : nullptr;
+    const bool ram_snap = bool(snap);
     const DiskEntry* dleaf = nullptr;
     if (!ram_snap) {
         const auto it = disk_.find(key);
@@ -905,16 +864,16 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
         const auto expect_table = layout_table(layout_);
         parallel_for(reads.size(), options_.io_threads, [&](std::size_t i) {
             auto& r = reads[i];
-            const bool snap = r.depth == 0U;
-            const DiskEntry& e = snap ? *dleaf : *dsk[r.depth - 1U];
-            if (!read_file(snap ? snapshot_path(e.key) : block_path(e.key), r.data, r.size, options_.drop_page_cache)) return;
+            const bool is_snap = r.depth == 0U;
+            const DiskEntry& e = is_snap ? *dleaf : *dsk[r.depth - 1U];
+            if (!read_file(is_snap ? snapshot_path(e.key) : block_path(e.key), r.data, r.size, options_.drop_page_cache)) return;
             Header h{};
-            if (!parse_header(r.data, r.size, snap ? kKindSnapshot : kKindBlock, h)) return;
+            if (!parse_header(r.data, r.size, is_snap ? kKindSnapshot : kKindBlock, h)) return;
             if (std::memcmp(h.model_id, options_.model_id.data(), 32) != 0 || h.layout_hash != layout_hash || h.block != B || h.layers != layers ||
                 h.key != e.key || h.depth != e.depth || h.parent != e.parent)
                 return;
             if (h.payload_bytes < table || std::memcmp(r.data.data() + kHeaderBytes, expect_table.data(), table) != 0) return;
-            if (!snap) {
+            if (!is_snap) {
                 if (r.size != e.block_bytes) return;
                 if (std::memcmp(r.data.data() + kHeaderBytes + table, e.tokens.data(), std::size_t{B} * 4U) != 0) return;
                 if (h.payload_checksum != e.block_digest) return;
@@ -954,19 +913,9 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
     std::vector<const std::uint8_t*> ring_src(layers, nullptr), carry_src(layers, nullptr);
     std::vector<std::size_t> ring_n(layers, 0), carry_n(layers, 0);
     std::vector<char> carry_valid(layers, 0);
-    if (ram_snap) {
-        const auto& snap = *leaf->snapshot;
-        s.next_token = snap.next_token;
-        for (std::size_t l = 0; l < layers; ++l) {
-            ring_src[l] = snap.rings[l].data();
-            ring_n[l] = snap.rings[l].size();
-            carry_src[l] = reinterpret_cast<const std::uint8_t*>(snap.carries[l].data());
-            carry_n[l] = snap.carries[l].size();
-            carry_valid[l] = snap.carry_valid[l];
-        }
-    } else {
-        const std::uint8_t* p = snap_read->data.data() + kHeaderBytes + table;
-        const std::uint8_t* end = snap_read->data.data() + snap_read->size;
+    {
+        const std::uint8_t* p = ram_snap ? reinterpret_cast<const std::uint8_t*>(snap->fixed.data.get()) : snap_read->data.data() + kHeaderBytes + table;
+        const std::uint8_t* end = ram_snap ? p + snap->fixed.bytes : snap_read->data.data() + snap_read->size;
         const auto get = [&](void* dst, std::size_t n) {
             if (static_cast<std::size_t>(end - p) < n) throw PrefixCacheReadError("deepseek41 prefix cache: snapshot file too short");
             std::memcpy(dst, p, n);
@@ -984,7 +933,8 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
             get(&rn, 8);
             get(&cn, 8);
             get(&cv, 8);
-            if (rn > (std::uint64_t{1} << 30U) || cn > (std::uint64_t{1} << 20U) || static_cast<std::uint64_t>(end - p) < rn + cn * 4U)
+            if ((!ram_snap && (rn > (std::uint64_t{1} << 30U) || cn > (std::uint64_t{1} << 20U))) ||
+                static_cast<std::uint64_t>(end - p) < rn + cn * 4U)
                 throw PrefixCacheReadError("deepseek41 prefix cache: snapshot sizes");
             ring_src[l] = p;
             ring_n[l] = rn;
@@ -1008,8 +958,8 @@ AttentionState PrefixCache::load(std::span<const std::uint32_t> tokens, std::uin
         L.idx_keys.resize(ixb * D);
         for (std::uint32_t k = 0; k < D; ++k) {
             if (ram[k] != nullptr) {
-                std::memcpy(L.kv.data() + kvb * k, ram[k]->kv[l].data(), kvb);
-                std::memcpy(L.idx_keys.data() + ixb * k, ram[k]->idx[l].data(), ixb);
+                std::memcpy(L.kv.data() + kvb * k, ram_layer(*ram[k],l,false), kvb);
+                std::memcpy(L.idx_keys.data() + ixb * k, ram_layer(*ram[k],l,true), ixb);
             } else {
                 std::memcpy(L.kv.data() + kvb * k, disk_payload[k] + kv_off[l], kvb);
                 std::memcpy(L.idx_keys.data() + ixb * k, disk_payload[k] + idx_off[l], ixb);
@@ -1029,13 +979,12 @@ void PrefixCache::use(const AttentionState& loaded, std::uint64_t key) {
     const std::uint64_t now = ++clock_;
     bool from_disk = false;
     std::uint64_t logits = 0;
-    const auto it = nodes_.find(key);
-    if (it != nodes_.end() && it->second->depth == D && it->second->snapshot) {
-        it->second->snapshot->last_use = now;
-        logits = it->second->snapshot->logits_fnv;
-    } else {
-        from_disk = true;
+    const auto snap=ram_snapshot(key);
+    if(snap && snap->position/B==D) {
+        (void)ram_snapshot(key,true);
+        logits=ram_logits(*snap);
     }
+    else from_disk=true;
     if (const auto d = disk_.find(key); d != disk_.end() && d->second->snapshot) {
         d->second->last_use = now;
         if (from_disk) logits = d->second->logits_fnv;
@@ -1100,99 +1049,60 @@ bool PrefixCache::insert(const AttentionState& s, std::uint64_t logits_fnv, std:
 
 bool PrefixCache::insert_ram(const AttentionState& s, std::uint64_t logits_fnv, std::uint32_t kv_from, const std::vector<std::uint64_t>& keys) {
     namespace attn = ds41::attn;
-    const std::uint32_t B = options_.block;
-    const std::uint32_t blocks = s.position / B;
+    const auto B=options_.block;
+    const auto blocks=s.position/B;
     const std::span<const std::uint32_t> tokens(s.tokens);
-    // the chain as far as the cache has it
-    std::uint32_t have = 0;
-    for (std::uint32_t k = 0; k < blocks; ++k) {
-        if (ram_node(keys[k], k + 1U, tokens.subspan(std::size_t{k} * B, B)) == nullptr) break;
-        have = k + 1U;
+    std::uint32_t have=0;
+    std::shared_ptr<const PrefixCacheSegment> tip;
+    for(std::uint32_t k=0;k<blocks;++k) {
+        auto n=ram_node(keys[k],k+1,tokens.subspan(std::size_t{k}*B,B));
+        if(!n) break;
+        tip=std::move(n); have=k+1;
     }
-    if (have * B < kv_from) {  // the blocks below kv_from are not in this tier
-        ++stats_.refused;
-        return false;
+    if(have*B<kv_from) { ++stats_.refused; return false; }
+    for(auto k=have;k<blocks;++k) if(owner_->chain_segment(scope_,ram_id(keys[k]))) { ++stats_.refused; return false; }
+    if(have==blocks && ram_snapshot(keys.back(),true)) { ++clock_; return true; }
+    std::uint64_t block_payload=0;
+    const auto block_metadata=kNodeOverhead+std::uint64_t{B}*4+s.layers.size()*(2*sizeof(std::vector<std::uint8_t>)+64);
+    for(const auto& l:s.layers) if(l.owns_kv) block_payload+=std::uint64_t{B/l.ratio}*(attn::kKvEntryBytes+attn::kIdxEntryBytes);
+    std::uint64_t fixed_payload=16+s.layers.size()*24;
+    std::uint64_t snap_charge=kNodeOverhead+s.layers.size()*(sizeof(std::vector<std::uint8_t>)+sizeof(std::vector<float>)+65);
+    for(const auto& l:s.layers) { fixed_payload+=l.ring.size()+l.carry.size()*4; snap_charge+=l.ring.size()+l.carry.size()*4; }
+    std::vector<std::shared_ptr<PrefixCacheSegment>> fresh;
+    for(auto k=have;k<blocks;++k) {
+        auto n=std::make_shared<PrefixCacheSegment>();
+        n->digest=ram_id(keys[k]); n->parent=k?ram_id(keys[k-1]):ram_id(0);
+        n->identity=ram_id(0); n->block_index=k; n->block_rows=B;
+        n->tokens.assign(tokens.begin()+std::size_t{k}*B,tokens.begin()+std::size_t{k+1}*B);
+        n->ancestor=tip; n->charge=block_metadata+block_payload; n->payload.bytes=block_payload;
+        tip=n; fresh.push_back(std::move(n));
     }
-    // a key in use by another chain (hash collision): do not insert
-    for (std::uint32_t k = have; k < blocks; ++k)
-        if (nodes_.contains(keys[k])) {
-            ++stats_.refused;
-            return false;
+    auto cp=std::make_shared<PrefixCacheCheckpoint>();
+    cp->identity=ram_id(0); cp->digest=ram_id(keys.back()); cp->position=s.position; cp->block_rows=B;
+    cp->segments.push_back(tip); cp->charge=snap_charge; cp->fixed.bytes=fixed_payload;
+    cp->retention.scope=scope_; cp->retention.max_bytes=options_.budget_bytes?options_.budget_bytes:UINT64_MAX;
+    const bool ok=owner_->retain_chain(cp,[&](PrefixCacheCheckpoint& target,const PrefixCacheAllocator& allocate) {
+        for(auto& n:fresh) {
+            n->payload=allocate(block_payload);
+            auto* out=n->payload.data.get();
+            for(const auto& l:s.layers) if(l.owns_kv) {
+                const auto first=(n->block_index*B-kv_from)/l.ratio;
+                const auto kvb=std::size_t{B/l.ratio}*attn::kKvEntryBytes, ixb=std::size_t{B/l.ratio}*attn::kIdxEntryBytes;
+                std::memcpy(out,l.kv.data()+first*attn::kKvEntryBytes,kvb); out+=kvb;
+                std::memcpy(out,l.idx_keys.data()+first*attn::kIdxEntryBytes,ixb); out+=ixb;
+            }
         }
-    if (have == blocks && nodes_.at(keys[blocks - 1U])->snapshot) {
-        nodes_.at(keys[blocks - 1U])->snapshot->last_use = ++clock_;
-        return true;
-    }
-    // bytes this insert adds
-    const auto block_bytes = [&] {
-        std::uint64_t n = kNodeOverhead + std::uint64_t{B} * 4U + s.layers.size() * (2U * sizeof(std::vector<std::uint8_t>) + 64U);
-        for (const auto& L : s.layers)
-            if (L.owns_kv) n += std::uint64_t{B / L.ratio} * (attn::kKvEntryBytes + attn::kIdxEntryBytes);
-        return n;
-    };
-    std::uint64_t snap_bytes = kNodeOverhead + s.layers.size() * (sizeof(std::vector<std::uint8_t>) + sizeof(std::vector<float>) + 65U);
-    for (const auto& L : s.layers) snap_bytes += L.ring.size() + L.carry.size() * 4U;
-    std::uint64_t need = snap_bytes;
-    for (std::uint32_t k = have; k < blocks; ++k) need += block_bytes();
-    if (options_.budget_bytes != 0U) {
-        if (need > options_.budget_bytes) {
-            ++stats_.refused;
-            return false;
+        target.fixed=allocate(fixed_payload);
+        auto* out=target.fixed.data.get();
+        const auto put=[&](const void* p,std::size_t n) { if(n) std::memcpy(out,p,n); out+=n; };
+        put(&s.next_token,4); put(&s.position,4); put(&logits_fnv,8);
+        for(const auto& l:s.layers) {
+            const std::uint64_t rn=l.ring.size(),cn=l.carry.size(),cv=l.carry_valid?1:0;
+            put(&rn,8); put(&cn,8); put(&cv,8); put(l.ring.data(),l.ring.size()); put(l.carry.data(),l.carry.size()*4);
         }
-        // evict, but never the chain this insert extends (pin its existing nodes by giving them a reference)
-        Node* tip = have > 0U ? nodes_.at(keys[have - 1U]).get() : nullptr;
-        if (tip != nullptr) ++tip->children;  // a pin: prune() never removes a node with children
-        while (stats_.bytes + need > options_.budget_bytes && stats_.snapshots > 0U) evict_one();
-        if (tip != nullptr) --tip->children;
-        if (stats_.bytes + need > options_.budget_bytes) {
-            if (tip != nullptr) prune(tip);
-            ++stats_.refused;
-            return false;
-        }
-    }
-    Node* parent = have > 0U ? nodes_.at(keys[have - 1U]).get() : nullptr;
-    for (std::uint32_t k = have; k < blocks; ++k) {
-        auto n = std::make_unique<Node>();
-        n->key = keys[k];
-        n->parent = parent;
-        n->depth = k + 1U;
-        n->tokens.assign(tokens.begin() + std::size_t{k} * B, tokens.begin() + std::size_t{k + 1U} * B);
-        n->kv.resize(layout_.size());
-        n->idx.resize(layout_.size());
-        for (std::size_t l = 0; l < layout_.size(); ++l) {
-            const auto& L = s.layers[l];
-            if (!L.owns_kv) continue;
-            const std::size_t per = B / L.ratio, first = (std::size_t{k} * B - kv_from) / L.ratio;
-            n->kv[l].assign(L.kv.begin() + static_cast<std::ptrdiff_t>(first * attn::kKvEntryBytes),
-                            L.kv.begin() + static_cast<std::ptrdiff_t>((first + per) * attn::kKvEntryBytes));
-            n->idx[l].assign(L.idx_keys.begin() + static_cast<std::ptrdiff_t>(first * attn::kIdxEntryBytes),
-                             L.idx_keys.begin() + static_cast<std::ptrdiff_t>((first + per) * attn::kIdxEntryBytes));
-        }
-        n->bytes = block_bytes();
-        stats_.bytes += n->bytes;
-        ++stats_.blocks;
-        if (parent != nullptr) ++parent->children;
-        parent = n.get();
-        nodes_.emplace(keys[k], std::move(n));
-    }
-    Node* leaf = parent;
-    auto snap = std::make_unique<Node::Snapshot>();
-    snap->rings.resize(layout_.size());
-    snap->carries.resize(layout_.size());
-    snap->carry_valid.assign(layout_.size(), 0);
-    for (std::size_t l = 0; l < layout_.size(); ++l) {
-        snap->rings[l] = s.layers[l].ring;
-        snap->carries[l] = s.layers[l].carry;
-        snap->carry_valid[l] = s.layers[l].carry_valid ? 1 : 0;
-    }
-    snap->next_token = s.next_token;
-    snap->logits_fnv = logits_fnv;
-    snap->last_use = ++clock_;
-    snap->bytes = snap_bytes;
-    stats_.bytes += snap_bytes;
-    ++stats_.snapshots;
-    leaf->snapshot = std::move(snap);
-    return true;
+    });
+    if(ok) ++clock_; else ++stats_.refused;
+    return ok;
 }
 
 bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv, std::uint32_t kv_from, const std::vector<std::uint64_t>& keys) {
@@ -1286,14 +1196,14 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
         file->reserve(block_file);
         put_raw(*file, table.data(), table.size());
         put_raw(*file, tokens.data() + std::size_t{k} * B, std::size_t{B} * 4U);
-        const Node* rn = k * B < kv_from ? ram_node(keys[k], k + 1U, tokens.subspan(std::size_t{k} * B, B)) : nullptr;
+        const auto rn = k * B < kv_from ? ram_node(keys[k], k + 1U, tokens.subspan(std::size_t{k} * B, B)) : nullptr;
         for (std::size_t l = 0; l < layers; ++l) {
             const auto& L = s.layers[l];
             if (!L.owns_kv) continue;
             const std::size_t per = B / L.ratio;
             if (rn != nullptr) {
-                put_raw(*file, rn->kv[l].data(), rn->kv[l].size());
-                put_raw(*file, rn->idx[l].data(), rn->idx[l].size());
+                put_raw(*file, ram_layer(*rn,l,false), per*attn::kKvEntryBytes);
+                put_raw(*file, ram_layer(*rn,l,true), per*attn::kIdxEntryBytes);
             } else {
                 const std::size_t first = (std::size_t{k} * B - kv_from) / L.ratio;
                 put_raw(*file, L.kv.data() + first * attn::kKvEntryBytes, per * attn::kKvEntryBytes);
@@ -1344,31 +1254,6 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
     writer_->push({snapshot_path(leaf.key), std::move(file)});
     reservation.remaining -= queued;
     return true;
-}
-
-void PrefixCache::evict_one() {
-    Node* victim = nullptr;
-    for (auto& [key, n] : nodes_)
-        if (n->snapshot && (victim == nullptr || n->snapshot->last_use < victim->snapshot->last_use)) victim = n.get();
-    if (victim == nullptr) return;
-    stats_.bytes -= victim->snapshot->bytes;
-    --stats_.snapshots;
-    ++stats_.evicted_snapshots;
-    victim->snapshot.reset();
-    prune(victim);
-}
-
-// Removes `n` and its ancestors while they have neither a snapshot nor children (no resume point needs them).
-void PrefixCache::prune(Node* n) {
-    while (n != nullptr && !n->snapshot && n->children == 0U) {
-        Node* parent = n->parent;
-        if (parent != nullptr) --parent->children;
-        stats_.bytes -= n->bytes;
-        --stats_.blocks;
-        ++stats_.evicted_blocks;
-        nodes_.erase(n->key);
-        n = parent;
-    }
 }
 
 void PrefixCache::drop_disk_snapshot(DiskEntry& e) {

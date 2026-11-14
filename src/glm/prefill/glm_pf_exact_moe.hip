@@ -1,8 +1,10 @@
 // Exact grouped routed + shared experts. Arithmetic helpers retain their original provenance.
 #include "glm/prefill/glm_pf_exact_moe.hpp"
+#include "core/moe_i4_chain.hpp"
 #include "glm/prefill/glm_moe_traits.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/common/glm_math.hpp"
+#include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_exact_x.hpp"
 #include "glm/prefill/glm_pf_wmma_x.hpp"
 #ifndef STRIX_GLM_PF_IU4_LIB
@@ -13,6 +15,8 @@
 #include "core/activation_quant.hpp"  // strix-trellis fast/iu4-grouped (STRIX_GLM_PF_IU4_TRELLIS_DIR/src)
 #endif
 #include <algorithm>
+#include "moe_core/device_plan.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -78,55 +82,70 @@ __device__ __forceinline__ moe::Exl3 matrix(const Args& a, unsigned expert, unsi
     return (&a.experts[expert].gate)[m];
 }
 
-// Each wave transforms one H128 block exactly once per (pair, matrix). The
-// materialized FP16 values have the same boundary as the V1 LDS staging.
-__global__ void input_kernel(Args a) {
-    if (a.ntiles && blockIdx.y >= *a.ntiles) return;
-    const Tile tile = a.tiles[blockIdx.y];
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned m = blockIdx.z;
-    const moe::Exl3 w = matrix(a, tile.expert, m);
-    // One CTA covers 1024 input channels for every row in this expert tile.
-    // Eight H128 waves avoid a separate tiny CTA for each transform block.
-    for (unsigned r = 0; r < tile.count; ++r) {
-        const unsigned pair = a.pairs[tile.first + r];
-        const unsigned begin = (blockIdx.x * 8U + wave) * 128U;
-        d::transform_block_at(a.x + std::size_t{pair / P} * H, w.suh,
-                              a.input + (std::size_t{pair} * 2U + m) * H + begin, begin, 0, lane);
+// Model binding only; the A-load and paired SwiGLU/A4 and down epilogues are shared.
+struct I4Binding {
+    static constexpr unsigned H=::strix::glm::pf::exact_moe::H, I=::strix::glm::pf::exact_moe::I;
+    const float* x; float* out; Args a;
+    __host__ __device__ __forceinline__ const unsigned* map() const { return a.pairs; }
+    __device__ __forceinline__ unsigned pair(unsigned pos) const { return a.pairs[pos]; }
+    __device__ __forceinline__ unsigned token(unsigned p) const { return p/P; }
+    __device__ __forceinline__ float weight(unsigned p) const { return a.weights[(p/P)*8+p%P]; }
+    __device__ __forceinline__ float* contribution(unsigned p) const { return a.output+size_t(p)*H; }
+    __device__ __forceinline__ float suh(unsigned e,unsigned m,unsigned c) const { return d::half_bits(matrix(a,e,m).suh[c]); }
+    __device__ __forceinline__ float activation(float g,float u) const {
+        const float gg=g>kClamp ? kClamp : g, uu=u>kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
+        return silu(gg)*uu;
     }
-}
-// Token-ordered gate/up input transform (STRIX_GLM_PF_IN_TOKEN, default on; =0 restores input_kernel; device plan):
-// one CTA per (1024-channel chunk, row);
-// wave w owns H128 block blockIdx.x * 8 + w, loads its four x values once and writes transform_block_at's values for
-// the row's eight routed experts x two matrices and the shared expert, at the same per-(pair, matrix) destination.
-// input_kernel reads the row chunk once per (pair, matrix): 18 reads of a 16 KiB row that is not cache resident at
-// 8K (134 MB of x per layer); this reads it once. Rows the device plan rejects (plan_scatter's test) get only the
-// shared pair, as their routed pairs are in no tile. Same ops, same bits.
-__global__ __launch_bounds__(256) void input_token_kernel(Args a) {
-    const unsigned row = blockIdx.y, wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned begin = (blockIdx.x * 8U + wave) * 128U;
-    const float* x = a.x + std::size_t{row} * H;
-    float xv[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) xv[j] = x[begin + lane + 32U * static_cast<unsigned>(j)];
-    unsigned e[8];
-    bool bad = false;
-#pragma unroll
-    for (unsigned k = 0; k < 8U; ++k) {
-        e[k] = a.ids[std::size_t{row} * 8U + k];
-        bad = bad || e[k] >= E || (k && e[k] <= e[k - 1]);
+};
+struct I4ReferenceSchedule {
+    using Binding=I4Binding;
+    static constexpr bool kCachedInput=false;
+    Binding b; uint8_t* aq; float* as;
+    __device__ __forceinline__ unsigned source_pair(unsigned row) const { return row/2; }
+    __device__ __forceinline__ bool input(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+        const auto& a=b.a;
+        if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
+        const auto tile=a.tiles[blockIdx.y];if(i>=tile.count) return false;
+        const unsigned p=a.pairs[tile.first+i],m=blockIdx.z;
+        r={tile.expert,2*p+m,m,(blockIdx.x*8+threadIdx.x/32)*128,H,nullptr,tile.expert==E ? nullptr:aq,as,a.input};return true;
     }
-    for (unsigned k = 0; k < P; ++k) {
-        if (k < 8U && bad) continue;
-        const unsigned expert = k == 8U ? E : e[k];
-        _Float16* out = a.input + (std::size_t{row} * P + k) * 2U * H + begin;
-#pragma unroll
-        for (unsigned m = 0; m < 2U; ++m) {
-            const moe::Exl3 w = matrix(a, expert, m);
-            d::transform_block_values(xv, w.suh, out + m * H, begin, 0, lane);
+    __device__ __forceinline__ bool activation(unsigned i,strix::core::moe_i4::ReferenceRow& r) const {
+        const auto& a=b.a;
+        if(a.ntiles && blockIdx.y>=*a.ntiles) return false;
+        const auto tile=a.tiles[blockIdx.y];const unsigned row=threadIdx.x/32+8*i;if(row>=tile.count) return false;
+        const unsigned p=a.pairs[tile.first+row];
+        r={tile.expert,p,2,blockIdx.x*128,I,a.gu,tile.expert==E ? nullptr:aq,as,a.at};return true;
+    }
+};
+
+// Token-ordered input reuses one cached H128 row for the ordered slots and matrices.
+// Keep the invalid-row rule and the unrolled two-matrix loop of input_token_kernel.
+struct I4TokenReferenceSchedule {
+    using Binding=I4Binding;
+    static constexpr unsigned kInputRows=P;
+    static constexpr unsigned kInputMatrices=2;
+    Binding b;
+    struct Rows { unsigned experts[8]; bool bad; };
+    __device__ __forceinline__ unsigned token() const { return blockIdx.y; }
+    __device__ __forceinline__ unsigned col() const { return (blockIdx.x*8U+threadIdx.x/32)*128U; }
+    __device__ __forceinline__ unsigned source_pair(unsigned row) const { return row/2; }
+    __device__ __forceinline__ Rows prepare() const {
+        Rows rows;
+        rows.bad=false;
+        #pragma unroll
+        for(unsigned k=0;k<8U;++k) {
+            rows.experts[k]=b.a.ids[std::size_t{token()}*8U+k];
+            rows.bad=rows.bad || rows.experts[k]>=E || (k && rows.experts[k]<=rows.experts[k-1]);
         }
+        return rows;
     }
-}
+    __device__ __forceinline__ bool admit(const Rows& rows,unsigned k) const { return !(k<8U && rows.bad); }
+    __device__ __forceinline__ void input(const Rows& rows,unsigned k,unsigned m,strix::core::moe_i4::ReferenceRow& r) const {
+        const unsigned expert=k==8U ? E:rows.experts[k],pair=token()*P+k;
+        r={expert,2*pair+m,m,col(),H,nullptr,nullptr,nullptr,b.a.input};
+    }
+};
+
 bool input_token_enabled() { return aux::enabled_default_on("STRIX_GLM_PF_IN_TOKEN"); }  // bitwise; 8K -0.31 s
 
 // One wave per 16-output tile, eight waves per H128 block. Each decoded operand is reused
@@ -546,31 +565,10 @@ void launch_linear_s(Args a, unsigned shared_bits, hipStream_t stream) {
         linear_kernel_s<4, Down, true, R><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "X3 shared linear");
 }
-__global__ void activation_kernel(Args a) {
-    if (a.ntiles && blockIdx.y >= *a.ntiles) return;
-    const Tile tile = a.tiles[blockIdx.y];
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const moe::Exl3 down = matrix(a, tile.expert, 2);
-    for (unsigned r = wave; r < tile.count; r += 8) {
-        const unsigned pair = a.pairs[tile.first + r];
-        float v[4];
-#pragma unroll
-        for (unsigned j = 0; j < 4; ++j) {
-            const unsigned i = blockIdx.x * 128 + lane + 32 * j;
-            const float g = a.gu[(std::size_t{pair} * 2) * I + i];
-            const float u = a.gu[(std::size_t{pair} * 2 + 1) * I + i];
-            const float gg = g > kClamp ? kClamp : g;
-            const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
-            const float act = silu(gg) * uu;
-            const float scaled = d::materialize(act * d::half_bits(down.suh[i]));
-            v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-        }
-        d::hadamard128(v, lane);
-#pragma unroll
-        for (unsigned j = 0; j < 4; ++j)
-            a.at[std::size_t{pair} * I + blockIdx.x * 128 + lane + 32 * j] = static_cast<_Float16>(v[j]);
-    }
-}
+
+
+// The shared reference combine uses four values per lane and a flattened row grid.
+// Retain this scalar-per-thread kernel for the existing (H/256, rows) launch.
 __global__ void combine_kernel(Args a) {
     const unsigned row = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
     float y = 0.0F;
@@ -580,12 +578,12 @@ __global__ void combine_kernel(Args a) {
 }
 template<int TM, bool Cached> void launch(Args a, unsigned tiles, hipStream_t stream) {
     if constexpr (Cached) {
-        input_kernel<<<dim3(H / 1024, tiles, 2), 256, 0, stream>>>(a);
+        strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
         ok(hipGetLastError(), "gate/up input transform");
     }
     linear_kernel<TM, false, Cached><<<dim3(I / 128, tiles, 2), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "gate/up");
-    activation_kernel<<<dim3(I / 128, tiles), 256, 0, stream>>>(a);
+    strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
     ok(hipGetLastError(), "R15/down transform");
     linear_kernel<TM, true, Cached><<<dim3(H / 128, tiles), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "down");
@@ -595,116 +593,51 @@ template<int TM, bool Cached> void launch(Args a, unsigned tiles, hipStream_t st
 // Device plan, byte-equal to the host plan in enqueue(): expert e's pairs in ascending row order (a row holds an
 // expert at most once), shared pairs r*9+8 last, groups[e] = {e, offset, count}, tiles of 16 rows per expert in
 // expert order. A row whose ids are not strictly ascending and < 288 sets *flag and contributes no routed pair.
-struct PlanArgs {
-    unsigned rows;
-    const std::uint32_t* ids;
-    unsigned* blk;    // [blocks][E] counts, then exclusive per-expert block prefixes
-    unsigned* rank;   // [rows][8] rank among the block's earlier rows holding the same expert
-    unsigned* off;    // [E + 1] expert offsets, [E + 1] tile count
+// The planner is the shared moe_core::device_plan; this policy is GLM's routing glue (top-8 of 288, pair = r*9+slot).
+struct PlanOut {
     unsigned* pairs;
     Tile* tiles;
     Tile* groups;
-    unsigned* flag;
 };
-__global__ __launch_bounds__(kPlanRows) void plan_rank_kernel(PlanArgs p) {
-    __shared__ unsigned cnt[kPlanRows / 32U][E];
-    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, r = blockIdx.x * kPlanRows + tid;
-    for (unsigned i = tid; i < kPlanRows / 32U * E; i += kPlanRows) (&cnt[0][0])[i] = 0;
-    unsigned e[8];
-    bool bad = false;
+struct PlanPolicy {
+    static constexpr unsigned kExperts = E, kTopK = 8, kRows = kPlanRows;
+    static constexpr bool kDropInvalid = true;
+    using Out = PlanOut;
+    using A = ::strix::moe_core::device_plan::Args<PlanPolicy>;
+    __device__ static bool load(const A& p, unsigned r, unsigned (&e)[8], float (&)[8]) {
+        bool bad = false;
 #pragma unroll
-    for (unsigned k = 0; k < 8U; ++k) {
-        e[k] = r < p.rows ? p.ids[std::size_t{r} * 8U + k] : E;
-        bad = bad || (r < p.rows && (e[k] >= E || (k && e[k] <= e[k - 1])));
-    }
-    if (bad) {
-        atomicOr(p.flag, 1U);
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) e[k] = E;
-    }
-    __syncthreads();
-    // Wave-local ranks: one pass per distinct expert held by any lane; lanes below hold earlier rows.
-    unsigned rk[8] = {}, done = 0;
-#pragma unroll
-    for (unsigned k = 0; k < 8U; ++k) if (e[k] >= E) done |= 1U << k;
-    for (;;) {
-        const unsigned pending = static_cast<unsigned>(__ballot(done != 0xffU));
-        if (!pending) break;
-        const unsigned leader = static_cast<unsigned>(__builtin_ctz(pending));
-        unsigned mine = E;
-#pragma unroll
-        for (unsigned k = 8U; k-- > 0;) if (!(done >> k & 1U)) mine = e[k];
-        const unsigned x = static_cast<unsigned>(__shfl(static_cast<int>(mine), static_cast<int>(leader)));
-        unsigned slot = 8U;
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) if (e[k] == x) slot = k;
-        const unsigned holders = static_cast<unsigned>(__ballot(slot < 8U));
-        if (slot < 8U) {
-            rk[slot] = cnt[wave][x] + static_cast<unsigned>(__builtin_popcount(holders & ((1U << lane) - 1U)));
-            done |= 1U << slot;
+        for (unsigned k = 0; k < 8U; ++k) {
+            e[k] = p.ids[std::size_t{r} * 8U + k];
+            bad = bad || e[k] >= E || (k && e[k] <= e[k - 1]);
         }
-        if (lane == leader) cnt[wave][x] += static_cast<unsigned>(__builtin_popcount(holders));
+        return bad;
     }
-    __syncthreads();
-    // Waves cover consecutive rows: prefix the wave counts per expert, publish the block's counts.
-    for (unsigned x = tid; x < E; x += kPlanRows) {
-        unsigned run = 0;
-        for (unsigned w = 0; w < kPlanRows / 32U; ++w) { const unsigned c = cnt[w][x]; cnt[w][x] = run; run += c; }
-        p.blk[std::size_t{blockIdx.x} * E + x] = run;
-    }
-    __syncthreads();
-    if (r < p.rows)
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k) p.rank[std::size_t{r} * 8U + k] = e[k] < E ? rk[k] + cnt[wave][e[k]] : 0U;
-}
-__global__ __launch_bounds__(1024) void plan_scan_kernel(PlanArgs p, unsigned blocks) {
-    __shared__ unsigned count[E + 1], tile_off[E + 1];
-    const unsigned tid = threadIdx.x;
-    for (unsigned x = tid; x < E; x += blockDim.x) {
-        unsigned run = 0;
-        for (unsigned b = 0; b < blocks; ++b) {
-            unsigned* c = p.blk + std::size_t{b} * E + x;
-            const unsigned v = *c;
-            *c = run;
-            run += v;
+    __device__ static void fallback(unsigned (&)[8], float (&)[8]) {}
+    // off[E + 1] = tile count (Args::ntiles of the grouped kernels).
+    __device__ static void finish(const A& p, const unsigned* count, const unsigned* start) {
+        __shared__ unsigned tile_off[E + 1];
+        const unsigned tid = threadIdx.x;
+        if (tid == 0) {
+            unsigned t = 0;
+            for (unsigned x = 0; x <= E; ++x) {
+                tile_off[x] = t;
+                p.out.groups[x] = {x, start[x], count[x]};
+                t += (count[x] + 15U) / 16U;
+            }
+            p.off[E + 1] = t;
         }
-        count[x] = run;
+        __syncthreads();
+        for (unsigned x = tid; x <= E; x += blockDim.x)
+            for (unsigned r = 0, t = tile_off[x]; r < count[x]; r += 16U, ++t)
+                p.out.tiles[t] = {x, start[x] + r, count[x] - r < 16U ? count[x] - r : 16U};
     }
-    if (tid == 0) count[E] = p.rows;
-    __syncthreads();
-    if (tid == 0) {
-        unsigned n = 0, t = 0;
-        for (unsigned x = 0; x <= E; ++x) {
-            p.off[x] = n;
-            tile_off[x] = t;
-            p.groups[x] = {x, n, count[x]};
-            n += count[x];
-            t += (count[x] + 15U) / 16U;
-        }
-        p.off[E + 1] = t;
-    }
-    __syncthreads();
-    for (unsigned x = tid; x <= E; x += blockDim.x)
-        for (unsigned r = 0, t = tile_off[x]; r < count[x]; r += 16U, ++t)
-            p.tiles[t] = {x, p.off[x] + r, count[x] - r < 16U ? count[x] - r : 16U};
-}
-__global__ __launch_bounds__(kPlanRows) void plan_scatter_kernel(PlanArgs p) {
-    const unsigned r = blockIdx.x * kPlanRows + threadIdx.x;
-    if (r >= p.rows) return;
-    unsigned e[8];
-    bool bad = false;
-#pragma unroll
-    for (unsigned k = 0; k < 8U; ++k) {
-        e[k] = p.ids[std::size_t{r} * 8U + k];
-        bad = bad || e[k] >= E || (k && e[k] <= e[k - 1]);
-    }
-    if (!bad)
-#pragma unroll
-        for (unsigned k = 0; k < 8U; ++k)
-            p.pairs[p.off[e[k]] + p.blk[std::size_t{blockIdx.x} * E + e[k]] + p.rank[std::size_t{r} * 8U + k]] = r * P + k;
-    p.pairs[p.off[E] + r] = r * P + 8U;
-}
+    __device__ static void routed(const A& p, unsigned r, unsigned k, unsigned, float, unsigned pos) { p.out.pairs[pos] = r * P + k; }
+    __device__ static void shared(const A& p, unsigned r, unsigned pos) { p.out.pairs[pos] = r * P + 8U; }
+};
+
 #include "glm/prefill/glm_pf_iu4.inc"
+
 // The grouped variants (v3 and the X cores): input transform, gate/up, activation, down, combine. grid_tiles is the
 // tile count (host plan) or its upper bound (device plan; surplus CTAs return on Args::ntiles).
 void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::ExpertSlices& shared, hipStream_t stream,
@@ -719,8 +652,8 @@ void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::E
     (void)q;
     (void)qs;
 #endif
-    if (a.ids && input_token_enabled()) input_token_kernel<<<dim3(H / 1024, a.rows), 256, 0, stream>>>(a);
-    else input_kernel<<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(a);
+    if (a.ids && input_token_enabled()) strix::core::moe_i4::reference_input_kernel<I4TokenReferenceSchedule><<<dim3(H / 1024, a.rows), 256, 0, stream>>>(I4TokenReferenceSchedule{{a.x,a.out,a}});
+    else strix::core::moe_i4::reference_input_kernel<I4ReferenceSchedule><<<dim3(H / 1024, grid_tiles, 2), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
     ok(hipGetLastError(), "v3 gate/up input transform");
     // FAST glm-pf-wmma-x (STRIX_GLM_PF_WMMA=1): the X3 calls (V11 / V14) on the WMMA linears.
     if ((selected == 11 || selected == 14) && wmma_x::enabled()) {
@@ -740,7 +673,7 @@ void launch_grouped(Args a, unsigned grid_tiles, unsigned selected, const moe::E
     else if (selected == 6) launch_linear_x<false>(a, shared.gate.bits, stream);
     else launch_linear_v3<false>(a, shared.gate.bits, stream);
     if (!a.aux_act) {
-        activation_kernel<<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(a);
+        strix::core::moe_i4::reference_activation_kernel<I4ReferenceSchedule><<<dim3(I / 128, grid_tiles), 256, 0, stream>>>(I4ReferenceSchedule{{a.x,a.out,a},nullptr,nullptr});
         ok(hipGetLastError(), "v3 R15/down transform");
     }
     if (selected == 20) launch_linear_w<true>(a, shared.down.bits, stream);
@@ -984,20 +917,15 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
     if (v.shared.gate.bits != v.shared.up.bits)
         throw std::invalid_argument("exact moe: shared gate/up bits must match decode contract");
     auto* base = static_cast<unsigned char*>(ws);
-    const unsigned blocks = (v.rows + kPlanRows - 1U) / kPlanRows;
     const std::size_t cap_blocks = (plan.capacity + kPlanRows - 1U) / kPlanRows;
     auto* blk = reinterpret_cast<unsigned*>(base + l.plan);
     auto* rank = reinterpret_cast<unsigned*>(base + l.plan + align256(cap_blocks * E * sizeof(unsigned)));
     auto* off = rank + align256(std::size_t{plan.capacity} * 8U * sizeof(unsigned)) / sizeof(unsigned);
-    const PlanArgs pa{v.rows, v.ids, blk, rank, off, reinterpret_cast<unsigned*>(base + l.pairs),
-                      reinterpret_cast<Tile*>(base + l.tiles), reinterpret_cast<Tile*>(base + l.groups), flag};
-    plan_rank_kernel<<<blocks, kPlanRows, 0, stream>>>(pa);
-    ok(hipGetLastError(), "device plan ranks");
-    plan_scan_kernel<<<1, 1024, 0, stream>>>(pa, blocks);
-    ok(hipGetLastError(), "device plan scan");
-    plan_scatter_kernel<<<blocks, kPlanRows, 0, stream>>>(pa);
-    ok(hipGetLastError(), "device plan scatter");
-    Args a{v.rows, v.x, v.weights, v.out, v.table, v.shared, pa.pairs, pa.tiles, pa.groups,
+    ::strix::moe_core::device_plan::Args<PlanPolicy> pa{v.rows, v.ids, nullptr, blk, rank, off, flag,
+                                               {reinterpret_cast<unsigned*>(base + l.pairs), reinterpret_cast<Tile*>(base + l.tiles),
+                                                reinterpret_cast<Tile*>(base + l.groups)}};
+    ok(::strix::moe_core::device_plan::enqueue(pa, stream), "device plan");
+    Args a{v.rows, v.x, v.weights, v.out, v.table, v.shared, pa.out.pairs, pa.out.tiles, pa.out.groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
            reinterpret_cast<_Float16*>(base + l.input), v3_row_buckets() ? 1U : 0U, off + E + 1};
     a.ids = v.ids;
@@ -1005,6 +933,7 @@ void enqueue_device(const DeviceView& v, Plan& plan, void* ws, std::size_t bytes
     launch_grouped(a, grid_tiles, selected, v.shared, stream, v.iu4, v.iu4_scratch);
 }
 namespace iu4 {
+
 bool built() { return STRIX_GLM_PF_IU4_LIB != 0; }
 namespace {
 template<class T> T* device_alloc(std::size_t count, std::size_t& total) {
@@ -1014,7 +943,7 @@ template<class T> T* device_alloc(std::size_t count, std::size_t& total) {
     return static_cast<T*>(p);
 }
 }  // namespace
-double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream) {
+double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t stream, int scale_rule) {
 #if STRIX_GLM_PF_IU4_LIB
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned e = 0; e < E; ++e) {
@@ -1042,7 +971,7 @@ double convert_into(const moe::ExpertSlices* host_table, Layer& q, hipStream_t s
         for (unsigned e = 0; e < E; ++e) tr[e] = (&host_table[e].gate)[m].trellis;
         ok(hipMemcpyAsync(trellis_tab, tr.data(), E * sizeof(void*), hipMemcpyHostToDevice, stream), "iu4 trellis table");
         iu4_ok(strix::core::convert_exl3_iu4(trellis_tab, 4, static_cast<int>(E), static_cast<int>(K), static_cast<int>(N), q.wq[m],
-                                               reinterpret_cast<_Float16*>(q.ws[m]), std::size_t{K} * N / 2U, std::size_t{N} * (K / 64U), stream),
+                                               reinterpret_cast<_Float16*>(q.ws[m]), std::size_t{K} * N / 2U, std::size_t{N} * (K / 64U), stream, scale_rule),
                "iu4 convert (strix-trellis convert_exl3_iu4)");
         ok(hipStreamSynchronize(stream), "iu4 trellis table");  // tr is reused for the next matrix
     }
@@ -1096,6 +1025,21 @@ void release(Scratch& s) {
                     static_cast<void*>(s.as_down), s.tiles, static_cast<void*>(s.ntiles)})
         if (p) (void)hipFree(p);
     s = Scratch{};
+}
+void set_chain_policy_for_test(const ChainPolicy* policy) {
+#if STRIX_GLM_PF_IU4_LIB
+    i4_chain_test_policy.store(policy ? (policy->shared_gsave ? 1 : 0) | (policy->lend ? 2 : 0) : -1, std::memory_order_relaxed);
+#else
+    (void)policy;
+#endif
+}
+ChainRun last_chain_run() {
+#if STRIX_GLM_PF_IU4_LIB
+    const std::uint32_t v = i4_chain_last.load(std::memory_order_relaxed);
+    return {(v >> 31) != 0, static_cast<int>(v & 15U), static_cast<int>((v >> 4) & 15U), (v & 0x100U) != 0};
+#else
+    return {};
+#endif
 }
 }  // namespace iu4
 } // namespace strix::glm::pf::exact_moe

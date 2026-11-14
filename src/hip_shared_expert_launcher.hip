@@ -1,3 +1,5 @@
+#include "strix/env_flags.hpp"
+#include "core/row_layout.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -9,6 +11,7 @@
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
 #if defined(STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC)
@@ -581,6 +584,37 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel
     }
     if (blockIdx.x != 0) return;
     const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
+    float sum = 0.0F;
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+}
+
+// Cohort rows: the same activation and scalar gate as rows_shared_activation_scalar_kernel for rows that are not
+// one strided run (the sessions of a cohort), through per-row addresses: one launch for every session's rows.
+struct SharedActivationRowsSite {
+    std::uint64_t workspace[32];
+    std::uint64_t input[32];
+};
+__global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_site_kernel(
+    SharedActivationRowsSite site, const void* scalar_weights, std::uint32_t intermediate_size,
+    std::uint32_t input_width) {
+    __shared__ float scratch[kThreads];
+    auto* workspace = reinterpret_cast<float*>(site.workspace[blockIdx.y]);
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < intermediate_size) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate_size + index];
+        workspace[index] = (gate / (1.0F + expf(-gate))) * up;
+    }
+    if (blockIdx.x != 0) return;
+    const auto* input = reinterpret_cast<const std::uint16_t*>(site.input[blockIdx.y]);
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
@@ -1643,10 +1677,7 @@ struct SharedDownR8NarrowSite : SharedDownRowsSite<8U> {
 template <unsigned Rows>
 void launch_shared_down_rows(const SharedDownRowsSite<Rows>& site, bool a8, hipStream_t stream, int forced = -1) {
     if constexpr (Rows == 8U) {
-        static const bool enabled = [] {
-            const char* v = std::getenv("STRIX_QWEN_SHARED_DOWN_NARROW");
-            return v && v[0] == '1';
-        }();
+        static const bool enabled = strix::envcfg::flag("STRIX_QWEN_SHARED_DOWN_NARROW", false);
         if (a8 && site.width == 640U && (forced < 0 ? enabled : forced != 0)) {
             SharedDownR8NarrowSite narrow{};
             static_cast<SharedDownRowsSite<8U>&>(narrow) = site;
@@ -1825,13 +1856,7 @@ void known_shared_range(KnownSharedSpan view) {
 }
 std::uint64_t known_shared_stride(const ExecutionBufferAddress& first,
                                   const ExecutionBufferAddress& second) {
-    if (first.bytes != second.bytes || first.bytes > UINT64_MAX - 255U || second.address <= first.address)
-        throw std::invalid_argument("known-window shared R2 row extent/order differs");
-    const auto expected = (first.bytes + 255U) / 256U * 256U;
-    const auto stride = static_cast<std::uint64_t>(second.address - first.address);
-    if (stride != expected)
-        throw std::invalid_argument("known-window shared R2 row stride differs from serial allocation");
-    return stride;
+    return core::retained_row_stride(first.address, first.bytes, second.address, second.bytes);
 }
 const ExecutionMemoryBinding& known_shared_memory(const ExecutionDispatchContext& row) {
     if (!row.resources || !row.resources->scratch || !row.arena)
@@ -2207,10 +2232,7 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
     // q8_rows::tiled launch per projection, same bits; the 16/8-row remainder keeps its launches.
     const std::uint64_t tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && rows.size() / 32U * 32U >= q8_rows::tiled::min_rows()
         ? rows.size() / 32U * 32U : 0U;
-    static const bool shared_pre_env = [] {
-        const char* v = std::getenv("STRIX_QPF2K_SHARED_PRE");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
+    static const bool shared_pre_env = strix::envcfg::flag("STRIX_QPF2K_SHARED_PRE", false, strix::EnvFlagMatch::exact);
     SharedDownTiledSite pre_site{};
     _Float16* pre_image = nullptr;
     unsigned* pre_overflow = nullptr;
@@ -2364,7 +2386,7 @@ void shared_expert_known_prefill_rows_launch_detached(std::span<const ExecutionD
     static_cast<void>(known_shared_rows_stream());
     // Compact rows: one row's workspace view rounded up to 256 bytes (the arena's row stride spans the whole row view).
     const auto row_bytes = resolve_dispatch_temporary(rows[0], 0).bytes;
-    const auto stride = (row_bytes + 255U) / 256U * 256U;
+    const auto stride = core::physical_row_stride((row_bytes + 255U) / 256U * 256U, rows.size(), 256U);
     if (!stream || !workspace || workspace % 256U || !row_bytes || row_bytes > views.shape.workspace_stride_bytes ||
         stride > UINT64_MAX / rows.size() || workspace_bytes < stride * rows.size() || workspace_bytes > UINTPTR_MAX - workspace)
         throw std::invalid_argument("detached known shared prefill workspace is invalid");
@@ -2480,7 +2502,24 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
         q8_rows::launch(site, config.dense_a8_projections, stream, false);
         check_hip(hipGetLastError(), "known-window cohort shared gate/up launch");
     }
-    for (std::size_t k = 0; k < segments.size(); ++k) {
+    // One launch for the rows of every session (STRIX_COHORT_SHARED_ACT_MERGED=0: one launch per session;
+    // in-process A/B: STRIX_COHORT_AB_OFF=sharedact).
+    static const bool merged_activation = strix::envcfg::flag("STRIX_COHORT_SHARED_ACT_MERGED", true);
+    unsigned activation_rows = 0;
+    for (std::size_t k = 0; k < segments.size(); ++k) activation_rows += counts[k];
+    if (merged_activation && activation_rows <= 32U && !known_window_cohort_feature_off("sharedact")) {
+        SharedActivationRowsSite site{};
+        unsigned row = 0;
+        for (std::size_t k = 0; k < segments.size(); ++k)
+            for (unsigned r = 0; r < counts[k]; ++r, ++row) {
+                site.workspace[row] = at(segments[k].workspace, segments[k].shape.workspace_stride_bytes, r);
+                site.input[row] = at(segments[k].input, segments[k].shape.input_stride_bytes, r);
+            }
+        hipLaunchKernelGGL(rows_shared_activation_scalar_site_kernel,
+            dim3((config.intermediate_size + kThreads - 1U) / kThreads, activation_rows), dim3(kThreads), 0, stream, site,
+            reinterpret_cast<const void*>(weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "known-window cohort shared activation/scalar rows launch");
+    } else for (std::size_t k = 0; k < segments.size(); ++k) {
         const auto& views = segments[k];
         hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, counts[k]),
             dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
@@ -2791,7 +2830,7 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     const auto rows = static_cast<std::uint32_t>(input.size());
     // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
     // lane kernel's repacked weights, for timing one unchanged matrix).
-    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
+    if (!strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     const bool down = role == HipSharedQ8ProjectionRole::down;
     if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
         (!down && role != HipSharedQ8ProjectionRole::gate_up) ||

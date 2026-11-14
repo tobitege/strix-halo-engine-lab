@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "strix/known_prompt_chunks.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -122,7 +123,7 @@ bool KnownPromptChunkCursor::advance() {
     }
     // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
     // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
-    static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
+    static const bool allow_headless=strix::envcfg::flag("STRIX_PREFILL_HEADLESS", true);
     const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>block;
     // A deferred block of windows_ is completed by the next block of windows_; anything else completes it first.
     if(!planning_only_ && deferred_ && (!window || backend!=&windows_)) {
@@ -160,7 +161,7 @@ bool KnownPromptChunkCursor::advance() {
                 validate_serial_decode_engine_logits(values,request_.vocab_size);
                 // STRIX_PREFILL_LOGITS_DIGEST=1: the terminal row's FP32 logits FNV-1a 64 also when the prompt ends in a serial
                 // suffix row (the tiled backend prints it for a block that ends the prompt).
-                static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
+                static const bool digest=strix::envcfg::flag("STRIX_PREFILL_LOGITS_DIGEST", false);
                 if(digest&&!window&&consumed+1U==request_.prompt_tokens.size()) {
                     std::uint64_t hash=14695981039346656037ULL;
                     for(const auto byte:std::as_bytes(std::span<const float>(values))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}

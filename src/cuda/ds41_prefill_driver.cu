@@ -1,6 +1,7 @@
 // deepseek41 CUDA prefill driver (cuda_ds41_prefill.hpp): the DevicePrefill plan on the CUDA layer kernels, with the
 // cone, the tiered routed-expert provider and the Engram rows from the model file.
 
+#include "strix/env_flags.hpp"
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/cuda_ds41_replay.hpp"
 #include "strix/cuda_ds41_router_v2.hpp"
@@ -737,10 +738,7 @@ struct CudaPrefill::Impl {
     std::unique_ptr<TensorFile> file;
     std::filesystem::path gguf_path;
     // STRIX_DS41_CUDA_ENGRAM_CHECK=1 at construction, set_engram_check() later: re-read every Engram job (diagnostics)
-    bool engram_check = [] {
-        const char* v = std::getenv("STRIX_DS41_CUDA_ENGRAM_CHECK");
-        return v && v[0] == '1';
-    }();
+    bool engram_check = strix::envcfg::flag("STRIX_DS41_CUDA_ENGRAM_CHECK", false);
     std::filesystem::path file_path;
     std::unique_ptr<FileReader> reader;         // routed-expert reads (the provider's loader thread)
     std::unique_ptr<FileReader> engram_reader;  // Engram rows (their own thread: a FileReader serves one caller at a time)

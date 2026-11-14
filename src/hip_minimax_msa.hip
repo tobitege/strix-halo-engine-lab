@@ -1,5 +1,6 @@
 // minimax-m3 MSA decode kernels (gfx1151, wave32). Declared arithmetic: strix/minimax_msa.hpp; every kernel equals the
 // host reference bit for bit (tests/hip_minimax_msa_tests.hip).
+#include "strix/hip_check.hpp"
 #include "strix/hip_minimax_msa.hpp"
 
 #include <stdexcept>
@@ -420,16 +421,14 @@ __global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) 
     }
 }
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 }  // namespace
 
 void enqueue_prep(const PrepView& v, hipStream_t stream) {
     const unsigned items = v.q_heads + 2 * v.kv_heads + v.idx_heads + 1;
     hipLaunchKernelGGL(prep_kernel, dim3(v.rows, items), dim3(32), 0, stream, v);
-    check(hipGetLastError(), "minimax prep");
+    hip_check(hipGetLastError(), "minimax prep");
 }
 
 void enqueue_scores(const ScoreView& v, hipStream_t stream) {
@@ -438,32 +437,32 @@ void enqueue_scores(const ScoreView& v, hipStream_t stream) {
     const unsigned local = (v.max_blocks + v.shard_count - 1 - v.shard_rank) / v.shard_count;
     const std::size_t lds = static_cast<std::size_t>(v.rows) * v.idx_heads * kIdxDim * sizeof(float);
     if (local != 0) hipLaunchKernelGGL(scores_kernel, dim3(local), dim3(kScoreThreads), lds, stream, v);
-    check(hipGetLastError(), "minimax scores");
+    hip_check(hipGetLastError(), "minimax scores");
 }
 
 void enqueue_select(const SelectView& v, hipStream_t stream) {
     if (v.max_blocks > kMaxSelBlocks) throw std::invalid_argument("minimax select: more than 8192 blocks");
     hipLaunchKernelGGL(select_kernel, dim3(v.rows * v.heads), dim3(kSelThreads), 0, stream, v);
-    check(hipGetLastError(), "minimax select");
+    hip_check(hipGetLastError(), "minimax select");
 }
 
 void enqueue_candidates(const CandidateView& v, hipStream_t stream) {
     if (v.max_blocks > kMaxSelBlocks || v.shard_count == 0 || v.shard_rank >= v.shard_count)
         throw std::invalid_argument("minimax candidates: bad view");
     hipLaunchKernelGGL(candidates_kernel, dim3(v.rows * v.heads), dim3(kSelThreads), 0, stream, v);
-    check(hipGetLastError(), "minimax candidates");
+    hip_check(hipGetLastError(), "minimax candidates");
 }
 
 void enqueue_merge(const MergeView& v, hipStream_t stream) {
     hipLaunchKernelGGL(merge_kernel, dim3(v.rows * v.heads), dim3(kSelThreads), 0, stream, v);
-    check(hipGetLastError(), "minimax merge");
+    hip_check(hipGetLastError(), "minimax merge");
 }
 
 void enqueue_attention(const AttentionView& v, hipStream_t stream) {
     hipLaunchKernelGGL(attention_chunk_kernel, dim3(v.rows * v.kv_heads, kMaxChunks), dim3(kAttnWaves * 32), 0, stream, v);
-    check(hipGetLastError(), "minimax attention chunk");
+    hip_check(hipGetLastError(), "minimax attention chunk");
     hipLaunchKernelGGL(attention_combine_kernel, dim3(v.rows * v.kv_heads * kGroup), dim3(32), 0, stream, v);
-    check(hipGetLastError(), "minimax attention combine");
+    hip_check(hipGetLastError(), "minimax attention combine");
 }
 
 }  // namespace strix::minimax::msa::hip

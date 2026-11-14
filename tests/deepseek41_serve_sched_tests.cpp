@@ -71,6 +71,50 @@ void service_options() {
     }
 }
 
+void admit_first_policy() {
+    using A = strix::serve::AdmitFirst;
+    A a;
+    expect(a.select == A::Select::automatic && a.min_live == 5U && a.max_decode_gap_ms == 1000.0, "regime selector defaults");
+    expect(!a.engaged(4) && a.engaged(5) && a.engaged(8), "automatic: engaged from the measured crossover");
+    expect(!a.prompt_before_decode(4, 3, 1, 0.0), "few live requests: decode first");
+    expect(a.prompt_before_decode(8, 7, 1, 0.0) && a.prompt_before_decode(8, 1, 7, 999.0), "many live requests: waiting prompts first");
+    expect(!a.prompt_before_decode(8, 0, 4, 0.0), "nothing waits: decode steps as usual");
+    expect(!a.prompt_before_decode(8, 3, 0, 0.0), "nothing decodes: nothing to hold");
+    expect(!a.prompt_before_decode(8, 7, 1, 1000.0), "the decode gap is bounded");
+    expect(!a.prompt_before_decode(8, 7, 1, -1.0), "a clock step back never holds");
+    std::map<std::string, std::string> env;
+    const auto options = [&] { return sc::options_from(true, [&](const char* k) { return env[k]; }); };
+    expect(options().admit_first.select == A::Select::automatic && std::string(options().admit_first.name()) == "auto", "default on with the selector");
+    env["STRIX_SERVE_ADMIT_FIRST"] = "0";
+    expect(!options().admit_first.engaged(64) && !options().admit_first.prompt_before_decode(64, 7, 1, 0.0), "forced off at every concurrency");
+    env["STRIX_SERVE_ADMIT_FIRST"] = "1";
+    expect(options().admit_first.engaged(1) && options().admit_first.prompt_before_decode(2, 1, 1, 0.0), "forced on at every concurrency");
+    env["STRIX_SERVE_ADMIT_FIRST"] = "auto";
+    env["STRIX_SERVE_ADMIT_FIRST_MIN_LIVE"] = "3";
+    env["STRIX_SERVE_ADMIT_FIRST_GAP_MS"] = "250";
+    a = options().admit_first;
+    expect(a.engaged(3) && !a.engaged(2) && a.max_decode_gap_ms == 250.0, "crossover and gap overrides");
+    expect(!a.prompt_before_decode(8, 7, 1, 250.0), "overridden gap bound");
+    env["STRIX_SERVE_ADMIT_FIRST_GAP_MS"] = "0";
+    expect(!options().admit_first.prompt_before_decode(8, 7, 1, 0.0), "gap 0 is the decode-first order");
+    const auto rejected = [&](const char* k, const char* v) {
+        auto saved = env; env[k] = v; bool threw = false;
+        try { (void)options(); } catch (const std::exception&) { threw = true; }
+        env = saved; return threw;
+    };
+    expect(rejected("STRIX_SERVE_ADMIT_FIRST", "maybe") && rejected("STRIX_SERVE_ADMIT_FIRST_MIN_LIVE", "0") &&
+           rejected("STRIX_SERVE_ADMIT_FIRST_GAP_MS", "-1"), "invalid selector values rejected");
+    // the selector only orders work: prefill units and budgets do not depend on it
+    env.clear();
+    const auto base = options();
+    env["STRIX_SERVE_ADMIT_FIRST"] = "1";
+    const auto on = options();
+    const auto two = [](double) { return 2U; };
+    expect(on.mode == base.mode && on.min_rows == base.min_rows && on.unit_rows == base.unit_rows && on.target_ms() == base.target_ms() &&
+           sc::row_budget(on, false) == sc::row_budget(base, false) && sc::tick_budget(on, true, true, two) == sc::tick_budget(base, true, true, two),
+           "same prefill path and units either way");
+}
+
 void short_first() {
     struct Entry { unsigned rows, skips = 0; };
     std::vector<Entry> pending{{100}, {20}, {20}};
@@ -331,6 +375,7 @@ void auto_rows() {
 int main() {
     service_options();
     auto_rows();
+    admit_first_policy();
     short_first();
     control_trace();
     admission();

@@ -1,6 +1,7 @@
 #include "strix/env_flags.hpp"
 // Adapted mathematical codec and transforms; see notices/ for retained attribution.
 #include "device.hpp"
+#include "core/trellis_codec.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdlib>
@@ -147,12 +148,9 @@ __global__ void output_group_kernel(Group g, unsigned rows, unsigned* failure) {
     const auto t = blockIdx.y;
     output_body(g.w[t], g.out[t], rows, failure, std::size_t(blockIdx.x) * 4 + threadIdx.x / 32);
 }
-__device__ __forceinline__ float native_codebook(unsigned s) {
-    const unsigned product = s * 0x83dcd12dU;
-    const unsigned sum = __builtin_amdgcn_udot4(product, 0x01010101U, 0, false);
-    const float value = float(1024 + sum) * fp16_value(0x1eeeU) + fp16_value(0xc931U);
-    return float(_Float16(materialize(value)));
-}
+// mul1 codebook value of the shared codec (FP32 reference form; the separate multiply and add this identity
+// was specified with are exact in FP32, so the value is the same for all 65,536 states).
+__device__ __forceinline__ float native_codebook(unsigned s) { return core::trellis::Mul1::value(s); }
 template <unsigned K> __device__ float decoded(LinearView w, unsigned input, unsigned output) {
     const auto* tile = w.data + 2ULL * (w.inputs + w.outputs) +
         (std::size_t(input / 16) * (w.outputs / 16) + output / 16) * (32 * K);
@@ -237,69 +235,20 @@ template <unsigned Rows> void launch_core(LinearView w, const _Float16* x, float
 // chunk's window, and decodes each coefficient with one FP16 FMA. That FMA
 // equals RN16(RN32(.)) for all 1021 codebook sums (exact product, no
 // double-rounding tie); the operator bench enumerates all 65,536 states.
-using Word4 = std::uint32_t __attribute__((ext_vector_type(4)));
+using core::trellis::Word4;
 using Half8 = _Float16 __attribute__((ext_vector_type(8)));
 template <unsigned N, class F> __device__ __forceinline__ void unrolled(F&& f) {
     [&]<unsigned... I>(std::integer_sequence<unsigned, I...>) { (f.template operator()<I>(), ...); }(
         std::make_integer_sequence<unsigned, N>{});
 }
-constexpr unsigned position_of(unsigned row, unsigned col) {
-    return ((col & 7U) << 5U) | ((row & 6U) << 2U) | (row & 1U) | ((row & 8U) >> 2U) | ((col & 8U) >> 1U);
-}
-template <unsigned K, unsigned G, unsigned G0> struct LaneTile {
-    static_assert(G == 8 ? G0 == 0 : G == 4 && (G0 == 0 || G0 == 4));
-    static constexpr unsigned ring = 8 * K;
-    // A half tile also needs the word preceding its first group (ring wrap for G0=0).
-    static constexpr unsigned base = G == 8 ? 0 : (G0 * K + ring - 4) % ring;
-    static constexpr unsigned vectors = G == 8 ? 2 * K : G * K / 4 + 1;
-    Word4 v[vectors];
-    __device__ __forceinline__ void load(const std::uint32_t* tile) {
-#pragma unroll
-        for (unsigned i = 0; i < vectors; ++i) v[i] = *reinterpret_cast<const Word4*>(tile + (base + 4 * i) % ring);
-    }
-    template <unsigned J> __device__ __forceinline__ std::uint32_t word() const {
-        static_assert(J < 4 * vectors);
-        return v[J / 4][J % 4];
-    }
-    // Same bits as format.hpp state(): 16 ring bits ending at (P+1)K, MSB first.
-    template <unsigned P> __device__ __forceinline__ unsigned state() const {
-        constexpr unsigned start = ((P + 1) * K + 256 * K - 16) % (256 * K), off = start % 32;
-        constexpr unsigned first = (start / 32 + ring - base) % ring;
-        if constexpr (off <= 16) return (word<first>() >> (16 - off)) & 65535U;
-        else {
-            constexpr unsigned second = (start / 32 + 1 + ring - base) % ring;
-            return ((word<first>() << (off - 16)) | (word<second>() >> (48 - off))) & 65535U;
-        }
-    }
-};
-// One FP16 FMA per coefficient. (A packed half2 form was observed to be
-// miscompiled for gfx1151 when its halves are extracted; scalar FMA avoids it.)
-__device__ __forceinline__ _Float16 codebook_half(unsigned s) {
-    // 0x6400 + sum is the FP16 encoding of 1024 + sum (sum <= 1020).
-    const unsigned sum = __builtin_amdgcn_udot4(s * 0x83dcd12dU, 0x01010101U, 0x6400U, false);
-    const auto scale = __builtin_bit_cast(_Float16, std::uint16_t(0x1eee));
-    const auto bias = __builtin_bit_cast(_Float16, std::uint16_t(0xc931));
-    return __builtin_elementwise_fma(__builtin_bit_cast(_Float16, std::uint16_t(sum)), scale, bias);
-}
-// codebook_half with full-rate integer ops (v_mul_lo_u32 and v_dot4_u32_u8 issue at
-// quarter and half rate on gfx1151): s * 0x83dcd12d from two 16-bit multiplies
-// (exact for s < 2^16, which every state is) and the byte sum by v_sad_u8. Same
-// 32-bit product, same sum, same FP16 FMA, so the same value for all 65,536 states.
-__device__ __forceinline__ unsigned hash16(unsigned s) {
-    constexpr unsigned adjusted = 0x83dcd12dU - 1U, upper = (adjusted & 0xffff0000U) | 1U, lower = adjusted & 65535U;
-    unsigned high, product;
-    // high = s | lo16(s * hi16(M - 1)) << 16; product = s * lo16(M - 1) + high = s * M (mod 2^32).
-    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel:[0,0] op_sel_hi:[0,1]" : "=v"(high) : "v"(s), "s"(upper));
-    asm("v_mad_u32_u16 %0, %1, %2, %1" : "=v"(product) : "v"(high), "s"(lower));
-    return product;
-}
-__device__ __forceinline__ _Float16 codebook_half16(unsigned s) {
-    unsigned sum;
-    asm("v_sad_u8 %0, %1, 0, %2" : "=v"(sum) : "v"(hash16(s)), "s"(0x6400U));
-    const auto scale = __builtin_bit_cast(_Float16, std::uint16_t(0x1eee));
-    const auto bias = __builtin_bit_cast(_Float16, std::uint16_t(0xc931));
-    return __builtin_elementwise_fma(__builtin_bit_cast(_Float16, std::uint16_t(sum)), scale, bias);
-}
+constexpr unsigned position_of(unsigned row, unsigned col) { return core::trellis::Format::position(row, col); }
+// Whole (G = 8) or half (G = 4, column groups G0 .. G0 + 3 and + 8) tile windows of the shared codec.
+template <unsigned K, unsigned G, unsigned G0> using LaneTile = core::trellis::LaneTile<K, G, G0>;
+// One FP16 FMA per coefficient (shared codec; the scalar form, since a packed half2 form was observed to be
+// miscompiled for gfx1151 when its halves are extracted). codebook_half16 is the same value with full-rate
+// integer ops (v_mul_lo_u32 and v_dot4_u32_u8 issue at quarter and half rate on gfx1151).
+__device__ __forceinline__ _Float16 codebook_half(unsigned s) { return core::trellis::Mul1::half(s); }
+__device__ __forceinline__ _Float16 codebook_half16(unsigned s) { return core::trellis::Mul1::half16(s); }
 // Hash = true tabulates the full-rate form the decode cores use by default, so the
 // exhaustive 65,536-state comparison covers it.
 template <bool Hash> __global__ void codebook_table_kernel(std::uint16_t* out) {
@@ -311,82 +260,54 @@ template <bool Hash> __global__ void codebook_table_kernel(std::uint16_t* out) {
 // Lane t holds output columns t/4 and t/4+8 and inputs (2a, 2a+1, 2a+8, 2a+9)
 // with a = t%4, i.e. the eight consecutive ring states 8t..8t+7 of each tile,
 // read from three aligned words per lane (coalesced across the wave).
-using GlobalU32 = const std::uint32_t __attribute__((address_space(1)));
-__device__ __forceinline__ unsigned uni(unsigned v) {
-    return unsigned(__builtin_amdgcn_readfirstlane(int(v)));
-}
-template <class T> __device__ __forceinline__ const T* uniform(const T* p) {
-    const auto v = reinterpret_cast<std::uintptr_t>(p);
-    return reinterpret_cast<const T*>((std::uintptr_t(uni(unsigned(v >> 32U))) << 32U) | uni(unsigned(v)));
-}
-template <class T> __device__ __forceinline__ const T* scalar_advance(const T* base, unsigned elements) {
-    auto address = reinterpret_cast<std::uintptr_t>(base) + std::size_t(elements) * sizeof(T);
-    // Keep the complete advanced base in SGPRs before adding the lane offset.
-    // Uniformity alone lets instruction selection sink row strides into vaddr.
-    asm("" : "+s"(address));
-    return reinterpret_cast<const T*>(address);
-}
+using core::trellis::GlobalU32;
+using core::trellis::uni;
+using core::trellis::uniform;
+using core::trellis::scalar_advance;
 __device__ __forceinline__ std::uint32_t load_u32(const void* base, unsigned offset) {
-    // Nonvolatile: the unused third word at K4 must remain dead-load eliminable.
-    asm("" : "+v"(offset)); // SGPR base plus a 32-bit VGPR byte offset.
-    return *(GlobalU32*)(static_cast<const std::uint8_t*>(base) + offset);
+    return core::trellis::load_u32(static_cast<const unsigned char*>(base), offset);
 }
+// The shared codec's Lane reader (LaneGeom / LaneWords / TileStates) behind this file's names.
 template <unsigned K> struct CoopOffsets {
-    unsigned a, b, c, x;
+    unsigned a, b, c, x, align;
     __device__ explicit CoopOffsets(unsigned lane) {
-        constexpr unsigned count = 8 * K;
-        const unsigned index = ((lane * 8 + 1) * K + 256 * K - 16) / 32;
-        a = 4 * (index % count); b = 4 * ((index + 1) % count); c = 4 * ((index + 2) % count);
+        const core::trellis::LaneGeom<int(K)> g(lane);
+        a = g.oa; b = g.ob; c = g.oc; align = g.align;
         x = 4 * (lane & 3U);
     }
 };
-template <unsigned K, bool Saddr = false> struct CoopLane {
-    std::uint32_t high, low, tail;
+template <unsigned K, bool Saddr = false> struct CoopLane : core::trellis::TileStates<int(K)> {
+    using States = core::trellis::TileStates<int(K)>;
+    using Geom = core::trellis::LaneGeom<int(K)>;
+    using Words = core::trellis::LaneWords<int(K)>;
     __device__ __forceinline__ void load(const std::uint32_t* data, unsigned lane) {
         static_assert(!Saddr);
-        constexpr unsigned count = 8 * K;
-        const unsigned start = (lane * 8 + 1) * K + 256 * K - 16, index = start / 32, shift = start & 31U; // shift != 0
-        const auto a = data[index % count], b = data[(index + 1) % count], c = data[(index + 2) % count];
-        high = (a << shift) | (b >> (32 - shift));
-        low = (b << shift) | (c >> (32 - shift));
-        tail = c << shift;
+        const Geom g(lane);
+        static_cast<States&>(*this) = core::trellis::align_words<int(K)>(Words::issue_at(data, g), g.align);
     }
     __device__ __forceinline__ void load(const std::uint32_t* data, unsigned lane, const CoopOffsets<K>& offsets) {
-        if constexpr (Saddr) {
-            const auto a = load_u32(data, offsets.a), b = load_u32(data, offsets.b), c = load_u32(data, offsets.c);
-            align(a, b, c, lane);
-        } else load(data, lane);
+        if constexpr (Saddr)
+            static_cast<States&>(*this) =
+                core::trellis::align_words<int(K)>(Words(load_u32(data, offsets.a), load_u32(data, offsets.b), load_u32(data, offsets.c)), offsets.align);
+        else load(data, lane);
     }
     // The same window from words fetched earlier (CoopWords): alignment is
     // deferred to the chunk's use so pending prefetches are not waited on.
     __device__ __forceinline__ void align(std::uint32_t a, std::uint32_t b, std::uint32_t c, unsigned lane) {
-        const unsigned shift = ((lane * 8 + 1) * K + 256 * K - 16) & 31U;
-        high = (a << shift) | (b >> (32 - shift));
-        low = (b << shift) | (c >> (32 - shift));
-        tail = c << shift;
-    }
-    // State 8t+J: the 16 ring bits starting J*K bits into the aligned window.
-    template <unsigned J> __device__ __forceinline__ unsigned state() const {
-        constexpr unsigned offset = J * K;
-        if constexpr (offset <= 16) return (high >> (16 - offset)) & 65535U;
-        else if constexpr (offset < 32) return ((high << (offset - 16)) | (low >> (48 - offset))) & 65535U;
-        else if constexpr (offset <= 48) return (low >> (48 - offset)) & 65535U;
-        else return ((low << (offset - 48)) | (tail >> (80 - offset))) & 65535U;
+        static_cast<States&>(*this) = core::trellis::align_words<int(K)>(Words(a, b, c), Geom(lane).align);
     }
 };
 // Raw trellis words of one lane and chunk (CoopLane::load's three reads).
-template <unsigned K, bool Saddr = false> struct CoopWords {
-    std::uint32_t a, b, c;
+template <unsigned K, bool Saddr = false> struct CoopWords : core::trellis::LaneWords<int(K)> {
+    using Words = core::trellis::LaneWords<int(K)>;
     __device__ __forceinline__ void fetch(const std::uint32_t* data, unsigned lane) {
         static_assert(!Saddr);
-        constexpr unsigned count = 8 * K;
-        const unsigned index = ((lane * 8 + 1) * K + 256 * K - 16) / 32;
-        a = data[index % count]; b = data[(index + 1) % count]; c = data[(index + 2) % count];
+        static_cast<Words&>(*this) = Words::issue_at(data, core::trellis::LaneGeom<int(K)>(lane));
     }
     __device__ __forceinline__ void fetch(const std::uint32_t* data, unsigned lane, const CoopOffsets<K>& offsets) {
-        if constexpr (Saddr) {
-            a = load_u32(data, offsets.a); b = load_u32(data, offsets.b); c = load_u32(data, offsets.c);
-        } else fetch(data, lane);
+        if constexpr (Saddr)
+            static_cast<Words&>(*this) = Words(load_u32(data, offsets.a), load_u32(data, offsets.b), load_u32(data, offsets.c));
+        else fetch(data, lane);
     }
 };
 // Accumulates one split of one tile column; returns the quad-reduced value in
@@ -920,10 +841,23 @@ template <unsigned Rows> void launch_core(LinearView w, const _Float16* x, float
 }
 // Four waves share the same K16 progression and own a 64x64 output tile.
 // Panels are optional: both paths form exactly the same FP16 operands.
+// Without panels the B fragments come from the shared codec's Fragment reader
+// (lane = output column, its 16 input coordinates; the next tile's raw words are
+// issued before the current tile's matrix operations): the same FP16 coefficient
+// per (input, output) as decoded<K>, so the same operands and the same bytes.
 template <unsigned K> __global__ void wmma_kernel(LinearView w, const _Float16* x, unsigned rows,
                                                   float* out, unsigned* failure, const _Float16* panels) {
+    using Reader = core::trellis::Fragment<int(K)>;
+    using Word8 = std::uint32_t __attribute__((ext_vector_type(8)));
     const auto lane = threadIdx.x % 32, wave = threadIdx.x / 32;
     const auto m0 = blockIdx.y * 64 + (wave / 2) * 32, n0 = blockIdx.x * 64 + (wave % 2) * 32;
+    const Reader reader(int(lane % 16));
+    const auto* trellis = reinterpret_cast<const std::uint32_t*>(w.data + 2ULL * (w.inputs + w.outputs));
+    const std::size_t tile_words = 8 * K, k_stride = std::size_t(w.outputs / 16) * tile_words;
+    std::uint32_t raw[2][Reader::kLoads];
+    if (!panels)
+#pragma unroll
+        for (unsigned t = 0; t < 2; ++t) reader.issue(trellis + std::size_t(n0 / 16 + t) * tile_words, raw[t]);
     Float8 c[2][2]{};
     for (unsigned k0 = 0; k0 < w.inputs; k0 += 16) {
         Half16 a[2], b[2];
@@ -931,12 +865,23 @@ template <unsigned K> __global__ void wmma_kernel(LinearView w, const _Float16* 
         for (unsigned t = 0; t < 2; ++t) {
             const auto r = m0 + t * 16 + lane % 16, n = n0 + t * 16 + lane % 16;
 #pragma unroll
-            for (unsigned e = 0; e < 16; ++e) {
-                a[t][e] = r < rows ? x[std::size_t(r) * w.inputs + k0 + e] : _Float16(0);
-                b[t][e] = panels ? panels[(std::size_t(n / 16) * (w.inputs / 16) + k0 / 16) * 256 + (n % 16) * 16 + e]
-                                  : _Float16(decoded<K>(w, k0 + e, n));
+            for (unsigned e = 0; e < 16; ++e) a[t][e] = r < rows ? x[std::size_t(r) * w.inputs + k0 + e] : _Float16(0);
+            if (panels) {
+#pragma unroll
+                for (unsigned e = 0; e < 16; ++e)
+                    b[t][e] = panels[(std::size_t(n / 16) * (w.inputs / 16) + k0 / 16) * 256 + (n % 16) * 16 + e];
+            } else {
+                std::uint32_t normalized[Reader::kNormalized], fragment[8];
+                reader.normalize(raw[t], normalized);
+                Reader::template decode16<core::trellis::Mul1>(normalized, fragment);
+                b[t] = __builtin_bit_cast(Half16, Word8{fragment[0], fragment[1], fragment[2], fragment[3],
+                                                        fragment[4], fragment[5], fragment[6], fragment[7]});
             }
         }
+        if (!panels && k0 + 16 < w.inputs)
+#pragma unroll
+            for (unsigned t = 0; t < 2; ++t)
+                reader.issue(trellis + std::size_t(k0 / 16 + 1) * k_stride + std::size_t(n0 / 16 + t) * tile_words, raw[t]);
 #pragma unroll
         for (unsigned i = 0; i < 2; ++i)
 #pragma unroll

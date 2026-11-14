@@ -9,7 +9,7 @@ deployment's environment (pack paths), listed below.
 | setting | default | off | effect (P17.1 campaign) |
 |---|---|---|---|
 | `STRIX_DS41_PREPARED_LOAD` | discover exact matching per-node pack ([layout and preparation](prepared-load.md)) | `=0`; explicit directory overrides discovery | R1 tokens identical; default discovery vs `=0` whole-run wall -22.1 s mean (66.0 -> 43.8 s; explicit directory -20.6 s), fresh-process ABBA x2, two Strix Halo nodes, production identity, TP packed accepted on both ranks (72 GiB/node) |
-| `STRIX_DS41_BATCH_SEGMENTS` | on (off by itself with `STRIX_DS41_BATCH_ROWS16=1`) | `=0` | batch N=8 +9 % |
+| `STRIX_DS41_BATCH_SEGMENTS` | on (also with `STRIX_DS41_BATCH_ROWS16=1`; server qualification pending below) | `=0` | batch N=8 +9 %; no 9–16-row gain established here |
 | `STRIX_DS41_TP_DOWN` | on (the expert-TP down, width 1152 only) | `=0` | R6 window -3 %, batch N=8 +1.6 % |
 | `STRIX_DS41_EXPERT_ROWS` | on: routed IQ2_XXS gate/up and Q2_K down hold every weight group of a wave in registers across the staged-row parts | `=0` | same bits (rank in-process ABA, both ranks: R1 tokens + logits slice, window tokens, attention state). EP decode (the serve identity): R1 -0.16 % [-0.060, -0.031 ms], R6 -1.43 % [-1.001, -0.524 ms], 4/4 faster; expert-TP decode: R1 +0.03 % (neutral), R6 -0.39 % (3/3 faster) |
 | `STRIX_DS41_SERVE_SCHED` | `interleave` | `=off` | 8K prompt under load: decode stall <= 1 s instead of ~13 s (its own TTFT about doubles) |
@@ -24,6 +24,13 @@ deployment's environment (pack paths), listed below.
 
 Unchanged (off unless set): the tpserve prefill
 (`STRIX_DS41_PREFILL_EXPERT_TP`, slower than the EP prefill), `STRIX_DS41_BATCH_ROWS16`.
+
+The newly enabled segment path with `STRIX_DS41_BATCH_ROWS16=1` still needs
+server-level qualification of actual 9–16-row steps with mixed segment lengths
+and complete token/logit/state comparisons against `STRIX_DS41_BATCH_SEGMENTS=0`.
+Launch-splitting kernel coverage does not establish this gate. Per-rank
+token-stream checksums are diagnostic only: they omit row/slot identity and step
+boundaries, can collide, and do not replace complete exactness comparisons.
 
 ## Agent prefix policy (default)
 
@@ -232,6 +239,8 @@ mixed-load qualification; the P17.1 figures above do not qualify them. See the
 While no request decodes and no other prompt waits for its prefill, the pending prefill runs the rest of its
 piece at once instead of 250 ms units (same bits; a request that arrives meanwhile waits for that piece);
 `STRIX_DS41_SERVE_IDLE_WHOLE=0` keeps the bounded units while idle.
+From five live requests the serve prefills waiting prompts before the next decode step (admit-first, same tokens);
+`STRIX_SERVE_ADMIT_FIRST=0` keeps decode first.
 Use `STRIX_DS41_SERVE_SERVICE_MS=0` for coarse row budgeting and
 `STRIX_DS41_SERVE_SHORT_FIRST=0` for FIFO; restart both ranks when changing settings.
 

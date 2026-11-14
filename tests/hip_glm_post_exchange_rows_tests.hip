@@ -1,6 +1,7 @@
 // Native per-row fused-boundary qualification: R17 + R7 vs split Tier A, both rank orientations.
 #include "glm/xfer/glm_post_exchange.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
+#include "xport/row_fold.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -68,21 +69,78 @@ void run(unsigned rows, unsigned rank, unsigned poisoned, unsigned source) {
     const std::uint64_t sequence = 1;
     ok(hipMemcpy(ready.p, &sequence, sizeof(sequence), hipMemcpyHostToDevice));
     const X::RxView none{};
-    for (unsigned wait = 0; wait < 2; ++wait) for (unsigned form = 0; form < 2; ++form) {
+    // Exchange row fold: the pair sum computed on the host (rank 0's partial first), read as one folded slot.
+    std::vector<float> folded(np);
+    strix::xport::fold_rows(strix::xport::RowFold::sum_f32, folded.data(), rank == 0 ? local.data() : peer.data(),
+                            rank == 0 ? peer.data() : local.data(), np * sizeof(float));
+    Buffer<float> df(np);
+    ok(hipMemcpy(df.p, folded.data(), np * sizeof(float), hipMemcpyHostToDevice));
+    for (unsigned fold = 0; fold < 2; ++fold) for (unsigned wait = 0; wait < 2; ++wait) for (unsigned form = 0; form < 2; ++form) {
         ok(hipMemset(gate.p, 0, sizeof(sequence)));
-        const X::RxView view = wait == 0 ? none : X::RxView{dp.p, ready.p, sequence, gate.p};
-        const float* remote = wait == 0 ? dp.p : nullptr;
+        const float* payload = fold == 0 ? dp.p : df.p;
+        const float* dlp = fold == 0 ? dl.p : nullptr;
+        const X::RxView view = wait == 0 ? none : X::RxView{payload, ready.p, sequence, gate.p};
+        const float* remote = wait == 0 ? payload : nullptr;
         ok(hipMemcpy(dff.p, initial.data(), initial.size() * sizeof(unsigned), hipMemcpyHostToDevice));
-        if (form == 0) X::post_expand(dx.p, dm.p, dl.p, remote, view, rank, fused.p, dff.p + 1, rows, nullptr, 1);
+        if (form == 0) X::post_expand(dx.p, dm.p, dlp, remote, view, rank, fused.p, dff.p + 1, rows, nullptr, 1);
         else {
             X::hc_bracket(dx.p, dm.p, bracket.p, rows, nullptr);
-            X::post_expand_bracket(bracket.p, dm.p, dl.p, remote, view, rank, fused.p, dff.p + 1, rows, nullptr, 1);
+            X::post_expand_bracket(bracket.p, dm.p, dlp, remote, view, rank, fused.p, dff.p + 1, rows, nullptr, 1);
         }
         ok(hipMemcpy(actual.data(), fused.p, nx * sizeof(float), hipMemcpyDeviceToHost));
         ok(hipMemcpy(ff.data(), dff.p, ff.size() * sizeof(unsigned), hipMemcpyDeviceToHost));
         if (std::memcmp(expected.data(), actual.data(), nx * sizeof(float)) != 0 || sf != ff)
             throw std::runtime_error("fused/split output bits or per-row flags differ");
     }
+}
+// Host fold == device sum on 1e6 rows x 64 pairs of raw bit patterns (every exponent, subnormals, signed zeros,
+// infinities, cancellation, overflow, ties). NaN results must be NaN on both sides (payload is not compared).
+void fold_equals_device() {
+    const std::size_t n = std::size_t{1000000} * 64;
+    std::vector<float> a(n), b(n), hs(n), ds(n);
+    std::uint64_t z = 0x9e3779b97f4a7c15ULL;
+    auto word = [](std::uint32_t u) {
+        float v;
+        std::memcpy(&v, &u, 4);
+        return v;
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+        z ^= z << 13U;
+        z ^= z >> 7U;
+        z ^= z << 17U;
+        std::uint32_t ua = static_cast<std::uint32_t>(z), ub = static_cast<std::uint32_t>(z >> 32U);
+        const std::uint32_t ea = (ua >> 23U) & 0xffU;
+        switch (i % 16) {
+        case 1: ub = (ub & 0x807fffffU) | (ua & 0x7f800000U); break;                       // same exponent
+        case 2: ub = ua ^ 0x80000000U; break;                                              // exact cancellation
+        case 3: ua &= 0x807fffffU; ub &= 0x807fffffU; break;                               // subnormals
+        case 4: ua &= 0x80000000U; ub &= 0x80000000U; break;                               // signed zeros
+        case 5: ua = (ua & 0x80000000U) | 0x7f7fffffU; ub = (ub & 0x80000000U) | 0x7f7ffff0U; break;  // overflow
+        case 6: ub = (ub & 0x807fffffU) | ((ea > 24U ? ea - 24U : 0U) << 23U); break;      // sticky bits / ties
+        default: break;
+        }
+        a[i] = word(ua);
+        b[i] = word(ub);
+    }
+    strix::xport::fold_rows(strix::xport::RowFold::sum_f32, hs.data(), a.data(), b.data(), n * sizeof(float));
+    Buffer<float> da(n), db(n), dy(n);
+    ok(hipMemcpy(da.p, a.data(), n * sizeof(float), hipMemcpyHostToDevice));
+    ok(hipMemcpy(db.p, b.data(), n * sizeof(float), hipMemcpyHostToDevice));
+    sum_rank_order<<<static_cast<unsigned>((n + 255) / 256), 256>>>(da.p, db.p, dy.p, 0, static_cast<unsigned>(n));
+    ok(hipGetLastError());
+    ok(hipMemcpy(ds.data(), dy.p, n * sizeof(float), hipMemcpyDeviceToHost));
+    std::size_t bad = 0, nans = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool hn = hs[i] != hs[i], dn = ds[i] != ds[i];
+        if (hn || dn) {
+            ++nans;
+            if (hn != dn) ++bad;
+        } else if (std::memcmp(&hs[i], &ds[i], 4) != 0) {
+            ++bad;
+        }
+    }
+    std::printf("row fold sum_f32: host == device on %zu pairs (1e6 rows x 64), %zu NaN results, %zu differ\n", n, nans, bad);
+    if (bad != 0) throw std::runtime_error("row fold: host sum differs from the device sum");
 }
 }  // namespace
 
@@ -91,6 +149,7 @@ int main() {
         for (unsigned rows = 1; rows <= 8; ++rows) for (unsigned rank = 0; rank < 2; ++rank)
             for (unsigned poisoned = 0; poisoned <= rows; ++poisoned) for (unsigned source = 0; source < 3; ++source)
                 run(rows, rank, poisoned, source);
+        fold_equals_device();
         std::puts("post-exchange stride-1: all output bits and row flags match split");
         return 0;
     } catch (const std::exception& e) {

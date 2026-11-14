@@ -3,9 +3,11 @@
 #include "gemma4/contracts/g4_types.hpp"
 #include "gemma4/dflash/dflash.hpp"
 #include "auto_policy.hpp"
+#include "native_memory.hpp"
 #include "strix/serve/json.hpp"
 #include <functional>
 #include <map>
+#include <optional>
 #include <stdexcept>
 
 // Optional DraftSession hooks for autoregressive drafters are available (e4b-eagle / MTP check these).
@@ -42,6 +44,10 @@ public:
     // Optional: a new stream admitting `admitted` positions whose committed state equals this one byte for byte
     // (same digest; the same passes give the same outputs). nullptr = unsupported.
     [[nodiscard]] virtual std::unique_ptr<StreamState> fork(std::uint32_t admitted) const { (void)admitted; return nullptr; }
+    // Retained object + backing allocation bytes, excluding allocator bookkeeping.
+    // Unknown payloads must not claim a complete host retention budget.
+    [[nodiscard]] virtual std::optional<std::uint64_t> retained_bytes() const { return std::nullopt; }
+    [[nodiscard]] virtual std::optional<memory::Payload> native_payload() const { return {}; }
 };
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
 // requested, the final-norm hidden rows that RowPlan::export_hidden returns.
@@ -92,6 +98,13 @@ public:
         (void)hidden; (void)logits;
         return false;
     }
+    // Exact input continuation requires qualified arithmetic and complete rollback copies.
+    [[nodiscard]] virtual bool input_continuation_supported() const { return false; }
+    // Separate native cache-work admission. Unknown by default; this never
+    // derives device scratch from HostTarget worker geometry.
+    [[nodiscard]] virtual std::optional<std::uint64_t> native_turn_work_bound() const { return {}; }
+    // Existing device/pinned buffer payload only; not full service memory/RSS.
+    [[nodiscard]] virtual std::optional<memory::Payload> native_buffer_payload() const { return {}; }
     virtual std::unique_ptr<StreamState> create_stream() = 0;
     virtual std::unique_ptr<StreamState> create_stream(std::uint32_t admitted_context) {
         (void)admitted_context;
@@ -171,6 +184,11 @@ public:
     virtual void discard() noexcept { pending_taps_.clear(); pending_positions_.clear(); }
     // Session-specific receipt fields (prompt lookup); default adds nothing, so other sessions' receipts are unchanged.
     virtual void report(strix::serve::Json& receipt) const { (void)receipt; }
+    // Full lane checkpoint support is separate from prompt seeding. A clone
+    // must freeze every proposal/context cursor and bind the supplied stream.
+    // Unsupported drafters refuse full snapshots; prompt reuse still seeds a
+    // fresh drafter through seed(), and never inherits sampling state.
+    virtual std::unique_ptr<DraftSession> clone(StreamState&) const { return nullptr; }
 private:
     std::vector<float> pending_taps_;
     std::vector<std::uint64_t> pending_positions_;
@@ -212,6 +230,11 @@ struct PrefixSnapshot {
     std::shared_ptr<const StreamState> state;
     std::vector<float> hidden;
     bool prefill_written = false;
+    enum class Purpose { prefix, complete_turn };
+    Purpose purpose = Purpose::prefix;
+    std::vector<float> logits, taps;
+    std::string identity;
+    [[nodiscard]] std::optional<std::uint64_t> retained_bytes() const;
 };
 struct Result {
     Status status = Status::running;
@@ -270,11 +293,43 @@ public:
     // of the prompt's first prompt.size()-1 tokens) the stream starts from a fork of that state and prefills only
     // the rest; Result::cached_tokens says how many rows it skipped (0 when the backend or drafter cannot reuse it).
     std::size_t submit(Request request, std::shared_ptr<const PrefixSnapshot> prefix = {});
+    std::size_t submit_at(std::size_t slot, Request request, std::shared_ptr<const PrefixSnapshot> prefix = {});
+    // Explicit mode: no change to legacy Request admission or aggregate defaults.
+    void submit_input_at(std::size_t slot);
+    void stage_input(std::size_t slot, std::span<const std::uint32_t>);
+    void configure_decode(std::size_t slot, Sampling, std::span<const std::uint32_t> stops, std::size_t allowance);
+    void resume(std::size_t slot);
+    // Quiescent successful terminal transition; caller protects the complete
+    // slot with capture_lane/restore_lane through logical publication too.
+    void commit_pending(std::size_t slot);
+    [[nodiscard]] bool sealed_turn(std::size_t slot) const;
+    [[nodiscard]] std::shared_ptr<PrefixSnapshot> turn_snapshot(std::size_t slot) const;
+    [[nodiscard]] bool input_mode(std::size_t slot) const;
+    [[nodiscard]] std::size_t input_remaining(std::size_t slot) const;
+    [[nodiscard]] std::span<const std::uint32_t> input_history(std::size_t slot) const;
+    [[nodiscard]] std::span<const std::uint32_t> queued_input(std::size_t slot) const;
+    [[nodiscard]] std::optional<std::uint32_t> pending(std::size_t slot) const;
+    [[nodiscard]] std::span<const float> retained_logits(std::size_t slot) const;
+    void release(std::size_t slot);
+    [[nodiscard]] std::vector<std::uint32_t> history(std::size_t slot, std::uint64_t from = 0) const;
+    [[nodiscard]] std::size_t prompt_offset(std::size_t slot) const;
+    [[nodiscard]] const Request& request(std::size_t slot) const;
+    [[nodiscard]] std::shared_ptr<const void> capture_lane(std::size_t slot) const;
+    // Complete live allocation query plus conservative future final-row payload;
+    // never creates a stream or capture to estimate headroom.
+    [[nodiscard]] std::optional<std::uint64_t> turn_retained_bound(std::size_t slot) const;
+    [[nodiscard]] std::optional<std::uint64_t> turn_work_bound() const;
+    [[nodiscard]] std::optional<std::uint64_t> captured_lane_bytes(const std::shared_ptr<const void>&) const;
+    void restore_lane(std::size_t slot, const std::shared_ptr<const void>&);
     // The slot's committed state as a snapshot (nullptr when the backend cannot fork). Between steps only.
     [[nodiscard]] std::shared_ptr<PrefixSnapshot> snapshot(std::size_t slot) const;
     void cancel(std::size_t slot);
     // At most one forward_rows call, with <=8 total causal/independent rows.
     bool step();
+    struct LaneAdvance { std::size_t slot; std::function<bool()> cancelled; };
+    // One bounded compute/planner step, with explicit participants. No queue,
+    // lease, cache, continuation, publication or completion ownership here.
+    bool advance(std::span<const LaneAdvance> lanes, bool subset = false);
     // At most `streams` many-row prefill chunks per step, round-robin across slots (0 = every eligible stream,
     // the default). Decoding streams still step every call; outputs are unchanged.
     void set_prefill_limit(std::size_t streams) { prefill_limit_ = streams; }

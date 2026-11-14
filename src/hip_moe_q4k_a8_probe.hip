@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_arch_caps.hpp"
 #include "strix/hip_moe_q4k_a8_probe.hpp"
@@ -426,9 +427,7 @@ __global__ void half_conversion(unsigned* output) {
     const unsigned i=blockIdx.x*256U+threadIdx.x;
     output[i]=__float_as_uint(half_float(i));
 }
-void check(hipError_t error,const char* operation) {
-    if(error!=hipSuccess) throw std::runtime_error(std::string(operation)+": "+hipGetErrorString(error));
-}
+using strix::hip_check;
 }
 namespace {
 void admit_q5k_stream(hipStream_t stream) {
@@ -439,7 +438,7 @@ void admit_q5k_stream(hipStream_t stream) {
         context->arguments.memory.arena_base))
         throw std::invalid_argument("Q5K A8 rejects graph or foreign launch context");
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
-    check(hipStreamIsCapturing(stream,&capture),"Q5K A8 capture query");
+    hip_check(hipStreamIsCapturing(stream,&capture),"Q5K A8 capture query");
     if (capture != hipStreamCaptureStatusNone)
         throw std::invalid_argument("Q5K A8 rejects capture before enqueue");
 }
@@ -472,23 +471,23 @@ void enqueue_projection(const Request& request,const Bindings& b,hipStream_t str
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
             routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
     }
-    check(hipGetLastError(),"Q4K A8 projection enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 projection enqueue");
 }
 } // namespace
 void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
     if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
-    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
     validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
-    check(hipGetLastError(),"Q4K A8 route enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
     if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
     enqueue_projection(request,b,stream);
 }
 void enqueue_serial_prologue_probe(const Request& request,const Bindings& b,float* clear,unsigned clear_words,
@@ -496,7 +495,7 @@ void enqueue_serial_prologue_probe(const Request& request,const Bindings& b,floa
     validate(request,b);
     if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
     if(!clear || !route_weights || request.shape.top_k>1024U) throw std::invalid_argument("Q4K A8 serial prologue bindings are invalid");
-    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
     const void* input=reinterpret_cast<const void*>(b.input.address);
@@ -506,42 +505,42 @@ void enqueue_serial_prologue_probe(const Request& request,const Bindings& b,floa
         request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
     else serial_prologue<false><<<1,1024,0,stream>>>(input,routes,route_weights,clear,clear_words,
         request.shape.hidden,request.shape.top_k,request.shape.experts,codes,deltas,sums,status);
-    check(hipGetLastError(),"Q4K A8 serial prologue enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 serial prologue enqueue");
     enqueue_projection(request,b,stream);
 }
 void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
     if (request.gate_type != 12) throw std::invalid_argument("shared gate/up staging supports Q4K only");
-    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
     validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
-    check(hipGetLastError(),"Q4K A8 route enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
     if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
     project_shared_gate_up<<<dim3(request.shape.rows/32U,1,request.shape.top_k),256,0,stream>>>(
         reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
         routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
-    check(hipGetLastError(),"Q4K A8 shared gate/up projection enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 shared gate/up projection enqueue");
 }
 void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
     if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
-    check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
+    hip_check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
     validate_routes<<<1,32,0,stream>>>(routes,request.shape.top_k,request.shape.experts,status);
-    check(hipGetLastError(),"Q4K A8 route enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 route enqueue");
     const void* input=reinterpret_cast<const void*>(b.input.address);
     auto* codes=reinterpret_cast<signed char*>(b.codes.address);auto* deltas=reinterpret_cast<float*>(b.deltas.address);
     auto* sums=reinterpret_cast<int*>(b.sums.address);
     if(request.input==InputKind::bf16)quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
-    check(hipGetLastError(),"Q4K A8 quantizer enqueue");
+    hip_check(hipGetLastError(),"Q4K A8 quantizer enqueue");
 }
 namespace known_rows {
 void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream,
@@ -549,27 +548,27 @@ void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned c
     if(!active) active=count;
     if(count==0U||count>known_rows::max_union_rows||count*request.shape.top_k>known_rows::max_assignments||request.shape.experts>512U||active>count)
         throw std::invalid_argument("A8 window prologue geometry is invalid");
-    check(hipPeekAtLastError(),"A8 window prologue stale error");
+    hip_check(hipPeekAtLastError(),"A8 window prologue stale error");
     if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
     else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active,batch_cap);
-    check(hipGetLastError(),"A8 window prologue enqueue");
+    hip_check(hipGetLastError(),"A8 window prologue enqueue");
 }
 void enqueue_prefill_prologue(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {
     if(count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U)
         throw std::invalid_argument("A8 prefill prologue geometry is invalid");
-    check(hipPeekAtLastError(),"A8 prefill prologue stale error");
+    hip_check(hipPeekAtLastError(),"A8 prefill prologue stale error");
     if(request.input==InputKind::bf16)prefill_prologue<true><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
     else prefill_prologue<false><<<count,1024,0,stream>>>(rows,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
-    check(hipGetLastError(),"A8 prefill prologue enqueue");
+    hip_check(hipGetLastError(),"A8 prefill prologue enqueue");
 }
 } // namespace known_rows
 void enqueue_division_probe(const std::uint32_t* a,const std::uint32_t* b,std::uint32_t* output,unsigned count,hipStream_t stream) {
     if(!a || !b || !output || count==0) throw std::invalid_argument("invalid division receipt bindings");
-    division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count);check(hipGetLastError(),"Q4K A8 division receipt enqueue");
+    division_receipt<<<(count+255U)/256U,256,0,stream>>>(a,b,output,count);hip_check(hipGetLastError(),"Q4K A8 division receipt enqueue");
 }
 void enqueue_half_conversion_probe(std::uint32_t* output,hipStream_t stream) {
     if(output==nullptr) throw std::invalid_argument("null half conversion destination");
-    half_conversion<<<256,256,0,stream>>>(output);check(hipGetLastError(),"Q4K A8 half conversion enqueue");
+    half_conversion<<<256,256,0,stream>>>(output);hip_check(hipGetLastError(),"Q4K A8 half conversion enqueue");
 }
 
 // A8 down is a separate, explicitly selected numerical contract.
@@ -716,9 +715,9 @@ void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t str
         context->arguments.memory.arena_base))
         throw std::invalid_argument("A8 down rejects graph or foreign launch context");
     hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
-    check(hipStreamIsCapturing(stream,&capture),"A8 down capture query");
+    hip_check(hipStreamIsCapturing(stream,&capture),"A8 down capture query");
     if(capture!=hipStreamCaptureStatusNone) throw std::invalid_argument("A8 down rejects capture before enqueue");
-    check(hipPeekAtLastError(),"A8 down pre-enqueue stale error");
+    hip_check(hipPeekAtLastError(),"A8 down pre-enqueue stale error");
 }
 }
 void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
@@ -728,7 +727,7 @@ void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b
         reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
         reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
         reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
-    check(hipGetLastError(),"A8 down activation/quantization enqueue");
+    hip_check(hipGetLastError(),"A8 down activation/quantization enqueue");
 }
 void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
     down_admit(r,b,stream);
@@ -761,7 +760,7 @@ void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
             r.shape.hidden,r.shape.intermediate,r.shape.experts);
     }
-    check(hipGetLastError(),"A8 down integer rawdot enqueue");
+    hip_check(hipGetLastError(),"A8 down integer rawdot enqueue");
 }
 
 }

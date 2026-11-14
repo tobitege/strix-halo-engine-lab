@@ -54,8 +54,9 @@ struct IU4GroupedOperands {
 // EXL3 -> IU4 g64 pack of one matrix per expert (the engines' iu4_convert_kernel, moved here
 // with shared load-time rounding). trellis[e] = expert e's tiles (nullptr =
 // skip). Both nibbles and scales are built at load time; source widths are 2..8.
+// scale_rule: iu4_scale_rule_legacy (default, bits unchanged) or iu4_scale_rule_fast_full (core/iu4.hpp).
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,
-    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream);
+    uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream, int scale_rule = 0);
 // Upper bound of the tile list length for a plan: ceil(rows_total / BM) + experts.
 size_t iu4_grouped_max_tiles(size_t map_rows, int experts, int tile);
 // Device: tiles = expert-ordered BM-row tiles of every nonempty group, *ntiles = count.

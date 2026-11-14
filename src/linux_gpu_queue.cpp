@@ -1,5 +1,6 @@
 #include "strix/linux_gpu_queue.hpp"
 
+#include <chrono>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -100,11 +101,11 @@ struct LinuxGpuQueue::Impl {
     std::uint64_t last_handle = 0, last_epoch = 0, capacity = 0;
     std::uint32_t capabilities = 0;
     bool imported = false, armed = false, stopped = false, failed = false, import_ambiguous = false, cleanup_ambiguous = false;
+    std::chrono::steady_clock::time_point verified{}; // lean: the last FD/pool identity check
     Impl(GpuQueueIo calls, GpuQueueExpected e) : io(std::move(calls)), expected(e) {}
     void current(bool productive = true) {
         if (productive && failed) malformed("GPU queue is failed; only bounded cleanup/recovery is allowed");
-        io.require_current();
-        if (pool.lifetime) pool.require_current();
+        verify();
     }
     GpuQueueSyscall raw(unsigned long command, void* argument) {
         current(false); const auto result = io.ioctl_call(command, argument); current(false); return result;
@@ -114,9 +115,22 @@ struct LinuxGpuQueue::Impl {
     void hot() {
         if (!expected.lean) { current(); return; }
         if (failed) malformed("GPU queue is failed; only bounded cleanup/recovery is allowed");
+        // Bounded staleness: the clock read is not a system call; the identity check (fstat + two fcntl) runs
+        // once per interval instead of five times around every operation.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - verified >= expected.identity_interval) verify();
+    }
+    void verify() {
+        io.require_current();
+        if (pool.lifetime) pool.require_current();
+        verified = std::chrono::steady_clock::now();
     }
     GpuQueueSyscall hot_raw(unsigned long command, void* argument) {
-        return expected.lean ? io.ioctl_owned(command, argument) : raw(command, argument);
+        if (!expected.lean) return raw(command, argument);
+        const auto result = io.ioctl_owned(command, argument);
+        // An unexpected failure is attributed only after the descriptor is known to be ours.
+        if (result.result < 0 && result.error != EAGAIN && result.error != EINTR) verify();
+        return result;
     }
     bool outstanding() const {
         for (const auto& direction : operations)

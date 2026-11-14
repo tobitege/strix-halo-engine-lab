@@ -8,6 +8,7 @@
 // hit rate by the target's own top-1 probability (over its 32 largest logits) and by the drafter's confidence.
 // --streams-raw FILE replaces the drafter rows of the (single) dump with rows made from other target streams, e.g. the
 // official model's with FP8 activations, to see how the target's activation identity moves acceptance.
+#include "strix/device/hip_gate.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/hip_ds41_dspark.hpp"
@@ -104,6 +105,10 @@ struct Stats {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::string target, draft_file, vocab_spec = "full", streams_raw, features;
     bool top_rank = false, all_positions = false;
     std::vector<std::string> dumps;

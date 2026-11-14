@@ -1,5 +1,5 @@
 // One rank of the DSpark drafter with the head split by vocabulary over two ranks (two nodes).
-//   strix-ds41-dspark-rank TARGET.gguf DRAFT.gguf --rank R (--listen PORT | --connect HOST:PORT | --usb4 DEV,DEV,...)
+//   strix-ds41-dspark-rank TARGET.gguf DRAFT.gguf --rank R (--transport SPEC | --listen PORT | --connect HOST:PORT | --usb4 DEV,DEV,...)
 //                          [--vocab SPEC] [--steps N]
 // Each rank first drafts alone (world 1, the reference), then resets and drafts the same sequence with
 // the head split (world 2); the tokens and confidences must be identical. Inputs are synthetic target
@@ -7,7 +7,9 @@
 // stream devices of every live cable, in the paired order of the detected topology, never fixed
 // numbers) or TCP (debug).
 
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "strix/hip_ds41_dspark.hpp"
@@ -18,7 +20,6 @@
 #include <cstdio>
 #include <iostream>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -61,7 +62,11 @@ Run run(DeviceDrafter& d, std::uint32_t steps) {
 } // namespace
 
 int main(int argc, char** argv) try {
-    std::string target, draft_file, listen, connect, usb4, vocab_spec = "full";
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
+    std::string target, draft_file, listen, connect, usb4, spec, vocab_spec = "full";
     std::uint32_t rank = 0, steps = 8;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -73,29 +78,23 @@ int main(int argc, char** argv) try {
         else if (a == "--listen") listen = next();
         else if (a == "--connect") connect = next();
         else if (a == "--usb4") usb4 = next();
+        else if (a == "--transport") spec = next();
         else if (a == "--vocab") vocab_spec = next();
         else if (a == "--steps") steps = static_cast<std::uint32_t>(std::stoul(next()));
         else if (target.empty()) target = a;
         else if (draft_file.empty()) draft_file = a;
         else throw std::invalid_argument("unknown argument " + a);
     }
-    const int transports = !listen.empty() + !connect.empty() + !usb4.empty();
+    const int transports = !listen.empty() + !connect.empty() + !usb4.empty() + !spec.empty();
     if (target.empty() || draft_file.empty() || transports != 1 || rank > 1U || steps < 2U)
-        throw std::invalid_argument("usage: strix-ds41-dspark-rank TARGET DRAFT --rank R (--listen PORT | --connect HOST:PORT)");
+        throw std::invalid_argument("usage: strix-ds41-dspark-rank TARGET DRAFT --rank R (--transport SPEC | --listen PORT | --connect HOST:PORT | --usb4 DEV,...)");
+    // The shorthand flags are transport specs of the shared opener.
+    if (!listen.empty()) spec = "tcp-listen:" + listen;
+    if (!connect.empty()) spec = "tcp-connect:" + connect;
+    if (!usb4.empty()) spec = "usb4:" + usb4;
     // Connect first (before the weights) so that the peer does not wait on our loading.
-    std::unique_ptr<strix::dist::Transport> transport;
-    if (!usb4.empty()) {
-        std::vector<std::string> devices;
-        std::stringstream ss(usb4);
-        for (std::string d; std::getline(ss, d, ',');) devices.push_back(d);
-        transport = strix::dist::usb4_host(devices);
-    } else if (!listen.empty()) transport = strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(listen)), std::chrono::milliseconds(600000));
-    else {
-        const auto colon = connect.rfind(':');
-        transport = strix::dist::tcp_connect(connect.substr(0, colon), static_cast<std::uint16_t>(std::stoul(connect.substr(colon + 1))),
-                                             std::chrono::milliseconds(600000));
-    }
-    strix::dist::Communicator comm({rank, 2U, 1U, 89U}, std::move(transport), 64U);
+    auto opened = strix::dist::open_pair(spec, rank, {std::chrono::seconds(600)});
+    strix::dist::Communicator comm({rank, 2U, 1U, 89U}, std::move(opened.host), std::move(opened.direct), 64U);
     const auto weights = load_weights(target, draft_file);
     DeviceDrafter d(weights->weights);
     const auto choice = choose_vocabulary(vocab_spec, {});

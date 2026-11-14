@@ -57,7 +57,9 @@ ninja -C build strix-hip-decode-token
 ```
 
 The run prints a JSON receipt with token IDs and timing. Add `--print-effective-config` to see the resolved
-configuration before any device work.
+configuration before any device work. With the [drafter bundle](docs/engine/speculative/mtp-native-cli.md#default-mtp-drafter-bundle)
+beside the model this command decodes with exact MTP speculation (the MTP figure above); without it, or with
+`--no-mtp` / `STRIX_MTP=0`, it decodes the same tokens one at a time.
 
 Pair (DeepSeek). Two nodes with 128 GB each and two USB4 cables. Run on both nodes, with `--rank 1` and the other
 address on the second one:

@@ -9,6 +9,8 @@
 // Every row's bits depend only on that row (batch invariance R = 1..8). Build with the engine flags (-ffp-contract=off).
 #include <hip/hip_runtime.h>
 
+#include "strix/pair/producer_publish.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -61,14 +63,15 @@ std::size_t scratch_bytes(Group g, unsigned rows, Knobs k);
 // rows 1..8; x rows have stride x_stride floats (>= input), 4-byte aligned; outputs as stated.
 void kda_qkv(const Mat (&m)[3], const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws,
              hipStream_t s, Knobs k = env_knobs());
+// pub (o projections): y is the exchange TX slot holding the whole partial; the kernel publishes it after its last store.
 void kda_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s,
-           Knobs k = env_knobs());
+           Knobs k = env_knobs(), const strix::pair::ProducerPublish* pub = nullptr);
 void dsa_a(const Mat& q_a, const Mat& kv_a, const float* x, unsigned x_stride, unsigned rows, float* qa, unsigned qa_stride,
            float* kva, unsigned kva_stride, void* ws, hipStream_t s, Knobs k = env_knobs());
 void dsa_b(const Mat& q_b, const Mat& wq_b, const float* qr, unsigned qr_stride, unsigned rows, float* q, unsigned q_stride,
            float* qI, unsigned qI_stride, void* ws, hipStream_t s, Knobs k = env_knobs());
 void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s,
-           Knobs k = env_knobs());
+           Knobs k = env_knobs(), const strix::pair::ProducerPublish* pub = nullptr);
 
 // Per-(group, rows) knob table (default on; STRIX_GLM_TIERB_TABLE=0 off) switched at runtime (A/B in one process).
 void set_table_enabled(bool on);

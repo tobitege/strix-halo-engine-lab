@@ -1,6 +1,8 @@
 #include "strix/prefix_state_cache.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/unbuffered_file.hpp"
+#include "strix/session/checkpoint_io.hpp"
+#include "strix/session/prefix_cache.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -12,13 +14,6 @@
 #include <string>
 #include <system_error>
 #include <unordered_set>
-
-#if defined(__unix__)
-#include <fcntl.h>
-#include <unistd.h>
-#elif defined(_WIN32)
-#include <io.h>
-#endif
 
 namespace strix {
 namespace {
@@ -70,18 +65,17 @@ ModelContentIdentity get(const std::uint8_t (&in)[32]) {
 class File final {
 public:
     File(const std::filesystem::path& path, const char* mode) : file_(std::fopen(path.string().c_str(), mode)) {}
-    // Whole-file payload streams ("rb" or "wb"): unbuffered unless STRIX_SESSION_DIRECT_IO=0.
+    // Whole-file reads: unbuffered unless STRIX_SESSION_DIRECT_IO=0.
     enum class Stream { payload };
     File(const std::filesystem::path& path, const char* mode, Stream) {
         if (!state_file_io::unbuffered_io_enabled()) { file_ = std::fopen(path.string().c_str(), mode); return; }
-        if (std::string_view(mode) == "wb") writer_ = std::make_unique<state_file_io::SequentialWriter>(path, false, 0666);
-        else reader_ = std::make_unique<state_file_io::SequentialReader>(path);
+        reader_ = std::make_unique<state_file_io::SequentialReader>(path);
     }
     ~File() { if (file_) std::fclose(file_); }
     File(const File&) = delete;
     File& operator=(const File&) = delete;
     [[nodiscard]] bool open() const noexcept {
-        return file_ != nullptr || (writer_ && writer_->open()) || (reader_ && reader_->open());
+        return file_ != nullptr || (reader_ && reader_->open());
     }
     void read(void* data, std::uint64_t bytes) {
         if (reader_) {
@@ -96,55 +90,10 @@ public:
             bytes -= chunk;
         }
     }
-    void write(const void* data, std::uint64_t bytes) {
-        if (writer_) {
-            try { writer_->write(data, bytes); } catch (const std::exception&) { throw std::runtime_error("prefix cache file write failed"); }
-            return;
-        }
-        const auto* in = static_cast<const std::byte*>(data);
-        while (bytes) {
-            const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, 64ULL << 20));
-            if (std::fwrite(in, 1, chunk, file_) != chunk) throw std::runtime_error("prefix cache file write failed");
-            in += chunk;
-            bytes -= chunk;
-        }
-    }
-    void close(bool durable = false) {
-        if (writer_) {
-            auto writer = std::move(writer_);
-            try { writer->finish(durable); } catch (const std::exception&) { throw std::runtime_error("prefix cache file sync failed"); }
-            return;
-        }
-        if (file_ && durable) {
-            if (std::fflush(file_) != 0) throw std::runtime_error("prefix cache file flush failed");
-#if defined(__unix__)
-            if (::fdatasync(::fileno(file_)) != 0) throw std::runtime_error("prefix cache file sync failed");
-#elif defined(_WIN32)
-            if (::_commit(::_fileno(file_)) != 0) throw std::runtime_error("prefix cache file sync failed");
-#endif
-        }
-        if (file_ && std::fclose(file_) != 0) { file_ = nullptr; throw std::runtime_error("prefix cache file close failed"); }
-        file_ = nullptr;
-    }
 private:
     std::FILE* file_ = nullptr;
-    std::unique_ptr<state_file_io::SequentialWriter> writer_;
     std::unique_ptr<state_file_io::SequentialReader> reader_;
 };
-
-void sync_directory(const std::filesystem::path& dir, bool durable) {
-#if defined(__unix__)
-    if (!durable) return;
-    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0) throw std::runtime_error("prefix cache directory open failed");
-    const int result = ::fsync(fd);
-    ::close(fd);
-    if (result != 0) throw std::runtime_error("prefix cache directory sync failed");
-#else
-    // The native serving implementation is POSIX; other hosts sync file contents only.
-    static_cast<void>(dir); static_cast<void>(durable);
-#endif
-}
 
 // A tagged envelope inside the existing v1 metadata section. No parallel files/store.
 std::vector<std::byte> disk_metadata(const PrefixCacheCheckpoint& checkpoint) {
@@ -155,14 +104,6 @@ std::vector<std::byte> disk_metadata(const PrefixCacheCheckpoint& checkpoint) {
     std::memcpy(out.data()+sizeof(count), checkpoint.producer_certificate.data(), count*sizeof(std::uint64_t));
     std::memcpy(out.data()+sizeof(count)+count*sizeof(std::uint64_t), checkpoint.metadata.data(), checkpoint.metadata.size());
     return out;
-}
-
-std::filesystem::path temporary_path(const std::filesystem::path& path) {
-    long pid = 0;
-#if defined(__unix__)
-    pid = static_cast<long>(::getpid());
-#endif
-    return path.string() + ".tmp." + std::to_string(pid);
 }
 
 std::uint64_t checkpoint_host_bytes(const PrefixCacheCheckpoint& checkpoint) {
@@ -178,6 +119,12 @@ double elapsed_ms(std::chrono::steady_clock::time_point start) {
 std::vector<std::uint32_t> PrefixCacheCheckpoint::tokens() const {
     std::vector<std::uint32_t> out;
     out.reserve(static_cast<std::size_t>(position));
+    if(chain_retention && segments.size()==1) {
+        std::vector<const PrefixCacheSegment*> path;
+        for(auto p=segments.front().get();p;p=p->ancestor.get()) path.push_back(p);
+        for(auto i=path.rbegin();i!=path.rend();++i) out.insert(out.end(),(*i)->tokens.begin(),(*i)->tokens.end());
+        return out;
+    }
     for (const auto& segment : segments) out.insert(out.end(), segment->tokens.begin(), segment->tokens.end());
     return out;
 }
@@ -229,7 +176,7 @@ PrefixStateCache::PrefixStateCache(PrefixStateCachePolicy policy, PrefixCacheAll
     require(policy_.host_byte_budget != 0 && static_cast<bool>(allocate_),
         "prefix state cache needs a positive host byte budget and an allocator");
     if (!policy_.disk_directory.empty()) {
-        std::filesystem::create_directories(policy_.disk_directory);
+        session::checkpoint_io::create_directories(policy_.disk_directory,policy_.durable && !policy_.legacy);
         // Leftovers of interrupted writers (old enough not to belong to a live process).
         sweep_disk(std::chrono::minutes(10));
         update_disk_gauge();
@@ -248,12 +195,483 @@ PrefixStateCache::~PrefixStateCache() {
     }
 }
 
+void PrefixStateCache::reap_immutable_locked(Ledger& ledger) {
+    for (auto i = ledger.certificate_owners.begin(); i != ledger.certificate_owners.end();) {
+        if (i->first.expired()) { ledger.certificates -= i->second; i = ledger.certificate_owners.erase(i); }
+        else ++i;
+    }
+    for (auto i = ledger.immutable_owners.begin(); i != ledger.immutable_owners.end();) {
+        if (i->first.expired()) { ledger.immutable -= i->second; i = ledger.immutable_owners.erase(i); }
+        else ++i;
+    }
+}
+PrefixStateCache::RetentionLease::~RetentionLease() {
+    value.reset();
+    std::lock_guard lock(ledger->mutex);
+    ledger->retention_metadata -= metadata;
+    ledger->exempt -= exempt;
+    reap_immutable_locked(*ledger);
+}
+std::uint64_t PrefixStateCache::new_scope() {
+    std::lock_guard lock(mutex_);
+    if (next_scope_ == UINT64_MAX) throw std::overflow_error("cache scope exhausted");
+    const auto scope = ++next_scope_;
+    scope_evictions_.emplace(scope, 0);
+    named_views_.try_emplace(scope);
+    return scope;
+}
+const std::map<std::string, PrefixStateCache::NamedView>& PrefixStateCache::named_view(std::uint64_t scope) const {
+    std::lock_guard lock(mutex_);
+    return named_views_.at(scope);
+}
+std::vector<std::shared_ptr<const PrefixCacheCheckpoint>> PrefixStateCache::inspect(std::uint64_t scope) const {
+    std::lock_guard lock(mutex_);
+    std::vector<std::shared_ptr<const PrefixCacheCheckpoint>> result;
+    for (const auto& d : lru_) if (entries_.at(d).checkpoint->retention.scope == scope)
+        result.push_back(entries_.at(d).checkpoint);
+    return result;
+}
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::query(std::uint64_t scope, const EntryRank& rank, bool touch) {
+    std::lock_guard lock(mutex_);
+    auto best = entries_.end();
+    std::uint64_t score = 0;
+    for (auto i = entries_.begin(); i != entries_.end(); ++i) {
+        if (i->second.checkpoint->retention.scope != scope) continue;
+        const auto n = rank(*i->second.checkpoint);
+        if (n > score) { score = n; best = i; }
+    }
+    if (best == entries_.end()) return {};
+    if (touch) touch_locked(best->second);
+    return best->second.checkpoint;
+}
+std::uint64_t PrefixStateCache::retained_charge(std::uint64_t scope) const noexcept {
+    std::lock_guard lock(mutex_);
+    if(const auto i=chain_stats_.find(scope);i!=chain_stats_.end()) return i->second.bytes;
+    std::uint64_t total = 0;
+    for (const auto& [d,e] : entries_) if (e.checkpoint->retention.scope == scope) {
+        (void)d;
+        if (e.checkpoint->charge > UINT64_MAX - total) return UINT64_MAX;
+        total += e.checkpoint->charge;
+    }
+    return total;
+}
+std::uint64_t PrefixStateCache::scope_evictions(std::uint64_t scope) const noexcept {
+    std::lock_guard lock(mutex_);
+    const auto i = scope_evictions_.find(scope);
+    return i == scope_evictions_.end() ? 0 : i->second;
+}
+std::size_t PrefixStateCache::entry_count(std::uint64_t scope) const noexcept {
+    std::lock_guard lock(mutex_);
+    return static_cast<std::size_t>(std::count_if(entries_.begin(), entries_.end(),
+        [scope](const auto& item) { return item.second.checkpoint->retention.scope == scope; }));
+}
+bool PrefixStateCache::retention_room_locked(const PrefixEntryPolicy& p, std::uint64_t n,
+    std::string_view replacement, std::string_view keep) const {
+    if (!p.scope || !p.max_entries || (n > p.max_bytes && !p.sole_oversize)) return false;
+    std::uint64_t protected_bytes = 0, protected_count = 0;
+    for (const auto& [d,e] : entries_) {
+        (void)d;
+        const auto& c = *e.checkpoint;
+        if (c.retention.scope != p.scope || !e.protected_entry) continue;
+        if ((!replacement.empty() && c.replacement == replacement) || (!keep.empty() && c.keep == keep)) return false;
+        if (c.charge > UINT64_MAX - protected_bytes) return false;
+        protected_bytes += c.charge; ++protected_count;
+    }
+    return protected_count < p.max_entries && (n > p.max_bytes ? protected_count == 0 :
+        protected_bytes <= p.max_bytes - n);
+}
+bool PrefixStateCache::retention_room(const PrefixEntryPolicy& p, std::uint64_t n,
+    std::string_view replacement, std::string_view keep) const {
+    std::lock_guard lock(mutex_);
+    return retention_room_locked(p, n, replacement, keep);
+}
+bool PrefixStateCache::reclaim_one_locked(std::optional<std::uint64_t> scope, std::string_view protected_name) {
+    for (const auto& d : lru_) {
+        auto i = entries_.find(d);
+        const auto& c = *i->second.checkpoint;
+        if (c.chain_retention && !scope) continue; // this adopter has scoped victim authority
+        if ((scope && c.retention.scope != *scope) || i->second.protected_entry ||
+            (!protected_name.empty() && c.name == protected_name)) continue;
+        // Physical slab owners cannot be reclaimed while their backing is leased.
+        // Generic lookups may be evicted: their lease stays charged in the ledger.
+        if (!c.retention.scope && payload_pool_ && i->second.checkpoint.use_count() != 1) continue;
+        const auto owner = c.retention.scope;
+        erase_locked(d, true);
+        ++stats_.evicted; ++stats_.evictions_space;
+        if (owner) ++scope_evictions_.at(owner);
+        return true;
+    }
+    return false;
+}
+void PrefixStateCache::remove(std::uint64_t scope, const EntryPredicate& predicate) noexcept {
+    std::lock_guard lock(mutex_);
+    for (auto i = entries_.begin(); i != entries_.end();) {
+        const auto current = i++;
+        if (current->second.checkpoint->retention.scope == scope && predicate(*current->second.checkpoint))
+            erase_locked(current->first);
+    }
+}
+bool PrefixStateCache::unpin(std::uint64_t scope, const std::string& keep) {
+    std::lock_guard lock(mutex_);
+    for (auto& [d,e] : entries_) {
+        (void)d;
+        if (e.checkpoint->retention.scope == scope && e.protected_entry && e.checkpoint->keep == keep && !keep.empty()) {
+            e.protected_entry = false;
+            return true;
+        }
+    }
+    return false;
+}
+bool PrefixStateCache::reclaim(std::uint64_t scope, const std::function<bool(std::uint64_t)>& fits,
+    const std::optional<std::string>& protected_name) {
+    std::lock_guard lock(mutex_);
+    for (;;) {
+        std::uint64_t n = 0;
+        for (const auto& [d,e] : entries_) if (e.checkpoint->retention.scope == scope) {
+            (void)d;
+            if (e.checkpoint->charge > UINT64_MAX - n) return false;
+            n += e.checkpoint->charge;
+        }
+        if (fits(n)) return true;
+        if (!reclaim_one_locked(scope, protected_name.value_or(""))) return false;
+    }
+}
+bool PrefixStateCache::retain(std::shared_ptr<PrefixCacheCheckpoint> value, bool replace, Reservation* credit) {
+    if (!value || value->chain_retention) return false;
+    value = std::make_shared<PrefixCacheCheckpoint>(*value);
+    std::lock_guard lock(mutex_);
+    const auto& p = value->retention;
+    if (!scope_evictions_.contains(p.scope) || !named_views_.contains(p.scope) ||
+        !value->segments.empty() || !value->metadata.empty() ||
+        !value->producer_certificate.empty() || !retention_room_locked(p, value->charge, value->replacement, value->keep)) return false;
+    auto duplicate = entries_.end();
+    for (auto i = entries_.begin(); i != entries_.end(); ++i)
+        if (i->second.checkpoint->retention.scope == p.scope &&
+            i->second.checkpoint->replacement == value->replacement) { duplicate = i; break; }
+    if (duplicate != entries_.end() && !replace) return false;
+    // Freeze/allocate incoming control storage before deleting any old value.
+    auto lease = std::make_shared<RetentionLease>(); lease->ledger = ledger_;
+    lease->value = value;
+    const auto payload = value->snapshot ? value->snapshot->state.bytes : value->encoded ? value->fixed.bytes : 0;
+    if (payload > value->charge) return false;
+    const auto certificate_bytes = value->resident ? sizeof(session::ResidentState) +
+        value->resident->tokens().size() * sizeof(std::uint32_t) : 0;
+    if (certificate_bytes > value->charge - payload) return false;
+    const auto budget_metadata = value->charge - payload - certificate_bytes;
+    const auto metadata = value->declared_metadata ? value->declared_metadata : budget_metadata;
+    if (metadata < budget_metadata || (metadata != budget_metadata &&
+        (!value->legacy_index_exemption || (!value->encoded && (!value->snapshot || value->snapshot->turn))))) return false;
+    const auto exempt = metadata - budget_metadata;
+    std::uint64_t needed = budget_metadata;
+    decltype(ledger_->immutable_owners) staged, certificates;
+    {
+        std::lock_guard ledger_lock(ledger_->mutex);
+        reap_immutable_locked(*ledger_);
+        if (metadata > UINT64_MAX - ledger_->retention_metadata || exempt > UINT64_MAX - ledger_->exempt) return false;
+        if (value->snapshot) for (const auto& r : value->snapshot->state.ranks) {
+            auto old = ledger_->immutable_owners.find(r.owner);
+            if (old != ledger_->immutable_owners.end()) {
+                if (old->second != r.bytes) return false;
+            } else {
+                auto [i, added] = staged.emplace(r.owner, r.bytes);
+                if (!added && i->second != r.bytes) return false;
+                if (added) { if (r.bytes > UINT64_MAX - needed) return false; needed += r.bytes; }
+            }
+        }
+        if (value->resident && !ledger_->certificate_owners.contains(value->resident->state)) {
+            if (certificate_bytes > UINT64_MAX - needed) return false;
+            needed += certificate_bytes;
+            certificates.emplace(value->resident->state, certificate_bytes);
+        }
+        if (value->encoded) {
+            const auto found = receipts_.find(value->fixed.data.get());
+            const auto receipt = found == receipts_.end() ? nullptr : found->second.lock();
+            if (!receipt || !receipt->registered) {
+                if (value->encoded->capacity() > UINT64_MAX - needed) return false;
+                needed += value->encoded->capacity();
+            }
+        }
+    }
+    // Preallocate the real directory and LRU nodes before changing victims.
+    // Node transfer at publication cannot allocate or fail.
+    auto serial = epoch_;
+    do {
+        if (serial == UINT64_MAX) throw std::overflow_error("cache entry epoch exhausted");
+        ++serial;
+        value->digest = {};
+        std::memcpy(value->digest.bytes.data(), &p.scope, sizeof(p.scope));
+        std::memcpy(value->digest.bytes.data() + 8, &serial, sizeof(serial));
+        value->digest.bytes.back() = 0xff;
+    } while (entries_.contains(value->digest));
+    std::shared_ptr<const PrefixCacheCheckpoint> retained(lease, value.get());
+    std::list<ModelContentIdentity> pending_lru;
+    decltype(entries_) pending_directory;
+    std::map<std::string, NamedView> pending_view;
+    pending_lru.push_back(value->digest);
+    pending_directory.emplace(value->digest, Entry{retained, pending_lru.begin(), serial, 0, {}, !value->keep.empty()});
+    if (value->encoded) pending_view.emplace(value->name, NamedView{*value->encoded, serial});
+    const auto credited = credit && credit->ledger_ == ledger_ ? std::min(needed, credit->bytes_) : 0;
+    const auto incremental = needed - credited;
+    // Never wrap service arithmetic, even for the legacy unlimited sentinel.
+    if (needed > policy_.host_byte_budget && !p.sole_oversize) return false;
+    if (duplicate != entries_.end()) erase_locked(duplicate->first);
+    for (;;) {
+        std::uint64_t n = 0, count = 0;
+        for (const auto& [d,e] : entries_) if (e.checkpoint->retention.scope == p.scope) {
+            (void)d;
+            if (e.checkpoint->charge > UINT64_MAX - n) return false;
+            n += e.checkpoint->charge; ++count;
+        }
+        if (count < p.max_entries && (value->charge > p.max_bytes ? count == 0 : n <= p.max_bytes - value->charge)) break;
+        if (!reclaim_one_locked(p.scope)) return false;
+    }
+    // The legacy limit governs retained entries. A sole oversize prompt can
+    // replace an evicted capture whose backing is still borrowed by the active
+    // producer. Those leases remain fully charged/reported; producer transient
+    // admission bounds their peak. Strict turns never receive this exemption.
+    const auto budget = p.sole_oversize ? std::max(policy_.host_byte_budget, needed) : policy_.host_byte_budget;
+    if (budget == policy_.host_byte_budget) evict_to_budget_locked(incremental);
+    else while (retained_bytes_locked() > budget - incremental)
+        if (!reclaim_one_locked()) break;
+    if (retained_bytes_locked() > budget - incremental && !p.sole_oversize) return false;
+    if (payload_pool_) {
+        // The attached Qwen slab is already a physical commitment, including
+        // its free ranges. Typed owners and adopted codec extents cannot spend
+        // that same memory again: they must fit the remaining metadata reserve.
+        // Existing slab-only capture admission and pool fragmentation are intact.
+        std::lock_guard ledger_lock(ledger_->mutex);
+        reap_immutable_locked(*ledger_);
+        std::uint64_t outside = metadata_bytes_;
+        const auto pending = ledger_->reserved - credited;
+        for (const auto n : {ledger_->immutable, ledger_->certificates, ledger_->retention_metadata,
+                 ledger_->encoded, pending, needed, exempt}) {
+            if (n > metadata_allowance_ || outside > metadata_allowance_ - n) return false;
+            outside += n;
+        }
+    }
+    {
+        std::lock_guard ledger_lock(ledger_->mutex);
+        // Sole-oversize is a retention compatibility exception, never an
+        // arithmetic exception. Evicted captures can remain externally leased;
+        // include those owners and the complete metadata before publishing.
+        auto immutable = ledger_->immutable;
+        auto certificate = ledger_->certificates;
+        for (const auto& [owner,n] : staged) {
+            (void)owner;
+            if (n > UINT64_MAX - immutable) return false;
+            immutable += n;
+        }
+        for (const auto& [owner,n] : certificates) {
+            (void)owner;
+            if (n > UINT64_MAX - certificate) return false;
+            certificate += n;
+        }
+        if (metadata > UINT64_MAX - ledger_->retention_metadata) return false;
+        std::uint64_t complete = 0;
+        for (const auto n : {ledger_->bytes, ledger_->reserved - credited,
+                 metadata_bytes_, immutable, certificate, ledger_->retention_metadata + metadata}) {
+            if (n > UINT64_MAX - complete) return false;
+            complete += n;
+        }
+        if (credited) { ledger_->reserved -= credited; credit->bytes_ -= credited; }
+        ledger_->immutable_owners.merge(staged);
+        ledger_->certificates = certificate;
+        ledger_->certificate_owners.merge(certificates);
+        ledger_->immutable = immutable;
+        ledger_->retention_metadata += metadata; ledger_->exempt += exempt;
+        lease->metadata = metadata; lease->exempt = exempt;
+    }
+    entries_.merge(pending_directory);
+    named_views_.at(p.scope).merge(pending_view);
+    lru_.splice(lru_.end(), pending_lru);
+    epoch_ = serial;
+    prune_receipts_locked();
+    ++stats_.inserted;
+    return true;
+}
+PrefixStateCache::ChainStats PrefixStateCache::chain_stats(std::uint64_t scope) const {
+    std::lock_guard lock(mutex_);
+    auto i=chain_stats_.find(scope);
+    return i==chain_stats_.end() ? ChainStats{} : i->second;
+}
+std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::chain_segment(std::uint64_t scope, const ModelContentIdentity& d) const {
+    std::lock_guard lock(mutex_);
+    const auto i=chain_refs_.find(d);
+    if(i==chain_refs_.end() || i->second.scope!=scope) return {};
+    const auto s=segments_.find(d);
+    return s==segments_.end() ? nullptr : s->second.lock();
+}
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::chain_checkpoint(std::uint64_t scope, const ModelContentIdentity& d, bool touch) {
+    std::lock_guard lock(mutex_);
+    const auto i=entries_.find(d);
+    if(i==entries_.end() || !i->second.checkpoint->chain_retention || i->second.checkpoint->retention.scope!=scope) return {};
+    if(touch) touch_locked(i->second);
+    return i->second.checkpoint;
+}
+void PrefixStateCache::prune_chain_locked(const ModelContentIdentity& d, bool eviction) {
+    const auto i=chain_refs_.find(d);
+    if(i==chain_refs_.end() || i->second.refs || i->second.pins) return;
+    auto& s=chain_stats_.at(i->second.scope);
+    s.bytes-=i->second.charge; --s.blocks;
+    if(eviction) ++s.evicted_blocks;
+    // Remove the query index before releasing any payload owner.
+    segments_.erase(d); chain_refs_.erase(i);
+}
+void PrefixStateCache::release_chain_locked(const PrefixCacheCheckpoint& c, bool eviction) {
+    auto& s=chain_stats_.at(c.retention.scope);
+    s.bytes-=c.charge; --s.snapshots;
+    if(eviction) ++s.evicted_snapshots;
+    for(auto p=c.segments.front();p;p=p->ancestor) {
+        --chain_refs_.at(p->digest).refs;
+        prune_chain_locked(p->digest,eviction);
+    }
+}
+bool PrefixStateCache::retain_chain(std::shared_ptr<PrefixCacheCheckpoint> c,
+    const std::function<void(PrefixCacheCheckpoint&, const PrefixCacheAllocator&)>& fill) {
+    if(!c || c->segments.size()!=1 || !c->retention.scope || !c->charge ||
+       c->snapshot || c->resident || c->encoded || !c->metadata.empty() || !c->producer_certificate.empty()) return false;
+    c=std::make_shared<PrefixCacheCheckpoint>(*c);
+    std::lock_guard lock(mutex_);
+    const auto scope=c->retention.scope;
+    if(policy_.legacy || payload_pool_ || !scope_evictions_.contains(scope)) return false;
+    if(auto i=entries_.find(c->digest);i!=entries_.end()) {
+        if(i->second.checkpoint->retention.scope!=scope || !i->second.checkpoint->chain_retention) return false;
+        auto a=c->segments.front(), b=i->second.checkpoint->segments.front();
+        while(a && b) {
+            if(a->digest!=b->digest || a->parent!=b->parent || a->block_rows!=b->block_rows ||
+               a->block_index!=b->block_index || a->tokens!=b->tokens) return false;
+            a=a->ancestor; b=b->ancestor;
+        }
+        if(a || b || c->position!=i->second.checkpoint->position) return false;
+        touch_locked(i->second); return true;
+    }
+    std::vector<std::shared_ptr<const PrefixCacheSegment>> path, fresh;
+    std::set<ModelContentIdentity,DigestLess> visited;
+    auto need=c->charge;
+    for(auto p=c->segments.front();p;p=p->ancestor) {
+        if(!visited.insert(p->digest).second || !p->charge || p->payload.bytes>p->charge) return false;
+        if(p->ancestor && (p->block_index!=p->ancestor->block_index+1 || p->parent!=p->ancestor->digest)) return false;
+        if(!p->ancestor && p->block_index!=0) return false;
+        path.push_back(p);
+        const auto i=chain_refs_.find(p->digest);
+        if(i==chain_refs_.end()) {
+            // A leased, erased block cannot be republished as a new allocation.
+            if(p->payload.data || p->charge>UINT64_MAX-need) return false;
+            need+=p->charge; fresh.push_back(p);
+        } else if(i->second.scope!=scope || segments_.at(p->digest).lock()!=p) return false;
+    }
+    const auto limit=c->retention.max_bytes;
+    if(c->fixed.bytes>c->charge || need>limit || need>policy_.host_byte_budget) return false;
+    auto& gauges=chain_stats_[scope];
+    // All control nodes are prepared before selecting a victim.
+    decltype(chain_refs_) pending_refs;
+    decltype(segments_) pending_segments;
+    decltype(entries_) pending_entry;
+    std::list<ModelContentIdentity> pending_lru{c->digest};
+    c->chain_retention=true;
+    pending_entry.emplace(c->digest,Entry{c,pending_lru.begin(),0,0,{}});
+    for(const auto& p:fresh) {
+        pending_refs.emplace(p->digest,ChainRef{scope,0,0,p->charge});
+        pending_segments.emplace(p->digest,p);
+    }
+    for(const auto& p:path) if(auto i=chain_refs_.find(p->digest);i!=chain_refs_.end()) ++i->second.pins;
+    const auto unpin=[&] {
+        for(const auto& p:path) if(auto i=chain_refs_.find(p->digest);i!=chain_refs_.end() && i->second.pins) {
+            --i->second.pins; prune_chain_locked(p->digest,true);
+        }
+    };
+    try {
+        while(gauges.bytes>limit-need || retained_bytes_locked()>policy_.host_byte_budget-need)
+            if(!reclaim_one_locked(scope)) { unpin(); return false; }
+        Reservation credit(ledger_,need);
+        { std::lock_guard credits(ledger_->mutex); ledger_->reserved+=need; }
+        std::reverse(fresh.begin(),fresh.end());
+        std::size_t at=0;
+        // Reserve the complete legacy charge, including control storage. Payload
+        // receipts own that charge until the last immutable lease is released.
+        const PrefixCacheAllocator allocator=[&](std::uint64_t bytes) {
+            if(at>fresh.size()) throw std::invalid_argument("chain allocation count");
+            const auto expected=at<fresh.size()?fresh[at]->payload.bytes:c->fixed.bytes;
+            const auto charge=at<fresh.size()?fresh[at]->charge:c->charge;
+            if(bytes!=expected) throw std::invalid_argument("chain allocation size");
+            auto raw=bytes ? allocate_(bytes) : PrefixCacheBuffer{};
+            if(bytes && (!raw.data || raw.bytes<bytes)) throw PrefixCacheAllocationFailure();
+            auto receipt=std::make_shared<Receipt>();
+            receipt->ledger=ledger_; receipt->payload=std::move(raw.data); receipt->bytes=charge;
+            receipt->segment=at<fresh.size();
+            // Metadata-only segments still need a lifetime/credit owner; no
+            // zero-byte allocation is required of the service allocator.
+            auto* address=bytes ? receipt->payload.get() : reinterpret_cast<std::byte*>(receipt.get());
+            PrefixCacheBuffer result{std::shared_ptr<std::byte>(receipt,address),bytes};
+            {
+                std::lock_guard credits(ledger_->mutex);
+                ledger_->reserved-=charge; credit.bytes_-=charge; ledger_->bytes+=charge;
+                if(receipt->segment) ++ledger_->segments;
+                receipt->registered=true;
+            }
+            ++at; return result;
+        };
+        fill(*c,allocator);
+        if(at!=fresh.size()+1 || !c->fixed.data) throw std::invalid_argument("chain incomplete capture");
+        for(const auto& p:fresh) if(!p->payload.data) throw std::invalid_argument("chain missing block capture");
+        // Publication is a nonallocating node transfer. The pending entry owns
+        // the same checkpoint filled by the codec through its captured handle.
+        chain_refs_.merge(pending_refs); segments_.merge(pending_segments);
+        for(const auto& p:fresh) { gauges.bytes+=p->charge; ++gauges.blocks; }
+        for(const auto& p:path) ++chain_refs_.at(p->digest).refs;
+        gauges.bytes+=c->charge; ++gauges.snapshots;
+        pending_entry.begin()->second.epoch=++epoch_;
+        entries_.merge(pending_entry); lru_.splice(lru_.end(),pending_lru);
+        unpin(); ++stats_.inserted;
+        return true;
+    } catch(...) { unpin(); throw; }
+}
+bool PrefixStateCache::retain_encoded(std::shared_ptr<PrefixCacheCheckpoint> c, std::vector<std::uint8_t> bytes, Reservation* staging) {
+    if (!c || bytes.size() > c->retention.max_bytes || !c->retention.max_entries) return false;
+    // Hold the exact physical commitment before adopting the staging buffer.
+    // The resolver/family still admits codec/capture peaks before producing it.
+    auto own_credit = staging ? Reservation{} : reserve(bytes.capacity(), nullptr, {}, true);
+    auto& credit = staging ? *staging : own_credit;
+    if (credit.ledger_ != ledger_ || credit.bytes_ < bytes.capacity()) return false;
+    auto encoded = std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes));
+    // The immutable vector is itself the codec's backing allocation. Pool leases
+    // expose its bytes without duplicating storage; no raw device pointer enters.
+    PrefixCacheBuffer backing{std::shared_ptr<std::byte>(encoded,
+        reinterpret_cast<std::byte*>(const_cast<std::uint8_t*>(encoded->data()))), encoded->capacity()};
+    auto pool = std::make_shared<PrefixPayloadPool>(std::move(backing), 1);
+    c->fixed = pool->allocate(encoded->size());
+    c->charge = c->fixed.bytes;
+    const auto control = sizeof(PrefixCacheCheckpoint) + sizeof(PrefixPayloadPool) + sizeof(Receipt) + 256;
+    if (c->name.size() > (UINT64_MAX - control) / 3) return false;
+    c->declared_metadata = control + c->name.size() * 3;
+    c->legacy_index_exemption = true;
+    // Use the existing physical Receipt and ledger. Publication registers it;
+    // its pool extent remains charged until the final checkpoint/read lease dies.
+    auto receipt = std::make_shared<Receipt>();
+    receipt->ledger = ledger_; receipt->payload = c->fixed.data; receipt->bytes = encoded->capacity();
+    receipt->encoded_owner = encoded;
+    c->fixed.data = std::shared_ptr<std::byte>(receipt, c->fixed.data.get());
+    c->encoded = std::shared_ptr<const std::vector<std::uint8_t>>(receipt, encoded.get());
+    {
+        std::lock_guard lock(mutex_);
+        prune_receipts_locked();
+        receipts_[c->fixed.data.get()] = receipt;
+        std::lock_guard ledger_lock(ledger_->mutex);
+        ledger_->reserved -= receipt->bytes;
+        credit.bytes_ -= receipt->bytes;
+        ledger_->bytes += receipt->bytes;
+        ledger_->encoded += receipt->bytes;
+        receipt->registered = true; receipt->encoded = true;
+    }
+    return retain(std::move(c), true);
+}
+
 PrefixStateCache::Reservation::~Reservation() {
     if (ledger_) { std::lock_guard lock(ledger_->mutex); ledger_->reserved -= bytes_; }
 }
 
-PrefixStateCache::Reservation PrefixStateCache::reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming) {
-    if (policy_.legacy) return {};
+PrefixStateCache::Reservation PrefixStateCache::reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming, std::string_view protected_name, bool session_retention) {
+    if (policy_.legacy && !session_retention) return {};
     std::lock_guard lock(mutex_);
     std::vector<std::uint64_t> payloads;
     std::uint64_t metadata=0;
@@ -270,7 +688,7 @@ PrefixStateCache::Reservation PrefixStateCache::reserve(std::uint64_t bytes, con
             payload_pool_->can_allocate(payloads));
     };
     if (bytes <= policy_.host_byte_budget) {
-        evict_to_budget_locked(bytes, policy_.retention == PrefixCacheRetention::fair ? incoming : nullptr,payloads,metadata);
+        evict_to_budget_locked(bytes, policy_.retention == PrefixCacheRetention::fair ? incoming : nullptr,payloads,metadata,protected_name);
         if ((!incoming || policy_.retention != PrefixCacheRetention::fair || entries_.size() < 256) &&
             retained_bytes_locked() <= policy_.host_byte_budget - bytes && physical_fits()) {
             std::lock_guard ledger_lock(ledger_->mutex);
@@ -314,14 +732,24 @@ PrefixCacheBuffer PrefixStateCache::allocate(std::uint64_t bytes) const {
     receipt->ledger = ledger_; receipt->payload = buffer.data; receipt->bytes = bytes;
     buffer.data = std::shared_ptr<std::byte>(receipt, buffer.data.get());
     std::lock_guard lock(mutex_);
+    prune_receipts_locked();
     receipts_[buffer.data.get()] = receipt;
     return buffer;
 }
 
 std::uint64_t PrefixStateCache::retained_bytes_locked() {
-    if (policy_.legacy) return host_bytes_locked();
+    const auto host_metadata = policy_.legacy ? host_bytes_locked() : metadata_bytes_;
     std::lock_guard lock(ledger_->mutex);
-    return ledger_->bytes + ledger_->reserved + metadata_bytes_;
+    reap_immutable_locked(*ledger_);
+    std::uint64_t total = 0;
+    // Exempt legacy index metadata is reported, but is outside legacy budget
+    // arithmetic. Subtract it before adding, so saturation cannot create credit.
+    for (const auto n : {ledger_->bytes, ledger_->reserved, host_metadata, ledger_->immutable,
+             ledger_->retention_metadata - ledger_->exempt, ledger_->certificates}) {
+        if (n > UINT64_MAX - total) return UINT64_MAX;
+        total += n;
+    }
+    return total;
 }
 
 std::uint64_t PrefixStateCache::host_bytes_locked() {
@@ -339,6 +767,7 @@ std::uint64_t PrefixStateCache::host_bytes_locked() {
         else { total += it->second.second; ++it; }
     }
     for (const auto& [digest, entry] : entries_) {
+        if (entry.checkpoint->retention.scope) continue;
         total += checkpoint_host_bytes(*entry.checkpoint);
         if (session_buffers_.count(entry.checkpoint->fixed.data.get())) total -= entry.checkpoint->fixed.bytes;
     }
@@ -364,6 +793,11 @@ std::uint64_t PrefixStateCache::incremental_bytes_locked(const PrefixCacheCheckp
             total += segment->payload.bytes;
     }
     return total;
+}
+
+void PrefixStateCache::prune_receipts_locked() const noexcept {
+    for (auto i = receipts_.begin(); i != receipts_.end();)
+        if (i->second.expired()) i = receipts_.erase(i); else ++i;
 }
 
 void PrefixStateCache::register_buffer_locked(const PrefixCacheBuffer& buffer, bool segment) {
@@ -510,7 +944,7 @@ void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> c
         if (!inserted) { lru_.erase(link); return; }
         ++epoch_;
         try {
-            associate_locked(entry->second, key);
+            if (!checkpoint->retention.scope) associate_locked(entry->second, key);
         } catch (...) {
             --epoch_;
             entries_.erase(entry);
@@ -524,17 +958,19 @@ void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> c
     // noexcept. Repeated digests retain the same last-value-wins behavior.
     segments_.merge(staged_segments);
     for (const auto& segment : checkpoint->segments) segments_.find(segment->digest)->second = segment;
-    for (auto it = receipts_.begin(); it != receipts_.end();)
-        if (it->second.expired()) it = receipts_.erase(it); else ++it;
+    prune_receipts_locked();
     metadata_bytes_ += checkpoint->metadata.size() + checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
     register_buffer_locked(checkpoint->fixed, false);
     for (const auto& segment : checkpoint->segments) {
         register_buffer_locked(segment->payload, true);
     }
 }
-void PrefixStateCache::erase_locked(const ModelContentIdentity& digest) {
+void PrefixStateCache::erase_locked(const ModelContentIdentity& digest, bool eviction) {
     const auto it = entries_.find(digest);
     if (it == entries_.end()) return;
+    if (it->second.checkpoint->chain_retention) release_chain_locked(*it->second.checkpoint, eviction);
+    if (it->second.checkpoint->retention.scope && it->second.checkpoint->encoded)
+        named_views_.at(it->second.checkpoint->retention.scope).erase(it->second.checkpoint->name);
     metadata_bytes_ -= it->second.checkpoint->metadata.size() + it->second.checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
     for (const auto& key : it->second.conversations) {
         const auto group = group_activity_.find(key);
@@ -562,7 +998,10 @@ void PrefixStateCache::erase_locked(const ModelContentIdentity& digest) {
     entries_.erase(it);
 }
 void PrefixStateCache::touch_locked(Entry& entry, bool reused) {
+    if (entry.checkpoint->retention.scope && entry.checkpoint->retention.fifo) return;
     entry.epoch = ++epoch_;
+    if (entry.checkpoint->retention.scope && entry.checkpoint->encoded)
+        named_views_.at(entry.checkpoint->retention.scope).at(entry.checkpoint->name).touched = entry.epoch;
     if (reused) {
         ++entry.reuse;
         for (const auto& key : entry.conversations) group_activity_.at(key).reused = true;
@@ -571,16 +1010,27 @@ void PrefixStateCache::touch_locked(Entry& entry, bool reused) {
 }
 
 void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming,
-    std::span<const std::uint64_t> payloads, std::uint64_t metadata) {
+    std::span<const std::uint64_t> payloads, std::uint64_t metadata, std::string_view protected_name) {
     // Directory/association work is bounded independently of the payload size.
     auto remaining=payload_pool_?std::min<std::size_t>(entries_.size(),256):entries_.size();
     while (!lru_.empty() && remaining--) {
         const bool physical_pressure=payload_pool_ &&
             (metadata>metadata_allowance_ || metadata_bytes_>metadata_allowance_-metadata || !payload_pool_->can_allocate(payloads));
-        const bool pressure = retained_bytes_locked() + reserve > policy_.host_byte_budget || physical_pressure;
+        const bool pressure = reserve > policy_.host_byte_budget ||
+            retained_bytes_locked() > policy_.host_byte_budget - reserve || physical_pressure;
         const bool entry_pressure = policy_.retention == PrefixCacheRetention::fair && entries_.size() + (incoming ? 1U : 0U) > 256;
         if (!pressure && !entry_pressure) break;
-        auto victim = entries_.find(lru_.front());
+        const bool mixed = std::any_of(entries_.begin(), entries_.end(), [](const auto& item) {
+            return item.second.checkpoint->retention.scope != 0;
+        });
+        if (mixed && policy_.retention == PrefixCacheRetention::lru) {
+            if (!reclaim_one_locked({}, protected_name)) break;
+            continue;
+        }
+        auto first=lru_.begin();
+        while(first!=lru_.end() && entries_.at(*first).checkpoint->chain_retention) ++first;
+        if(first==lru_.end()) break;
+        auto victim = entries_.find(*first);
         if(payload_pool_ && policy_.retention==PrefixCacheRetention::lru) {
             auto oldest=lru_.begin();
             while(oldest!=lru_.end() && entries_.at(*oldest).checkpoint.use_count()!=1) ++oldest;
@@ -613,7 +1063,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             bool certified_only = true;
             std::vector<std::pair<ModelContentIdentity, const Entry*>> ranking;
             ranking.reserve(entries_.size() + (incoming ? 1U : 0U));
-            for (const auto& [d,e] : entries_) ranking.emplace_back(d, &e);
+            for (const auto& [d,e] : entries_) if (!e.checkpoint->retention.scope) ranking.emplace_back(d, &e);
             if (incoming) {
                 estimate.epoch = epoch_ + 1;
                 estimate.checkpoint = std::shared_ptr<const PrefixCacheCheckpoint>(incoming, [](const auto*) {});
@@ -660,7 +1110,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             }
             if (certified_only) mark_private_prefix_successors_locked(incoming, newest);
             for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-                if (it->second.checkpoint.use_count() != 1) continue;
+                if (it->second.checkpoint->retention.scope || it->second.checkpoint.use_count() != 1) continue;
                 const auto& c = *it->second.checkpoint;
                 unsigned rank = 0;
                 unsigned ordinary_rank = 0;
@@ -692,6 +1142,24 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
                 }
             }
         }
+        if (mixed && policy_.retention == PrefixCacheRetention::fair) {
+            auto generic = entries_.end();
+            for (const auto& d : lru_) {
+                auto i = entries_.find(d);
+                const auto& c = *i->second.checkpoint;
+                if (c.retention.scope && !c.chain_retention && !i->second.protected_entry && (protected_name.empty() || c.name != protected_name)) {
+                    generic = i; break;
+                }
+            }
+            // Keep inherited fair/certificate/group ranking inside its domain;
+            // arbitrate that candidate against generic FIFO/LRU by global age.
+            if (generic != entries_.end() && (best < 0 || generic->second.epoch < victim->second.epoch)) {
+                const auto d = generic->first;
+                ++scope_evictions_.at(generic->second.checkpoint->retention.scope);
+                erase_locked(d); ++stats_.evicted; ++stats_.evictions_space;
+                continue;
+            }
+        }
         if (policy_.retention == PrefixCacheRetention::fair && best < 0) break;
         const auto digest = victim->first;
         erase_locked(digest);
@@ -704,6 +1172,8 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
 }
 
 bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> checkpoint, Reservation* reservation) {
+    require(checkpoint && !checkpoint->retention.scope && !checkpoint->snapshot && !checkpoint->resident && !checkpoint->encoded,
+        "session RAM payloads cannot enter the legacy prefix disk writer");
     require(checkpoint && checkpoint->block_rows && checkpoint->position == checkpoint->segments.size() * checkpoint->block_rows,
         "prefix cache checkpoint is malformed");
     require(checkpoint->conversation.size()<=128,"prefix cache conversation key exceeds 128 bytes");
@@ -765,28 +1235,87 @@ std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::find_segment(const M
     return found == segments_.end() ? nullptr : found->second.lock();
 }
 
+namespace {
+// Bumps the disk epoch when a function that publishes or removes checkpoint files starts and when it ends,
+// so a lookup ticket whose disk probes overlap such a change is never trusted.
+struct DiskChange {
+    std::atomic<std::uint64_t>& epoch;
+    explicit DiskChange(std::atomic<std::uint64_t>& e) : epoch(e) { epoch.fetch_add(1, std::memory_order_acq_rel); }
+    ~DiskChange() { epoch.fetch_add(1, std::memory_order_acq_rel); }
+};
+}  // namespace
+
+PrefixLookupTicket PrefixStateCache::prepare_ticket(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+    std::uint32_t block_rows, std::uint64_t limit, bool probe_disk) const {
+    require(block_rows != 0, "prefix cache lookup needs a block size");
+    PrefixLookupTicket ticket;
+    ticket.identity = identity;
+    ticket.block_rows = block_rows;
+    ticket.tokens = tokens;
+    ticket.lookup_tokens = std::min<std::uint64_t>(limit, tokens.size());
+    ticket.digests = prefix_cache_block_digests(identity, tokens, block_rows, ticket.lookup_tokens / block_rows);
+    if (!probe_disk || policy_.disk_directory.empty()) return ticket;
+    // The epoch is read first: a publication or removal that overlaps the probes changes it.
+    ticket.disk_epoch = disk_epoch_.load(std::memory_order_acquire);
+    ticket.disk.assign(ticket.digests.size(), PrefixLookupTicket::disk_absent);
+    for (std::size_t k = 0; k < ticket.digests.size(); ++k) {
+        const auto path = checkpoint_path(policy_.disk_directory, ticket.digests[k]);
+        std::error_code error;
+        if (!std::filesystem::exists(path, error)) continue;
+        try {
+            File probe(path, "rb");
+            CheckpointHeader candidate;
+            if (!probe.open()) continue;
+            probe.read(&candidate, sizeof(candidate));
+            if (candidate.reserved <= 1U)
+                ticket.disk[k] = candidate.reserved ? PrefixLookupTicket::disk_certified : PrefixLookupTicket::disk_legacy;
+        } catch (const std::exception&) {
+            ticket.disk[k] = PrefixLookupTicket::disk_unknown; // the lookup probes it itself and accounts the failure
+        }
+    }
+    return ticket;
+}
+
+PrefixLookupTicket PrefixStateCache::prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
+    std::uint32_t block_rows, std::uint64_t limit) const {
+    auto owned = std::make_shared<const std::vector<std::uint32_t>>(tokens.begin(), tokens.end());
+    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, true);
+    ticket.owned = std::move(owned);
+    return ticket;
+}
+
 std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(const ModelContentIdentity& identity,
     std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit, bool promote, std::string_view conversation,
     const std::function<bool(const PrefixCacheCheckpoint&)>& eligible) {
-    require(block_rows != 0, "prefix cache lookup needs a block size");
-    const auto max_blocks = std::min<std::uint64_t>(limit, tokens.size()) / block_rows;
-    const auto digests = prefix_cache_block_digests(identity, tokens, block_rows, max_blocks);
+    // Not prepared ahead: the disk tier is probed during the walk, only for the blocks above the hit.
+    return find_longest(prepare_ticket(identity, tokens, block_rows, limit, false), promote, conversation, eligible);
+}
+
+std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(const PrefixLookupTicket& ticket, bool promote,
+    std::string_view conversation, const std::function<bool(const PrefixCacheCheckpoint&)>& eligible) {
+    require(ticket.block_rows != 0 && ticket.digests.size() == ticket.lookup_tokens / ticket.block_rows &&
+            ticket.lookup_tokens <= ticket.tokens.size(), "prefix cache lookup ticket is not prepared");
+    const auto& identity = ticket.identity;
+    const auto block_rows = ticket.block_rows;
+    const auto tokens = ticket.tokens;
+    const auto& digests = ticket.digests;
+    // One acquisition for the bookkeeping and the host-tier probe of every block of the prompt.
+    std::vector<std::shared_ptr<const PrefixCacheCheckpoint>> host(digests.size());
     {
         std::lock_guard lock(mutex_);
         for (auto it=receipts_.begin(); it!=receipts_.end();)
             if (it->second.expired()) it=receipts_.erase(it); else ++it;
         ++stats_.lookups;
-        stats_.lookup_tokens += std::min<std::uint64_t>(limit,tokens.size());
+        stats_.lookup_tokens += ticket.lookup_tokens;
+        for (std::size_t k = 0; k < digests.size(); ++k)
+            if (const auto it = entries_.find(digests[k]); it != entries_.end()) host[k] = it->second.checkpoint;
     }
+    // Prepared disk metadata is used only if no checkpoint file was published or removed since it was read.
+    const bool prepared_disk = ticket.disk.size() == digests.size() &&
+        ticket.disk_epoch == disk_epoch_.load(std::memory_order_acquire);
     for (auto k = digests.size(); k > 0; --k) {
         const auto& digest = digests[k - 1];
-        std::shared_ptr<const PrefixCacheCheckpoint> found;
-        {
-            std::lock_guard lock(mutex_);
-            if (const auto it = entries_.find(digest); it != entries_.end()) {
-                found = it->second.checkpoint;
-            }
-        }
+        const std::shared_ptr<const PrefixCacheCheckpoint> found = std::move(host[k - 1]);
         if (found) {
             if (eligible && !eligible(*found)) {
                 std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
@@ -809,14 +1338,19 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
         }
         if (policy_.disk_directory.empty() || (eligible && (!policy_.certified_disk || policy_.legacy))) continue;
         std::error_code error;
-        if (!std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
+        const std::uint8_t known = prepared_disk ? ticket.disk[k - 1] : std::uint8_t{PrefixLookupTicket::disk_unknown};
+        if (known == PrefixLookupTicket::disk_absent) continue;
+        if (known == PrefixLookupTicket::disk_unknown &&
+            !std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
         try {
             // Certified and legacy lookups never cross. Check before payload allocation.
-            File probe(checkpoint_path(policy_.disk_directory, digest), "rb");
-            CheckpointHeader candidate;
-            if (!probe.open()) continue;
-            probe.read(&candidate, sizeof(candidate));
-            if (candidate.reserved != (eligible ? 1U : 0U)) continue;
+            if (known == PrefixLookupTicket::disk_unknown) {
+                File probe(checkpoint_path(policy_.disk_directory, digest), "rb");
+                CheckpointHeader candidate;
+                if (!probe.open()) continue;
+                probe.read(&candidate, sizeof(candidate));
+                if (candidate.reserved != (eligible ? 1U : 0U)) continue;
+            } else if ((known == PrefixLookupTicket::disk_certified) != static_cast<bool>(eligible)) continue;
             if (auto loaded = load_from_disk(identity, digest, tokens.first(static_cast<std::size_t>(k * block_rows)), block_rows)) {
                 if (eligible && (loaded->producer_certificate.empty() || !eligible(*loaded))) {
                     std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
@@ -969,6 +1503,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
 }
 
 void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
+    const DiskChange disk_change(disk_epoch_);
     const auto start = std::chrono::steady_clock::now();
     const auto& dir = policy_.disk_directory;
     std::uint64_t written = 0;
@@ -978,9 +1513,7 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         if (std::filesystem::exists(path, error)) {
             // This segment may have been published by an earlier non-durable writer.
             if(policy_.durable && !policy_.legacy) {
-                File retained(path,"r+b");
-                if(!retained.open()) throw std::runtime_error("prefix cache retained segment cannot be synced");
-                retained.close(true);
+                session::checkpoint_io::sync_existing(path);
             }
             continue;
         }
@@ -992,21 +1525,17 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         header.block_rows = segment->block_rows;
         header.payload_bytes = segment->payload.bytes;
         header.payload_checksum = prefix_cache_checksum(segment->payload.span());
-        const auto temporary = temporary_path(path);
-        {
-            File file(temporary, "wb", File::Stream::payload);
-            if (!file.open()) throw std::runtime_error("prefix cache segment file cannot be created");
-            file.write(&header, sizeof(header));
-            file.write(segment->tokens.data(), segment->tokens.size() * sizeof(std::uint32_t));
-            file.write(segment->payload.data.get(), segment->payload.bytes);
-            file.close(policy_.durable && !policy_.legacy);
-        }
-        std::filesystem::rename(temporary, path);
+        session::checkpoint_io::Publication file(path,
+            {policy_.durable && !policy_.legacy,session::checkpoint_io::DirectIo::automatic,0666,{},false});
+        file.write(std::as_bytes(std::span(&header,1)));
+        file.write(std::as_bytes(std::span(segment->tokens)));
+        file.write(segment->payload.span());
+        file.commit();
         written += sizeof(header) + segment->payload.bytes;
     }
     const auto path = checkpoint_path(dir, checkpoint.digest);
     // Every segment name is durable before publishing the checkpoint that references it.
-    sync_directory(dir, policy_.durable && !policy_.legacy);
+    session::checkpoint_io::sync_directory(dir, policy_.durable && !policy_.legacy);
     if (!std::filesystem::exists(path, error)) {
         CheckpointHeader header;
         put(header.identity, checkpoint.identity);
@@ -1020,24 +1549,17 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
         header.metadata_bytes = metadata.size();
         header.fixed_checksum = prefix_cache_checksum(checkpoint.fixed.span());
         header.metadata_checksum = prefix_cache_checksum(metadata);
-        const auto temporary = temporary_path(path);
-        {
-            File file(temporary, "wb", File::Stream::payload);
-            if (!file.open()) throw std::runtime_error("prefix cache checkpoint file cannot be created");
-            file.write(&header, sizeof(header));
-            for (const auto& segment : checkpoint.segments) file.write(segment->digest.bytes.data(), 32);
-            file.write(metadata.data(), metadata.size());
-            file.write(checkpoint.fixed.data.get(), checkpoint.fixed.bytes);
-            file.close(policy_.durable && !policy_.legacy);
-        }
-        std::filesystem::rename(temporary, path);
-        sync_directory(dir, policy_.durable && !policy_.legacy);
+        session::checkpoint_io::Publication file(path,
+            {policy_.durable && !policy_.legacy,session::checkpoint_io::DirectIo::automatic,0666});
+        file.write(std::as_bytes(std::span(&header,1)));
+        for (const auto& segment : checkpoint.segments) file.write(std::as_bytes(std::span(segment->digest.bytes)));
+        file.write(metadata);
+        file.write(checkpoint.fixed.span());
+        file.commit();
         written += sizeof(header) + checkpoint.fixed.bytes + metadata.size();
     } else if(policy_.durable && !policy_.legacy) {
-        File retained(path,"r+b");
-        if(!retained.open()) throw std::runtime_error("prefix cache retained checkpoint cannot be synced");
-        retained.close(true);
-        sync_directory(dir,true);
+        session::checkpoint_io::sync_existing(path);
+        session::checkpoint_io::sync_directory(dir,true);
     }
     std::lock_guard lock(mutex_);
     ++stats_.disk_writes;
@@ -1056,6 +1578,7 @@ void PrefixStateCache::update_disk_gauge() {
 
 void PrefixStateCache::enforce_disk_budget() {
     if (!policy_.disk_byte_budget) return;
+    const DiskChange disk_change(disk_epoch_);
     namespace fs = std::filesystem;
     struct Item { fs::path path; fs::file_time_type time; std::uint64_t bytes; };
     std::vector<Item> checkpoints;
@@ -1104,6 +1627,7 @@ void PrefixStateCache::enforce_disk_budget() {
 }
 
 void PrefixStateCache::sweep_disk(std::chrono::seconds min_age) {
+    const DiskChange disk_change(disk_epoch_);
     namespace fs = std::filesystem;
     std::error_code error;
     const auto now = fs::file_time_type::clock::now();
@@ -1206,6 +1730,8 @@ PrefixStateCacheStats PrefixStateCache::counters() {
         out.certificate_declines[i]=certificate_declines_[i].load(std::memory_order_relaxed);
     if (policy_.legacy) {
         out.host_bytes = host_bytes_locked(); out.host_segments = segments_.size();
+        std::lock_guard ledger_lock(ledger_->mutex);
+        out.host_bytes += ledger_->encoded;
     } else {
         std::lock_guard ledger_lock(ledger_->mutex);
         // Count the retained slab (including free ranges) and its reserved metadata once.
@@ -1213,11 +1739,28 @@ PrefixStateCacheStats PrefixStateCache::counters() {
         if(payload_pool_) out.pool_free_bytes=payload_pool_->free_bytes();
         out.host_segments = ledger_->segments;
     }
+    {
+        std::lock_guard ledger_lock(ledger_->mutex);
+        reap_immutable_locked(*ledger_);
+        out.immutable_bytes = ledger_->immutable;
+        out.retention_metadata_bytes = ledger_->retention_metadata + ledger_->certificates;
+        out.reserved_bytes = ledger_->reserved;
+        out.encoded_host_bytes = ledger_->encoded;
+        out.policy_exempt_bytes = ledger_->exempt;
+    }
+    out.service_bytes = retained_bytes_locked();
+    if (out.service_bytes > policy_.host_byte_budget)
+        out.legacy_live_over_budget_bytes = out.service_bytes - policy_.host_byte_budget;
+    if (out.policy_exempt_bytes > UINT64_MAX - out.service_bytes) out.service_bytes = UINT64_MAX;
+    else out.service_bytes += out.policy_exempt_bytes;
+    if (payload_pool_) out.service_bytes = policy_.host_byte_budget;
+    out.session_entries = static_cast<std::uint64_t>(std::count_if(entries_.begin(), entries_.end(),
+        [](const auto& item) { return item.second.checkpoint->retention.scope != 0; }));
     out.host_checkpoints = entries_.size();
     return out;
 }
 PrefixStateCacheStats PrefixStateCache::stats() {
-    if (!policy_.legacy) return counters();
+    if (!policy_.legacy || next_scope_) return counters();
     std::lock_guard lock(mutex_);
     auto out = stats_;
     for(std::size_t i=0;i<certificate_declines_.size();++i)

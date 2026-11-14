@@ -1,3 +1,5 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/session_state_layout.hpp"
@@ -11,27 +13,22 @@
 
 namespace {
 
-void check(
-    hipError_t error,
-    const char* operation) {
-    if (error != hipSuccess) {
-        throw std::runtime_error(
-            std::string(operation) +
-            ": " +
-            hipGetErrorString(error));
-    }
-}
+using strix::hip_check;
 
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     const bool pinned =
         argc == 2 &&
         std::string(argv[1]) ==
             "--pinned-host";
 
     hipDeviceProp_t properties{};
-    check(
+    hip_check(
         hipGetDeviceProperties(
             &properties, 0),
         "hipGetDeviceProperties");
@@ -65,7 +62,7 @@ int main(int argc, char** argv) try {
             allocator,
             generations);
 
-    check(
+    hip_check(
         hipMemset(
             reinterpret_cast<void*>(
                 memory.scratch().arena_base),
@@ -73,7 +70,7 @@ int main(int argc, char** argv) try {
             static_cast<std::size_t>(
                 memory.scratch().arena_bytes)),
         "hipMemset scratch");
-    check(
+    hip_check(
         hipMemset(
             reinterpret_cast<void*>(
                 memory.state().device_base),

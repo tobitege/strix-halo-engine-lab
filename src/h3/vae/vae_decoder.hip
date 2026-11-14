@@ -1,3 +1,4 @@
+#include "strix/env_flags.hpp"
 #include "h3/vae/vae_decoder.hpp"
 #include "h3/vae/precision.hpp"
 #include "h3/vae/latent_stats.hpp"
@@ -161,7 +162,7 @@ H16 GpuDecoder::decode_call(const H16& dec_in, int nt, int ny, int nx, CallTimin
     ck(hipEventRecord(d_->ev[1], st), "ev");
     const int nl = stop_after < 0 ? layers_ : stop_after;
     // STRIX_H3_VAE_PROFILE=1: events around every op of every layer (timing only; same launches)
-    static const bool profile = [] { const char* v = std::getenv("STRIX_H3_VAE_PROFILE"); return v && v[0] == '1'; }();
+    static const bool profile = strix::envcfg::flag("STRIX_H3_VAE_PROFILE", false);
     std::vector<hipEvent_t> pev;
     const auto mark = [&] {
         if (!profile) return;

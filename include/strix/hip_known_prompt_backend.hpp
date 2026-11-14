@@ -108,6 +108,7 @@ public:
         std::uint64_t position = 0;
         bool logits = false;
         std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> observer;
+        bool partial = false;   // tokens are the first rows of the backend's tiled owner (a partial block), not its whole T
     };
     [[nodiscard]] static std::vector<std::vector<float>> execute_group(HipKnownPromptBackend& group,
         std::span<const GroupMember> members, bool stage_ple = false);

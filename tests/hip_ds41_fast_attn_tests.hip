@@ -61,6 +61,14 @@ Err compare(const std::vector<float>& ref, const std::vector<float>& got) {
     e.rel_l2 = std::sqrt(num / std::max(den, 1e-30));
     return e;
 }
+// FNV-1a over the raw bytes: a FAST output fingerprint for cross-build bitwise receipts.
+template <class T>
+unsigned long long bits_hash(const std::vector<T>& v) {
+    unsigned long long h = 1469598103934665603ULL;
+    const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+    for (std::size_t i = 0; i < v.size() * sizeof(T); ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+}
 // Case options: also compare the A8 output (codes / deltas / sums of o); a NaN code in one window key (both kernels must
 // put NaN in exactly the same outputs).
 bool case_a8 = false, case_nan = false, case_big_key = false;
@@ -150,9 +158,10 @@ void run_case(const char* name, std::uint64_t last, unsigned rows, unsigned head
         const auto tk = dtick.get();
         expect(std::all_of(tk.begin(), tk.end(), [](std::uint32_t t) { return t == 0U; }), std::string(name) + " tickets left zero");
     }
-    std::printf("%-22s pos=%llu rows=%u heads=%u nc=%u qmax=%.2f scales=%u..%u tickets=%d exact_ms=%.4f fast_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g max_ref=%.3g\n",
+    std::printf("%-22s pos=%llu rows=%u heads=%u nc=%u qmax=%.2f scales=%u..%u tickets=%d exact_ms=%.4f fast_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g max_ref=%.3g fast_bits=%016llx codes_bits=%016llx\n",
                 name, static_cast<unsigned long long>(last), rows, heads, nc, qmax, smin, smax, tickets ? 1 : 0, exact_ms, fast_ms,
-                fast_ms > 0 ? exact_ms / fast_ms : 0.0, e.rel_l2, e.max_abs, e.max_ref);
+                fast_ms > 0 ? exact_ms / fast_ms : 0.0, e.rel_l2, e.max_abs, e.max_ref, bits_hash(got),
+                case_a8 ? bits_hash(dcodes.get()) : 0ULL);
     std::fflush(stdout);
 }
 // Hand-built window-only cases (rows 1, 32 heads, positions 0 .. last, every key in the window): the ring entries come
@@ -183,7 +192,8 @@ void window_case(const char* name, std::uint64_t last, float q0, Fill fill) {
     const auto got = dout.get();
     const Err e = compare(ref, got);
     expect(std::isfinite(ref[0]) && std::fabs(ref[0]) > 0.0F && e.nonfinite == 0 && e.rel_l2 < 2e-3, std::string(name) + ": FAST == exact within 2e-3");
-    std::printf("%-22s exact o[0]=%.7g fast o[0]=%.7g rel_l2=%.3g nonfinite=%zu\n", name, ref[0], got[0], e.rel_l2, e.nonfinite);
+    std::printf("%-22s exact o[0]=%.7g fast o[0]=%.7g rel_l2=%.3g nonfinite=%zu fast_bits=%016llx\n", name, ref[0], got[0], e.rel_l2,
+                e.nonfinite, bits_hash(got));
     std::fflush(stdout);
 }
 void sol_cases() {

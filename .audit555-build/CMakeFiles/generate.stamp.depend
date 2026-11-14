@@ -1,0 +1,25 @@
+# CMake generation dependency list for this directory.
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeCXXInformation.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeCommonLanguageInclude.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeGenericSystem.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeInitializeConfigs.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeLanguageInformation.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeRCInformation.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeSystemSpecificInformation.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/CMakeSystemSpecificInitialize.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Compiler/CMakeCommonCompilerMacros.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Compiler/MSVC-CXX.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Compiler/MSVC.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/FindPackageHandleStandardArgs.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/FindPackageMessage.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/FindPython/Support.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/FindPython3.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Platform/Windows-Initialize.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Platform/Windows-MSVC-CXX.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Platform/Windows-MSVC.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Platform/Windows.cmake
+C:/Users/Usuario/AppData/Local/Programs/Python/Python310/Lib/site-packages/cmake/data/share/cmake-3.28/Modules/Platform/WindowsPaths.cmake
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/3.28.1/CMakeCXXCompiler.cmake
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/3.28.1/CMakeRCCompiler.cmake
+D:/tmp/fix-pr555/.audit555-build/CMakeFiles/3.28.1/CMakeSystem.cmake
+D:/tmp/fix-pr555/tests/audit555_host/CMakeLists.txt

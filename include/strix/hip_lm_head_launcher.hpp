@@ -72,6 +72,16 @@ void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContex
     const HipLmHeadLauncherConfig& config);
 void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config);
+struct HipLmHeadGreedyRows {
+    std::span<const ExecutionDispatchContext> rows;
+    ExecutionBufferAddress partials;
+    HipGreedyRowsReply* replies;
+};
+// Launch the head once, then each greedy segment in order (including null replies).
+// The fallback's window-size check deliberately follows the head launch.
+void lm_head_rows_with_greedy(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config, std::span<const HipLmHeadGreedyRows> greedy,
+    bool window_rows_only = false);
 // The same launch followed by the window greedy selection of every row: replies as from
 // enqueue_hip_greedy_rows over the written logits. When the lean rows kernel applies
 // (config.rows_lean, 5-8 rows) its greedy partials are computed in the head kernel and only the

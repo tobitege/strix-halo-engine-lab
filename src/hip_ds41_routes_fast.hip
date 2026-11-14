@@ -5,6 +5,7 @@
 // counts[1] = the most entries of one expert. Only the reductions that thread 0 did alone over all
 // entries (and over all entries per leader) are done by every thread with LDS atomics.
 
+#include "strix/env_flags.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "hip_ds41_routes_fast_body.hpp"
 
@@ -131,7 +132,7 @@ void enqueue_build_routes_wide_serial(const BuildRoutesView& view, void* stream)
 }
 
 bool routes_fast_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_ROUTES_FAST"); return !(e && *e == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_DS41_ROUTES_FAST", true);
     return on;
 }
 

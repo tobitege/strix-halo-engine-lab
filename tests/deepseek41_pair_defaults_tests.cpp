@@ -217,6 +217,7 @@ void test_off_switches() {
         const World w;
         const auto r = w.run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--no-dspark"});
         check(!has_arg(r, "--dspark") && !has_arg(r, "--dspark-vocab"), "serve: --no-dspark");
+        check(!has_arg(w.run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--no-mtp"}), "--dspark"), "serve: --no-mtp");
         // explicit flags come after the defaults, so the parsers keep the user's value
         const auto s = w.run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--slots", "4", "--prefill-path", "rows",
                                               "--dspark-vocab", "full", "--peer-timeout", "60", "--prefill-rows", "4096"});

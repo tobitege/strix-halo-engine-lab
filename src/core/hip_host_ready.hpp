@@ -1,5 +1,6 @@
 #pragma once
 #include <hip/hip_runtime.h>
+#include "strix/hip_check.hpp"
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
@@ -15,7 +16,7 @@ class HipHostReady {
     std::uint64_t* host_ = nullptr;
     std::vector<hipEvent_t> events_;
     static void check(hipError_t e) {
-        if (e != hipSuccess) throw std::runtime_error("host readiness: HIP fence failed");
+        ::strix::hip_check_message(e, "host readiness: HIP fence failed");
     }
     void retire() noexcept {
         if (host_) for (std::size_t i = 0; i < events_.size(); ++i) publish(i);

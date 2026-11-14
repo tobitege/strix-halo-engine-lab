@@ -2,6 +2,7 @@
 
 #include "gemma4/kernels/ops.hpp"
 #include "layout.hpp"
+#include "gemma4/engine/native_memory.hpp"
 
 namespace strix::gemma4::gpu {
 struct Fp16Mirror; // kv/fp16_mirror.hpp
@@ -74,7 +75,15 @@ class DeviceStream {
     [[nodiscard]] std::string digest() const; // matches HostStream canonical logical digest
     // A new stream admitting `admitted` >= frontier() positions whose committed state is a byte copy of this one
     // (global slots [0, frontier), the whole sliding rings and their position tags): same digest, same next passes.
+    // Eager allocation, not page COW. Full rollback callers pass the ORIGINAL
+    // admitted capacity, never just frontier(). A completed copy borrows no queue.
     [[nodiscard]] std::unique_ptr<DeviceStream> fork(std::uint32_t admitted) const;
+    // Quiescent complete owner, including spare overlays and publication staging.
+    // Derived FAST owners are explicitly unsupported, rather than undercharged.
+    [[nodiscard]] std::optional<memory::Payload> memory_payload() const;
+    // Upper bound for a NEW exact stream, eight-row spare overlays and constructor
+    // tag staging. Does not query/create a device or allocate storage.
+    [[nodiscard]] static std::optional<memory::Work> allocation_bound(const ModelConfig&, std::uint32_t admitted);
     // Read-only view of a producing layer: committed snapshot plus, when given, that transaction's current overlay
     // (position-tag checked by the reader). Additive; no layout change. Drafters never write KV.
     [[nodiscard]] KvView kv_view(std::uint32_t layer, const KvTxn* transaction = nullptr) const;

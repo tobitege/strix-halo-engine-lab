@@ -32,7 +32,7 @@ int main() try {
         check(budgeted.options.resolved_qsa_prefill_budget == 1536U &&
             exported.at("STRIX_QWEN_PROFILE_OWNED_qsa_budget") == "fast:provisional:1536", "fast exports budget and provenance");
         const auto fields = serve::parse_json(effective_config_json(budgeted));
-        check(fields.find("prefill_identity")->as_string() == "fp16-v1+hcout16+qsab1536" &&
+        check(fields.find("prefill_identity")->as_string() == "fp16-v1+hcout16+gdnchunk16+qsab1536" &&
             fields.find("qsa_prefill_budget")->as_int() == 1536, "inspection binds actual budget into identity and witness");
         check(effective_config_notice(budgeted).find("ranked_slots=1536 local_tail=unchanged decode_verify=unchanged") != std::string::npos,
             "startup witness states scope");

@@ -16,6 +16,7 @@
 //             selects 0x42ce8ed0 / 0xc2b17218) == amd_expf(-g) by sign symmetry; v_add 1.0 (:220); IEEE div g/den
 //             (:221-236); v_mul u*q (:238); scalar dot v_dual_fmac_f32 sum = w * x + sum over features tid, tid+256, ...
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_dense.hpp"
 
 #include <cuda_fp16.h>
@@ -28,7 +29,7 @@ namespace {
 
 // STRIX_QRTX_DECODE_KERNELS=0: keep the tiled kernels at rows <= 8 too (reference seam for the decode-shaped ones).
 bool decode_rows_enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS", true);
     return on;
 }
 

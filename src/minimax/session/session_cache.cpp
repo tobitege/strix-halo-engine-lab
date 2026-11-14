@@ -1,4 +1,5 @@
 #include "strix/minimax/session_cache.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include "strix/minimax/model_assets.hpp"
 #include "strix/minimax/asset_input.hpp"
 #include "strix/model_content_hash.hpp"
@@ -18,13 +19,12 @@
 #include <stdexcept>
 #include <thread>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
-#include <windows.h>
+#endif
+#include <windows.h> // host available-memory observation only
 #else
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/file.h>
-#include <unistd.h>
 extern char **environ;
 #endif
 namespace strix::minimax::session {
@@ -36,44 +36,13 @@ void require(bool ok, const std::string &why) {
 // Nonblocking acquisition avoids crossed distributed writers waiting forever
 // while each holds its local lock. Contention is a collective budget refusal.
 class DirectoryLock {
-#ifdef _WIN32
-  HANDLE handle_ = INVALID_HANDLE_VALUE;
-#else
-  int fd_ = -1;
-#endif
+  ::strix::session::checkpoint_io::DirectoryLock lock_;
 public:
-  explicit DirectoryLock(const std::filesystem::path& dir) {
-    require(!dir.empty(), "session_budget: empty disk directory");
-    std::filesystem::create_directories(dir);
-    const auto path = dir / ".session.lock";
-#ifdef _WIN32
-    handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    OVERLAPPED offset{};
-    if (handle_ != INVALID_HANDLE_VALUE &&
-        LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                   0, 1, 0, &offset)) return;
-    if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
-#else
-    fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-    if (fd_ >= 0 && ::flock(fd_, LOCK_EX | LOCK_NB) == 0) return;
-    if (fd_ >= 0) ::close(fd_);
-#endif
+  explicit DirectoryLock(const std::filesystem::path& dir) try
+    : lock_(dir, ::strix::session::checkpoint_io::LockMode::nonblocking) {}
+  catch (const std::exception&) {
     throw std::runtime_error("MiniMax session: session_budget: disk directory locked/unavailable");
   }
-  ~DirectoryLock() {
-#ifdef _WIN32
-    OVERLAPPED offset{};
-    UnlockFileEx(handle_, 0, 1, 0, &offset);
-    CloseHandle(handle_);
-#else
-    ::flock(fd_, LOCK_UN);
-    ::close(fd_);
-#endif
-  }
-  DirectoryLock(const DirectoryLock&) = delete;
-  DirectoryLock& operator=(const DirectoryLock&) = delete;
 };
 struct Writer {
   Bytes b;
@@ -94,9 +63,8 @@ struct Reader {
   std::size_t p = 0;
   std::span<const std::uint8_t> raw(std::uint64_t n) {
     require(n <= b.size() - p, "truncated/bounds");
-    auto v = b.subspan(p, static_cast<std::size_t>(n));
-    p += static_cast<std::size_t>(n);
-    return v;
+    const auto v = ::strix::session::checkpoint_io::take(std::as_bytes(b), p, n);
+    return {reinterpret_cast<const std::uint8_t*>(v.data()), v.size()};
   }
   std::uint64_t u64() {
     auto v = raw(8);
@@ -157,13 +125,19 @@ void frontier(Writer &w, const Frontier &f) {
   w.u64(f.accepted);
   w.u64(f.drafter);
   w.u64(f.control);
-  w.u64(f.pending);
-  w.u64(f.pending_valid);
+  w.u64(f.pending.value_or(0));
+  w.u64(f.pending.has_value());
   w.u64(f.drafter_ready);
   w.text(f.sampling);
   w.text(f.lineage);
 }
 void valid(const Checkpoint &c) {
+  ::strix::validate_session_envelope(c);
+  require(c.frontier.predictor==0 && c.frontier.selection==0 && c.frontier.rng_draws==0 && c.compatibility.numerical_config.empty() &&
+              !c.compatibility.mtp && !c.compatibility.model.valid() && !c.compatibility.executable.valid(),
+          "unsupported legacy envelope fields");
+  for (const auto& section : c.sections) require(!section.payload.data && !section.payload.bytes, "legacy section storage");
+  require(c.compatibility.family == "minimax" && c.compatibility.format_version == 1, "schema");
   validate_id(c.id);
   validate_id(c.generation);
   require((c.world == 1 || c.world == 2) && c.rank < c.world, "TP geometry");
@@ -173,8 +147,8 @@ void valid(const Checkpoint &c) {
               c.frontier.sampling == "greedy" && !c.frontier.lineage.empty(),
           "unsupported frontier/sampling");
   require(c.sections.size() <= 512, "section count");
-  require(c.frontier.consumed <= SIZE_MAX / 76800 && c.frontier.pending_valid &&
-              c.frontier.pending < 200064 &&
+  require(c.frontier.consumed <= SIZE_MAX / 76800 && c.frontier.pending.has_value() &&
+              *c.frontier.pending < 200064 &&
               c.frontier.emitted <= c.frontier.consumed + 1 &&
               c.frontier.control <= 1,
           "committed frontier bounds");
@@ -623,7 +597,7 @@ Checkpoint decode_with(std::span<const std::uint8_t> b, const std::string &compa
     f.drafter = r.u64();
     f.control = r.u64();
     f.pending = r.u32();
-    f.pending_valid = r.bit();
+    if (!r.bit()) f.pending.reset();
     f.drafter_ready = r.bit();
     f.sampling = r.text();
     f.lineage = r.text();
@@ -637,6 +611,7 @@ Checkpoint decode_with(std::span<const std::uint8_t> b, const std::string &compa
     for (std::uint64_t i = 0; i < count; ++i) {
       Section s;
       s.name = r.text();
+      s.rank = rank;
       require(r.u64() == rank, "section rank");
       s.replicated = r.bit();
       require(r.u64() == offset, "section offset");
@@ -686,69 +661,17 @@ std::string state_digest(const Checkpoint &c) {
   return sha(encode(canonical));
 }
 Bytes read(const std::filesystem::path &p, std::uint64_t max_bytes) {
-  auto n = std::filesystem::file_size(p);
-  require(n <= max_bytes && n <= std::numeric_limits<std::size_t>::max(),
-          "file admission");
-  Bytes b(static_cast<std::size_t>(n));
-  std::ifstream f(p, std::ios::binary);
-  require(bool(f), "open " + p.string());
-  if (n)
-    f.read(reinterpret_cast<char *>(b.data()), static_cast<std::streamsize>(n));
-  require(bool(f) && f.peek() == std::char_traits<char>::eof(),
-          "read/truncated/changed file");
+  Bytes b;
+  try {
+    ::strix::session::checkpoint_io::read(p, 0, max_bytes, [&](std::uint64_t n) {
+      b.resize(static_cast<std::size_t>(n)); return std::as_writable_bytes(std::span(b));
+    });
+  } catch (const std::exception& e) { throw std::runtime_error(std::string("MiniMax session: ") + e.what()); }
   return b;
 }
-void atomic_write(const std::filesystem::path &p,
-                  std::span<const std::uint8_t> b) {
-  std::filesystem::create_directories(p.parent_path());
-  auto tmp = p;
-  tmp += ".tmp-" + random_generation();
-#ifdef _WIN32
-  auto h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                       FILE_ATTRIBUTE_NORMAL, nullptr);
-  require(h != INVALID_HANDLE_VALUE, "create temporary");
-  bool ok = true;
-  std::size_t pos = 0;
-  while (pos < b.size()) {
-    DWORD n = 0;
-    auto size =
-        static_cast<DWORD>(std::min<std::size_t>(b.size() - pos, 1U << 30));
-    if (!WriteFile(h, b.data() + pos, size, &n, nullptr) || !n) {
-      ok = false;
-      break;
-    }
-    pos += n;
-  }
-  ok = ok && FlushFileBuffers(h);
-  CloseHandle(h);
-  require(ok, "write/fsync");
-  require(MoveFileExW(tmp.c_str(), p.c_str(),
-                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH),
-          "rename");
-#else
-  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-  require(fd >= 0, "create temporary");
-  std::size_t pos = 0;
-  bool ok = true;
-  while (pos < b.size()) {
-    auto n = ::write(fd, b.data() + pos,
-                     std::min<std::size_t>(b.size() - pos, 1U << 30));
-    if (n <= 0) {
-      ok = false;
-      break;
-    }
-    pos += static_cast<std::size_t>(n);
-  }
-  ok = ok && ::fsync(fd) == 0;
-  int closed = ::close(fd);
-  require(ok && closed == 0, "write/fsync");
-  require(::rename(tmp.c_str(), p.c_str()) == 0, "rename");
-  int dir = ::open(p.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-  require(dir >= 0, "directory open");
-  ok = ::fsync(dir) == 0;
-  closed = ::close(dir);
-  require(ok && closed == 0, "directory fsync");
-#endif
+void atomic_write(const std::filesystem::path &p, std::span<const std::uint8_t> b) {
+  try { ::strix::session::checkpoint_io::atomic_write(p, std::as_bytes(b)); }
+  catch (const std::exception& e) { throw std::runtime_error(std::string("MiniMax session: ") + e.what()); }
 }
 void agree(bool success, const Exchange &x, const std::string &phase) {
   Writer w;
@@ -763,10 +686,10 @@ void agree(bool success, const Exchange &x, const std::string &phase) {
 }
 Cache::Cache(std::string compat, std::uint32_t rank, std::uint32_t world,
              std::uint64_t budget, std::filesystem::path dir, Exchange x,
-             std::uint64_t max_parked, std::uint64_t disk_budget)
+             std::uint64_t max_parked, std::uint64_t disk_budget, std::shared_ptr<PrefixStateCache> owner)
     : compat_(std::move(compat)), rank_(rank), world_(world),
       max_parked_(max_parked), disk_budget_(disk_budget), budget_(budget),
-      directory_(std::move(dir)), exchange_(std::move(x)) {
+      directory_(std::move(dir)), exchange_(std::move(x)), ram_(budget, max_parked, std::move(owner)) {
   require((world == 1 || world == 2) && rank < world && bool(exchange_),
           "cache geometry/exchange");
 }
@@ -788,16 +711,17 @@ void Cache::identify(Checkpoint &c) {
 }
 Stats Cache::stats() const {
   Stats s;
-  s.entries = entries_.size();
-  s.evictions = evictions_;
-  for (const auto &[id, e] : entries_) {
-    (void)id;
-    s.bytes += e.bytes.size();
-  }
+  s.entries = ram_.size();
+  s.evictions = evictions_ + ram_.evictions();
+  s.bytes = ram_.bytes();
   std::error_code ec;
   if (!directory_.empty() && std::filesystem::exists(directory_, ec))
     for (const auto& e : std::filesystem::directory_iterator(directory_))
-      if (e.is_regular_file() && e.path().extension() == ".session") s.disk_bytes += e.file_size();
+      if (e.is_regular_file() && e.path().extension() == ".session") {
+        const auto bytes = e.file_size();
+        require(bytes <= UINT64_MAX - s.disk_bytes, "session_budget: disk accounting overflow");
+        s.disk_bytes += bytes;
+      }
   return s;
 }
 std::uint64_t available_memory() {
@@ -831,35 +755,24 @@ bool memory_admitted(std::uint64_t parked, std::uint64_t payload,
   return payload <= (available - reserve) / 6;
 }
 void Cache::prepare_capture(std::uint64_t payload) {
+  working_ = {};
   const auto available = available_memory();
   require(memory_admitted(0, payload, budget_, available),
           "session_budget: single capture peak exceeds budget/MemAvailable");
-  while (!memory_admitted(stats().bytes, payload, budget_, available)) {
-    require(!entries_.empty(), "capture admission");
-    auto victim = std::min_element(entries_.begin(), entries_.end(),
-                                   [](const auto &a, const auto &b) {
-                                     return a.second.touched < b.second.touched;
-                                   });
-    entries_.erase(victim);
-    ++evictions_;
-  }
+  working_ = ram_.owner()->reserve(payload * 6, nullptr, {}, true);
+  require(bool(working_), "session_budget: common capture commitment refused");
 }
 // A full cache must still restore its own entries: evict other parked sessions (LRU) until the restore peak fits,
 // never the one being resumed.
 void Cache::prepare_resume(const std::string &id, std::uint64_t payload) {
+  working_ = {};
   const auto available = available_memory();
   // Refuse before evicting anything when even the target alone cannot be restored.
-  const auto target = entries_.find(id);
-  require(target != entries_.end() && memory_admitted(target->second.bytes.size(), payload, budget_, available),
+  const auto* target = ram_.find(id);
+  require(target && memory_admitted(target->size(), payload, budget_, available),
           "host budget/capture peak/MemAvailable admission refused");
-  while (!memory_admitted(stats().bytes, payload, budget_, available)) {
-    auto victim = entries_.end();
-    for (auto it = entries_.begin(); it != entries_.end(); ++it)
-      if (it->first != id && (victim == entries_.end() || it->second.touched < victim->second.touched)) victim = it;
-    require(victim != entries_.end(), "host budget/capture peak/MemAvailable admission refused");
-    entries_.erase(victim);
-    ++evictions_;
-  }
+  working_ = ram_.owner()->reserve(payload * 6, nullptr, id, true);
+  require(bool(working_), "session_budget: common protected restore commitment refused");
 }
 void Cache::admit(std::uint64_t payload) const {
   require(memory_admitted(stats().bytes, payload, budget_, available_memory()),
@@ -867,14 +780,17 @@ void Cache::admit(std::uint64_t payload) const {
 }
 void Cache::capture(Checkpoint c) {
   std::uint64_t bytes = 1048576;
-  for (const auto &s : c.sections)
-    bytes += s.bytes.size();
   bool ok = true;
   try {
+    for (const auto &s : c.sections) {
+      require(s.bytes.size() <= UINT64_MAX - bytes, "session_budget: capture size overflow");
+      bytes += s.bytes.size();
+    }
     prepare_capture(bytes);
   } catch (...) {
     ok = false;
   }
+  auto working = std::move(working_);
   agree(ok, exchange_, "session_budget: capture-admission");
   identify(c);
   Bytes b;
@@ -898,19 +814,8 @@ void Cache::capture(Checkpoint c) {
               other.shared == replicated && other.world == world_ &&
               other.rank == (world_ == 1 ? rank_ : 1 - rank_),
           "RAM peer frontier/replicated mismatch");
-  auto old = entries_.find(c.id);
-  if (old != entries_.end())
-    entries_.erase(old);
   require(max_parked_ > 0, "session_budget: max parked zero");
-  while (stats().bytes > budget_ - b.size() || entries_.size() >= max_parked_) {
-    auto victim = std::min_element(entries_.begin(), entries_.end(),
-                                   [](const auto &a, const auto &v) {
-                                     return a.second.touched < v.second.touched;
-                                   });
-    entries_.erase(victim);
-    ++evictions_;
-  }
-  entries_[c.id] = {std::move(b), ++clock_};
+  require(ram_.put(c.id, std::move(b), &working), "session_budget: RAM retention refused");
 }
 void Cache::checkpoint(Checkpoint c) {
   identify(c);
@@ -920,11 +825,15 @@ void Cache::checkpoint(Checkpoint c) {
   std::vector<std::string> digests;
   std::string root;
   bool ok = true;
+  PrefixStateCache::Reservation working;
   try {
     std::uint64_t bytes = 1048576;
-    for (const auto &s : c.sections)
+    for (const auto &s : c.sections) {
+      require(s.bytes.size() <= UINT64_MAX - bytes, "session_budget: capture size overflow");
       bytes += s.bytes.size();
+    }
     prepare_capture(bytes);
+    working = std::move(working_);
     b = encode_with(c, digests, root);
     encode_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
@@ -933,8 +842,13 @@ void Cache::checkpoint(Checkpoint c) {
   } catch (...) { ok = false; }
   agree(ok, exchange_, "session_budget: disk-encode-admission");
   std::unique_ptr<DirectoryLock> disk_lock;
-  try { disk_lock = std::make_unique<DirectoryLock>(directory_); }
-  catch (...) { ok = false; }
+  Bytes previous_group;
+  bool had_group = false;
+  try {
+    disk_lock = std::make_unique<DirectoryLock>(directory_);
+    had_group = std::filesystem::exists(manifest(directory_, c.id));
+    if (had_group) previous_group = read(manifest(directory_, c.id), 1U << 20);
+  } catch (...) { ok = false; }
   agree(ok, exchange_, "session_budget: disk-lock");
   // Keep the lock through admission, eviction, payload write and manifest
   // publication. Existing generations remain charged during replacement.
@@ -951,7 +865,7 @@ void Cache::checkpoint(Checkpoint c) {
           if (e.path().extension() != ".session") continue;
           const auto name = e.path().filename().string();
           const auto dot = name.find('.');
-          if (dot == std::string::npos) continue;
+          if (dot == std::string::npos || name.substr(0,dot)==c.id) continue;
           if (e.last_write_time() < oldest) { oldest = e.last_write_time(); victim = name.substr(0, dot); }
         }
       }
@@ -968,7 +882,7 @@ void Cache::checkpoint(Checkpoint c) {
     if (rank_ != 0 && !fits) {
       auto oldest = std::filesystem::file_time_type::max();
       for (const auto& e : std::filesystem::directory_iterator(directory_))
-        if (e.path().extension() == ".session" && e.last_write_time() < oldest) {
+        if (e.path().extension() == ".session" && e.path().filename().string().substr(0,e.path().filename().string().find('.')) != c.id && e.last_write_time() < oldest) {
           oldest = e.last_write_time(); local_victim = e.path().filename().string().substr(0, e.path().filename().string().find('.'));
         }
     }
@@ -1023,7 +937,19 @@ void Cache::checkpoint(Checkpoint c) {
   } catch (...) {
     ok = false;
   }
-  agree(ok, exchange_, "manifest-published");
+  try { agree(ok, exchange_, "manifest-published"); }
+  catch (...) {
+    // A peer may refuse after this rank replaced its manifest. Roll back the
+    // local name while the protocol lock is still held; payload generations are
+    // immutable and the last good generation remains available on both ranks.
+    const auto failure = std::current_exception();
+    if (had_group) atomic_write(manifest(directory_, c.id), previous_group);
+    else {
+      std::filesystem::remove(manifest(directory_, c.id));
+      ::strix::session::checkpoint_io::sync_directory(directory_);
+    }
+    std::rethrow_exception(failure);
+  }
   std::fprintf(
       stderr,
       "rank %u session checkpoint bytes %zu encode_s %.6f write_fsync_s %.6f "
@@ -1037,6 +963,7 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
   const auto start = std::chrono::steady_clock::now();
   validate_id(id);
   Checkpoint c;
+  PrefixStateCache::Reservation working;
   std::vector<std::string> digests;
   std::string root, replicated;
   bool ok = true;
@@ -1046,13 +973,13 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
   try {
     if (disk) disk_lock = std::make_unique<DirectoryLock>(directory_);
     if (!disk) {
-      auto it = entries_.find(id);
-      require(it != entries_.end(), "session_not_found: RAM miss");
-      prepare_resume(id, it->second.bytes.size());
-      it = entries_.find(id);
-      c = decode_with(it->second.bytes, compat_, rank_, world_, budget_, digests, root);
+      const auto lease = ram_.lease(id);
+      require(bool(lease), "session_not_found: RAM miss");
+      prepare_resume(id, lease->encoded->size());
+      working = std::move(working_);
+      c = decode_with(*lease->encoded, compat_, rank_, world_, budget_, digests, root);
       replicated = shared(c, digests);
-      it->second.touched = ++clock_;
+      ram_.touch(id);
     } else {
       require(on_disk(id), "session_not_found: disk miss");
       const auto manifest_start = std::chrono::steady_clock::now();
@@ -1085,6 +1012,8 @@ Checkpoint Cache::resume(const std::string &id, bool disk) {
       const auto actual = std::filesystem::file_size(path);
       require(actual == rr[rank_].bytes, "session_corrupt: rank file size disagrees with receipt");
       admit(actual);
+      working = ram_.owner()->reserve(actual * 6, nullptr, id, true);
+      require(bool(working), "session_budget: common disk restore commitment refused");
       // Bound read by the admitted size too: growth after stat cannot allocate more.
       const auto read_start = std::chrono::steady_clock::now();
       auto bytes = read(path, actual);
@@ -1149,8 +1078,8 @@ std::vector<Summary> Cache::describe(bool include_disk) const {
   };
   std::vector<Summary> result;
   for (const auto& id : list()) {
-    auto it = entries_.find(id);
-    if (it != entries_.end()) result.push_back(header(it->second.bytes, it->second.bytes.size()));
+    const auto* bytes = ram_.find(id);
+    if (bytes) result.push_back(header(*bytes, bytes->size()));
     else if (include_disk) {
       auto group = read(manifest(directory_, id), 1U << 20);
       require(group.size() >= 72, "session_corrupt: list group truncated");
@@ -1186,7 +1115,7 @@ void Cache::erase_locked(const std::string &id) {
   validate_id(id);
   bool ok = true;
   try {
-    entries_.erase(id); // rank payloads are immutable; remove only this
+    ram_.erase(id); // rank payloads are immutable; remove only this
                         // session's local files
     // RAM-only caches have no directory; never resolve paths against the working directory.
     if (!directory_.empty()) std::filesystem::remove(manifest(directory_, id));
@@ -1205,7 +1134,7 @@ void Cache::erase_locked(const std::string &id) {
 }
 std::vector<std::string> Cache::list() const {
   std::set<std::string> ids;
-  for (const auto &[id, e] : entries_) {
+  for (const auto &[id, e] : ram_.entries()) {
     (void)e;
     ids.insert(id);
   }

@@ -1,0 +1,15 @@
+[
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":2}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3,"stream":true,"stream_options":{"include_usage":true}}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3,"temperature":1}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3,"n":2}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3,"response_format":{"type":"json_object"}}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"hi","max_tokens":3,"logprobs":true}},
+  {"method":"GET","path":"/missing","body":{}},
+  {"method":"POST","path":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"hi"}],"max_tokens":3,"enable_thinking":false}},
+  {"method":"POST","path":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"hi"}],"max_tokens":2,"stream":true,"enable_thinking":false}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"new","max_tokens":3,"state_cache":{"retain":false}}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"new!","max_tokens":3}},
+  {"method":"POST","path":"/v1/completions","body":{"prompt":"new!","max_tokens":3,"state_cache":{"retain":false}}}
+]

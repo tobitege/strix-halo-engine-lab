@@ -1,6 +1,7 @@
 #include "strix/startup_markers.hpp"
 #include "strix/serial_request.hpp"
 #include "strix/serial_decode_replay.hpp"
+#include "strix/power/sampler.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -121,6 +122,7 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
         if (next >= request.vocab_size)
             throw std::invalid_argument("greedy emission token is outside vocabulary");
         startup::first_token();
+        power::mark_first_token();
         result.generated_tokens.push_back(
             next);
 
@@ -326,6 +328,7 @@ SerialGreedyTokenCursor::SerialGreedyTokenCursor(SerialGreedyRequest request) : 
 void SerialGreedyTokenCursor::emit_pending() {
     if (result_.generated_tokens.size() >= request_.max_new_tokens) { done_ = true; return; }
     startup::first_token();
+    power::mark_first_token();
     result_.generated_tokens.push_back(pending_);
     if (pending_ == request_.eos_token_id) {
         result_.stop_reason = SerialRequestStopReason::eos;

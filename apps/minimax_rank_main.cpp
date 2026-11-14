@@ -1,3 +1,5 @@
+#include "strix/route_receipt.hpp"
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
 // The DS bench roles in one binary: teacher-forced gates, single-user sessions (TTFT, prefill tok/s, decode tok/s) and
@@ -20,13 +22,12 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfcore | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
 //   --sel-check PROMPT.u32:K:N[:v]               selection-once check: decode logits with STRIX_MM_SELECT_ONCE off / on bitwise equal at >= 16K (STRIX_MM_SEL_CHECK_LEN)
 //   --xb-check PROMPT.u32:K:N[:v]                exchange boundary check: decode logits of the 4 (wait, inplace) configurations bitwise == 00 (N slots, or :v one N-row verify window)
-//                                                    (pfcore: prefill MoE WMMA core, off = lib, on = STRIX_MM_AB_PFCORE, default 3 = v4)
 //                                                    (pfgufuse: single-split gate/up fusion off/on; 7 prefills with state and final-row hashes)
 //                                                    (pftails: MoE tail classes on the caller's stream vs beside MT8 on a side stream; 7 hashed prefills)
 //                                                    (pfpair: paired MT8 PIPE bands off vs auto (calls >= 2048 rows); 7 hashed prefills)
@@ -66,6 +67,7 @@
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
+#include "minimax/attn/msa_select_dump.hpp"
 #include "hip_minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
@@ -114,22 +116,6 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
 // The transport shared in turn by the communicator and the exchange module (shared exchange form).
 using Borrowed = strix::xport::BorrowedTransport<
     strix::xport::BorrowedAbort::forward, strix::xport::BorrowedState::base_default>;
-
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (as the DS apps).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
-                                                     std::uint16_t capabilities) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::hyphen_transport;
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(180);
-    options.usb.transport_capabilities = capabilities;
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    receipt = std::move(opened.receipt);
-    return std::move(opened.host);
-}
 
 std::vector<std::uint32_t> read_u32(const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -213,7 +199,16 @@ std::vector<std::uint32_t> session(mm::Engine& eng, const std::string& name, con
     const auto st0 = eng.comm_stats();
     const mm::Profile pf0 = eng.profile();
     const auto t0 = Clock::now();
+    // STRIX_MM_QUALITY_SELECT=1 with STRIX_MM_QUALITY_OUT=PREFIX: the block ids every sparse prefill batch selected,
+    // as PREFIX-<name>-sel-r<rank>.u32 (msa_select_dump.hpp; synchronizes each batch: quality runs only).
+    const char* const qsel = std::getenv("STRIX_MM_QUALITY_SELECT");
+    const char* const qsel_out = std::getenv("STRIX_MM_QUALITY_OUT");
+    const bool sel_dump = qsel != nullptr && std::strcmp(qsel, "1") == 0 && qsel_out != nullptr && *qsel_out != '\0';
+    if (sel_dump)
+        strix::minimax::msa::fused::set_select_dump(
+            (std::string(qsel_out) + "-" + name + "-sel-r" + std::to_string(eng.rank()) + ".u32").c_str());
     std::vector<std::uint32_t> gen{eng.prefill(0, prompt, 0)};
+    if (sel_dump) strix::minimax::msa::fused::set_select_dump(nullptr);
     const double ttft = secs(t0, Clock::now());
     const mm::Profile pf1 = eng.profile();
     const auto st1 = eng.comm_stats();
@@ -992,6 +987,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         else if (flag == "xbinplace") { eng.set_xb_inplace(on); eng.set_xb_wait(false); }
         else if (flag == "xbboth") { eng.set_xb_wait(on); eng.set_xb_inplace(on); }
         else if (flag == "xbprep") eng.set_xb_prep(on);
+        else if (flag == "xbfold") eng.set_xb_fold(on);  // needs the process STRIX_MMX_FOLD=rows (fold slots)
         else if (flag == "xbpub") eng.set_xb_publish(on);  // on top of the process XB_INPLACE (env)
         else if (flag == "xbilp") eng.set_xb_postilp(on);
         else if (flag == "xbset") {  // a whole flag set: STRIX_MM_AB_XBSET letters w i p u m l (B) vs all six off (A)
@@ -1049,7 +1045,6 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             const char* e = std::getenv("STRIX_MM_AB_CORE8");
             const std::string value = e != nullptr ? e : "2";
             if (value != "1" && value != "2") throw std::invalid_argument("STRIX_MM_AB_CORE8 must be 1 or 2");
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(1);
             eng.set_prefill_pipe(on ? 0 : -1);
             eng.set_prefill_core8(on ? (value == "1" ? 1 : 2) : -1);
@@ -1070,12 +1065,10 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             const char* e = std::getenv("STRIX_MM_AB_CORE8");
             const std::string value = e != nullptr ? e : "1";
             if (value != "1" && value != "2") throw std::invalid_argument("STRIX_MM_AB_CORE8 must be 1 or 2");
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(1);
             eng.set_prefill_core8(on ? (value == "1" ? 1 : 2) : 0);
         }
         else if (flag == "mtfit") {
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(on ? 1 : 0);
         }
         else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(on ? 1 : 0);  // FAST_I4 layers: EXL3 (A) / W4A4 IU4 (B), lossy
@@ -1088,15 +1081,8 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             eng.set_prefill_msa_batch(on);
             eng.set_prefill_attend4(on);
             eng.set_prefill_router_batch(on);
-            strix::minimax::moe::opt::set_prefill_core(3);
             eng.set_prefill_mtfit(on ? 1 : 0);
             strix_trellis_lab_set_wmma_tiled(on ? 1 : 0);
-        }
-        else if (flag == "pfcore") {  //: prefill MoE core, lib (off) vs STRIX_MM_AB_PFCORE (on)
-            const char* c = std::getenv("STRIX_MM_AB_PFCORE");
-            const int core = c != nullptr ? std::atoi(c) : 3;
-            if (core < 1 || core > 3) throw std::invalid_argument("STRIX_MM_AB_PFCORE must be 1, 2 or 3 (v2, v3, v4)");
-            strix::minimax::moe::opt::set_prefill_core(on ? core : 0);
         } else throw std::invalid_argument("--ab: unknown flag " + flag);
     };
     const bool start_arm = flag == "staging" ? eng.fused_staging() : flag == "attn" ? eng.fused_attention()
@@ -1105,7 +1091,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "idxdec" ? eng.index_decode() : flag == "idxattn" ? eng.index_attn()
                          : flag == "idxconc" ? eng.index_concurrent()
                          : flag == "xbwait" ? eng.xb_wait() : flag == "xbinplace" ? eng.xb_inplace()
-                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbwarmo" ? eng.xb_warm_o() != 0 : flag == "moegrid" ? true : flag == "moepipe" ? false : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
+                         : flag == "xbboth" ? eng.xb_wait() : flag == "xbprep" ? eng.xb_prep() : flag == "xbfold" ? eng.xb_fold() : flag == "xbpub" ? eng.xb_publish() : flag == "xbwarm" ? eng.xb_warm() != 0 : flag == "xbwarmo" ? eng.xb_warm_o() != 0 : flag == "moegrid" ? true : flag == "moepipe" ? false : flag == "xbilp" ? eng.xb_postilp() : flag == "xbset" ? eng.xb_wait()
                          : flag == "pfx" ? eng.prefill_xchg() : flag == "pfil" ? eng.prefill_interleave()
                          : flag == "pfidx" ? eng.prefill_index_tile()
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
@@ -1118,7 +1104,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     const bool pfx0 = eng.prefill_xchg(), pfxip0 = eng.prefill_inplace();
     const bool msa0 = eng.prefill_msa_batch(), att0 = eng.prefill_attend4(), rtr0 = eng.prefill_router_batch();  // pfall restores these
     const unsigned router_rows0 = eng.prefill_router_rows();  // pfrouterrows restores it
-    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset";
+    const bool xb = flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbfold" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset";
     const bool xb_w0 = eng.xb_wait(), xb_i0 = eng.xb_inplace(), xb_p0 = eng.xb_prep(), xb_u0 = eng.xb_publish();
     const unsigned xb_m0 = eng.xb_warm(), xb_o0 = eng.xb_warm_o();
     const auto xb_oc0 = eng.xb_warm_o_count();
@@ -1131,9 +1117,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = (flag != "pfcore" && (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || flag == "pfcore" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
-    // pfcore / pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfcore" || flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
@@ -1198,19 +1184,15 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_prefill_core8(-1);
         eng.set_prefill_pipe(-1);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
     else if (flag == "pfpipe") eng.set_prefill_pipe(pipe0);
     else if (flag == "core8") {
         eng.set_prefill_core8(-1);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
     else if (flag == "mtfit") {
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
     }
-    else if (flag == "pfcore") strix::minimax::moe::opt::set_prefill_core(-1);  // back to the process default
     else if (flag == "pfidx") {
         eng.set_prefill_index_tile(start_arm);
         eng.set_prefill_msa_batch(msa0);
@@ -1224,7 +1206,6 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_prefill_attend4(att0);
         eng.set_prefill_router_batch(rtr0);
         eng.set_prefill_mtfit(-1);
-        strix::minimax::moe::opt::set_prefill_core(-1);
         strix_trellis_lab_set_wmma_tiled(-1);
     }
     else if (xb) {
@@ -1676,6 +1657,10 @@ void sel_check(mm::Engine& eng, const std::string& name, const std::vector<std::
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
     if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
     if (argc < 5) {
@@ -1755,7 +1740,6 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(warm.hits));
             return 0;
         }
-        std::string receipt;
         // The ranks load at different speeds (measurement: 44 s vs 166 s under page-cache pressure): the first collective after
         // the load must not hit the dist layer's 120 s default. An explicit value wins.
         (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
@@ -1776,8 +1760,9 @@ int main(int argc, char** argv) {
         const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
         if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
             throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
-        auto transport = open_transport(argv[3], opt.rank, receipt, capabilities);
-        if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
+        auto opened = strix::dist::open_pair(argv[3], opt.rank, {std::chrono::seconds(180), capabilities});
+        auto transport = std::move(opened.host);
+        if (!opened.receipt.empty()) std::printf("transport: %s\n", opened.receipt.c_str());
         strix::dist::Group group;
         group.transport_capabilities = capabilities;
         group.rank = opt.rank;
@@ -1822,9 +1807,10 @@ int main(int argc, char** argv) {
         const bool borrow = xfer_load || pfx_load;
         // Keep the host owner alive for both modules even when direct is present.
         // Engine module entry retires communicator work before handing it over.
-        auto comm_owner = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), std::move(gpu_direct), max_bytes)
-                        : borrow ? std::make_unique<strix::dist::Communicator>(group, std::make_unique<Borrowed>(*transport), max_bytes)
-                                 : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
+        const bool lend = opened.direct != nullptr || borrow;
+        auto comm_owner = std::make_unique<strix::dist::Communicator>(
+            group, lend ? std::unique_ptr<strix::dist::Transport>(std::make_unique<Borrowed>(*transport)) : std::move(transport),
+            std::move(opened.direct), max_bytes);
         strix::dist::Communicator& comm = *comm_owner;
         std::printf("connected: rank %u transport %s routes %s %.1f s\n", opt.rank, comm.transport_name().c_str(),
                     comm.route_text().c_str(), secs(t_start, Clock::now()));
@@ -1833,6 +1819,11 @@ int main(int argc, char** argv) {
         if (exchanger) eng.set_exchanger(exchanger.get(), xfer_env == nullptr || std::string(xfer_env) == "on");
         if (pfx) eng.set_prefill_exchanger(pfx.get(), pfx_on);
         const auto lr = eng.load();
+        // Shared route receipt: both ranks must have resolved the same numerical route before any product runs.
+        try {
+            const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+            std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
+        } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);

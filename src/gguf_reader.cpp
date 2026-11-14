@@ -126,7 +126,7 @@ private:
     MetadataEntry read_metadata() {
         MetadataEntry entry;
         entry.key = read_string(65'535);
-        if (!valid_key(entry.key)) {
+        if (!valid_key(entry.key, limits_.allow_hyphen_in_keys)) {
             fail("invalid GGUF metadata key");
         }
         entry.type = read_value_type();
@@ -290,7 +290,7 @@ private:
         position_ += static_cast<std::uint64_t>(length);
     }
 
-    static bool valid_key(const std::string& key) {
+    static bool valid_key(const std::string& key, bool allow_hyphen) {
         if (key.empty() || key.front() == '.' || key.back() == '.') {
             return false;
         }
@@ -299,7 +299,7 @@ private:
             const auto character = static_cast<unsigned char>(symbol);
             const bool valid = (character >= 'a' && character <= 'z') ||
                                (character >= '0' && character <= '9') ||
-                               character == '_' || character == '.';
+                               character == '_' || character == '.' || (allow_hyphen && character == '-');
             if (!valid || (character == '.' && previous_dot)) {
                 return false;
             }

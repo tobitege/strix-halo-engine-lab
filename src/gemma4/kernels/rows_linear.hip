@@ -354,7 +354,12 @@ void linear_rows(LinearView w, const float* x, unsigned rows, float* out, Queue 
         return;
     if (!w.data || !w.inputs || !w.outputs)
         throw std::runtime_error("empty device linear");
+    if (many && variant < 0 && staged_rows_preferred(w.format, rows, w.inputs, w.outputs, false) &&
+        linear_staged_rows(w, nullptr, x, rows, out, q, failure))
+        return;
     if (many && many_rows<false>(w, {}, x, rows, out, q, failure, variant))
+        return;
+    if (linear_staged_rows(w, nullptr, x, rows, out, q, failure))
         return;
     for (unsigned r = 0; r < rows; r += 8U)
         linear(w, x + std::size_t(r) * w.inputs, std::min(8U, rows - r), out + std::size_t(r) * w.outputs, true, q,
@@ -385,7 +390,12 @@ void gate_up_rows(LinearView gate, LinearView up, const float* x, unsigned rows,
             check_finite(out, std::size_t(rows) * gate.outputs, failure, q);
         return;
     }
+    if (many && variant < 0 && staged_rows_preferred(gate.format, rows, gate.inputs, gate.outputs, true) &&
+        linear_staged_rows(gate, &up, x, rows, out, q, failure))
+        return;
     if (many && many_rows<true>(gate, up, x, rows, out, q, failure, variant))
+        return;
+    if (linear_staged_rows(gate, &up, x, rows, out, q, failure))
         return;
     for (unsigned r = 0; r < rows; r += 8U)
         gpu::gate_up(gate, up, x + std::size_t(r) * gate.inputs, std::min(8U, rows - r),

@@ -1,5 +1,6 @@
 // Prompt-lookup hybrid draft session (see lookup.hpp). Exact: proposals only; greedy verification decides every token.
 #include "lookup.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -10,16 +11,6 @@
 
 namespace strix::gemma4::engine::lookup {
 namespace {
-double env_value(const char* name, double fallback, double low, double high) {
-    const auto* v = std::getenv(name);
-    if (!v || !*v) return fallback;
-    std::size_t used = 0;
-    double x = 0;
-    try { x = std::stod(v, &used); } catch (...) { used = 0; }
-    if (used != std::string(v).size() || !(x >= low && x <= high))
-        throw std::invalid_argument(std::string(name) + " outside [" + std::to_string(low) + "," + std::to_string(high) + "]");
-    return x;
-}
 // Verify cost of R = 1..8 rows relative to R1 (release bench, 64-token context: 17.89 ms + 0 / 1.08 / 3.41 / 5.74 /
 // 8.24 / 10.74 / 13.24 / 15.74 ms). Scaled by the stream's measured base cycle (cycle minus rows minus drafting), so
 // the row term grows with the context-dependent pass cost.
@@ -372,10 +363,10 @@ LookupConfig LookupConfig::from_environment() {
     }
     if (!mode.empty() && mode != "auto" && mode != "1" && mode != "on")
         throw std::invalid_argument("STRIX_G4_LOOKUP must be auto, 1/on or 0/off");
-    c.min_length = std::uint32_t(env_value("STRIX_G4_LOOKUP_MIN", c.min_length, 1, 16));
-    c.margin = env_value("STRIX_G4_LOOKUP_MARGIN", c.margin, 1, 2);
-    c.index.capacity = std::uint32_t(env_value("STRIX_G4_LOOKUP_TOKENS", c.index.capacity, 64, double(1U << 22)));
-    c.spec_arbiter = env_value("STRIX_SPEC_ARBITER", 0, 0, 1) == 1;
+    c.min_length = std::uint32_t(strix::env_number<double>("STRIX_G4_LOOKUP_MIN", c.min_length, 1, 16));
+    c.margin = strix::env_number<double>("STRIX_G4_LOOKUP_MARGIN", c.margin, 1, 2);
+    c.index.capacity = std::uint32_t(strix::env_number<double>("STRIX_G4_LOOKUP_TOKENS", c.index.capacity, 64, double(1U << 22)));
+    c.spec_arbiter = strix::env_number<double>("STRIX_SPEC_ARBITER", 0, 0, 1) == 1;
     return c;
 }
 strix::serve::Json LookupConfig::json() const {

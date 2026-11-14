@@ -13,6 +13,7 @@
 // of SEQS), re-import the state, feed its first P tokens in windows of up to 8 rows (teacher forcing), then N greedy
 // steps (timing; no reference). One JSON line per step: tokens, FNV, match, wall / device ms, remote layers, slots,
 // answer items, RTT (sum, max), server time, dynamic hits / copies; --timeline: one line per (step, layer).
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_hot_residency.hpp"
 #include "strix/cuda_ds41_hot_site.hpp"
 #include "strix/cuda_ds41_parts_host_driver.hpp"
@@ -92,6 +93,9 @@ double mean(const std::vector<double>& v) { return v.empty() ? 0.0 : std::accumu
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");

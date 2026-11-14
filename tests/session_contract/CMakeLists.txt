@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.24)
+project(strix_session_contract LANGUAGES CXX)
+include(CTest)
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${REPO_ROOT}/cmake/StrixSession.cmake")
+if(BUILD_TESTING)
+    # Retain this entry point's original strict contract compilation.
+    if(MSVC)
+        target_compile_options(session_engine_contract_tests PRIVATE /WX)
+    else()
+        target_compile_options(session_engine_contract_tests PRIVATE -Werror)
+    endif()
+endif()

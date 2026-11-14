@@ -8,6 +8,7 @@
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
+#include "glm/prefill/glm_pf_kda_wmma.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "glm/engine/glm_kvshard.hpp"
@@ -166,6 +167,7 @@ public:
         if (kp && std::string(kp) != "0" && std::string(kp) != "1")
             throw std::invalid_argument("STRIX_GLM_PF_KDA_PACK must be 0 or 1");
         kda_pack_ = kp && std::string(kp) == "1";  // 1 = contiguous KDA projections + pack_qkv (the pre-strided form)
+        kda_wmma_ = kda_wmma::enabled();  // FAST identity glm-pf-kda-wmma-v1 (f_a / g_a / b / f_b / g_b on WMMA): default with STRIX_GLM_PF_WMMA=1
         (void)exact::tile_rows();
         route_ids_.resize(R * kTopE);
         route_weights_.resize(R * kTopE);
@@ -272,10 +274,19 @@ public:
         }
         {  // the three projections of x share one launch under dense v3 (v1 / v2 run them one by one); same bits
             const DenseProj px[3] = {{w.f_a, 0, kKdaDim, ta_}, {w.g_a, 0, kKdaDim, tb128_}, {w.b, 0, H, b_}};
-            dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+            const DenseProj pf{w.f_b, 0, C, f_}, pg{w.g_b, 0, C, g_};
+            if (kda_wmma_ && kda_wmma::supported(D::WType::F16, kHidden, px, 3, R) &&
+                kda_wmma::supported(D::WType::F16, kKdaDim, &pf, 1, R) && kda_wmma::supported(D::WType::F16, kKdaDim, &pg, 1, R)) {
+                // FAST (default with the FAST route): the same five projections on the shared dense FP16 WMMA core.
+                kda_wmma::dense_group(x, kHidden, px, 3, R, c.stream);
+                kda_wmma::dense_group(ta_, kKdaDim, &pf, 1, R, c.stream);
+                kda_wmma::dense_group(tb128_, kKdaDim, &pg, 1, R, c.stream);
+            } else {
+                dense_rows_group(x, D::WType::F16, kHidden, px, 3, R, c.stream);
+                dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
+                dense_rows(tb128_, w.g_b, D::WType::F16, kKdaDim, 0, C, g_, R, c.stream);
+            }
         }
-        dense_rows(ta_, w.f_b, D::WType::F16, kKdaDim, 0, C, f_, R, c.stream);
-        dense_rows(tb128_, w.g_b, D::WType::F16, kKdaDim, 0, C, g_, R, c.stream);
         const D::KdaDev kd{H, w.conv, w.A_log, w.dt_bias, w.o_norm};
         float* S = st.S + static_cast<std::size_t>(slot) * H * kKdaDim * kKdaDim;
         float* cv = st.conv + static_cast<std::size_t>(slot) * 3 * C * 3;
@@ -596,6 +607,7 @@ private:
     std::size_t exact_wsb_ = 0;
     bool exact_on_ = false;
     bool kda_pack_ = false;
+    bool kda_wmma_ = false;
     void* moe_ws_ = nullptr;
     std::size_t moe_wsb_ = 0;
     float *eo_, *ge_, *ue_, *ae_, *sh1_;

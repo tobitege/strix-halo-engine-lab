@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/hip_check.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/hip_generation_output.hpp"
@@ -87,20 +88,20 @@ public:
         for(std::size_t i=1;i<steps.size();++i)
             if(steps[i].op==SerialOp::final_hyper_mix && steps[i-1U].op==SerialOp::mlp_inject) tap_=i-1U;
         if(tap_==SIZE_MAX) throw std::logic_error("MTP wide copy verify has no wide hidden tap step");
-        check(hipMalloc(reinterpret_cast<void**>(&hidden_),static_cast<std::size_t>(width_*rows_)),"MTP wide hidden rows");
+        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&hidden_),static_cast<std::size_t>(width_*rows_)),"MTP wide hidden rows");
         // The in-place components a forward overwrites: everything but the position-indexed KV and sparse index.
         for(const auto& a:resources_.session_state_layout->allocations) {
             if(a.component==SessionStateComponent::attention_kv || a.component==SessionStateComponent::sparse_index) continue;
             Saved s;s.view=resolve_session_state(*resources_.session_state_layout,*resources_.session_state_memory,a.component);
             if(s.view.storage==SessionStateStorage::device)
-                check(hipMalloc(reinterpret_cast<void**>(&s.device),static_cast<std::size_t>(s.view.bytes)),"MTP wide state snapshot");
+                strix::hip_check(hipMalloc(reinterpret_cast<void**>(&s.device),static_cast<std::size_t>(s.view.bytes)),"MTP wide state snapshot");
             else s.host.resize(static_cast<std::size_t>(s.view.bytes));
             saved_.push_back(std::move(s));
         }
         logits_.resize(static_cast<std::size_t>(vocab_));
         greedy_bytes_=hip_greedy_rows_scratch_bytes(hip_greedy_rows_max,static_cast<std::uint32_t>(vocab_));
-        check(hipMalloc(reinterpret_cast<void**>(&greedy_scratch_),static_cast<std::size_t>(greedy_bytes_)),"MTP wide greedy scratch");
-        check(hipHostMalloc(reinterpret_cast<void**>(&replies_),sizeof(HipGreedyRowsReply)*rows_,hipHostMallocMapped|hipHostMallocCoherent),
+        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&greedy_scratch_),static_cast<std::size_t>(greedy_bytes_)),"MTP wide greedy scratch");
+        strix::hip_check(hipHostMalloc(reinterpret_cast<void**>(&replies_),sizeof(HipGreedyRowsReply)*rows_,hipHostMallocMapped|hipHostMallocCoherent),
             "MTP wide greedy replies");
     }
     ~MtpWideCopyCycle() {
@@ -157,7 +158,7 @@ public:
             // External forwards need QSA invalidation even without pending GDN rows.
             verifier->flush_pending_window();
             owner.discard_deferred();
-            check(hipDeviceSynchronize(),"MTP wide cycle start fence");
+            strix::hip_check(hipDeviceSynchronize(),"MTP wide cycle start fence");
             const auto base=session;
             snapshot();
             host_phase_mark("w1 flush+snapshot");
@@ -173,7 +174,7 @@ public:
                session.committed_tokens!=base.committed_tokens+wide_rows || result.logits.size()!=wide_rows ||
                result.logit_row_indices.size()!=wide_rows)
                 throw std::logic_error("MTP wide forward did not commit every row with its logits");
-            check(hipDeviceSynchronize(),"MTP wide forward completion");
+            strix::hip_check(hipDeviceSynchronize(),"MTP wide forward completion");
             host_phase_mark("w2 wide forward");
             const auto is_eos=[&](std::uint32_t t){return std::find(eos.begin(),eos.end(),t)!=eos.end();};
             // Row r predicts the token after inputs[r]; it is accepted when it equals inputs[r + 1].
@@ -187,7 +188,7 @@ public:
             for(std::uint32_t r=0;r<wide_rows;++r) {
                 // Host logits: the diagnostics sink, the non-finite fallback, and the adopted last row.
                 if(digest || row_logits_ || !device_tokens || r+1U==wide_rows) {
-                    check(hipMemcpy(logits_.data(),reinterpret_cast<const void*>(result.logits[r].address),
+                    strix::hip_check(hipMemcpy(logits_.data(),reinterpret_cast<const void*>(result.logits[r].address),
                         static_cast<std::size_t>(vocab_*sizeof(float)),hipMemcpyDeviceToHost),"MTP wide row logits");
                     if(row_logits_) row_logits_(r,logits_);
                     if(digest) row_digests.push_back(raw_fp32_logits_digest(logits_));
@@ -232,7 +233,6 @@ public:
     }
 private:
     struct Saved {SessionStateAddress view;std::byte* device=nullptr;std::vector<std::byte> host;};
-    static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(std::uint32_t row) const {
         return MtpDeviceView{reinterpret_cast<std::uintptr_t>(hidden_+static_cast<std::size_t>(row)*width_),width_,1U};
     }
@@ -243,7 +243,7 @@ private:
             for(std::uint32_t r=0;r<wide_rows;++r) {
                 const auto source=resolve_dispatch_write(row(r),0);
                 if(source.bytes<width_) throw std::logic_error("MTP wide tap row is undersized");
-                check(hipMemcpyAsync(hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
+                strix::hip_check(hipMemcpyAsync(hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
                     static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"MTP wide tap copy");
             }
         };
@@ -260,7 +260,7 @@ private:
             enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits).subspan(first,count),
                 static_cast<std::uint32_t>(vocab_),scratch,replies_+first,stream);
         }
-        check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP wide greedy rows completion");
+        strix::hip_check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP wide greedy rows completion");
         std::vector<std::uint32_t> tokens(wide_rows);
         for(std::uint32_t r=0;r<wide_rows;++r) {
             if(replies_[r].status) return std::nullopt;
@@ -271,21 +271,21 @@ private:
     void snapshot() {
         const auto stream=static_cast<hipStream_t>(target_.stream());
         for(auto& s:saved_) {
-            if(s.device) check(hipMemcpyAsync(s.device,reinterpret_cast<const void*>(s.view.address),static_cast<std::size_t>(s.view.bytes),
+            if(s.device) strix::hip_check(hipMemcpyAsync(s.device,reinterpret_cast<const void*>(s.view.address),static_cast<std::size_t>(s.view.bytes),
                 hipMemcpyDeviceToDevice,stream),"MTP wide state snapshot copy");
             else std::memcpy(s.host.data(),reinterpret_cast<const void*>(s.view.address),s.host.size());
         }
-        check(hipStreamSynchronize(stream),"MTP wide state snapshot completion");
+        strix::hip_check(hipStreamSynchronize(stream),"MTP wide state snapshot completion");
     }
     void restore() {
-        check(hipDeviceSynchronize(),"MTP wide restore fence");
+        strix::hip_check(hipDeviceSynchronize(),"MTP wide restore fence");
         const auto stream=static_cast<hipStream_t>(target_.stream());
         for(auto& s:saved_) {
-            if(s.device) check(hipMemcpyAsync(reinterpret_cast<void*>(s.view.address),s.device,static_cast<std::size_t>(s.view.bytes),
+            if(s.device) strix::hip_check(hipMemcpyAsync(reinterpret_cast<void*>(s.view.address),s.device,static_cast<std::size_t>(s.view.bytes),
                 hipMemcpyDeviceToDevice,stream),"MTP wide state restore copy");
             else std::memcpy(reinterpret_cast<void*>(s.view.address),s.host.data(),s.host.size());
         }
-        check(hipStreamSynchronize(stream),"MTP wide state restore completion");
+        strix::hip_check(hipStreamSynchronize(stream),"MTP wide state restore completion");
     }
     HipMtpTargetHidden& target_;
     ExecutionRuntimeResources resources_;

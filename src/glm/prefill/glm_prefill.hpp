@@ -91,9 +91,10 @@ void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* 
 // VALU GEMM (each weight tile read once per 64 rows instead of once per row). `in` must be a multiple of 32.
 void dense_rows(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y, unsigned rows,
                 hipStream_t s);
-// Read-once STRIX_GLM_PF_DENSE_ROWS=3 (default) | 2 | 1; explicit selector bypasses the environment for bitwise gates/timing.
+// Read-once STRIX_GLM_PF_DENSE_ROWS=4 (default) | 3 | 2 | 1; explicit selector bypasses the environment for bitwise gates/timing.
+// v4 = the shared FMA-rows core (src/core/fma_rows.hpp) for chains of at most 4096 inputs, v3 route otherwise.
 // v3 = v2's chains in a 128 x 64 tile for grouped projections (dense_rows_group); single calls keep the v2 tile.
-// Same bits as v2 and v1.
+// Same bits in every version.
 void dense_rows_versioned(const float* x, const void* w, dev::WType wt, unsigned in, unsigned o0, unsigned n, float* y,
                           unsigned rows, hipStream_t s, unsigned version);
 // Up to kDenseGroupMax projections of the same x (same in, rows and weight type) in one launch under v3; v1 / v2 run them

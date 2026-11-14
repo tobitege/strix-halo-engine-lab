@@ -333,9 +333,14 @@ struct RawCore {
     __device__ void operator()(std::uint64_t, unsigned, const float (&)[4], const float (&)[4], const float (&)[4]) const {}
 };
 
+// Row epilogues opt into scalar wave rows with `static constexpr bool kWaveRows = true` (they then form their output
+// pointers with strix::core::wave_row); without it rows stay per-lane.
+template <class E> inline constexpr bool kEpilogueWaveRows = false;
+template <class E> requires requires { E::kWaveRows; } inline constexpr bool kEpilogueWaveRows<E> = E::kWaveRows;
+
 // scan: one CTA (8 waves) per value head; wave w owns value columns 16 w .. 16 w + 15 and holds S^T for them
 // (8 tiles, 64 FP32 per lane). Each chunk's operands are staged once in LDS from registers loaded during the previous
-// chunk; v is already conv'd in prep; z (row epilogues) is loaded late in the chunk.
+// chunk; v is already conv'd in prep; z (row epilogues) is loaded late in the chunk. A wave is 32 consecutive threads.
 template <GdnRecurrentStorage Storage, bool B16, class Epilogue = RawCore>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void scan_kernel(GdnPrefillRows rows, std::uint32_t count, float* state,
     std::uint32_t key_heads, Conv conv, Scratch in, Epilogue epilogue = {}) {
@@ -351,6 +356,10 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void s
     auto* Os = reinterpret_cast<float*>(qk_raw);
     const unsigned head = blockIdx.x, tid = threadIdx.x, lane = tid % 32U, w = tid / 32U, l16 = lane % 16U, rh = lane / 16U;
     const unsigned col = 16U * w + l16;
+    // Row policy of the epilogue: with kWaveRows the wave's row index is a scalar, so z and epilogue rows w + 8 i get
+    // scalar address bases (core/wave_uniform.hpp) and no per-lane row pointers stay live across the chunk loop beside
+    // the 64-register state.
+    const unsigned wrow = kEpilogueWaveRows<Epilogue> ? strix::core::wave_index(tid) : w;
     const std::uint32_t n = (count + kC - 1U) / kC;
     const std::uint64_t rows_p = static_cast<std::uint64_t>(n) * kC, kh = head % key_heads;
     const _Float16* q16 = in.q16 + kh * rows_p * kD;
@@ -385,7 +394,7 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void s
         if constexpr (Epilogue::kRows) {
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) {
-                const std::uint32_t row = c * kC + w + 8U * i, t = row < count ? row : count - 1U;
+                const std::uint32_t row = c * kC + wrow + 8U * i, t = row < count ? row : count - 1U;
 #pragma unroll
                 for (unsigned p = 0; p < 4U; ++p) zr[i][p] = in_z<B16>(rows, conv, t, static_cast<std::uint64_t>(head) * kD + 32U * p + lane);
             }
@@ -500,7 +509,7 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6))) void s
             __syncthreads();
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) {
-                const unsigned r = w + 8U * i;
+                const unsigned r = wrow + 8U * i;
                 if (r < m) {
                     const float value[4] = {Os[r * kSQ + lane], Os[r * kSQ + 32U + lane], Os[r * kSQ + 64U + lane], Os[r * kSQ + 96U + lane]};
                     epilogue(first + r, head, value, zr[i], wn);

@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 #include "dist_latency_trace.hpp"
@@ -43,7 +45,7 @@ namespace strix::dist {
 namespace {
 
 void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string("dist communicator: ") + what + ": " + hipGetErrorString(status));
+    ::strix::hip_check_prefixed("dist communicator: ", status, what);
 }
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("dist transport: " + what); }
 
@@ -699,7 +701,7 @@ private:
     std::array<std::pair<std::size_t, std::size_t>, 4> table_{}; // (message bytes up to, streams), STRIX_DIST_USB4_STREAMS
     std::chrono::milliseconds timeout_;
     bool small_spin_ = false;
-    const bool spin_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
+    const bool spin_ = strix::envcfg::flag("STRIX_DIST_USB4_SPIN", false);
     std::atomic<bool> aborted_{false};
     std::atomic<bool> poisoned_{false};
     // Per stream, for failure reports: bytes done / expected of the part in flight, last successful read and write
@@ -712,7 +714,7 @@ private:
         std::uint64_t last_w_count = 0, last_r_count = 0;  // calling thread only
     };
     // STRIX_DIST_USB4_TRAFFIC=1: per-stream bytes, busy time and completion skew, printed when the transport closes
-    const bool traffic_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_TRAFFIC"); return v && v[0] == '1'; }();
+    const bool traffic_ = strix::envcfg::flag("STRIX_DIST_USB4_TRAFFIC", false);
     std::uint64_t eager_messages_ = 0, eager_bytes_ = 0, striped_messages_ = 0, striped_bytes_ = 0, skew_w_ns_ = 0, skew_r_ns_ = 0;
     [[nodiscard]] std::string traffic() const {
         std::ostringstream out;
@@ -943,7 +945,7 @@ std::vector<Candidate> layout_candidates(const Usb4AutoOptions& options, std::ve
 }
 
 bool pairing_debug() {
-    static const bool debug = [] { const char* v = std::getenv("STRIX_DIST_USB4_DEBUG"); return v && v[0] == '1'; }();
+    static const bool debug = strix::envcfg::flag("STRIX_DIST_USB4_DEBUG", false);
     return debug;
 }
 void note(Candidate& c, const std::string& what) {
@@ -2320,6 +2322,35 @@ void Communicator::exchange(hipStream_t stream, const void* local, void* remote,
     finish(stream, remote);
 }
 
+// The hint before a device start(): a symmetric exchange guesses the next message (its receive is posted early); a
+// one-way transfer sets its direction instead and posts nothing early.
+void Communicator::direct_hint(std::size_t bytes, unsigned rings) {
+    if (direction_ == ExchangeDirection::both) direct_->expect_next(bytes, rings);
+    else if (!direct_->use_direction(direction_)) throw std::logic_error("dist transfer: the device exchange has no one-way form");
+}
+
+bool Communicator::transfer(hipStream_t stream, bool sending, void* device, std::size_t bytes, const Tag& tag) {
+    if (!device || bytes == 0U) throw std::invalid_argument("dist transfer size or buffer");
+    if (!direct_) return false;
+    const Route& r = route(bytes);
+    if (!r.direct || r.host_percent) return false;
+    // Ask once whether the engine has a one-way form; the probe leaves the next start() symmetric.
+    if (!one_way_probed_) {
+        one_way_ = direct_->use_direction(ExchangeDirection::send);
+        if (one_way_) static_cast<void>(direct_->use_direction(ExchangeDirection::both));
+        one_way_probed_ = true;
+    }
+    if (!one_way_) return false;
+    struct Scope {
+        ExchangeDirection& value;
+        ~Scope() { value = ExchangeDirection::both; }
+    } scope{direction_};
+    direction_ = sending ? ExchangeDirection::send : ExchangeDirection::receive;
+    start(stream, sending ? device : nullptr, bytes, tag);
+    finish(stream, sending ? nullptr : device);
+    return true;
+}
+
 void Communicator::start(hipStream_t stream, const void* local, std::size_t bytes, const Tag& tag) {
     if (!terminal_.empty()) throw std::runtime_error("dist exchange: the communicator stopped earlier: " + terminal_);
     if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
@@ -2329,7 +2360,7 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
         // Device to device. The kernel checks each operation's framing (epoch, sequence, size, slot); the identity
         // of the collective (plan, request, tag, layer) and a checksum of the payload travel in-band and are checked
         // by the receiver's GPU. Messages above the capacity are exchanged in chunks in finish().
-        if (!local) throw std::invalid_argument("dist exchange size or buffers");
+        if (!local && direction_ != ExchangeDirection::receive) throw std::invalid_argument("dist exchange size or buffers");
         const Route& r = route(bytes);
         stats_.last_entry = std::chrono::steady_clock::now();
         tag_ = tag;
@@ -2337,19 +2368,19 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
         const std::size_t host = r.host_percent ? std::min(max_bytes_, bytes / 100U * r.host_percent + bytes % 100U * r.host_percent / 100U) & ~std::size_t{63} : 0U;
         direct_offset_ = host;
         direct_bytes_ = bytes - host;
-        direct_local_ = static_cast<const std::byte*>(local) + host;
+        direct_local_ = local ? static_cast<const std::byte*>(local) + host : nullptr;
         mix_rings_ = r.rings;
         if (host) start_host(stream, local, host);
         if (direct_bytes_ <= direct_->capacity()) {
             direct_->use_rings(r.rings);
-            direct_->expect_next(direct_bytes_, r.rings); // the next message on the rings is likely this size again
+            direct_hint(direct_bytes_, r.rings); // the next message on the rings is likely this size again
             direct_->start(stream, direct_local_, direct_bytes_, ExchangeIdentity{group_.plan, tag.request, tag.kind, tag.layer});
         } else if (direct_chunk_overlap_) {
             const std::size_t chunk = direct_->capacity() & ~std::size_t{63};
             if (!chunk) throw std::runtime_error("dist direct capacity below chunk alignment");
             const auto after = std::min(chunk, direct_bytes_ - chunk);
             direct_->use_rings(direct_offset_ ? mix_rings_ : route(chunk).rings);
-            direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
+            direct_hint(after, direct_offset_ ? mix_rings_ : route(after).rings);
             direct_->start(stream, direct_local_, chunk, ExchangeIdentity{group_.plan, tag.request, tag.kind, tag.layer});
         }
         direct_started_ = true;
@@ -2775,10 +2806,10 @@ void Communicator::finish(hipStream_t stream, void* remote) {
         return;
     }
     if (direct_started_) {
-        if (!remote) throw std::invalid_argument("dist exchange receive buffer");
+        if (!remote && direction_ != ExchangeDirection::send) throw std::invalid_argument("dist exchange receive buffer");
         direct_started_ = false;
         const auto t0 = std::chrono::steady_clock::now();
-        auto* const direct_remote = static_cast<std::byte*>(remote) + direct_offset_;
+        auto* const direct_remote = remote ? static_cast<std::byte*>(remote) + direct_offset_ : nullptr;
         if (direct_bytes_ <= direct_->capacity()) {
             direct_->finish(stream, direct_remote);
         } else {
@@ -2791,14 +2822,14 @@ void Communicator::finish(hipStream_t stream, void* remote) {
                 const std::size_t after = offset + n < direct_bytes_ ? std::min(chunk, direct_bytes_ - offset - n) : std::min(chunk, direct_bytes_);
                 if (offset != 0 || !direct_chunk_overlap_) {
                     direct_->use_rings(direct_offset_ ? mix_rings_ : route(n).rings);
-                    direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
-                    direct_->start(stream, static_cast<const std::byte*>(direct_local_) + offset, n,
+                    direct_hint(after, direct_offset_ ? mix_rings_ : route(after).rings);
+                    direct_->start(stream, direct_local_ ? static_cast<const std::byte*>(direct_local_) + offset : nullptr, n,
                                    ExchangeIdentity{group_.plan, tag_.request, tag_.kind, tag_.layer + static_cast<std::uint32_t>(offset / chunk)});
                 }
-                direct_->finish(stream, direct_remote + offset);
+                direct_->finish(stream, direct_remote ? direct_remote + offset : nullptr);
             }
         }
-        stats_.bytes_sent += direct_bytes_;
+        if (direction_ != ExchangeDirection::receive) stats_.bytes_sent += direct_bytes_;
         if (direct_offset_) { // mixed: the host part counts the exchange and its time
             stats_.check += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             finish_host(stream, remote);
@@ -2856,7 +2887,7 @@ void Communicator::stop(const std::string& why) {
 }
 
 bool Communicator::check_on_caller() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_CHECK_ON_CALLER"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_DIST_CHECK_ON_CALLER", false);
     return on;
 }
 

@@ -14,14 +14,14 @@ __device__ __forceinline__ float materialize_fp32(float value) {
 // Four contiguous wave-sized slices give each lane indices lane+32*j.
 // Strides 1..16 communicate across lanes; strides 32,64 remain in registers.
 // The operation order matches the ascending-stride FP32 reference exactly.
-__device__ __forceinline__ void hadamard128(float (&values)[4]) {
-    const int lane = int(threadIdx.x & 31U);
+// `lane` is the caller's wave lane (threadIdx.x & 31 unless the kernel remaps lanes).
+__device__ __forceinline__ void hadamard128(float (&values)[4], unsigned lane) {
     #pragma unroll
     for(int stride=1;stride<32;stride*=2) {
         #pragma unroll
         for(int j=0;j<4;++j) {
             float peer=__shfl_xor(values[j],stride,32);
-            values[j]=(lane&stride)?peer-values[j]:values[j]+peer;
+            values[j]=(lane&static_cast<unsigned>(stride))?peer-values[j]:values[j]+peer;
         }
     }
     #pragma unroll
@@ -34,6 +34,9 @@ __device__ __forceinline__ void hadamard128(float (&values)[4]) {
     }
     #pragma unroll
     for(int j=0;j<4;++j) values[j]=materialize_fp32(values[j]*0x1.6a09e6p-4f);
+}
+__device__ __forceinline__ void hadamard128(float (&values)[4]) {
+    hadamard128(values, threadIdx.x & 31U);
 }
 
 }

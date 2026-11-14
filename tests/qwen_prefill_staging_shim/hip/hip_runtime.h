@@ -81,3 +81,13 @@ inline hipError_t hipMemcpyAsync(void* destination, const void* source, std::siz
     } else std::memcpy(destination, source, bytes);
     return hipSuccess;
 }
+// Row-by-row strided copy (device-to-device only in the staging under test).
+inline hipError_t hipMemcpy2DAsync(void* destination, std::size_t destination_pitch, const void* source,
+    std::size_t source_pitch, std::size_t width, std::size_t height, hipMemcpyKind kind, hipStream_t stream) {
+    for (std::size_t row = 0; row < height; ++row) {
+        const auto status = hipMemcpyAsync(static_cast<std::byte*>(destination) + row * destination_pitch,
+            static_cast<const std::byte*>(source) + row * source_pitch, width, kind, stream);
+        if (status != hipSuccess) return status;
+    }
+    return hipSuccess;
+}

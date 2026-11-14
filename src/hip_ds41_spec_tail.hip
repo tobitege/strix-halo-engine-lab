@@ -1,5 +1,6 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/ds41_spec_tail.hpp"
+#include "strix/hip_check.hpp"
 
 #include "strix/dist/communicator.hpp"
 #include "strix/ds41_dspark_files.hpp"
@@ -15,7 +16,7 @@
 namespace strix::ds41::dspark {
 namespace {
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("spec tail drafter: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("spec tail drafter: ", e, what);
 }
 }  // namespace
 

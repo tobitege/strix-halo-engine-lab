@@ -7,9 +7,19 @@ namespace {
 class HostState final : public StreamState {
 public:
     explicit HostState(const ModelConfig& config) : state_(config) {}
+    explicit HostState(std::unique_ptr<HostStream> state) : state_(std::move(*state)) {}
+    std::unique_ptr<StreamState> fork(std::uint32_t admitted) const override {
+        if (admitted < frontier()) throw std::invalid_argument("host snapshot capacity below frontier");
+        return std::make_unique<HostState>(state_.snapshot());
+    }
     std::unique_ptr<KvTxn> begin() override { return state_.begin(); }
     std::uint64_t frontier() const override { return state_.frontier(); }
     std::string digest() const override { return state_.digest(); }
+    std::optional<std::uint64_t> retained_bytes() const override {
+        const auto bytes=state_.retained_bytes();
+        if(bytes>UINT64_MAX-(sizeof(HostState)-sizeof(HostStream))) throw std::overflow_error("host retained size overflow");
+        return bytes+sizeof(HostState)-sizeof(HostStream);
+    }
     bool kv_view(std::uint32_t layer, const KvTxn* transaction, KvView& out) const override {
         // "No KV on this layer"/poisoned = unavailable; a foreign transaction (std::invalid_argument) propagates.
         try { out = state_.kv_view(layer,transaction); return true; } catch (const std::runtime_error&) { return false; }

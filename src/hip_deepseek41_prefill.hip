@@ -1,4 +1,6 @@
+#include "strix/env_flags.hpp"
 #include "strix/file_snapshot.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -8,10 +10,12 @@
 #include "strix/dist/communicator.hpp"
 #include "xport/ds41_adapter.hpp"
 #include "hip_deepseek41_prefill_xport.hpp"
+#include "core/hip_range_weight_loader.hpp"
 #include "core/hip_host_ready.hpp"
 #include "core/layer_read_ahead.hpp"
 #include <optional>
 #include "strix/ds41_engram.hpp"
+#include "strix/session/embed_splice_hip.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
@@ -56,7 +60,7 @@ namespace strix::deepseek41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 prefill: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 prefill: ", e, what);
 }
 
 std::uint64_t fnv_bytes(const void* data, std::size_t n, std::uint64_t h = 14695981039346656037ULL) {
@@ -178,65 +182,13 @@ private:
     const std::uint8_t* base_ = nullptr;
 };
 
-// Byte ranges of the model file into device memory through two pinned staging buffers, with O_DIRECT (the weights
-// never enter the page cache). The copy of one buffer runs on the loader's own stream while the other is read; a
-// buffer is read into again only after its copy's event, and load() returns after the last copy completed.
-class DirectLoader {
-public:
-    static constexpr std::uint64_t align = 4096, chunk = 128ULL << 20U;
-    explicit DirectLoader(const std::filesystem::path& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd_ < 0) throw std::runtime_error("deepseek41 prefill: cannot open " + path.string());
-        strix::LoaderCapture::record(path, fd_);
-        check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "loader stream");
-        for (int k = 0; k < 2; ++k) {
-            check(hipHostMalloc(reinterpret_cast<void**>(&buffer_[k]), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
-            check(hipEventCreateWithFlags(&copied_[k], hipEventDisableTiming), "staging event");
-        }
+// Byte ranges of the model file into device memory through the shared weight-load queue (core/weight_load_queue.hpp):
+// O_DIRECT reads on bounded workers, per-ticket pinned staging retired by upload events, an own non-blocking copy
+// stream. load() only queues; ready() is the one wait, at the end of the load or before the first consumer.
+struct DirectLoader : strix::core::HipRangeWeightLoader {
+    explicit DirectLoader(const std::filesystem::path& path) : HipRangeWeightLoader(path.string()) {
+        strix::LoaderCapture::record(path, fd());
     }
-    ~DirectLoader() {
-        if (stream_ != nullptr) (void)hipStreamSynchronize(stream_);
-        for (int k = 0; k < 2; ++k) {
-            if (copied_[k] != nullptr) (void)hipEventDestroy(copied_[k]);
-            if (buffer_[k] != nullptr) (void)hipHostFree(buffer_[k]);
-        }
-        if (stream_ != nullptr) (void)hipStreamDestroy(stream_);
-        if (fd_ >= 0) ::close(fd_);
-    }
-    DirectLoader(const DirectLoader&) = delete;
-    DirectLoader& operator=(const DirectLoader&) = delete;
-    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
-        std::uint64_t done = 0;
-        while (done < bytes) {
-            const std::uint64_t at = offset + done, base = at & ~(align - 1U), lead = at - base;
-            const std::uint64_t take = std::min(bytes - done, chunk - lead);
-            const std::uint64_t want = (lead + take + align - 1U) & ~(align - 1U);
-            std::uint8_t* buffer = buffer_[next_];
-            if (pending_[next_]) check(hipEventSynchronize(copied_[next_]), "staging reuse");  // its previous copy is done
-            std::uint64_t got = 0;
-            while (got < lead + take) {
-                const auto n = ::pread(fd_, buffer + got, want - got, static_cast<off_t>(base + got));
-                if (n <= 0) throw std::runtime_error("deepseek41 prefill: short read of the weights");
-                got += static_cast<std::uint64_t>(n);
-            }
-            check(hipMemcpyAsync(device + done, buffer + lead, take, hipMemcpyHostToDevice, stream_), "weight upload");
-            check(hipEventRecord(copied_[next_], stream_), "staging event");
-            pending_[next_] = true;
-            next_ ^= 1;
-            done += take;
-        }
-        check(hipStreamSynchronize(stream_), "weight upload");
-        pending_[0] = pending_[1] = false;
-    }
-
-private:
-    int fd_ = -1;
-    hipStream_t stream_ = nullptr;
-    std::uint8_t* buffer_[2] = {nullptr, nullptr};
-    hipEvent_t copied_[2] = {nullptr, nullptr};
-    bool pending_[2] = {false, false};
-    int next_ = 0;
 };
 
 std::uint64_t row_bytes(ds41::WeightFormat f, std::uint32_t width) {
@@ -628,6 +580,11 @@ struct DevicePrefill::Impl {
     Dev<std::int32_t> xsums, qsums;
     Dev<std::uint32_t> ids;
     Dev<std::uint8_t> image_rows;
+    // Embedding rows (set_embed_rows): the splice of the next run, the one of the run in progress, the device staging of
+    // its rows (grown on demand, never beyond max_rows rows) and whether image_rows holds a flag of an earlier run.
+    strix::session::EmbedSplice embed_next, embed_run;
+    Dev<std::uint16_t> embed_stage;
+    bool image_rows_set = false;
     // per chunk of chunk_rows rows
     Dev<float> q, o, o_low;
     Dev<std::int8_t> ocodes, olcodes;
@@ -832,6 +789,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
         DirectLoader loader(gguf);
         std::unique_ptr<DirectLoader> overlay_loader;
         if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+        const std::function<void()> loaded = [&] { loader.ready(); if (overlay_loader) overlay_loader->ready(); };
         for (const auto& n : names) {
             const auto* t = m.tensors.at(n);
             const auto* over = m.overlay ? m.overlay->find(n) : nullptr;
@@ -848,7 +806,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 Dev<std::uint8_t> d(part);
                 auto& from = over != nullptr ? *overlay_loader : loader;
                 ds41::expert_tp::load_part([&from](std::uint64_t at, std::uint64_t count, std::uint8_t* dst) { from.load(at, count, dst); },
-                                           offset, bytes, c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream);
+                                           offset, bytes, c.n_routed_experts, down, c.hidden_size, options.rank, d.p, m.stream, loaded);
                 m.weights.emplace(n, std::move(d));
                 continue;
             }
@@ -878,6 +836,19 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             (over != nullptr ? *overlay_loader : loader).load(offset, bytes, d.p);
             m.weights.emplace(n, std::move(d));
         }
+        loaded();  // end-of-load publication: the one wait for every tensor queued above
+        const auto ls = loader.stats();
+        std::fprintf(stderr, "deepseek41 prefill %s\n",
+                     strix::core::weight_load_line(ls, loader.peak_pinned_bytes(), loader.options()).c_str());
+    }
+    if (const char* out = strix::envcfg::text("STRIX_LOAD_HASH_OUT")) {  // identity gate: one line per loaded tensor
+        std::FILE* f = std::fopen(out, "w");
+        if (f == nullptr) throw std::runtime_error("STRIX_LOAD_HASH_OUT: cannot write the hash file");
+        for (const auto& [name, d] : m.weights)
+            if (d.owned)
+                std::fprintf(f, "%s %llu %016llx\n", name.c_str(), static_cast<unsigned long long>(d.n),
+                             static_cast<unsigned long long>(strix::core::device_weight_hash64(d.p, d.n)));
+        std::fclose(f);
     }
     {
         std::vector<ds41::EngramTable> tables;
@@ -1409,6 +1380,7 @@ std::unique_ptr<PrefillTask> DevicePrefill::begin_from(std::span<const std::uint
     s->tokens.assign(tokens.begin(), tokens.end());
     s->start = extend ? m.rows_done : 0U;
     s->opt = task;
+    m.embed_run = std::exchange(m.embed_next, {});
     check(hipGetDevice(&s->device), "task device");
     m.task = s.get();
     auto* raw = s.get();
@@ -1453,12 +1425,14 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
+    impl_->embed_run = std::exchange(impl_->embed_next, {});
     return run_from(tokens, 0U);
 }
 
 PrefillResult DevicePrefill::extend(std::span<const std::uint32_t> tokens) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
     if (impl_->broken || impl_->cancel_broken) throw std::logic_error("deepseek41 prefill: the sequence was abandoned (cancelled task); run() first");
+    impl_->embed_run = std::exchange(impl_->embed_next, {});
     return run_from(tokens, impl_->rows_done);
 }
 
@@ -1466,6 +1440,8 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
+    // provided embedding rows of this run (none: text, nothing below changes)
+    const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)
     // stream_experts: layer `layer`'s experts into slot layer % 2 (on the prefetch thread or inline)
     const auto load_experts = [&m](std::uint32_t layer) {
@@ -1477,6 +1453,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             const auto& [offset, bytes] = m.expert_extent.at("blk." + std::to_string(layer) + "." + expert_kind_tensor(kind));
             loader.load(offset, bytes, d.p);
         }
+        loader.ready();
         slot.layer = static_cast<std::int32_t>(layer);
         m.expert_read_seconds += seconds_since(t0);
     };
@@ -1526,6 +1503,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         m.snap_rings.emplace_back(std::size_t{AttentionHost::ring_capacity} * attn::kWindowEntryBytes);
     for (const auto t : tokens)
         if (t >= c.vocab_size) throw std::invalid_argument("deepseek41 prefill: token outside the vocabulary");
+    embeds.validate(T, c.hidden_size);
+    const std::vector<std::uint8_t> embed_extras = embeds.empty() ? std::vector<std::uint8_t>{} : embeds.extras_rows(T);
     const std::uint32_t H = c.hidden_size, hc = c.hc_mult, K = c.num_experts_per_tok, I = c.moe_intermediate_size;
     const std::uint32_t QA = c.q_lora_rank, QH = c.num_attention_heads * c.head_dim, OL = c.o_groups * c.o_lora_rank;
     const std::uint32_t W = m.options.window_rows, C = m.options.chunk_rows, D = attn::kHeadDim;
@@ -1837,6 +1816,12 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     std::vector<std::shared_future<void>> engram_futures;
     std::future<double> engram_job;  // destroyed (joined) before gates, promises and requests
     bool engram_split_read = true, engram_layer_blocks = false;
+    // Engram rows read in pieces (one read-ahead block per Engram chunk of every layer, in the order the layer runs them):
+    // a chunk's kernels wait only for their own rows, so the first Engram layer runs while the rest of its rows still
+    // come off the disk (a new prompt's rows are random 4 KiB reads; the layer used to wait for all of them). Same rows,
+    // same kernels: bitwise identical. Default on; STRIX_DS41_ENGRAM_PIECE_READ=0: one block per layer / first + rest.
+    std::size_t engram_piece_blocks = 0;  // blocks per layer (0: off)
+    std::uint32_t engram_piece_rows = 0;
     m.join_engram_ahead();  // the previous run's lookahead: its rows are in the payload cache (or it failed: read below)
     const std::vector<std::uint32_t> engram_next = std::exchange(m.engram_next, {});
     {
@@ -1845,10 +1830,30 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         if (m.hasher->positions() != P0) throw std::logic_error("deepseek41 prefill: Engram history out of step");
         const std::uint32_t per_token = m.hasher->layers() * engram_cols;
         std::vector<std::uint64_t> ids(std::size_t{T} * per_token), one(per_token);  // [row][layer][column] of this run
+        // Gate only: plain history is the negative control; a full padding sequence is the dead-row oracle.
+        std::optional<ds41::EngramHasher> plain_hasher;
+        std::vector<std::uint64_t> padding_row, plain_row;
+        bool dead_matches = true, dead_differs = false;
+        if (m.options.verify_embed_extras && !embeds.empty()) {
+            plain_hasher = *m.hasher;
+            plain_row.resize(per_token);
+            ds41::EngramHasher padding(m.model.engram);
+            const auto all = padding.hash_sequence(std::vector<std::uint32_t>(m.model.engram.max_ngram_size, m.model.engram.pad_id));
+            padding_row.assign(all.end() - per_token, all.end());
+        }
         for (std::uint32_t t = 0; t < T; ++t) {
-            m.hasher->push(tokens[t], one);
+            // a provided (image) row is a dead n-gram position
+            m.hasher->push(!embed_extras.empty() && embed_extras[t] != 0U ? ds41::engram_dead_token(tokens[t]) : tokens[t], one);
+            if (plain_hasher) {
+                plain_hasher->push(tokens[t], plain_row);
+                if (embed_extras[t] != 0U) {
+                    dead_matches = dead_matches && one == padding_row;
+                    dead_differs = dead_differs || one != plain_row;
+                }
+            }
             std::copy(one.begin(), one.end(), ids.begin() + static_cast<std::ptrdiff_t>(std::size_t{t} * per_token));
         }
+        result.embed_dead_hash_checked = dead_matches && dead_differs;
         for (std::uint32_t li = 0; li < m.model.engram.layer_ids.size(); ++li) {
             if (m.model.engram.layer_ids[li] >= m.options.layers) continue;
             engram_layers.push_back(li);
@@ -1874,7 +1879,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t k = 0; k < engram_cols; ++k)
                         m.engram_ahead_requests.push_back({li, nids[std::size_t{t} * per_token + li * engram_cols + k]});
         }
-        static const bool ahead_log = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG"); return v && v[0] == '1'; }();
+        static const bool ahead_log = strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false);
         const auto own_stats = ahead_log ? m.engram_reader->stats() : ds41::EngramReaderStats{};
         const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
             if (ahead_log) {
@@ -1918,7 +1923,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // the same shared read-ahead loop to independently ready layers.
                 const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
                 std::vector<std::size_t> offsets{0};
-                if (engram_split_read) {
+                static const bool piece_read = strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact);
+                if (engram_split_read && !engram_layer_blocks && Tn > 0U && piece_read) {
+                    engram_piece_rows = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
+                    engram_piece_blocks = (Tn + engram_piece_rows - 1U) / engram_piece_rows;
+                    offsets.clear();
+                    for (std::size_t at = 0; at < requests.size(); at += layer_requests)
+                        for (std::size_t r0 = 0; r0 < Tn; r0 += engram_piece_rows) offsets.push_back(at + r0 * engram_cols);
+                } else if (engram_split_read) {
                     if (engram_layer_blocks)
                         for (std::size_t at = layer_requests; at < requests.size(); at += layer_requests) offsets.push_back(at);
                     else if (engram_layers.size() >= 2U) offsets.push_back(layer_requests);
@@ -1958,14 +1970,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         }
         result.engram_seconds = seconds_since(t0);
     }
-    const auto join_engram = [&](std::uint32_t layer) {
+    const auto join_engram = [&](std::uint32_t layer, std::uint32_t row = 0xFFFFFFFFU) {  // row: the piece starting there
         if (!engram_job.valid()) return;
+        if (layer != 0xFFFFFFFFU && (engram_piece_blocks != 0U) != (row != 0xFFFFFFFFU)) return;  // pieces: joined per piece
         const auto t0 = std::chrono::steady_clock::now();
         if (layer != 0xFFFFFFFFU) {
             const auto& ids = m.model.engram.layer_ids;
             const auto li = static_cast<std::uint32_t>(std::find(ids.begin(), ids.end(), layer) - ids.begin());
             const auto at = static_cast<std::size_t>(std::find(engram_layers.begin(), engram_layers.end(), li) - engram_layers.begin());
-            const auto block = !engram_split_read ? 0U : engram_layer_blocks ? at : std::min<std::size_t>(at, 1U);
+            const auto block = engram_piece_blocks != 0U ? at * engram_piece_blocks + row / engram_piece_rows
+                               : !engram_split_read ? 0U : engram_layer_blocks ? at : std::min<std::size_t>(at, 1U);
             if (engram_ready) engram_ready->wait(block, st);
             else engram_futures.at(block).get();
         } else {
@@ -1992,6 +2006,71 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             run_tokens = Dev<std::uint32_t>(Tn);
             run_tokens.upload(local_tokens, st);
             dtokens = run_tokens.p;
+        }
+    }
+    // Provided embedding rows: this rank's rows of the splice, as (local row, rows, source) pieces, staged on the device;
+    // the router's per-row image flag. A text run uploads nothing (the flags stay zero).
+    struct EmbedPiece {
+        std::uint32_t local = 0, rows = 0;
+        std::size_t embed_at = 0;  // first row in embed_stage
+    };
+    std::vector<EmbedPiece> embed_pieces;
+    if (!embeds.empty() || m.image_rows_set) {
+        const std::size_t embed_width = c.hidden_size;
+        std::vector<std::uint8_t> embed_flags(Tn, 0);
+        std::vector<std::uint32_t> embed_local(T, UINT32_MAX);
+        for (std::uint32_t l = 0; l < Tn; ++l) {
+            embed_local[global_row[l]] = l;
+            if (!embed_extras.empty()) embed_flags[l] = embed_extras[global_row[l]];
+        }
+        // A shorter replacement must also erase flags beyond its own rows before declaring the buffer clean.
+        if (m.image_rows_set) m.image_rows.zero(st);
+        if (Tn != 0U) m.image_rows.upload(embed_flags, st);
+        m.image_rows_set = std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) != embed_flags.end();
+        if (m.options.verify_embed_extras && m.image_rows_set) {
+            // Known-effect fixture on an actual uploaded image flag: zero scores, text selects 0, image selects 1.
+            const auto at = static_cast<std::size_t>(std::find(embed_flags.begin(), embed_flags.end(), std::uint8_t{1}) - embed_flags.begin());
+            Dev<float> x(256), weight(256 * 256), bias(256), image_bias(256), scores(256), weights(1);
+            Dev<std::uint32_t> selected(1);
+            x.zero(st);
+            weight.zero(st);
+            std::vector<float> b(256, 0.0F), bi(256, 0.0F);
+            b[0] = 2.0F;
+            bias.upload(b, st);
+            bi[1] = 2.0F;
+            image_bias.upload(bi, st);
+            ds41::RouterView v;
+            v.x = x.p; v.weight = weight.p; v.bias = bias.p; v.bias_image = image_bias.p;
+            v.image_rows = m.image_rows.p + at;
+            v.rows = 1; v.hidden = 256; v.experts = 256; v.top_k = 1;
+            v.scores = scores.p; v.ids = selected.p; v.weights = weights.p;
+            ds41::enqueue_prefill_router(v, st);
+            const auto image_id = download(selected.p, 1, st).front();
+            v.image_rows = nullptr;
+            ds41::enqueue_prefill_router(v, st);
+            result.embed_image_router_checked = image_id == 1U && download(selected.p, 1, st).front() == 0U;
+        }
+        std::size_t embed_at = 0;
+        for (const auto& seg : embeds.segments)
+            for (std::uint32_t i = 0; i < seg.rows; ++i)
+                if (embed_local[seg.run_row + i] != UINT32_MAX) ++embed_at;
+        if (embed_at > m.embed_stage.n / embed_width) m.embed_stage = Dev<std::uint16_t>(embed_at * embed_width);
+        embed_at = 0;
+        for (const auto& seg : embeds.segments) {
+            for (std::uint32_t i = 0; i < seg.rows;) {  // maximal pieces of consecutive local rows
+                const std::uint32_t piece_local = embed_local[seg.run_row + i];
+                if (piece_local == UINT32_MAX) {
+                    ++i;
+                    continue;
+                }
+                std::uint32_t piece_rows = 1;
+                while (i + piece_rows < seg.rows && embed_local[seg.run_row + i + piece_rows] == piece_local + piece_rows) ++piece_rows;
+                check(hipMemcpyAsync(m.embed_stage.p + embed_at * embed_width, seg.data + std::size_t{i} * embed_width, std::size_t{piece_rows} * embed_width * 2U,
+                                     hipMemcpyHostToDevice, st), "embed rows upload");
+                embed_pieces.push_back({piece_local, piece_rows, embed_at});
+                embed_at += piece_rows;
+                i += piece_rows;
+            }
         }
     }
     // dense-site routes by (rows, groups): one "expert" per group, slot = row * groups + group (overlap: kept across runs)
@@ -2071,6 +2150,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         switch (s.op) {
         case Op::embed:
             if (Tn != 0U) ds41::enqueue_embedding(m.devh("token_embd.weight"), dtokens, Tn, H, stream_now(), st);  // row_split: a rank may own no row
+            for (const auto& e : embed_pieces)  // provided rows replace the lookup, in every residual stream copy
+                strix::session::enqueue_embed_splice(stream_now(), hc, m.embed_stage.p + e.embed_at * H, H, embeds.format, e.local, e.rows, st);
             m.identity_pre = true;
             break;
         case Op::engram: {  // encoder layers only: every row
@@ -2085,6 +2166,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 const std::uint32_t n = std::min(E, Tn - r0);
                 cut(PrefillUnitLevel::finest, s.layer, "engram");
                 ++engram_cut;
+                join_engram(layer, r0);  // piece blocks: this chunk's rows only (else joined above)
                 check(hipMemcpyAsync(m.erows.p, erow + std::size_t{r0} * engram_cols * 264U, std::size_t{n} * engram_cols * 264U,
                                      hipMemcpyHostToDevice, st), "engram rows");
                 ds41::enqueue_engram_rows_bf16(m.erows.p, n * engram_cols, m.emb.p, st);
@@ -2829,7 +2911,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.weight = m.devf(s.weights[0]);
             v.bias = m.devf(s.weights[1]);
             v.bias_image = m.devf(s.weights[2]);
-            v.image_rows = m.image_rows.p;
+            v.image_rows = m.image_rows.p + o0;
             v.rows = no;
             v.hidden = H;
             v.experts = c.n_routed_experts;
@@ -3246,8 +3328,8 @@ void DevicePrefill::import_state(const AttentionState& s) {
             if (r.ratio == 2U && S.carry_valid && S.carry.size() != L.carry[0].n) fail("carry of layer " + std::to_string(l));
         }
     }
-    for (const auto t : s.tokens)
-        if (t >= m.model.config.vocab_size) fail("token outside the vocabulary");
+    for (const auto t : s.tokens)  // kEngramDeadBit: a provided (image) row of the history
+        if ((t & ~ds41::kEngramDeadBit) >= m.model.config.vocab_size) fail("token outside the vocabulary");
     m.cancel_broken = true;
     hipStream_t st = m.stream;
     for (std::uint32_t l = 0; l < m.options.layers; ++l) {
@@ -3367,6 +3449,23 @@ void DevicePrefill::set_engram_lookahead(std::span<const std::uint32_t> next) {
     static const bool on = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }();
     impl_->engram_next.assign(next.begin(), next.end());
     if (!on) impl_->engram_next.clear();
+}
+
+void DevicePrefill::set_embed_rows(strix::session::EmbedSplice splice) {
+    if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
+    impl_->embed_next = std::move(splice);
+}
+
+std::vector<std::uint16_t> DevicePrefill::embedding_rows(std::span<const std::uint32_t> tokens) const {
+    const auto& m = *impl_;
+    const std::size_t width = m.model.config.hidden_size;
+    std::vector<std::uint16_t> out(tokens.size() * width);
+    const std::uint16_t* table = m.devh("token_embd.weight");
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] >= m.model.config.vocab_size) throw std::invalid_argument("deepseek41 prefill: token outside the vocabulary");
+        check(hipMemcpy(out.data() + i * width, table + std::size_t{tokens[i]} * width, width * 2U, hipMemcpyDeviceToHost), "embedding rows");
+    }
+    return out;
 }
 
 void DevicePrefill::set_decoder_deferral(std::uint32_t next_rows) {

@@ -5,6 +5,7 @@
 // Used by strix-cuda-qwen-serve (slot scheduler), qwen_cohort_e2e (gate + bench).
 #pragma once
 
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_cohort_plan.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
 
@@ -71,11 +72,11 @@ inline const WideModel& wide_model() {
     return m;
 }
 inline bool wide_rule_default() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_WIDE_RULE"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_WIDE_RULE", true);
     return on;
 }
 inline bool draft_batch_default() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_DRAFT_BATCH"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DRAFT_BATCH", true);
     return on;
 }
 

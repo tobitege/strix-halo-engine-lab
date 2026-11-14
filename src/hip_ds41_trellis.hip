@@ -1,5 +1,6 @@
 // Device side of ds41_trellis.hpp: the trellis library context, prepared sites, per-stream workspaces and the linear.
 #include "strix/ds41_trellis.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/ds41_exact_flags.hpp"
 
 #include "strix/ds41_moe.hpp"
@@ -30,7 +31,7 @@ namespace strix::ds41 {
 namespace {
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("ds41 trellis: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("ds41 trellis: ", e, what);
 }
 hipStream_t as_stream(void* s) { return static_cast<hipStream_t>(s); }
 unsigned blocks_for(std::size_t n, unsigned block) { return static_cast<unsigned>((n + block - 1U) / block); }

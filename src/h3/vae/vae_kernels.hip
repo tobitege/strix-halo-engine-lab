@@ -5,6 +5,8 @@
 // FP16 rounding points follow the reference module (see vae_ref.hpp): one FP32 computation and one FP16
 // rounding per tensor op; linears accumulate K16 tiles in ascending order into one FP32 accumulator.
 
+#include "strix/env_flags.hpp"
+#include "strix/hip_check.hpp"
 #include "h3/vae/vae_kernels.hpp"
 
 #include <hip/hip_runtime.h>
@@ -23,7 +25,7 @@ typedef float f8 __attribute__((ext_vector_type(8)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 vae hip: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 vae hip: ", e, what);
 }
 void launched(const char* what) { check(hipGetLastError(), what); }
 
@@ -351,7 +353,7 @@ __global__ __launch_bounds__((BM / 64U) * (BN / 64U) * 32U) void gemm_tiled_kern
 // STRIX_H3_VAE_GEMM=0: the simple 128 x 128 kernel (same bits, slower).
 int tiled_override = -1;
 bool use_tiled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_H3_VAE_GEMM"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_H3_VAE_GEMM", true);
     return tiled_override < 0 ? on : tiled_override != 0;
 }
 // Block tile choice (routing only: every tile gives the same bits, each output's K16 order is fixed).
@@ -362,7 +364,7 @@ int tile_override = -1;
 // 128 x 128 30.1 TF; w2 (K 8192) 256 x 256 21.2 TF; out (2048 x 2048) and the rest 128 x 256.
 unsigned tile_for(unsigned M, unsigned N, unsigned K, unsigned mode) {
     if (tile_override >= 0) return unsigned(tile_override);
-    static const int env = [] { const char* v = std::getenv("STRIX_H3_VAE_TILE"); return v ? std::atoi(v) : -1; }();
+    static const int env = strix::envcfg::integer("STRIX_H3_VAE_TILE", -1);
     if (env >= 0 && env <= 3) return unsigned(env);
     (void)M;
     if (mode == 3U) return 3U;

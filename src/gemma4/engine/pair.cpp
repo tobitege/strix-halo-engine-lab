@@ -3,10 +3,14 @@
 #include "pair.hpp"
 #include "gemma4/prefill/pair.hpp"
 #include "gemma4/prefill/prefill.hpp"
+#include "strix/dist/pipeline_timeline.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/pair/link.hpp"
 #include "strix/pair/regime.hpp"
 #include "xport/hip_pipe_staging.hpp"
+#include "xport/pair_device_link.hpp"
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
@@ -24,7 +28,6 @@ unsigned env_cut(const ModelConfig& config) {
     if (*end || cut == 0 || cut >= config.layers) throw std::invalid_argument("STRIX_G4_PAIR_CUT must be in [1, layers)");
     return unsigned(cut);
 }
-bool env_on(const char* name) { const char* v = std::getenv(name); return v && std::string_view(v) == "1"; }
 std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
     for (const char b : bytes) { hash ^= static_cast<unsigned char>(b); hash *= 1099511628211ULL; }
     return hash;
@@ -32,11 +35,11 @@ std::uint64_t fnv(std::uint64_t hash, std::string_view bytes) {
 struct StageReset { ~StageReset() { prefill::pair_stage = {}; } };
 void add_breakdown(Json& pair_json) {
     const auto& ps = prefill::pair_stage;
-    if (!env_on("STRIX_G4_PAIR_BREAKDOWN")) return;
+    if (!strix::env_flag_default_off("STRIX_G4_PAIR_BREAKDOWN")) return;
     pair_json.set("linear_ms", ps.linear_ms); pair_json.set("attention_ms", ps.attention_ms); pair_json.set("other_ms", ps.other_ms);
 }
 } // namespace
-bool pair_enabled() { return env_on("STRIX_G4_PAIR"); }
+bool pair_enabled() { return strix::env_flag_default_off("STRIX_G4_PAIR"); }
 std::size_t pair_chunk_count(std::size_t prompt, std::size_t chunk) {
     std::size_t count = 0, processed = 0;
     while (const auto n = prompt_chunk_rows(prompt, processed, processed, chunk)) { processed += n; ++count; }
@@ -70,12 +73,14 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     // Both ranks must run the same model, tables, profile and cut: their words go in every seam header.
     std::uint64_t identity = fnv(14695981039346656037ULL, backend.identity().dump());
     identity = fnv(identity, std::to_string(cut) + ":" + std::to_string(prompt.size()));
-    auto link = pair::open_link(rank, prefix, tcp_port);
+    // Control on the host transport; with --transport usb4gpu seam pieces move device to device, one way, with the
+    // seam CRC computed on the device (the shared pair::DeviceLink, as the Qwen pair).
+    pair::DeviceLink link(unsigned(rank), 0x50503447ULL /* "G4PP" */, pair::open_device_link(unsigned(rank), prefix, tcp_port), "g4-pair");
     const auto linked = Clock::now();
     const auto capacity = prefill::pair_seam_bytes(config, cut, unsigned(chunk));
     pair::PipeOptions pipe_options;
     pipe_options.profile_label = "g4-pair-profile";
-    pipe_options.profile = env_on("STRIX_G4_PAIR_PROFILE");
+    pipe_options.profile = strix::env_flag_default_off("STRIX_G4_PAIR_PROFILE");
     pipe_options.validate = [&, identity, count, cut](const pair::PipeHeader& h, std::uint64_t sequence) {
         using W = prefill::PairWord;
         if (h[W::magic] != prefill::pair_seam_magic || h[1] != sequence || h[42] != 3U || h[41] != count ||
@@ -84,12 +89,21 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
             throw std::runtime_error("gemma4 pair seam header mismatch (model, profile, cut, prompt or chunk)");
         return std::size_t(h[W::bytes]);
     };
+    // STRIX_PAIR_TIMING=1: per-chunk compute + seam phases on the shared timeline (same columns as Qwen).
+    dist::PipelineTimeline timeline("g4-prefill", unsigned(rank),
+        {"chunk", "d2h-wait", "crc", "wire", "ack-wait", "header-wait", "h2d-wait"});
+    if (timeline.enabled()) { pipe_options.timeline = &timeline; pipe_options.timing = {1, 2, 3, 4, 5, 6}; }
     pair::Pipe pipe(rank, count,
-        [&](std::span<const std::byte> data) { link->send(data); },
-        [&](std::span<std::byte> data) { link->receive(data); },
-        [&] { link->abort("gemma4 pair prefill stopped"); }, std::move(pipe_options),
-        [&] { return pair::make_hip_pipe_staging(capacity, [] { return static_cast<hipStream_t>(prefill::pair_stage.queue); }); },
-        [](std::span<const std::byte> data) { return dist::crc32c(data); });
+        [&](std::span<const std::byte> data) { link.send(data); },
+        [&](std::span<std::byte> data) { link.receive(data); },
+        [&] { link.abort("gemma4 pair prefill stopped"); }, std::move(pipe_options),
+        [&] {
+            auto staging = pair::make_hip_pipe_staging(capacity, [] { return static_cast<hipStream_t>(prefill::pair_stage.queue); });
+            staging->route_device([&link](std::size_t bytes) { return link.device_checked(bytes); });
+            return staging; },
+        [](std::span<const std::byte> data) { return dist::crc32c(data); },
+        [&link](bool sending, pair::PipeStaging& staging, std::size_t offset, std::size_t bytes) {
+            return link.piece(sending, staging, offset, bytes); });
     StageReset reset;
     prefill::pair_stage = {}; prefill::pair_stage.pipe = &pipe; prefill::pair_stage.rank = rank;
     prefill::pair_stage.cut = cut; prefill::pair_stage.identity = identity;
@@ -103,19 +117,25 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
         std::size_t processed = 0;
         auto chunks = Json::array();
         const auto start = Clock::now();
+        std::uint64_t step = 0;
         while (const auto n = prompt_chunk_rows(prompt.size(), processed, state->frontier(), chunk)) {
             const auto begin = Clock::now();
             auto tx = state->begin();
             (void)backend.prefill_rows(*tx, prompt.subspan(processed, n), false, false);
             tx->commit(n);
             processed += n;
-            chunks.push(ms(Clock::now() - begin));
+            const auto end = Clock::now();
+            chunks.push(ms(end - begin));
+            if (timeline.enabled()) { timeline.add(step, 0, begin, end); timeline.mark(step, begin, end); }
+            ++step;
         }
         pipe.finish(count);
+        link.finish();
         pair_json.set("stage_ms", ms(Clock::now() - start)); pair_json.set("chunk_ms", chunks);
         pair_json.set("seal_wait_ms", prefill::pair_stage.seal_ms);
         add_breakdown(pair_json);
         pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
+        timeline.report(ms(Clock::now() - linked));
         auto receipt = Json::object(); receipt.set("pair", pair_json); receipt.set("prompt_tokens", std::uint64_t(prompt.size()));
         emit({}, receipt);
         return 0;
@@ -125,12 +145,14 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
     const auto slot = coordinator.submit(std::move(request));
     coordinator.run();
     pipe.finish(count);
+    link.finish();
     const auto& result = coordinator.result(slot);
     auto receipt = coordinator.receipt(slot); receipt.set("stream", std::uint64_t(slot));
     pair_json.set("seam_wait_ms", prefill::pair_stage.wait_ms);
     { auto chunks = Json::array(); for (const auto v : prefill::pair_stage.chunk_ms) chunks.push(v); pair_json.set("chunk_ms", chunks); }
     add_breakdown(pair_json);
     pair_json.set("link_to_done_ms", ms(Clock::now() - linked));
+    timeline.report(ms(Clock::now() - linked));
     receipt.set("pair", pair_json);
     emit(result.ids, receipt);
     return result.status == Status::failed ? 1 : 0;

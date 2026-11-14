@@ -1,10 +1,11 @@
 # MiniMax H3 text encoder (K8): host tokenizer + presentation; prefill planned on the dense path.
+include("${CMAKE_CURRENT_LIST_DIR}/StrixVisionPreprocess.cmake")
 add_library(strix_h3_te STATIC
     src/h3/te/te_tokenizer.cpp
     src/h3/te/te_vision_host.cpp
     src/serve/json.cpp)
 target_include_directories(strix_h3_te PUBLIC src include)
-target_link_libraries(strix_h3_te PUBLIC strix_h3_common)
+target_link_libraries(strix_h3_te PUBLIC strix_h3_common strix_vision_preprocess)
 target_compile_features(strix_h3_te PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_options(strix_h3_te PRIVATE /utf-8)

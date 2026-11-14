@@ -1,4 +1,5 @@
 #include "strix/cuda_ds41_common.hpp"
+#include "strix/device/cuda_enumerator.hpp"
 
 #include <cuda_runtime.h>
 
@@ -17,10 +18,13 @@ void check(cudaError_t status, const char* what, const char* file, int line) {
 }
 
 DeviceInfo select_device(int ordinal) {
-    int count = 0;
-    STRIX_CUDA_CHECK(cudaGetDeviceCount(&count));
-    if (ordinal < 0 || ordinal >= count) throw std::runtime_error("ds41 cuda: no CUDA device " + std::to_string(ordinal));
-    STRIX_CUDA_CHECK(cudaSetDevice(ordinal));
+    // The start gate picks the card (declared, not excluded, with a role) and restricts the process to it. An index is
+    // never an identity, so `ordinal` cannot move work to another card: it has to agree with the bound device.
+    const auto& bound = strix::device::bind_cuda();
+    if (ordinal > 0 && ordinal != bound.visible.ordinal)
+        throw std::runtime_error("ds41 cuda: device index " + std::to_string(ordinal) + " is not available: the process is bound to declared device " +
+                                 bound.device.id + " (select a card with --device-id or STRIX_DEVICE)");
+    ordinal = bound.visible.ordinal;
     cudaDeviceProp p{};
     STRIX_CUDA_CHECK(cudaGetDeviceProperties(&p, ordinal));
     DeviceInfo d;

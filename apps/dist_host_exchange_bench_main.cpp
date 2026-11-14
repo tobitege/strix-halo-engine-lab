@@ -1,4 +1,7 @@
+#include "strix/device/hip_gate.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/open_transport.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -35,9 +38,7 @@ struct Args {
     bool pinned = false;  // host buffers pinned (a TAIL's receive buffer is) or pageable
 };
 
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 
 void fill(std::byte* p, std::size_t n, std::uint32_t rank, std::size_t size, int iter) {
     std::uint64_t x = 0x9E3779B97F4A7C15ULL ^ (std::uint64_t{rank} << 56U) ^ (std::uint64_t{size} << 20U) ^ static_cast<std::uint64_t>(iter);
@@ -59,11 +60,11 @@ struct Rank {
     static constexpr std::size_t chunk = std::size_t{1} << 20U;
     Rank(std::uint32_t r, std::unique_ptr<strix::dist::Transport> t, bool pin)
         : rank(r), comm(strix::dist::Group{r, 2U, 7U, 0x68787362ULL}, std::move(t), chunk), pinned(pin) {
-        check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
-        check(hipMalloc(reinterpret_cast<void**>(&control), 2U * chunk), "control");
+        hip_check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+        hip_check(hipMalloc(reinterpret_cast<void**>(&control), 2U * chunk), "control");
         if (pin) {
-            check(hipHostMalloc(reinterpret_cast<void**>(&out), chunk, hipHostMallocDefault), "out");
-            check(hipHostMalloc(reinterpret_cast<void**>(&in), chunk, hipHostMallocDefault), "in");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&out), chunk, hipHostMallocDefault), "out");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&in), chunk, hipHostMallocDefault), "in");
         } else {
             out = new std::byte[chunk];
             in = new std::byte[chunk];
@@ -84,10 +85,10 @@ struct Rank {
     }
     // the device forward's exchange_host before this change, one chunk
     void device_path(std::size_t n, std::uint64_t at) {
-        check(hipMemcpyAsync(control, out, n, hipMemcpyHostToDevice, stream), "control upload");
+        hip_check(hipMemcpyAsync(control, out, n, hipMemcpyHostToDevice, stream), "control upload");
         comm.exchange(stream, control, control + chunk, n, strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0xC1U, at});
-        check(hipMemcpyAsync(in, control + chunk, n, hipMemcpyDeviceToHost, stream), "control download");
-        check(hipStreamSynchronize(stream), "control");
+        hip_check(hipMemcpyAsync(in, control + chunk, n, hipMemcpyDeviceToHost, stream), "control download");
+        hip_check(hipStreamSynchronize(stream), "control");
     }
     void host_path(std::size_t n, std::uint64_t at) {
         comm.exchange_host(std::span<const std::byte>(out, n), std::span<std::byte>(in, n),
@@ -156,6 +157,10 @@ int bench(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transp
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -199,18 +204,8 @@ int main(int argc, char** argv) try {
         if (failure) std::rethrow_exception(failure);
         return rc0 | rc1;
     }
-    std::unique_ptr<strix::dist::Transport> t;
-    const auto limit = std::chrono::milliseconds(60000);
-    if (a.transport.rfind("tcp-listen:", 0) == 0) t = strix::dist::tcp_listen(static_cast<std::uint16_t>(std::stoul(a.transport.substr(11))), limit);
-    else if (a.transport.rfind("tcp-connect:", 0) == 0) {
-        const auto rest = a.transport.substr(12);
-        const auto c = rest.rfind(':');
-        t = strix::dist::tcp_connect(rest.substr(0, c), static_cast<std::uint16_t>(std::stoul(rest.substr(c + 1))), limit);
-    } else if (a.transport == "usb4auto") {
-        strix::dist::Usb4AutoOptions o;
-        o.rank = a.rank;
-        t = strix::dist::usb4_host_auto(o);
-    } else throw std::invalid_argument("--transport emulate | tcp-listen:PORT | tcp-connect:HOST:PORT | usb4auto");
+    // The host exchange is what this bench measures: a GPU-direct exchange (usb4gpu) is negotiated but not used.
+    auto t = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(60)}).host;
     std::printf("rank %u transport %s\n", a.rank, t->name().c_str());
     return bench(a, a.rank, std::move(t));
 } catch (const std::exception& e) {

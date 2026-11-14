@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT TARGET strix_serve)
+    project(strix_serial_session_owner_host LANGUAGES CXX)
+    include(CTest)
+    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../session_runtime" shared)
+    return()
+endif()
+get_filename_component(SERIAL_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DPYTHON=${Python3_EXECUTABLE}"
+    "-DSOURCE=${SERIAL_ROOT}/apps/hip_http_serve.hpp" "-DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}"
+    -P "${CMAKE_CURRENT_LIST_DIR}/extract_reference.cmake" RESULT_VARIABLE rc)
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "Serial production binding extraction refused")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SERIAL_ROOT}/apps/hip_http_serve.hpp"
+    "${SERIAL_ROOT}/apps/hip_session_store.hpp"
+    "${CMAKE_CURRENT_LIST_DIR}/extract_reference.cmake")
+# Compile the real queue with its existing deterministic submission seam.
+# This supplies queue symbols before the ordinary serve archive is searched.
+add_library(serial_observed_queue STATIC "${SERIAL_ROOT}/src/serve/engine.cpp")
+target_include_directories(serial_observed_queue PUBLIC "${SERIAL_ROOT}/include")
+target_compile_features(serial_observed_queue PUBLIC cxx_std_20)
+target_compile_definitions(serial_observed_queue PUBLIC STRIX_SERVE_QUEUE_TEST)
+strix_session_warnings(serial_observed_queue)
+add_executable(serial_session_owner_tests replay_tests.cpp)
+target_include_directories(serial_session_owner_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(serial_session_owner_tests PRIVATE strix_session_owner serial_observed_queue strix_serve)
+if(MSVC)
+    target_compile_options(serial_session_owner_tests PRIVATE /EHsc /utf-8 /UNDEBUG)
+else()
+    target_compile_options(serial_session_owner_tests PRIVATE -UNDEBUG)
+endif()
+add_test(NAME serial-session-owner COMMAND serial_session_owner_tests)
+add_test(NAME serial-session-owner-checks COMMAND "${CMAKE_COMMAND}"
+    "-DBINARY=$<TARGET_FILE:serial_session_owner_tests>" -DCHECK_FAILURE=ON
+    -P "${CMAKE_CURRENT_LIST_DIR}/extract_reference.cmake")
+set_tests_properties(serial-session-owner serial-session-owner-checks PROPERTIES TIMEOUT 30 LABELS "cpu;session;serial")
+set(STRIX_SERIAL_OWNER_REFERENCE "" CACHE FILEPATH "Optional immutable task-entry serial capture")
+if(STRIX_SERIAL_OWNER_REFERENCE)
+    file(SHA256 "${STRIX_SERIAL_OWNER_REFERENCE}" reference_sha)
+    if(NOT reference_sha STREQUAL "9fd34acbc25ffc06916f5aa5cfc91e48b5b39e3ebdf7ca3a92eacf4035ded86c")
+        message(FATAL_ERROR "Unexpected immutable serial entry capture")
+    endif()
+    add_test(NAME serial-session-owner-reference COMMAND serial_session_owner_tests --compare "${STRIX_SERIAL_OWNER_REFERENCE}")
+    set_tests_properties(serial-session-owner-reference PROPERTIES TIMEOUT 30 LABELS "cpu;session;serial;reference")
+endif()

@@ -2,6 +2,7 @@
 #include "deepseek41_prefill_xport_traits.hpp"
 #include "xport/channel.hpp"
 #include "xport/channel_communicator.hpp"
+#include "strix/hip_check.hpp"
 
 namespace strix::deepseek41::prefill_xport {
 using Exchange = xport::Channel<Traits>;
@@ -12,7 +13,7 @@ struct Runtime {
     Event bridge = nullptr;
     ~Runtime() { destroy(bridge); }
     static void check(hipError_t e) {
-        if (e != hipSuccess) throw std::runtime_error("prefill xport: HIP fence/copy failed");
+        ::strix::hip_check_message(e, "prefill xport: HIP fence/copy failed");
     }
     static Tag tag(const InputTag& value) {
         return {static_cast<Kind>(value.kind), value.layer, value.request};

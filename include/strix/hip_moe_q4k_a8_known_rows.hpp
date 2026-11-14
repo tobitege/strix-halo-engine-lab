@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/hip_moe_q4k_a8_probe.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "strix/moe_route_prune.hpp"
 #include <array>
 #include <span>
 #include <stdexcept>
@@ -129,6 +130,8 @@ void set_prefill_core2(int core);
 void set_prefill_route(int bits);
 // qpf2k/moe-mi test hook: overrides STRIX_QPF2K_MOE_DA16 (1 = FP16 down operand image written by the last gate/up tile; -1 = environment).
 void set_prefill_da16(int on);
+// Test hook: overrides STRIX_QPF2K_MOE_DA16_ISSUE (1 = uniform DA16 activation issue, 0 = masked issue; -1 = environment, automatic when unset).
+void set_prefill_da16_issue(int on);
 // MoE header reuse test hook: overrides STRIX_QPF2K_MOE_HDR (1 = gate/up header reuse kernel; -1 = environment).
 void set_prefill_hdr(int on);
 // Test hooks: STRIX_QPF2K_MOE_TIERS / STRIX_QPF2K_MOE_DOWN_LDS_EPI, default OFF;
@@ -184,6 +187,9 @@ bool prefill_da16_ran();
 bool prefill_clear_skipped();
 // True only after all three certificate producer specializations were enqueued for this call.
 bool prefill_certificate_produced();
+// RoutePrune of this thread's next enqueue_prefill calls (off by default): the route weights of pruned assignments become 0
+// and the CSR plans the kept ones only; the caller's merge must skip zero-weight slots.
+void set_prefill_route_prune(moe_core::RoutePrune prune);
 // Reserve once before any prefill submission; largest compiled T first, on its device.
 void reserve_prefill_pools(unsigned rows);
 std::array<std::uint64_t, 2> prefill_test_image_generations();

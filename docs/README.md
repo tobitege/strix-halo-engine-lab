@@ -97,12 +97,14 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Experimental virtual Q8 GDN input projection](engine/kernels/virtual-q8-gdn-input.md): Experimental --virtual-q8-gdn-input one-wave Q8 GDN input projection.
 - [Experimental prefetch8 Q8 GDN input variant](engine/kernels/virtual-q8-gdn-prefetch.md): Experimental --prefetch-q8-gdn-input prefetch8 variant of virtual Q8 GDN input.
 - [Verify-window step folds](engine/kernels/window-step-folds.md): Opt-in verify-window step folds (inject/norm, combine/inject, commit/combine) via env switches.
+- [Shared trellis (EXL3) weight codec](engine/kernels/trellis-codec.md): The one reader and codebook for packed trellis weights that GLM, MiniMax, Gemma and the tiled core share.
 - [CUDA compressed-weight linears: design](engine/kernels/cuda-trellis-design.md): Experimental trellis-weight linears on CUDA (`STRIX_ENABLE_CUDA_TRELLIS`, off by default). *Experimental.*
 - [CUDA compressed-weight linears: report](engine/kernels/cuda-trellis-report.md): Implementation report, build and tests of the CUDA prototype. *Experimental.*
 
 ## Engine: decode
 
 - [Int8 attention KV cache (kv-int8-tok-v1)](engine/decode/attention-kv-int8.md): Opt-in int8 per-token-scaled QSA attention KV cache (kv-int8-tok-v1): storage layout, admission, validation.
+- [Exchange row fold](engine/decode/exchange-row-fold.md): Opt-in CPU fold of the one-row decode all-reduce on the exchange progress thread; switches, exactness gates and the work/wait measurement ([es](engine/decode/exchange-row-fold.es.md)).
 - [Deferred eager MoE status](engine/decode/deferred-moe-status.md): Deferred eager MoE completion-status policy; included in adopted automatic v3 profile.
 - [Requested generation output](engine/decode/generation-output.md): --logprob-token: requested token logprobs during serial --generate via bounded ledger.
 - [Experimental scalar greedy output](engine/decode/gpu-greedy-output.md): Experimental --gpu-greedy-token: on-GPU argmax over full LM-head output with validated reply.
@@ -113,6 +115,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: prefill
 
 - [Known input windows](engine/prefill/known-input-windows.md): Known-input windows: layer-major traversal of 2/4/8 known inputs (--known-prefix-window).
+- [Row layout policy](engine/prefill/row-layout.md): physical row stride off page multiples, shared by every row buffer
 - [Explicit known-prefix prefill](engine/prefill/known-prefix-prefill.md): Early source-only note on --known-prefix-prefill-rows T (16..2048) step-major prefill.
 - [Prefill numerical profile](engine/prefill/prefill-numerical-profile.md): --prefill-numerical-profile: separate prefill arithmetic from decode numerical profile; admitted pairs.
 - [Prompt groups: several requests' prompt blocks in one prefill run](engine/prefill/prompt-batch.md): STRIX_PROMPT_BATCH: several requests' tiled prompt blocks in one prefill run.
@@ -151,7 +154,6 @@ work as it stood on their date; documents marked **Superseded** name their repla
 ## Engine: transport, USB4 and multi-node
 
 - [Two-rank communicator](engine/transport/communicator.md): Two-rank distributed communicator: memory/TCP/USB4 transports, automatic USB4 pairing, exchange protocol.
-- [Native known-input sequence component](engine/transport/distributed-known-sequence.md): HipDistributedKnownSequence: two-peer known-input sequence over native transport with stage-owned weights/state.
 - [Stage-owned storage inventory](engine/transport/distributed-owner-inventory.md): Stage-owned storage inventory API for distributed stage resources and token participants.
 - [Coherent staged readiness](engine/transport/staged-readiness.md): STRIX_DIST_STAGED_READY_BYTES: coherent staged readiness host path in communicator.
 - [Cooperative controller recovery and safe domain retirement](engine/transport/usb4-controller-recovery.md): USB4 driver patch 0009: cooperative controller recovery, domain retirement, controller groups, USB4NET coexistence.

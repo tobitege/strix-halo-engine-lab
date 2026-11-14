@@ -1,6 +1,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include "strix/hip_check.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -40,7 +41,7 @@ struct PrefillTimeline {
     double pipeline_reuse_wait = 0, host_reuse_wait = 0;
 
     static void check(hipError_t e) {
-        if (e != hipSuccess) throw std::runtime_error("prefill timeline HIP event failure");
+        ::strix::hip_check_message(e, "prefill timeline HIP event failure");
     }
     PrefillTimeline(const PrefillTimeline&) = delete;
     PrefillTimeline& operator=(const PrefillTimeline&) = delete;

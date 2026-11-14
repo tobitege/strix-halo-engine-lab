@@ -4,6 +4,7 @@
 // global indices as in router_ref.hpp. All launches on the caller's stream; no host synchronisation except the
 // LUT size read in build_lut (it needs the total entry count to size the entry buffer).
 #include <hip/hip_runtime.h>
+#include "strix/hip_check.hpp"
 
 #include <cstdint>
 #include <stdexcept>
@@ -252,7 +253,7 @@ private:
     void* p_ = nullptr;
 };
 inline void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("h3 sparse: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("h3 sparse: ", e, what);
 }
 }  // namespace dev
 

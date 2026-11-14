@@ -67,6 +67,13 @@ bool store_fusion_enabled();
 bool row_prefetch_enabled(std::uint32_t rows);
 bool pair_tile_enabled(std::uint32_t rows);
 bool staged_input_enabled(std::uint32_t rows);
+// Nine to sixteen shared rows in one staged pass over the weights (up: fused
+// gate/up of one format). Returns false, enqueueing nothing, when the staged
+// schedule is not admitted; the bytes equal those of the eight-row passes.
+// True where that staged pass measured faster than the many-row tile.
+bool staged_rows_preferred(WeightFormat format, std::uint32_t rows, std::uint32_t inputs, std::uint32_t outputs, bool gate);
+bool linear_staged_rows(LinearView w, const LinearView* up, const float* x, std::uint32_t rows, float* out, Queue queue,
+                        std::uint32_t* failure);
 void synchronize(Queue queue = nullptr);
 void require_device(); // gfx1151 / wave32 only; does not silently select another identity
 void linear(LinearView w, const float* x, std::uint32_t rows, float* out, bool shared = true, Queue queue = nullptr,

@@ -6,7 +6,8 @@
 #include <vector>
 
 // models/registry.toml: one table per supported model (description file, engine family, profile tag,
-// defaults tables, entry points). Descriptive data; nothing in an engine reads it to choose behaviour.
+// defaults tables, entry points). The shared serve shell reads it for selection;
+// numerical behavior and production defaults remain in the compiled adapters.
 namespace strix::model_registry {
 
 struct Entry {

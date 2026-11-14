@@ -1,10 +1,14 @@
 #include "strix/serve/json_constraint.hpp"
 
+#include "strix/env_flags.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <limits>
 #include <map>
 #include <set>
@@ -1012,14 +1016,16 @@ struct MaskCache {
     std::list<Entry> lru;
     std::unordered_multimap<std::size_t, std::list<Entry>::iterator> index;
     std::size_t used = 0, budget;
+    ConstraintMemoStats totals;
     explicit MaskCache(std::size_t bytes) : budget(bytes) {}
     bool get(const std::string& key, AllowedTokens& mask) {
         std::lock_guard lock(mutex);
         const auto [first, last] = index.equal_range(std::hash<std::string>{}(key));
         for (auto it = first; it != last; ++it) if (it->second->key == key) {
             mask = it->second->mask;
-            lru.splice(lru.begin(), lru, it->second); return true;
+            lru.splice(lru.begin(), lru, it->second); ++totals.hits; return true;
         }
+        ++totals.misses;
         return false;
     }
     void put(std::string key, std::shared_ptr<const unsigned char> trie, const AllowedTokens& mask) {
@@ -1295,6 +1301,164 @@ ConstraintProgram compile_json_schema(const Json& schema, const ConstraintLimits
     return ConstraintProgram(c.data);
 } catch (const std::bad_alloc&) { error("", "limits", "schema allocation resource limit"); }
 ConstraintProgram compile_json_object() { return compile_json_schema(parse_json("{\"type\":\"object\"}")); }
+
+struct ConstraintProgramCache::Impl {
+    using Program = std::shared_ptr<const ConstraintProgram>;
+    struct Entry {
+        std::string key;
+        std::shared_future<Program> program;
+        bool ready = false;
+    };
+    ConstraintProgramCacheConfig config;
+    mutable std::mutex mutex;
+    std::list<Entry> lru; // most recently used first
+    std::unordered_multimap<std::size_t, std::list<Entry>::iterator> index;
+    ConstraintProgramCacheStats totals;
+    void (*before_compile)(void*) = nullptr;
+    void* compile_context = nullptr;
+
+    std::list<Entry>::iterator find(std::size_t hash, const std::string& key) {
+        const auto [first, last] = index.equal_range(hash);
+        for (auto it = first; it != last; ++it) if (it->second->key == key) return it->second;
+        return lru.end();
+    }
+    std::list<Entry>::iterator erase(std::list<Entry>::iterator entry) {
+        const auto [first, last] = index.equal_range(std::hash<std::string>{}(entry->key));
+        for (auto it = first; it != last; ++it) if (it->second == entry) { index.erase(it); break; }
+        totals.key_bytes -= entry->key.size();
+        return lru.erase(entry);
+    }
+    // Finished entries leave from the cold end; an entry that is still compiling has waiters and stays.
+    bool reserve(std::size_t bytes) {
+        const auto fits = [&] {
+            return lru.size() < config.max_programs && totals.key_bytes <= config.key_bytes - bytes;
+        };
+        auto it = lru.end();
+        while (it != lru.begin() && !fits()) {
+            --it;
+            if (!it->ready) continue;
+            it = erase(it);
+            ++totals.evictions;
+        }
+        return fits();
+    }
+    static void field(std::string& key, std::size_t value) { key += std::to_string(value); key.push_back(','); }
+    static std::string key_of(const Json& schema, const ConstraintLimits& l) {
+        std::string key = "v";
+        field(key, ConstraintProgramCache::semantics_version);
+        for (const std::size_t value : {l.schema_bytes, l.nodes, l.depth, l.properties, l.enum_values, l.max_string_length,
+                                        l.max_output_bytes, l.compilation_steps, l.literal_bytes, l.trie_nodes,
+                                        l.alternative_expansions, l.mask_cache_bytes})
+            field(key, value);
+        key.push_back('|');
+        key += schema.dump();
+        return key;
+    }
+    Program compile(const Json& schema, const ConstraintLimits& limits, bool cached) {
+        if (before_compile) before_compile(compile_context);
+        ConstraintLimits effective = limits;
+        if (cached && effective.mask_cache_bytes == 0) effective.mask_cache_bytes = config.mask_cache_bytes;
+        return std::make_shared<const ConstraintProgram>(compile_json_schema(schema, effective));
+    }
+};
+// The limits struct is serialized field by field into the key; a new field must be added there too.
+static_assert(sizeof(ConstraintLimits) == 12 * sizeof(std::size_t), "ConstraintProgramCache key: add the new limit");
+
+ConstraintProgramCache::ConstraintProgramCache(ConstraintProgramCacheConfig config)
+    : ConstraintProgramCache(config, nullptr, nullptr) {}
+ConstraintProgramCache::ConstraintProgramCache(ConstraintProgramCacheConfig config, void (*before_compile)(void*), void* context)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->config = config;
+    impl_->before_compile = before_compile;
+    impl_->compile_context = context;
+}
+ConstraintProgramCache::~ConstraintProgramCache() = default;
+const ConstraintProgramCacheConfig& ConstraintProgramCache::config() const { return impl_->config; }
+ConstraintProgramCacheStats ConstraintProgramCache::stats() const {
+    std::lock_guard lock(impl_->mutex);
+    auto out = impl_->totals;
+    out.programs = impl_->lru.size();
+    return out;
+}
+void ConstraintProgramCache::clear() {
+    std::lock_guard lock(impl_->mutex);
+    for (auto it = impl_->lru.begin(); it != impl_->lru.end();) {
+        const auto entry = it++;
+        if (entry->ready) (void)impl_->erase(entry);
+    }
+}
+std::shared_ptr<const ConstraintProgram> ConstraintProgramCache::json_object() {
+    static const Json object = parse_json("{\"type\":\"object\"}");
+    return json_schema(object);
+}
+std::shared_ptr<const ConstraintProgram> ConstraintProgramCache::json_schema(const Json& schema, const ConstraintLimits& limits) {
+    Impl& impl = *impl_;
+    // The size check of the compiler comes first, so an oversized schema is refused before it is serialized.
+    if (impl.config.max_programs != 0) { std::size_t bytes = 0; schema_size(schema, bytes, limits.schema_bytes); }
+    std::string key = impl.config.max_programs != 0 ? Impl::key_of(schema, limits) : std::string{};
+    if (impl.config.max_programs == 0 || key.size() > impl.config.key_bytes / 4U) {
+        { std::lock_guard lock(impl.mutex); ++impl.totals.uncached; }
+        return impl.compile(schema, limits, false);
+    }
+    const std::size_t hash = std::hash<std::string>{}(key);
+    std::promise<Impl::Program> promise;
+    {
+        std::unique_lock lock(impl.mutex);
+        if (const auto hit = impl.find(hash, key); hit != impl.lru.end()) {
+            impl.lru.splice(impl.lru.begin(), impl.lru, hit);
+            ++(hit->ready ? impl.totals.hits : impl.totals.joined);
+            const auto program = hit->program;
+            lock.unlock();
+            return program.get(); // rethrows the compilation error of the request that started it
+        }
+        ++impl.totals.misses;
+        if (!impl.reserve(key.size())) {
+            ++impl.totals.uncached;
+            lock.unlock();
+            return impl.compile(schema, limits, false);
+        }
+        impl.lru.push_front({key, promise.get_future().share(), false});
+        try {
+            impl.index.emplace(hash, impl.lru.begin());
+        } catch (...) {
+            impl.lru.pop_front();
+            throw;
+        }
+        impl.totals.key_bytes += key.size();
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const auto elapsed = [&] {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count());
+    };
+    try {
+        auto program = impl.compile(schema, limits, true);
+        std::lock_guard lock(impl.mutex);
+        impl.totals.compile_ns += elapsed();
+        impl.find(hash, key)->ready = true;
+        promise.set_value(program);
+        return program;
+    } catch (...) {
+        std::lock_guard lock(impl.mutex);
+        impl.totals.compile_ns += elapsed();
+        ++impl.totals.failures;
+        promise.set_exception(std::current_exception());
+        (void)impl.erase(impl.find(hash, key));
+        throw;
+    }
+}
+ConstraintProgramCache& shared_constraint_program_cache() {
+    static ConstraintProgramCache cache([] {
+        ConstraintProgramCacheConfig config;
+        static const bool enabled = envcfg::flag("STRIX_CONSTRAINT_PROGRAM_CACHE", true, EnvFlagMatch::exact);
+        if (!enabled) config.max_programs = 0;
+        config.mask_cache_bytes = static_cast<std::size_t>(
+            env_bytes("STRIX_CONSTRAINT_MASK_MEMO_BYTES", config.mask_cache_bytes, 0, std::uint64_t{1} << 30U));
+        envcfg::record("STRIX_CONSTRAINT_MASK_MEMO_BYTES", envcfg::text("STRIX_CONSTRAINT_MASK_MEMO_BYTES"),
+                       std::to_string(config.mask_cache_bytes));
+        return config;
+    }());
+    return cache;
+}
 ConstraintCursor::ConstraintCursor(const ConstraintProgram& program) : data_(program.data_) {
     auto state = std::make_shared<ConstraintState>();
     for (const auto& plan : data_->plan->alternatives) { Frame f; f.plan = plan; state->branches.push_back(std::move(f)); }
@@ -1359,7 +1523,26 @@ struct ConstraintAccess {
     static auto identity(const TokenByteTrie& t) { return t.identity_; }
     static const auto& state(const ConstraintCursor& c) { return *c.state_; }
 };
+ConstraintMemoStats ConstraintProgram::memo_stats() const {
+    const auto cache = ConstraintAccess::cache(*this);
+    if (!cache) return {};
+    std::lock_guard lock(cache->mutex);
+    return cache->totals;
+}
+namespace {
+std::optional<AllowedTokens> walk_allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                          std::span<const std::uint32_t> eos_ids, const std::atomic<bool>* stop);
+}
 AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie, std::span<const std::uint32_t> eos_ids) {
+    return std::move(*walk_allowed(program, cursor, trie, eos_ids, nullptr));
+}
+std::optional<AllowedTokens> allowed_until(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                           std::span<const std::uint32_t> eos_ids, const std::atomic<bool>& stop) {
+    return walk_allowed(program, cursor, trie, eos_ids, &stop);
+}
+namespace {
+std::optional<AllowedTokens> walk_allowed(const ConstraintProgram& program, const ConstraintCursor& cursor, const TokenByteTrie& trie,
+                                          std::span<const std::uint32_t> eos_ids, const std::atomic<bool>* stop) {
     if (!ConstraintAccess::same(program, cursor)) throw ConstraintError("cursor belongs to a different program");
     AllowedTokens mask{trie.vocab_size(), std::vector<std::uint64_t>((trie.vocab_size() + 63) / 64)};
     const auto cache = ConstraintAccess::cache(program);
@@ -1371,7 +1554,8 @@ AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& 
     }
     // Iterative DFS: token length never consumes the native call stack.
     std::vector<std::pair<std::size_t, ConstraintCursor>> pending; pending.emplace_back(0, cursor);
-    while (!pending.empty()) {
+    for (std::size_t visited = 0; !pending.empty(); ++visited) {
+        if (stop && (visited & 255U) == 0 && stop->load(std::memory_order_relaxed)) return std::nullopt;
         auto [at, state] = std::move(pending.back()); pending.pop_back();
         for (auto id : trie.nodes()[at].ids) mask.set(id);
         for (auto [b, next] : trie.nodes()[at].edges) { auto copy = state; if (copy.advance(b)) pending.emplace_back(next, std::move(copy)); }
@@ -1380,6 +1564,7 @@ AllowedTokens allowed(const ConstraintProgram& program, const ConstraintCursor& 
     for (auto id : eos_ids) mask.set(id, cursor.complete());
     return mask;
 }
+}  // namespace
 std::uint32_t constrained_greedy(std::span<const float> logits, const AllowedTokens& mask) {
     if (logits.size() != mask.vocab_size) throw ConstraintError("logit vocabulary mismatch");
     std::uint32_t best = UINT32_MAX; float score = -std::numeric_limits<float>::infinity();

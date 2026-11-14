@@ -1,5 +1,7 @@
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/cohort_step_plan.hpp"
 #include "strix/hip_gdn_decode_fuse.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -11,8 +13,10 @@
 #include "strix/qpersist.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/known_window_cohort.hpp"
+#include "strix/known_window_rows_binding.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
+#include "core/wave_uniform.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -32,6 +36,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +57,11 @@
 
 namespace strix {
 namespace {
+
+inline bool gdn_window_tiled_enabled() {
+    static const bool enabled = strix::envcfg::flag("STRIX_GDN_WINDOW_TILED", false);
+    return enabled;
+}
 
 constexpr std::uint32_t kProjectionThreads = 256;
 constexpr std::uint32_t kRecurrentThreads = 128;
@@ -1135,6 +1145,18 @@ struct GdnInputTiledSite {
         unsigned m; std::uint32_t row;
         static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
+    }
+    bool vector_store_supported() const {
+        if (output_stride % 16U || outputs % 4U) return false;
+        for (unsigned m = 0; m < segments.count; ++m)
+            if (reinterpret_cast<std::uintptr_t>(output0[m]) % 16U || segments.first[m] % 4U) return false;
+        return true;
+    }
+    __device__ void store4(std::uint32_t out, std::uint32_t r, q8_rows::tiled::f4 value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        const q8_rows::tiled::f4 rounded{round_bf16(value.x), round_bf16(value.y), round_bf16(value.z), round_bf16(value.w)};
+        *reinterpret_cast<q8_rows::tiled::f4*>(output0[m] + r * output_stride + 4ULL * row) = rounded;
     }
 };
 // FAST route qwen-gdn-fp16-chunk: GdnInputTiledSite's outputs as BF16 bits in one compact row (q | k | v, then z at
@@ -2618,6 +2640,37 @@ void gdn_window_recurrent_segments_kernel(GdnSegments segments, std::uint32_t ke
     default: gdn_window_recurrence<8, Storage, Columns>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
     }
 }
+// Separate opt-in entry points: adding cases must not change the register allocation
+// of the established 2/4/8 segmented kernels above. Each case uses the exact
+// single-session Rows specialization, including pending commits and saved slots.
+template <bool ParallelGates>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_prepare_anyseg_kernel(GdnSegments segments, const void* conv_weights, SmallWeightKind conv_kind,
+    const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind, std::uint32_t key_heads,
+    std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto& s = segments.segment[blockIdx.y];
+#define STRIX_GDN_PREPARE_CASE(N) case N: \
+    gdn_window_prepare_rows<N, ParallelGates>(gdn_rows_prefix<N>(s.rows), s.conv_state, conv_weights, conv_kind, \
+        dt, dt_kind, a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break
+    switch (s.count) {
+    STRIX_GDN_PREPARE_CASE(1); STRIX_GDN_PREPARE_CASE(2); STRIX_GDN_PREPARE_CASE(3); STRIX_GDN_PREPARE_CASE(4);
+    STRIX_GDN_PREPARE_CASE(5); STRIX_GDN_PREPARE_CASE(6); STRIX_GDN_PREPARE_CASE(7); STRIX_GDN_PREPARE_CASE(8);
+    }
+#undef STRIX_GDN_PREPARE_CASE
+}
+template <GdnRecurrentStorage Storage, std::uint32_t Columns>
+__global__ __launch_bounds__(32)
+void gdn_window_recurrent_anyseg_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
+    const auto& s = segments.segment[blockIdx.y];
+#define STRIX_GDN_RECURRENT_CASE(N) case N: \
+    gdn_window_recurrence<N, Storage, Columns>(gdn_rows_prefix<N>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break
+    switch (s.count) {
+    STRIX_GDN_RECURRENT_CASE(1); STRIX_GDN_RECURRENT_CASE(2); STRIX_GDN_RECURRENT_CASE(3); STRIX_GDN_RECURRENT_CASE(4);
+    STRIX_GDN_RECURRENT_CASE(5); STRIX_GDN_RECURRENT_CASE(6); STRIX_GDN_RECURRENT_CASE(7); STRIX_GDN_RECURRENT_CASE(8);
+    }
+#undef STRIX_GDN_RECURRENT_CASE
+}
 // Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
 template <GdnRecurrentStorage Storage>
 __global__ __launch_bounds__(32)
@@ -3140,6 +3193,7 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
 // FP32 core row, one overflow count per aligned 8-lane group). z arrives prefetched; weights once per CTA.
 struct GdnFp16NormEpilogue {
     static constexpr bool kRows = true;
+    static constexpr bool kWaveRows = true; // rows are wave-uniform: scalar address bases (core/wave_uniform.hpp)
     GdnPrefillRows rows;
     const void* norm_weights;
     SmallWeightKind norm_kind;
@@ -3168,16 +3222,19 @@ struct GdnFp16NormEpilogue {
             const float gate_value = 1.0F / (1.0F + expf(-z[part]));
             const float result = value[part] * inv * w[part] * gate_value;
             if (core16) {
-                core16[row * core16_pitch + head * head_dim + channel] = static_cast<_Float16>(result);
+                _Float16* const part16 = strix::core::wave_row(core16, row * core16_pitch + head * head_dim + part * 32U);
+                part16[lane] = static_cast<_Float16>(result);
                 const auto bad = __ballot(isfinite(result) && !(fabsf(result) <= 65504.0F));
                 if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL) atomicAdd(core16_overflow, 1U);
                 continue;
             }
-            rows.core[base + channel] = result;
+            float* const part32 = strix::core::wave_row(rows.core, base + part * 32U);
+            part32[lane] = result;
             if (a8_codes) {
                 constexpr std::uint64_t pitch = q8_rows::kDenseA8WideRows;
                 const std::uint64_t width = static_cast<std::uint64_t>(value_heads) * head_dim, feature = head * head_dim + channel;
-                q8_rows::dense_a8_quantize_lane(result, a8_codes + row * width + feature,
+                std::int8_t* const part8 = strix::core::wave_row(a8_codes, row * width + head * head_dim + part * 32U);
+                q8_rows::dense_a8_quantize_lane(result, part8 + lane,
                     a8_deltas + row / pitch * (width / 32U * pitch) + feature / 32U * pitch + row % pitch);
             }
         }
@@ -5002,11 +5059,6 @@ void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowR
 }
 // Shapes: STRIX_GDN_LANES (keys of a column split over 2|4|8 lanes, default 4), STRIX_GDN_LANE_WAVES
 // (2|4|8 waves per recurrence block, default 8), STRIX_GDN_CHUNK (8|16 staged rows, default 8).
-std::uint32_t gdn_prefill_env(const char* name, std::uint32_t fallback, std::initializer_list<std::uint32_t> allowed) {
-    const char* v = std::getenv(name);
-    const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : fallback;
-    return std::find(allowed.begin(), allowed.end(), n) != allowed.end() ? n : fallback;
-}
 // STRIX_QPF2K_GDN=1 (default OFF): the qpf2k core kernels (gdn_qpf2k_prefill.inc) replace the production gates and lane
 // recurrence where their shape conditions hold; STRIX_QPF2K_GDN_PARTS (bit 1 recurrence, bit 2 gates, bit 4 fused core =
 // q/k conv per row segment + recurrence with v conv and gated norm, bit 8 = that core with the norm exchange pipelined one
@@ -5138,7 +5190,7 @@ unsigned qpf2k_kr_opt() {
 }
 bool qpf2k_gdn_coop_launch() {
     // Read once per process; launch-policy changes require a fresh process.
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_COOP_LAUNCH"); return v && v[0] == '1'; }();
+    static const bool enabled = strix::envcfg::flag("STRIX_QPF2K_GDN_COOP_LAUNCH", false);
     return enabled;
 }
 // Linux 7.4 cooperative-queue eviction/restore left the grid partly non-resident and hung prefill.
@@ -5231,7 +5283,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const bool fp16_chunk = gdn_fp16_chunk_enabled(first, strided);
     if (fp16_chunk) qpf2k &= ~4U;
     // STRIX_GDN_GATE_HEADS: beta/alpha outputs per gates block (1|2|4, default 2; must divide the head count).
-    static const auto gate_heads_env = gdn_prefill_env("STRIX_GDN_GATE_HEADS", 2U, {1U, 2U, 4U});
+    static const auto gate_heads_env = 1U << strix::env_choice("STRIX_GDN_GATE_HEADS", 1, {"1", "2", "4"});
     const auto gate_heads = first.value_heads % gate_heads_env ? 1U : gate_heads_env;
     const auto gates = [&]<unsigned H>() {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U, H>), dim3(first.value_heads * 2U / H, count / 8U),
@@ -5244,7 +5296,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     };
     // STRIX_GDN_GATES_ROWS=1: gdn_gates::gdn_gates_rows_kernel (the same chains, tree and transform; all rows of 16-row
     // tiles share their staged inputs and the weights of 16 outputs).
-    static const bool gates_rows = [] { const char* v = std::getenv("STRIX_GDN_GATES_ROWS"); return v && v[0] == '1'; }();
+    static const bool gates_rows = strix::envcfg::flag("STRIX_GDN_GATES_ROWS", false);
     constexpr unsigned GatesRB = 16U, GatesO = 4U, GatesS = 4U, GatesC = 8U;
     const bool rows_fit = gates_rows && count >= 256U && count % GatesRB == 0U && first.hidden % gdn_gates::kChains == 0U &&
         (first.value_heads * 2U) % (GatesO * GatesS) == 0U && input_stride % 8U == 0U &&
@@ -5254,7 +5306,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         (first.value_heads * 2U) % (QGatesO * QGatesW) == 0U && input_stride % 8U == 0U &&
         reinterpret_cast<std::uintptr_t>(first.input.address) % 16U == 0U;
     // STRIX_QPF2K_GDN_GATES_BATCH=1: the same kernel with Sched bit 4 (dt/a preloaded, transforms across lanes).
-    static const bool gates_batch_env = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_GATES_BATCH"); return v && v[0] == '1'; }();
+    static const bool gates_batch_env = strix::envcfg::flag("STRIX_QPF2K_GDN_GATES_BATCH", false);
     const bool gates_batch = gates_batch_env && !qpf2k::suppressed(qpf2k::Item::gdn_gates_batch);
     if (qpf2k_gates && gates_batch)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
@@ -5357,7 +5409,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             // STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS), 1 = every eligible call, 0 = off (8-row kernels). Off under the baseline,
             // STRIX_QPF2K_DEFAULTS=0 and GSQ models (code-default exact item, --print-effective-config long_context_items).
             static const bool chunk16_on = qpf2k::long_context_item_enabled("STRIX_QPF2K_GDN_CHUNK16", false);
-            static const bool chunk16_forced = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHUNK16"); return v && v[0] == '1'; }();
+            static const bool chunk16_forced = strix::envcfg::flag("STRIX_QPF2K_GDN_CHUNK16", false);
             static const std::uint32_t chunk16_max_rows = [] {
                 const char* v = std::getenv("STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS");
                 const long long n = v ? std::atoll(v) : static_cast<long long>(kQpf2kChunk16MaxRows);
@@ -5552,9 +5604,9 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
         first.key_heads, first.head_dim, config.model.gdn_qk_l2_epsilon);
     check_hip(hipGetLastError(), "GDN prefill conv rows launch");
-    static const auto lanes = gdn_prefill_env("STRIX_GDN_LANES", 4U, {2U, 4U, 8U});
-    static const auto waves = gdn_prefill_env("STRIX_GDN_LANE_WAVES", 8U, {2U, 4U, 8U});
-    static const auto chunk_env = gdn_prefill_env("STRIX_GDN_CHUNK", 8U, {8U, 16U});
+    static const auto lanes = 2U << strix::env_choice("STRIX_GDN_LANES", 1, {"2", "4", "8"});
+    static const auto waves = 2U << strix::env_choice("STRIX_GDN_LANE_WAVES", 2, {"2", "4", "8"});
+    static const auto chunk_env = 8U << strix::env_choice("STRIX_GDN_CHUNK", 0, {"8", "16"});
     const auto chunk = count % chunk_env ? 8U : chunk_env;
     auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
     const auto launch = [&]<GdnRecurrentStorage S, unsigned G, unsigned W, unsigned C>() {
@@ -5577,7 +5629,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     };
     // STRIX_GDN_FUSED_NORM=1 (prefill steps of >= 256 rows): gdn_gates::gdn_prefill_lanes_norm_kernel (recurrence + gated
     // RMSNorm, one block per value head; the same values as the lane recurrence followed by the norm rows kernel).
-    static const bool fused_norm = [] { const char* v = std::getenv("STRIX_GDN_FUSED_NORM"); return v && v[0] == '1'; }();
+    static const bool fused_norm = strix::envcfg::flag("STRIX_GDN_FUSED_NORM", false);
     if (fused_norm && first.head_dim == 128U && count >= 256U && count % 8U == 0U) {
         const auto fused = [&]<GdnRecurrentStorage S, bool A8>() {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_prefill_lanes_norm_kernel<S, 4U, 16U, 8U, A8>), dim3(first.value_heads), dim3(512),
@@ -5689,7 +5741,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     };
     // Dense A8 with 256-row output launches over whole 256-row steps: the gated RMSNorm quantizes the out
     // projection's input (no quantizer launch). STRIX_GDN_FUSED_A8=0 keeps the quantizer launches.
-    static const bool fused_env = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8"); return !v || v[0] != '0'; }();
+    static const bool fused_env = strix::envcfg::flag("STRIX_GDN_FUSED_A8", true);
     const q8_rows::DenseA8Slot fused_slot = fused_env && !config.dense_f16_prefill && !config.dense_g64_prefill && dense_wide >= q8_rows::kDenseA8WideRows && count % q8_rows::kDenseA8WideRows == 0U &&
             count <= kGdnFusedA8Rows && q8_rows::dense_a8_width(first.value_width) && first.tensors.out.manifest->ggml_type == 8U &&
             reinterpret_cast<std::uintptr_t>(first.tensors.out.runtime->address) % 4U == 0U ? gdn_fused_a8_scratch() : q8_rows::DenseA8Slot{};
@@ -5710,7 +5762,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
                 const std::uint64_t row0 = first_tile * 8U, width = first.value_width;
                 const q8_rows::DenseA8Slot slot{fused_a8->codes + row0 * width, fused_a8->deltas + row0 / W * (width / 32U * W)};
                 // STRIX_GDN_FUSED_A8_CHECK=1: the quantizer kernel on the same rows, compared byte for byte.
-                static const bool fused_check = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8_CHECK"); return v && v[0] == '1'; }();
+                static const bool fused_check = strix::envcfg::flag("STRIX_GDN_FUSED_A8_CHECK", false);
                 if (fused_check) {
                     const auto reference = q8_rows::dense_a8_wide_slot(q8_rows::a8_family_of<decltype(out)>());
                     const auto items = static_cast<std::uint32_t>(W * (width / 8U));
@@ -5778,11 +5830,11 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         count >= q8_rows::tiled::min_rows();
     // Causal core. STRIX_GDN_PREFILL_ROWS=0 keeps the per-tile gates and the serial prepare/recurrence/norm
     // kernels; STRIX_GDN_PREFILL_CHECK=1 runs both on the same inputs and compares every written byte.
-    static const bool rows_env = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_ROWS"); return !v || v[0] != '0'; }();
-    static const bool check = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_CHECK"); return v && v[0] == '1'; }();
+    static const bool rows_env = strix::envcfg::flag("STRIX_GDN_PREFILL_ROWS", true);
+    static const bool check = strix::envcfg::flag("STRIX_GDN_PREFILL_CHECK", false);
     const auto input_stride = gdn_prefill_input_stride(tiles);
     const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
-    static const bool qpf2k_check = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHECK"); return v && v[0] == '1'; }();
+    static const bool qpf2k_check = strix::envcfg::flag("STRIX_QPF2K_GDN_CHECK", false);
     // FAST route qwen-gdn-fp16-chunk on the row path: the tiled input projection writes BF16 rows for it.
     const bool fast16 = rows && !check && !qpf2k_check && gdn_fp16_chunk_enabled(first, strided);
     const std::uint16_t* x16 = nullptr;
@@ -5823,13 +5875,12 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     };
     Qpf2kCore16Route core16;
     const auto prepare_core16 = [&]() {
-        static const bool enabled = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16"); return v && v[0] == '1'; }();
         static const auto minimum = [] {
             const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_MIN_ROWS");
             const int n = v ? std::atoi(v) : 2048;
             return n >= 0 ? static_cast<std::uint32_t>(n) : 2048U;
         }();
-        if (!enabled || qpf2k::suppressed(qpf2k::Item::gdn_core16) || !tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
+        if (!tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
             first.value_width != 6144U || first.head_dim != 128U) return false;
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
         if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) return false;
@@ -5842,7 +5893,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         out.input0 = reinterpret_cast<const unsigned char*>(first.workspace.core); out.input_stride = si;
         out.output0 = reinterpret_cast<unsigned char*>(first.output.address); out.output_stride = so;
         if (!q8_rows::tiled::supported(out, count, q8_rows::tiled::kPre)) return false;
-        core16.form = gdn_prefill_env("STRIX_QPF2K_GDN_CORE16_FORM", 4U, {0U, 1U, 2U, 3U, 4U});
+        core16.form = static_cast<decltype(core16.form)>(strix::env_choice("STRIX_QPF2K_GDN_CORE16_FORM", 4, {"0", "1", "2", "3", "4"}));
         static const auto raster = [] {
             const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_RASTER");
             const int n = v ? std::atoi(v) : 2;
@@ -6098,10 +6149,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     if constexpr (Rows <= kGdnWindowRows) if (parts & 2U) {
     const auto saved = gdn_window_saved(config.model, layer.retained);
     // STRIX_GDN_WINDOW_PREPARE_GATES=1: the beta/gate scalars of the prepare spread over (head, row) pairs.
-    static const bool parallel_gates = [] {
-        const char* v = std::getenv("STRIX_GDN_WINDOW_PREPARE_GATES");
-        return v && v[0] == '1';
-    }();
+    static const bool parallel_gates = strix::envcfg::flag("STRIX_GDN_WINDOW_PREPARE_GATES", false);
     const auto prepare = parallel_gates ? gdn_window_prepare_kernel<Rows, true> : gdn_window_prepare_kernel<Rows, false>;
     hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U), dim3(kRecurrentThreads), 0,
         stream, rows, layer.conv_state, layer.conv, small_weight_kind(layer.conv_type), layer.dt,
@@ -6115,12 +6163,12 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         return static_cast<std::uint32_t>(n == 4 || n == 2 ? n : 8);
     }();
     if constexpr (Rows == 2U || Rows == 4U || Rows == 8U) {
-        if (qpersist_gdn_tail_enabled() && (parts & 4U) && shape.head_dim == 128U && window_columns == 8U) {
+        if (qpersist_gdn_window_tail_admitted(Rows) && (parts & 4U) && shape.head_dim == 128U && window_columns == 8U) {
             // Alternate recurrence organizations retain their own mapping.
             static const bool alternate = [] {
-                const char* tiled = std::getenv("STRIX_GDN_WINDOW_TILED");
+                const bool tiled = gdn_window_tiled_enabled();
                 const char* scatter = std::getenv("STRIX_QKERN_GDN_SCATTER");
-                return (tiled && tiled[0] == '1') || (scatter && scatter[0] == '1');
+                return tiled || (scatter && scatter[0] == '1');
             }();
             if (!alternate) {
                 const bool dense = config.dense_a8_projections;
@@ -6144,7 +6192,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     }
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns));
-        static const bool scatter = [] { const char* v = std::getenv("STRIX_QKERN_GDN_SCATTER"); return v && v[0] == '1'; }();
+        static const bool scatter = strix::envcfg::flag("STRIX_QKERN_GDN_SCATTER", false);
         if constexpr (Columns == 4U || Columns == 8U) if (scatter) {
             if (config.recurrent_storage == GdnRecurrentStorage::value_key)
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true>), tiles,
@@ -6162,7 +6210,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
     };
     // STRIX_GDN_WINDOW_TILED=1: key-value storage, coalesced 32-column slices through LDS (columns per wave as above).
-    static const bool tiled = [] { const char* v = std::getenv("STRIX_GDN_WINDOW_TILED"); return v && v[0] == '1'; }();
+    const bool tiled = gdn_window_tiled_enabled();
     const auto tiled_recurrence = [&]<std::uint32_t Columns>() {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_tiled_kernel<Rows, Columns>),
             dim3(shape.value_heads * (shape.head_dim / kGdnTiledColumns)), dim3(32U * (kGdnTiledColumns / Columns)), 0, stream,
@@ -6211,12 +6259,8 @@ std::uint64_t gdn_window_retained_row_bytes(const ModelContract& model) {
 std::uint64_t gdn_window_retained_bytes(const ModelContract& model) {
     return 2ULL * gdn_window_max_rows * gdn_window_retained_row_bytes(model);
 }
-void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+static void enqueue_bound_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
     const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
-#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
-    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
-#endif
-    validate_gdn_window(layer, rows, true, control, config, stream);
     const auto native = static_cast<hipStream_t>(stream);
     switch (rows.size()) {
     case 1: enqueue_gdn_window<1U>(layer, rows, control, config, native); break;
@@ -6228,6 +6272,15 @@ void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     case 7: enqueue_gdn_window<7U>(layer, rows, control, config, native); break;
     default: enqueue_gdn_window<8U>(layer, rows, control, config, native); break;
     }
+}
+void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
+    // Direct callers still need admission; rows launchers already validated at bind.
+    validate_gdn_window(layer, rows, true, control, config, stream);
+    enqueue_bound_gdn_window(layer, rows, control, config, stream);
 }
 void gdn_window_commit_enqueue(const GdnWindowLayer& layer, const GdnWindowControl* control,
     const HipGdnLauncherConfig& config, void* stream) {
@@ -6304,11 +6357,17 @@ GdnWindowBinding bind_gdn_window(std::span<const ExecutionDispatchContext> rows,
 } // namespace
 
 void gdn_window_rows_preflight(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
-    static_cast<void>(bind_gdn_window(rows, config, true));
+    std::optional<GdnWindowBinding> local;
+    static_cast<void>(KnownWindowRowsBindingScope::get(local, [&] { return bind_gdn_window(rows, config, true); }));
 }
 void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config) {
-    const auto bound = bind_gdn_window(rows, config, true);
-    gdn_window_enqueue(bound.layer, {bound.rows.data(), bound.count}, config.control, config.gdn, hip_execution_stream());
+    std::optional<GdnWindowBinding> local;
+    const auto& bound = KnownWindowRowsBindingScope::get(local, [&] { return bind_gdn_window(rows, config, true); });
+    // The binding contains no positions; runtime admission checks each window's positions.
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.gdn.dense_trellis_projections);
+#endif
+    enqueue_bound_gdn_window(bound.layer, {bound.rows.data(), bound.count}, config.control, config.gdn, hip_execution_stream());
 }
 void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config) {
     const auto bound = bind_gdn_window({&row, 1U}, config, false);
@@ -6377,9 +6436,10 @@ template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& bod
         gdn_window_rows_dispatch(rows, std::forward<Body>(body));
     }
 }
-// Part 2 (prepare and recurrence) of every cohort segment in one launch each (segments of 2, 4 or 8 rows).
+// Part 2 (prepare and recurrence) of every cohort segment in one launch each:
+// legacy 2/4/8 rows, or 1..8 through the separate ANYSEG entry points.
 static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
-    hipStream_t stream) {
+    hipStream_t stream, bool anyseg = false) {
     if (segments.size() > gdn_window_max_rows) throw std::invalid_argument("GDN cohort segments exceed eight sessions");
     const auto shape = gdn_window_shape(config.model);
     GdnSegments all{};
@@ -6397,8 +6457,10 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     }
     const auto& layer = segments[0].layer;
     const auto count = static_cast<std::uint32_t>(segments.size());
-    static const bool parallel_gates = [] { const char* v = std::getenv("STRIX_GDN_WINDOW_PREPARE_GATES"); return v && v[0] == '1'; }();
-    const auto prepare = parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>;
+    static const bool parallel_gates = strix::envcfg::flag("STRIX_GDN_WINDOW_PREPARE_GATES", false);
+    const auto prepare = anyseg
+        ? (parallel_gates ? gdn_window_prepare_anyseg_kernel<true> : gdn_window_prepare_anyseg_kernel<false>)
+        : (parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>);
     hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U, count), dim3(kRecurrentThreads), 0, stream, all,
         layer.conv, small_weight_kind(layer.conv_type), layer.dt, small_weight_kind(layer.dt_type), layer.a,
         small_weight_kind(layer.a_type), shape.key_heads, shape.value_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon);
@@ -6410,12 +6472,13 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     }();
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns), count);
-        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::value_key, Columns>), tiles,
-                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
-        else
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::key_value, Columns>), tiles,
-                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+        const auto launch = [&]<GdnRecurrentStorage Storage>() {
+            const auto kernel = anyseg ? gdn_window_recurrent_anyseg_kernel<Storage, Columns>
+                : gdn_window_recurrent_segments_kernel<Storage, Columns>;
+            hipLaunchKernelGGL(kernel, tiles, dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+        };
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key) launch.template operator()<GdnRecurrentStorage::value_key>();
+        else launch.template operator()<GdnRecurrentStorage::key_value>();
     };
     if (window_columns == 4U) recurrence.template operator()<4U>();
     else if (window_columns == 2U) recurrence.template operator()<2U>();
@@ -6448,12 +6511,19 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
         for (const auto& row : segment.rows) rows[count++] = row;
     }
     // More than 8 rows: dense A8 projections only (the 16-row-tile WMMA forms; the FP32 Q8 wide forms do not
-    // keep the per-row arithmetic of the 1..8-row forms). Totals other than 16 / 32 are padded for the
-    // projections with rows that read row 0's input and write only a sink no row reads.
+    // keep the per-row arithmetic of the 1..8-row forms). Split projections into existing row forms;
+    // only 15 / 31 retain a sink row reading row 0, since splitting would save just one row.
     if (count > gdn_window_max_rows && !config.dense_a8_projections)
         throw std::invalid_argument("GDN cohort window of more than 8 rows requires dense A8 projections");
     const auto native = static_cast<hipStream_t>(stream);
-    const auto padded = count <= gdn_window_max_rows || count == 16U || count == 32U ? count : count < 16U ? 16U : 32U;
+    auto plan = cohort_row_split(count);
+    // STRIX_COHORT_GDN_SPLIT=1 selects the split; the default stays the padded 16 / 32-row launch until a served
+    // cohort of 9..15 / 17..31 rows has passed the bitwise gate (the lockstep CLI cohorts never exceed 8 rows per
+    // call). In-process A/B: STRIX_COHORT_AB_OFF=gdnsplit.
+    static const bool split = [] { const char* v = std::getenv("STRIX_COHORT_GDN_SPLIT"); return v && v[0] == '1'; }();
+    if (count > gdn_window_max_rows && (!split || known_window_cohort_feature_off("gdnsplit")))
+        plan = {{{0U, count <= 16U ? 16U : 32U}}};
+    const auto padded = plan[0].rows > count ? plan[0].rows : count;
     if (padded > count) {
         const auto shape = gdn_window_shape(config.model);
         const auto workspace_bytes = ((static_cast<std::uint64_t>(shape.conv_width) + 2U * shape.value_width + 2U * shape.value_heads) *
@@ -6463,24 +6533,41 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
             rows[r] = {rows[0].input, reinterpret_cast<std::uint16_t*>(sink + workspace_bytes), reinterpret_cast<float*>(sink)};
     }
     const std::span<const GdnWindowRow> all(rows.data(), padded);
-    gdn_cohort_rows_dispatch(padded, [&](auto width) {
-        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
-    });
+    for (const auto& launch : plan) {
+        if (launch.rows == 0U) break;
+        gdn_cohort_rows_dispatch(launch.rows, [&](auto width) {
+            enqueue_gdn_window<decltype(width)::value>(a, all.subspan(launch.offset, launch.rows),
+                segments[0].control, config, native, 1U);
+        });
+    }
     // Part 2 of every segment in one prepare and one recurrence launch (STRIX_COHORT_GDN_SEGMENTS=0: one pair per
     // segment). The tiled recurrence (STRIX_GDN_WINDOW_TILED=1) keeps one pair per segment.
-    static const bool segmented = [] { const char* v = std::getenv("STRIX_COHORT_GDN_SEGMENTS"); return !v || v[0] != '0'; }();
-    static const bool tiled = [] { const char* v = std::getenv("STRIX_GDN_WINDOW_TILED"); return v && v[0] == '1'; }();
+    static const bool segmented = strix::envcfg::flag("STRIX_COHORT_GDN_SEGMENTS", true);
+    const bool tiled = gdn_window_tiled_enabled();
+    static const bool anyseg_set = strix::envcfg::flag("STRIX_COHORT_GDN_ANYSEG", false);
+    const bool anyseg = anyseg_set && !known_window_cohort_feature_off("anyseg"); // in-process A/B: STRIX_COHORT_AB_OFF=anyseg
     bool fused = segmented && !tiled && segments.size() >= 2U && !known_window_cohort_feature_off("gdnseg");
     for (const auto& segment : segments)
-        fused = fused && (segment.rows.size() == 2U || segment.rows.size() == 4U || segment.rows.size() == 8U);
-    if (fused) enqueue_gdn_window_segments(segments, config, native);
+        fused = fused && (anyseg || segment.rows.size() == 2U || segment.rows.size() == 4U || segment.rows.size() == 8U);
+    if (fused && anyseg) {
+        static const bool noted = [&] {
+            std::fprintf(stderr, "lever active: STRIX_COHORT_GDN_ANYSEG (first launch: %zu segments)\n", segments.size());
+            return true;
+        }();
+        static_cast<void>(noted);
+    }
+    if (fused) enqueue_gdn_window_segments(segments, config, native, anyseg);
     else for (const auto& segment : segments)
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
         });
-    gdn_cohort_rows_dispatch(padded, [&](auto width) {
-        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 4U);
-    });
+    for (const auto& launch : plan) {
+        if (launch.rows == 0U) break;
+        gdn_cohort_rows_dispatch(launch.rows, [&](auto width) {
+            enqueue_gdn_window<decltype(width)::value>(a, all.subspan(launch.offset, launch.rows),
+                segments[0].control, config, native, 4U);
+        });
+    }
 }
 
 void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment> segments) {
@@ -6725,7 +6812,7 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     const auto rows = static_cast<std::uint32_t>(input.size());
     // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
     // lane kernel's repacked weights, for timing one unchanged matrix).
-    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
+    if (!strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     if (rows < 1U || (rows > 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (direction != GdnKnownWindowProjectionDirection::bf16_to_fp32 &&
          direction != GdnKnownWindowProjectionDirection::fp32_to_bf16) ||

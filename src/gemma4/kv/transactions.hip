@@ -80,7 +80,8 @@ void DeviceStream::Impl::Txn::reserve_rows(std::size_t count) {
     // Allocate before the first pass. Appending must never reallocate live overlay bytes.
     for (std::size_t l = 0; l < overlay.size(); ++l) {
         const auto bytes = count * stream->cache[l].width * sizeof(float);
-        if (bytes > overlay[l].k.size()) { overlay[l].k.resize(bytes); overlay[l].v.resize(bytes); }
+        if (bytes > overlay[l].k.size()) overlay[l].k.resize(bytes);
+        if (bytes > overlay[l].v.size()) overlay[l].v.resize(bytes);
     }
     reserved = count;
 }
@@ -121,6 +122,9 @@ void DeviceStream::Impl::Txn::commit(std::size_t count) {
         synchronize(stream->queue);
     } catch (...) {
         // Hardware failure can leave partial writes; never offer that stream for continued execution.
+        // Drain any queued descriptor readers before pinned staging/overlays
+        // can be recycled. The stream remains quarantined even if draining succeeds.
+        (void)hipStreamSynchronize(static_cast<hipStream_t>(stream->queue));
         stream->poisoned = true;
         failed = true;
         throw;
@@ -186,6 +190,28 @@ DeviceStream::DeviceStream(const ModelConfig& config, unsigned admitted) : impl_
         }
 }
 DeviceStream::~DeviceStream() = default;
+std::optional<memory::Payload> DeviceStream::memory_payload() const {
+    const auto& s=*impl_;
+    if(impl_.use_count()!=1 || s.busy || s.poisoned || s.fp16_mirror || s.flash_pack ||
+       s.cache.size()!=s.config.layers || s.frontier>s.admitted) return {};
+    try {
+        auto n=memory::stream_payload(sizeof(DeviceStream)+sizeof(Impl),s.config.layer.capacity(),sizeof(LayerConfig),
+            s.cache.capacity(),sizeof(detail::Cache),s.spare_overlay.capacity(),sizeof(detail::Overlay),
+            s.publication.size(),bool(s.pinned_publication));
+        for(const auto& c:s.cache) {
+            for(const auto* b:{&c.k,&c.v,&c.tags}) if(b->size() && !b->data()) return {};
+            memory::stream_arrays(n,c.k.size(),c.v.size(),c.tags.size());
+        }
+        for(const auto& o:s.spare_overlay) {
+            memory::stream_arrays(n,o.k.size(),o.v.size(),0);
+        }
+        (void)n.total();return n;
+    } catch(const std::overflow_error&) {return {};}
+}
+std::optional<memory::Work> DeviceStream::allocation_bound(const ModelConfig& c,std::uint32_t admitted) {
+    return memory::exact_stream_bound(c,admitted,{sizeof(DeviceStream)+sizeof(Impl),sizeof(Impl::Txn),
+        sizeof(LayerConfig),sizeof(detail::Cache),sizeof(detail::Overlay),sizeof(detail::Publication)});
+}
 std::unique_ptr<KvTxn> DeviceStream::begin() {
     if (impl_->busy || impl_->poisoned)
         throw std::runtime_error("device stream busy or failed");
@@ -204,7 +230,7 @@ KvView DeviceStream::kv_view(std::uint32_t layer, const KvTxn* transaction) cons
     v.frontier = impl_->frontier;
     if (transaction) {
         const auto* tx = dynamic_cast<const Impl::Txn*>(transaction);
-        if (!tx || tx->stream != impl_ || tx->published)
+        if (!tx || tx->stream != impl_ || tx->published || tx->failed)
             throw std::invalid_argument("transaction does not belong to this stream");
         const auto r = tx->read(layer, tx->start);
         v.overlay_k = r.overlay_k; v.overlay_v = r.overlay_v; v.frontier = r.frontier; v.candidate_rows = r.candidate_rows;
@@ -215,36 +241,38 @@ std::unique_ptr<DeviceStream> DeviceStream::fork(std::uint32_t admitted) const {
     if (impl_->busy || impl_->poisoned || admitted < impl_->frontier)
         throw std::runtime_error("device stream cannot be forked");
     auto out = std::make_unique<DeviceStream>(impl_->config, admitted);
-    // With a writer queue every publication of this stream already completed on it (commit synchronizes that queue
-    // and the stream is not busy), so the copy runs there without waiting for other queues; the fork inherits it.
-    // Without one, publication ran on the null stream; the copy starts after all device work.
+    // A quiescent commit completed on its producer queue. Order all copies on
+    // that queue, including null-stream publication when KV_QUEUE is off.
     const auto q = static_cast<hipStream_t>(impl_->queue);
-    if (!q)
-        fork_checked(hipDeviceSynchronize());
-    out->impl_->queue = impl_->queue;
     const auto copy = [&](void* dst, const void* src, std::size_t bytes) {
-        fork_checked(q ? hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, q)
-                       : hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice));
+        if (bytes) fork_checked(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, q));
     };
-    for (std::size_t l = 0; l < impl_->cache.size(); ++l) {
-        const auto& from = impl_->cache[l];
-        auto& to = out->impl_->cache[l];
-        if (!from.width)
-            continue;
-        const auto slots = from.global ? impl_->frontier : std::uint64_t(from.slots);
-        const auto bytes = slots * from.width * sizeof(float);
-        copy(to.k.data(), from.k.data(), bytes);
-        copy(to.v.data(), from.v.data(), bytes);
-        copy(to.tags.data(), from.tags.data(), slots * sizeof(std::uint64_t));
-    }
-    if (q)
+    try {
+        for (std::size_t l = 0; l < impl_->cache.size(); ++l) {
+            const auto& from = impl_->cache[l];
+            auto& to = out->impl_->cache[l];
+            if (!from.width) continue;
+            const auto slots = from.global ? impl_->frontier : std::uint64_t(from.slots);
+            const auto bytes = slots * from.width * sizeof(float);
+            copy(to.k.data(), from.k.data(), bytes);
+            copy(to.v.data(), from.v.data(), bytes);
+            copy(to.tags.data(), from.tags.data(), slots * sizeof(std::uint64_t));
+        }
         fork_checked(hipStreamSynchronize(q));
+    } catch (...) {
+        // Enqueued reads must finish before destination destruction or source
+        // release/reuse, even when a later copy failed to enqueue.
+        if (hipStreamSynchronize(q) != hipSuccess) impl_->poisoned = true;
+        throw;
+    }
+    // A completed snapshot borrows no producer queue. The next executor binds
+    // its own writer queue; the immutable copy may outlive the source executor.
     out->impl_->frontier = impl_->frontier;
     return out;
 }
 std::string DeviceStream::digest() const {
-    if (impl_->poisoned)
-        throw std::runtime_error("failed device stream has no canonical state");
+    if (impl_->busy || impl_->poisoned)
+        throw std::runtime_error("busy/failed device stream has no canonical state");
     // STRIX_G4_DIGEST_BATCH (default on, read per call): one copy per cache array; =0 restores the reads of three
     // values per position. Both hash the same bytes in the same order.
     const auto* batch_switch = std::getenv("STRIX_G4_DIGEST_BATCH");
@@ -278,11 +306,15 @@ std::string DeviceStream::digest() const {
             const std::size_t used = c.global ? std::size_t(impl_->frontier) : std::size_t(c.slots);
             std::vector<std::uint64_t> tags(used);
             std::vector<float> ks(used * c.width), vs(used * c.width);
-            if (used) {
+            if (used) try {
                 stream_checked(hipMemcpyAsync(tags.data(), c.tags.data(), used * sizeof(std::uint64_t), hipMemcpyDeviceToHost, q));
                 stream_checked(hipMemcpyAsync(ks.data(), c.k.data(), ks.size() * sizeof(float), hipMemcpyDeviceToHost, q));
                 stream_checked(hipMemcpyAsync(vs.data(), c.v.data(), vs.size() * sizeof(float), hipMemcpyDeviceToHost, q));
                 stream_checked(hipStreamSynchronize(q));
+            } catch (...) {
+                // Host staging must remain alive until every queued write ends.
+                if (hipStreamSynchronize(q) != hipSuccess) impl_->poisoned = true;
+                throw;
             }
             for (auto p = first; p < impl_->frontier; ++p) {
                 const auto slot = std::size_t(c.global ? p : p % c.slots);

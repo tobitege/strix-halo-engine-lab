@@ -1,6 +1,7 @@
 // GLM engine: host memory accounting for the rank load (see glm_mem.hpp).
 #include "glm_mem.hpp"
 #include "strix/deploy/device.hpp"
+#include "strix/env_flags.hpp"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -47,13 +48,10 @@ std::map<std::string, std::uint64_t> read_kb_file(const std::string& path) {
     return m;
 }
 
+// GiB (fractions allowed) to bytes; unset/empty keeps `def` bytes, a value that is not a non-negative number throws.
 std::uint64_t env_gib(const char* name, std::uint64_t def) {
-    const char* e = std::getenv(name);
-    if (e == nullptr || *e == 0) return def;
-    char* end = nullptr;
-    const double v = std::strtod(e, &end);
-    if (end == e || !std::isfinite(v) || v < 0) throw std::invalid_argument(std::string(name) + ": not a size in GiB: " + e);
-    return static_cast<std::uint64_t>(v * static_cast<double>(kGiB));
+    const double gib = strix::env_number<double>(name, -1.0, 0.0, 1048576.0);
+    return gib < 0 ? def : static_cast<std::uint64_t>(gib * static_cast<double>(kGiB));
 }
 
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));

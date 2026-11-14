@@ -1,5 +1,5 @@
 #pragma once
-// Optional two-node Gemma 4 route (STRIX_G4_PAIR=1 with --rank 0|1 [--transport usb4auto|tcp --peer HOST]).
+// Optional two-node Gemma 4 route (STRIX_G4_PAIR=1 with --rank 0|1 [--transport usb4auto|usb4gpu|tcp --peer HOST]).
 // Prompt prefill is pipeline-parallel over the two nodes (prefill/pair.hpp): rank 0 runs layers [0, cut) of
 // every prompt chunk, rank 1 layers [cut, 42) of the previous chunk at the same time. Rank 1 receives rank
 // 0's K/V rows with the seam and commits them, so after the prompt it holds the complete stream and

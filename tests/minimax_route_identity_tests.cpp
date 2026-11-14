@@ -9,6 +9,7 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <iostream>
 #include <map>
 #include <set>
@@ -42,11 +43,9 @@ std::uint64_t fingerprint(const fs::path& path) {
     return hash;
 }
 // Audit scope: every file compiled into, or included by, the MiniMax rank/serve
-// targets in CMakeLists.txt (strix-minimax-rank, strix-minimax-serve and the
-// strix_minimax_* libraries they link), except shared non-MiniMax libraries
-// (strix_core, strix_dist, strix_serve, strix_lookup, strix_model_graph, ...),
-// which have their own gates. A directory rule takes every regular file below
-// it (recursive), so any new file in scope must be added to the receipt.
+// targets and the shared session owners that directly implement its request
+// lifecycle. HTTP parsing, tokenization, registry, transport and device/core
+// libraries remain under their own gates. Recursive rules fail closed on adds.
 struct ScopeRule { const char* dir; const char* prefix; bool recursive; const char* why; };
 constexpr ScopeRule scope_rules[] = {
     {"src/minimax", "", true, "strix_minimax_{engine,assets,defaults,session,serve,pfx,dspark,moe_opt_hip,model_description}"},
@@ -54,6 +53,9 @@ constexpr ScopeRule scope_rules[] = {
     {"src/dspark_common", "", true, "drafter kernels included by strix_minimax_dspark"},
     {"src/xport", "", true, "strix_xport INTERFACE linked by strix_minimax_engine (xfer)"},
     {"include/strix/minimax", "", true, "public headers of the strix_minimax_* libraries"},
+    {"include/strix/session", "", true, "shared contracts and storage APIs consumed by MiniMax"},
+    {"include/strix/serve", "session_runtime", false, "shared SessionRuntime API consumed by MiniMax"},
+    {"src/session", "", true, "shared queue, storage, backend and prefix owners used by MiniMax"},
     {"apps", "minimax_", false, "strix-minimax-rank / strix-minimax-serve mains"},
     {"src", "minimax_", false, "strix_minimax_msa (minimax_msa.cpp, minimax_moe.cpp)"},
     {"src", "hip_minimax_", false, "strix_minimax_msa_hip"},
@@ -62,10 +64,14 @@ constexpr ScopeRule scope_rules[] = {
     {"src", "bp_codec.", false, "compiled directly into strix-minimax-rank"},
     {"include/strix", "bp_codec.", false, "header of bp_codec.cpp"},
 };
-void source_coverage() {
-    const fs::path root(STRIX_ROUTE_SOURCE_DIR);
+constexpr const char* exact_scope_files[] = {
+    "cmake/StrixSession.cmake", "include/strix/serve/engine.hpp",
+    "src/serve/engine.cpp", "src/serve/session_runtime.cpp"};
+void source_coverage(const fs::path& source_root = fs::path(STRIX_ROUTE_SOURCE_DIR)) {
+    const fs::path root = source_root;
     std::set<std::string> found, expected;
     found.insert("CMakeLists.txt");  // build-time arithmetic/addressing switches
+    for (const auto* path : exact_scope_files) found.insert(path);
     const auto take = [&](const fs::directory_entry& entry, const ScopeRule& rule) {
         if (entry.is_regular_file() && entry.path().filename().generic_string().starts_with(rule.prefix))
             found.insert(entry.path().lexically_relative(root).generic_string());
@@ -77,17 +83,18 @@ void source_coverage() {
         else
             for (const auto& entry : fs::directory_iterator(root / rule.dir)) take(entry, rule);
     }
+    std::string stale;
     for (const auto& source : sources) {
         require(expected.insert(source.path).second, "duplicate source receipt");
-        require(fingerprint(root / source.path) == source.hash,
-                std::string("UNCOVERED source change; audit selectors before updating receipt: ") + source.path);
+        if (!fs::is_regular_file(root / source.path) || fingerprint(root / source.path) != source.hash)
+            stale += "\n  stale receipt: " + std::string(source.path);
     }
     std::string drift;
     for (const auto& path : found)
         if (!expected.contains(path)) drift += "\n  untracked in-scope: " + path;
     for (const auto& path : expected)
         if (!found.contains(path)) drift += "\n  receipt outside scope: " + path;
-    require(drift.empty(), "UNCOVERED added/removed MiniMax source; update census and source receipt" + drift);
+    require(stale.empty() && drift.empty(), "UNCOVERED source receipt/census drift; audit selectors before updating receipt" + stale + drift);
 }
 const Selector& allow(std::string_view id) {
     for (const auto& selector : selectors) if (id == selector.id) return selector;
@@ -354,14 +361,44 @@ void config_receipts() {
     }
     require(receipts == 2 && entries == 2 * values.size(), "incomplete rank/serve effective-config receipts");
 }
+void selector_boundary_proofs() {
+    using namespace strix::minimax::defaults;
+    const Cli serve = parse_cli("serve", {});
+    require(serve.transport == "usb4gpu", "serve direct transport construction default");
+    const Lookup explicit_cache = [](const char* key) -> const char* {
+        return std::string_view(key) == "STRIX_SESSION_CACHE" ? "on" : nullptr;
+    };
+    const auto automatic = session_policy(serve, explicit_cache, false);
+    const auto explicit_on = session_policy(serve, explicit_cache, true);
+    require(!automatic.enabled && !explicit_on.enabled &&
+            automatic.route == "serve/usb4gpu/fixed-width-one-session-v1" &&
+            automatic.reason.find("route not yet GPU-qualified") == 0 &&
+            explicit_on.reason == automatic.reason,
+            "direct serve session admission must refuse before storage/native work, including explicit opt-in");
+
+    for (const auto& item : items())
+        require(std::string_view(item.env) != "STRIX_MMATTN_INDEX_SPLIT",
+                "retired index split selector must not re-enter resolver defaults");
+    for (const auto* relative : {"src/minimax/attn/msa_fused.hip", "src/minimax/attn/msa_fused.hpp"}) {
+        std::ifstream input(fs::path(STRIX_ROUTE_SOURCE_DIR) / relative, std::ios::binary);
+        require(input.good(), std::string("cannot inspect retired selector source: ") + relative);
+        const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        require(source.find("STRIX_MMATTN_INDEX_SPLIT") == std::string::npos &&
+                source.find("index_split(") == std::string::npos &&
+                source.find("index_kernel<DecodeView, true>") == std::string::npos,
+                "retired index split selector or launch remains in current source");
+    }
+}
 }  // namespace
 int main(int argc, char** argv) {
     try {
-        const std::string_view mode = argc == 2 ? std::string_view(argv[1]) : std::string_view();
-        require(argc == 1 || (argc == 2 && (mode == "--require-identity" || mode == "--audit-sources")),
-                "usage: [--require-identity | --audit-sources]");
+        const std::string_view mode = argc >= 2 ? std::string_view(argv[1]) : std::string_view();
+        require(argc == 1 || (argc == 2 && (mode == "--require-identity" || mode == "--audit-sources")) ||
+                (argc == 3 && mode == "--audit-sources"),
+                "usage: [--require-identity | --audit-sources [source-root]]");
         // Source fingerprints are an audit aid, not a CI gate: any edit to a MiniMax source would fail them.
-        if (argc == 2) source_coverage();
+        if (argc >= 2) source_coverage(argc == 3 ? fs::path(argv[2]) : fs::path(STRIX_ROUTE_SOURCE_DIR));
+        selector_boundary_proofs();
         std::set<std::string_view> ids;
         std::array<unsigned, 3> counts{};
         bool open_gate = false;

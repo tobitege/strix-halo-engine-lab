@@ -16,7 +16,10 @@
 // GPU-direct, the breakdown of the progress thread (witness->submit, submit->RX complete, ->TX complete) and of the
 // stream (scatter, wait, gather).
 
+#include "strix/device/hip_gate.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/env_flags.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/staged_ready_kernels.hpp"
@@ -40,9 +43,7 @@
 #include <vector>
 
 namespace {
-void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
-}
+using strix::hip_check;
 double at(std::vector<double> v, double q) {
     std::sort(v.begin(), v.end());
     return v[std::min(v.size() - 1U, static_cast<std::size_t>(q * static_cast<double>(v.size())))];
@@ -65,7 +66,7 @@ struct Load {
     void* buffer = nullptr;
     explicit Load(bool on) {
         if (!on) return;
-        check(hipMalloc(&buffer, std::size_t{1} << 30U), "load buffer");
+        hip_check(hipMalloc(&buffer, std::size_t{1} << 30U), "load buffer");
         thread = std::thread([this] {
             hipStream_t s{};
             (void)hipStreamCreateWithFlags(&s, hipStreamNonBlocking);
@@ -85,6 +86,10 @@ struct Load {
 } // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     if (argc < 2) { std::cerr << "usage: strix-dist-gpu-probe RANK [SIZES...]\n"; return 2; }
     const auto rank = static_cast<std::uint32_t>(std::stoul(argv[1]));
     std::vector<std::size_t> sizes;
@@ -92,7 +97,7 @@ int main(int argc, char** argv) try {
     if (sizes.empty()) sizes = {64, 20480, 40960, 163840};
     const std::string path = env("STRIX_PROBE_PATH", "both"), label = env("STRIX_PROBE_LABEL", "");
     ::setenv("STRIX_DIST_ROUTE", "gpu", 0); // the gpu-direct arm measures the direct path unless a route is given
-    const bool load = env("STRIX_PROBE_LOAD", "0") == "1";
+    const bool load = strix::env_flag_default_off("STRIX_PROBE_LOAD");
     strix::dist::Usb4AutoOptions options;
     options.rank = rank;
     options.timeout = std::chrono::milliseconds(60000);
@@ -100,8 +105,8 @@ int main(int argc, char** argv) try {
     std::unique_ptr<strix::dist::Transport> control;
     std::unique_ptr<strix::dist::DeviceExchange> direct;
     strix::dist::GpuDirectSetup setup;
-    setup.depth = static_cast<std::uint32_t>(std::stoul(env("STRIX_PROBE_DEPTH", "4")));
-    setup.max_streams = static_cast<std::uint32_t>(std::stoul(env("STRIX_PROBE_GPU_LINKS", "8")));
+    setup.depth = strix::env_number<std::uint32_t>("STRIX_PROBE_DEPTH", 4U);
+    setup.max_streams = strix::env_number<std::uint32_t>("STRIX_PROBE_GPU_LINKS", 8U);
     std::string receipt;
     if (path == "gpu4") {
         const auto rv = env("STRIX_PROBE_RENDEZVOUS", "");
@@ -118,23 +123,23 @@ int main(int argc, char** argv) try {
     if (rank == 0U && direct) std::cout << receipt << '\n';
     const std::size_t largest = *std::max_element(sizes.begin(), sizes.end());
     hipStream_t s{};
-    check(hipStreamCreate(&s), "stream");
+    hip_check(hipStreamCreate(&s), "stream");
     void *local = nullptr, *remote = nullptr;
-    check(hipMalloc(&local, largest), "local");
-    check(hipMalloc(&remote, largest), "remote");
+    hip_check(hipMalloc(&local, largest), "local");
+    hip_check(hipMalloc(&remote, largest), "remote");
     std::vector<std::uint32_t> got(largest / 4U);
-    const unsigned pause_us = static_cast<unsigned>(std::stoul(env("STRIX_PROBE_PAUSE_US", "0")));
-    const bool hot_gap = env("STRIX_PROBE_HOT_GAP", "0") == "1";
-    const bool staged_ready = env("STRIX_PROBE_STAGED_READY", "0") == "1";
-    const double outlier_us = std::stod(env("STRIX_PROBE_OUTLIER_US", "10000"));
+    const unsigned pause_us = strix::env_number<unsigned>("STRIX_PROBE_PAUSE_US", 0U);
+    const bool hot_gap = strix::env_flag_default_off("STRIX_PROBE_HOT_GAP");
+    const bool staged_ready = strix::env_flag_default_off("STRIX_PROBE_STAGED_READY");
+    const double outlier_us = strix::env_number<double>("STRIX_PROBE_OUTLIER_US", 10000.0);
     // STRIX_PROBE_SYNC (default 1, =0 off): before every iteration both ranks exchange an untimed (bytes, i) token over
     // the control transport, so each timed exchange starts with both ranks ready (without it the ranks drift and take turns
     // waiting, and a p50 over a half-short / half-long set flips on a few samples).
-    const bool rendezvous = env("STRIX_PROBE_SYNC", "1") != "0";
+    const bool rendezvous = strix::env_flag_default_on("STRIX_PROBE_SYNC");
     const auto run = [&](strix::dist::Communicator& c, const char* name) {
         Load background(load);
         for (const auto size : sizes) {
-            const unsigned iterations = static_cast<unsigned>(std::stoul(env("STRIX_PROBE_ITERATIONS", size > (std::size_t{1} << 20U) ? "20" : "300")));
+            const unsigned iterations = strix::env_number<unsigned>("STRIX_PROBE_ITERATIONS", size > (std::size_t{1} << 20U) ? 20U : 300U);
             std::vector<double> us;
             std::vector<double> available_us;
             bool used_staged_ready = false;
@@ -161,7 +166,7 @@ int main(int argc, char** argv) try {
                 strix::dist::ProducerStage produced{};
                 if (staged_ready) produced = c.prepare_staged_ready(s, size);
                 // STRIX_PROBE_STAGED=1: the fused staging path (send_staging / finish_staged), when readiness is not in use
-                const bool staged = !produced.data && env("STRIX_PROBE_STAGED", "0") == "1";
+                const bool staged = !produced.data && strix::env_flag_default_off("STRIX_PROBE_STAGED");
                 const void* received = remote;
                 if (produced.data) {
                     strix::dist::enqueue_staged_pattern(produced, size, value_of(i, rank), s);
@@ -169,9 +174,9 @@ int main(int argc, char** argv) try {
                 } else {
                     void* producer = staged ? c.send_staging(size) : local;
                     if (!producer) throw std::runtime_error("staged probe requires fused staging and a host route");
-                    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(producer), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
+                    hip_check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(producer), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
                 }
-                check(hipStreamSynchronize(s), "producer");
+                hip_check(hipStreamSynchronize(s), "producer");
                 if (pause_us && hot_gap) {
                     const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(pause_us);
                     while (std::chrono::steady_clock::now() < until) {
@@ -207,12 +212,12 @@ int main(int argc, char** argv) try {
                 } else {
                     c.exchange(s, local, remote, size, strix::dist::Tag{1U, i, 0U});
                 }
-                check(hipStreamSynchronize(s), "exchange");
+                hip_check(hipStreamSynchronize(s), "exchange");
                 strix::dist::latency::mark("probe_h2d_sync_done", i);
                 const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 if (!produced.data) available = t;
                 const double c1 = cpu_seconds();
-                check(hipMemcpy(got.data(), received, size, hipMemcpyDefault), "read back");
+                hip_check(hipMemcpy(got.data(), received, size, hipMemcpyDefault), "read back");
                 const auto expect = value_of(i, 1U - rank);
                 bad += std::all_of(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(size / 4U), [&](std::uint32_t w) { return w == expect; }) ? 0U : 1U;
                 if (i >= 10U) {
@@ -278,7 +283,7 @@ int main(int argc, char** argv) try {
         strix::dist::Communicator host({rank, 2U, 1U, 1U}, std::make_unique<Borrowed>(*control), largest);
         run(host, "host");
     }
-    if (direct && env("STRIX_PROBE_DIAG", "0") == "1")
+    if (direct && strix::env_flag_default_off("STRIX_PROBE_DIAG"))
         for (std::size_t b : {std::size_t{20480}, std::size_t{163840}, std::size_t{1} << 20U})
             std::cout << "rank " << rank << " " << direct->diagnose(b) << std::endl;
     if (direct) {
@@ -291,7 +296,7 @@ int main(int argc, char** argv) try {
             const auto name = "mix-" + p;
             run(gpu, name.c_str());
         }
-        if (env("STRIX_PROBE_DIAG", "0") == "1") // again, now that the controller has written the RX arena
+        if (strix::env_flag_default_off("STRIX_PROBE_DIAG")) // again, now that the controller has written the RX arena
             for (std::size_t b : {std::size_t{20480}, std::size_t{163840}, std::size_t{1} << 20U})
                 std::cout << "rank " << rank << " after DMA: " << const_cast<strix::dist::DeviceExchange*>(gpu.device_exchange())->diagnose(b) << std::endl;
     }

@@ -9,6 +9,7 @@
 //           resume invariance).
 // --time 1: wall time of each prefill (after a warm-up run of the same identity). Exit 0 only if every gate passes.
 // Truncated stacks (--layers < 45) need STRIX_GLM_SMOKE_HEAD=1 and a synthetic model (the engine checks).
+#include "strix/device/hip_gate.hpp"
 #include <strix/glm/engine.hpp>
 
 #include "glm/common/glm_math.hpp"
@@ -109,6 +110,10 @@ void deviation(const Run& ref, const Run& x, const char* tag) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     try {
         if (argc < 2) throw std::invalid_argument("usage: strix-glm5-pf MODEL_DIR --prompt T.u32 [options]");
         ge::Options opt;

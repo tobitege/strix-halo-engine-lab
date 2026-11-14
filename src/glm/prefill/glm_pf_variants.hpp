@@ -27,7 +27,10 @@ inline constexpr PfVariant kPfVariants[] = {
     {"STRIX_GLM_PF_MLA_GEMM", "3|2|1", 3U},
     {"STRIX_GLM_PF_SCORES", "7|6|5|4|3|2", 7U},
     {"STRIX_GLM_PF_KDA_SCAN", "5|3|1", 5U},
-    {"STRIX_GLM_PF_DENSE_ROWS", "3|2|1", 3U},
+    {"STRIX_GLM_PF_DENSE_ROWS", "4|3|2|1", 4U},
+    // Physical form of dense rows version 4 (core::fma_rows::Form): 0 = automatic per shape, 1..7 force one form
+    // where the shape admits it. A selector of the same table so startup rejects an unknown value.
+    {"STRIX_GLM_PF_DENSE_FORM", "0|1|2|3|4|5|6|7", 0U},
 };
 
 inline const PfVariant* pf_variant_find(std::string_view env) {

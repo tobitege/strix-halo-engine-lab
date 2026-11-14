@@ -54,7 +54,6 @@ public:
 private:
     friend class HipDistributedTokenParticipant;
     friend class NativeDistributedBackend;
-    friend class CopiedStreamDistributedBackend;
     DistributedRuntimeRequest request_;
     std::uint64_t binding_=0,placement_=0,decision_=0,position_=0;
     std::uint32_t node_=0;

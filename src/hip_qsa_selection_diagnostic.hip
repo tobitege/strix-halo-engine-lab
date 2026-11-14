@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_qsa_selection_diagnostic.hpp"
 #include <hip/hip_runtime.h>
 #include <array>
@@ -11,9 +12,7 @@ namespace strix::qsa_selection_diagnostic {
 namespace {
 constexpr unsigned threads = 256, tile_items = 1024;
 void require(bool ok, const char* text) { if (!ok) throw std::invalid_argument(text); }
-void check(hipError_t result, const char* text) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(text) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 void validate_shape(Shape shape) {
     require(shape.blocks <= 32768 && shape.tail < compression &&
             static_cast<std::uint64_t>(shape.blocks) * compression + shape.tail <= 131072,
@@ -167,32 +166,32 @@ void enqueue(Shape shape, View<const float> scores, View<std::uint32_t> selected
                         ranges[j].begin >= ranges[i].begin + ranges[i].bytes,
                         "QSA diagnostic input/output/status/scratch overlap");
     if (!count) return;
-    check(hipPeekAtLastError(), "QSA diagnostic preexisting HIP error");
+    hip_check(hipPeekAtLastError(), "QSA diagnostic preexisting HIP error");
     if (direct) {
         hipLaunchKernelGGL(direct_tokens, dim3((count - 1U) / threads + 1U), dim3(threads), 0, stream,
                            selected.data, count, status.data);
-        check(hipGetLastError(), "QSA diagnostic direct selection");
+        hip_check(hipGetLastError(), "QSA diagnostic direct selection");
         return;
     }
     hipLaunchKernelGGL(validate_scores, dim3((shape.blocks - 1U) / threads + 1U), dim3(threads), 0, stream,
                        scores.data, shape.blocks, status.data);
-    check(hipGetLastError(), "QSA diagnostic finite validation");
+    hip_check(hipGetLastError(), "QSA diagnostic finite validation");
     std::uint32_t lists = (shape.blocks - 1U) / tile_items + 1U;
     hipLaunchKernelGGL(tile_top512, dim3(lists), dim3(threads), 0, stream,
                        scores.data, shape.blocks, ping.data, status.data);
-    check(hipGetLastError(), "QSA diagnostic local top512");
+    hip_check(hipGetLastError(), "QSA diagnostic local top512");
     Item* source = ping.data;
     Item* destination = pong.data;
     while (lists > 1) {
         const auto next = (lists + 1U) / 2U;
         hipLaunchKernelGGL(merge_top512, dim3(next), dim3(threads), 0, stream,
                            source, destination, lists, shape.blocks, status.data);
-        check(hipGetLastError(), "QSA diagnostic top512 merge");
+        hip_check(hipGetLastError(), "QSA diagnostic top512 merge");
         auto* previous = source; source = destination; destination = previous;
         lists = next;
     }
     hipLaunchKernelGGL(chronological_expand, dim3(1), dim3(threads), 0, stream,
                        source, shape.blocks, shape.tail, selected.data, status.data);
-    check(hipGetLastError(), "QSA diagnostic chronological expansion");
+    hip_check(hipGetLastError(), "QSA diagnostic chronological expansion");
 }
 } // namespace strix::qsa_selection_diagnostic

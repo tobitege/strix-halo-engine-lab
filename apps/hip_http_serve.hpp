@@ -8,11 +8,15 @@
 #include "hip_mtp_decode_bridge.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
+#include "strix/serve/session_api.hpp"
+#include "../src/qwen/http_session_owner.hpp"
+#include "../src/core/host_lane.hpp"
 #include "qwen_service_health.hpp"
 #include "qwen_rotary_capabilities.hpp"
 #include "qwen_moe_route_bf16.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/serve/serial_session_owner.hpp"
 #include "strix/serve/http_server.hpp"
 
 #include <algorithm>
@@ -54,7 +58,20 @@ inline void add_prefill_stats(serve::GenerationStats& stats) {
 class HttpConstraintRequests {
 public:
     HttpConstraintRequests(std::shared_ptr<const serve::BpeTokenizer> tokenizer,bool argmax_first)
-        : tokenizer_(std::move(tokenizer)),argmax_first_(argmax_first) {}
+        : tokenizer_(std::move(tokenizer)),argmax_first_(argmax_first) {
+        // Masks one step ahead (exact): on by default, STRIX_CONSTRAINT_MASK_AHEAD=0 builds every mask on the
+        // selecting thread as before. The walks run on the host lane's background threads: one walk can take far
+        // longer than a decode step, which the lane's critical threads (row folds) must never wait for. A lane that
+        // runs jobs inline (STRIX_HOST_LANE=0, no background threads) gives nothing to run ahead on.
+        // Ranked membership (opt-in, with --http-selection-fast): STRIX_CONSTRAINT_RANKED=N checks the N next-best
+        // logits of a refused row before walking a mask (0..4096; default 0 = always walk, the refusals of a full
+        // walk). Both settings are read strictly and recorded by the shared environment registry.
+        const auto policy=serve::constraint_selection_policy_from_environment();
+        const auto& lane=core::shared_host_lane().config();
+        ahead_=policy.mask_ahead && lane.enabled && lane.background_threads>0;
+        ranked_=policy.ranked;
+        std::fprintf(stderr,"constraint mask ahead: %s, ranked membership: %u\n",ahead_?"on":"off",argmax_first_?ranked_:0U);
+    }
     bool available(std::span<const std::uint32_t> stops) const {
         const auto id=tokenizer_->find("</think>");
         return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
@@ -67,12 +84,18 @@ public:
         if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);
         auto selection=std::make_shared<serve::ConstraintSelection>(spec,trie_,tokenizer_);
         selection->set_argmax_first(argmax_first_);
+        selection->set_ranked(ranked_);
+        if(ahead_) selection->set_mask_ahead([](std::function<void()> job) {
+            (void)core::shared_host_lane().submit(core::HostPriority::background,std::move(job));
+        });
         return std::make_shared<MtpConstraintRow>(std::move(selection));
     }
 private:
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
     std::shared_ptr<const serve::TokenByteTrie> trie_;
     bool argmax_first_;
+    unsigned ranked_=0;
+    bool ahead_=false;
 };
 // Execution failures stop the server; constraint refusals carry request-local receipts.
 class MtpBridgeEngine final : public serve::GenerationEngine {
@@ -139,6 +162,8 @@ public:
         stats.sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
         if (!result.final_state_digest.empty()) {
             stats.engine_extra.push_back({"final_state_digest", "\"" + result.final_state_digest + "\""});
+            if (!result.final_target_state_digest.empty())
+                stats.engine_extra.push_back({"final_target_state_digest", "\"" + result.final_target_state_digest + "\""});
             stats.engine_extra.push_back({"final_state_position", std::to_string(result.final_state_position)});
             if (!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components", result.final_state_components});
         }
@@ -187,38 +212,23 @@ inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
     const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
     if (enabled && (request.path == "/v1/sessions" || request.path == "/v1/cache/stats" || request.path.starts_with("/v1/sessions/"))) {
         try {
+            // Route grammar, id rule and durability parsing are the shared strix::serve ones (404 on an unknown route).
+            const auto parsed = serve::session_command(request.method, request.path, request.body);
             MtpServeRequest command;
-            if (request.method == "GET" && request.path == "/v1/sessions") command.session_operation = "list";
-            else if (request.method == "GET" && request.path == "/v1/cache/stats") command.session_operation = "stats";
-            else if (request.path.starts_with("/v1/sessions/")) {
-                const auto rest = request.path.substr(13);
-                const auto slash = rest.find('/');
-                command.session_id = rest.substr(0, slash);
-                validate_http_session_id(command.session_id);
-                if (request.method == "DELETE" && slash == std::string::npos) command.session_operation = "delete";
-                else if (request.method == "POST" && slash != std::string::npos) {
-                    command.session_operation = rest.substr(slash + 1U);
-                    if (command.session_operation != "checkpoint" && command.session_operation != "park" && command.session_operation != "resume")
-                        throw std::invalid_argument("unknown session operation");
-                    if (command.session_operation == "checkpoint") {
-                        const auto body = serve::parse_request_json(request.body);
-                        const auto* durability = body.find("durability");
-                        if (!durability || !durability->is_string()) throw std::invalid_argument("durability must be ram|disk");
-                        command.session_durability = durability->as_string();
-                    }
-                }
-            }
-            if (command.session_operation.empty()) { response.send(405, "application/json", "{}"); return true; }
+            const auto& op = parsed.find("op")->as_string();
+            command.session_operation = op == "ram_checkpoint" ? std::string("checkpoint") : op;
+            if (const auto* id = parsed.find("id")) command.session_id = id->as_string();
+            if (const auto* durability = parsed.find("durability")) command.session_durability = durability->as_string();
             response.send(200, "application/json", run(command).session_json);
         } catch (const SessionApiError& error) {
-            response.send(error.status, "application/json", session_error_json(error).dump());
+            response.send(error.status, "application/json", serve::session_error(error.code, error.what()).dump());
         } catch (const std::invalid_argument& error) {
-            response.send(400, "application/json", session_error_json(SessionApiError(400, "invalid_request", error.what())).dump());
+            response.send(400, "application/json", serve::session_error("invalid_request", error.what()).dump());
         } catch (const std::exception& error) {
             const bool incompatible = std::string_view(error.what()).find("compatibility mismatch") != std::string_view::npos;
-            SessionApiError classified(incompatible ? 409 : 422,
-                incompatible ? "session_incompatible" : "session_corrupt", error.what());
-            response.send(classified.status, "application/json", session_error_json(classified).dump());
+            const int status = incompatible ? 409 : 422;
+            response.send(status, "application/json",
+                serve::session_error(incompatible ? "session_incompatible" : "session_corrupt", error.what()).dump());
         }
         return true;
     }
@@ -304,6 +314,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         }
         MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,
             selection_mtp_available, probing ? &probe : nullptr, options.product_profile);
+        // Serial native-control binding begin.
+        serve::SerialSessionOwner owner(queue, engine);
+        // Serial native-control binding end.
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;
@@ -331,7 +344,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
             server.stop();
             queue.shutdown();
         });
-        queue.run(engine);
+        owner.runtime().run();
         finished.store(true);
         watcher.join();
         http_thread.join();
@@ -428,65 +441,20 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             const auto q = queue.snapshot();
             return serve::ServeCapacity{runner.slots(), q.running, std::nullopt, q.queued};
         };
-        serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
-        serve::HttpServerConfig http;
-        http.bind_address = options.http_bind;
-        http.port = static_cast<std::uint16_t>(options.http_port);
-        http.max_connections = options.http_max_connections;
-        serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-            api.handle(request, response);
-        });
-        if(before_listen) before_listen();
-        server.listen();
-        api.set_state("ready");
-        std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id
-                  << " batch " << runner.slots() << std::endl;
-
-        http_serve_stop_requested().store(false);
-        const auto previous_int = std::signal(SIGINT, http_serve_signal);
-        const auto previous_term = std::signal(SIGTERM, http_serve_signal);
-        std::atomic<bool> finished{false}, failed{false};
-        std::thread http_thread([&server] { server.serve(); });
-        std::thread watcher([&] {
-            while (!finished.load() && !http_serve_stop_requested().load() && !failed.load())
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (failed.load()) api.set_state("failed");
-            server.stop();
-            queue.shutdown();
-        });
-        // Jobs in the slots, finished by the runner (on_finish) or, after an engine failure, here.
-        std::vector<std::shared_ptr<serve::TakenJob>> live;
-        const auto release = [&](const std::shared_ptr<serve::TakenJob>& taken) {
-            live.erase(std::remove(live.begin(), live.end(), taken), live.end());
-        };
-        std::unique_lock<std::mutex> batch_lock;
-        if (runner.session_mutex) batch_lock = std::unique_lock<std::mutex>(*runner.session_mutex, std::defer_lock);
-        const auto admit = [&](serve::TakenJob taken_job,const MtpBatchRunner::AdmissionSink& submit) {
-            auto taken = std::make_shared<serve::TakenJob>(std::move(taken_job));
-            live.push_back(taken);
-            auto& job = taken->job;
-            if (job.prompt.empty() || job.prompt.size() >= options.context_tokens) {
-                queue.finish(*taken, {}, "prompt is empty or fills the context");
-                release(taken);
-                return;
-            }
-            if (!job.session_id.empty()) {
-                if (!runner.session_run || runner.active()) throw std::logic_error("named session requires an idle session runner");
-                if (batch_lock.owns_lock()) batch_lock.unlock();
-                // Named sessions run the fixed session protocol: no constrained decoding on that path.
-                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr, options.product_profile);
-                finish_http_session_job(queue, *taken, engine, [&] { release(taken); });
-                return;
-            }
+        std::atomic<bool> failed{false};
+        // Qwen native-control binding begin.
+        qwen::HttpSessionOwner::Native native;
+        const auto translate = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks,
+                                   const MtpBatchRunner::AdmissionSink& submit) {
             MtpBatchRequest request;
             request.constraint = constraints.make(job.constraint);
             request.cache_retention = job.cache_retention;
             request.prompt = job.prompt;
             request.max_tokens = job.max_tokens;
             request.stop_tokens = job.stop_tokens;
-            request.on_tokens = job.on_tokens;
-            request.on_progress = job.on_progress;
-            request.cancelled = [ticket=taken->ticket] {return ticket->cancelled() || http_serve_stop_requested().load();};
+            request.on_tokens = callbacks.tokens;
+            request.on_progress = callbacks.progress;
+            request.cancelled = callbacks.cancelled;
             request.ngram_draft = job.ngram_draft;
             request.draft_depth_max = job.draft_depth_max;
             request.tool_draft = job.tool_draft;
@@ -505,14 +473,13 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                     sampler_options.request_identity = next_token_sampling_request_identity(); // 1 unless STRIX_SAMPLING_REQUEST_IDENTITY=counter
                     request.sampler = std::make_shared<TokenSampler>(policy, sampler_options);
                 } catch (const std::exception& e) {  // this request fails alone; the server keeps serving
-                    queue.finish(*taken, {}, std::string("sampling policy refused: ") + e.what());
-                    release(taken);
+                    callbacks.finish({}, std::string("sampling policy refused: ") + e.what());
                     return;
                 }
                 sampling = "sampling-v1";
             }
             const auto prompt_tokens = job.prompt.size();
-            request.on_finish = [&queue, &release, taken, prompt_tokens, sampling, profile=options.product_profile](const MtpServeResult& result) {
+            request.on_finish = [finish=callbacks.finish, prompt_tokens, sampling, profile=options.product_profile](const MtpServeResult& result) {
                 serve::GenerationStats stats;
                 stats.engine_extra.emplace_back("profile", profile.json());
                 add_prefill_stats(stats);
@@ -540,74 +507,90 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.engine_extra.push_back({"shared_execution",result.shared_execution.json()});
                 if(!result.final_state_digest.empty()) {
                     stats.engine_extra.push_back({"final_state_digest","\""+result.final_state_digest+"\""});
+                    if(!result.final_target_state_digest.empty())
+                        stats.engine_extra.push_back({"final_target_state_digest","\""+result.final_target_state_digest+"\""});
                     if(!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components",result.final_state_components});
                     stats.engine_extra.push_back({"final_state_position",std::to_string(result.final_state_position)});
                 }
                 if(!result.prompt_state_digest.empty()) stats.engine_extra.push_back({"prompt_state_digest","\""+result.prompt_state_digest+"\""});
                 stats.finish = result.finish;
                 stats.sampling = sampling;
-                queue.finish(*taken, std::move(stats), result.error);
-                release(taken);
+                finish(std::move(stats), result.error);
             };
-            if (runner.session_mutex && !batch_lock.owns_lock()) batch_lock.lock();
+            callbacks.before_submit();
             submit(std::move(request));
         };
-        std::optional<serve::TakenJob> deferred;
-        runner.set_service_admission([&]()->std::size_t{return deferred || !queue.has_queued_work() ? 0U : std::max<std::size_t>(1U,static_cast<std::size_t>(queue.snapshot().queued));},[&](const MtpBatchRunner::AdmissionSink& prepare,const std::function<bool()>& can_prepare) {
-            while(!deferred && can_prepare()) {
-                auto job=queue.take(false);
-                if(!job) break;
-                // A named turn must wait until every ordinary slot is idle, including nested work.
-                if (!job->job.session_id.empty()) { deferred = std::move(job); break; }
-                admit(std::move(*job),prepare);
-            }
+        native.add_slot = [&](bool queued) { runner.add_slot(queued); };
+        native.active = [&] { return runner.active(); };
+        native.has_free_slot = [&] { return runner.has_free_slot(); };
+        native.submit = [&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks) {
+            translate(job, std::move(callbacks), [&](MtpBatchRequest request) { runner.admit(std::move(request)); });
+        };
+        native.service_admission = [&](std::function<std::size_t()> queued, qwen::HttpSessionOwner::Pump pump) {
+            if (!pump) { runner.set_service_admission({}, {}); return; }
+            runner.set_service_admission(std::move(queued), [&, pump=std::move(pump)](
+                const MtpBatchRunner::AdmissionSink& prepare, const std::function<bool()>& can_prepare) {
+                pump([&](const serve::GenerationJob& job, qwen::HttpSessionOwner::Callbacks callbacks) {
+                    translate(job, std::move(callbacks), prepare);
+                }, can_prepare);
+            });
+        };
+        native.step = [&] {
+            const auto generation = probing ? probe.pending_generation() : 0;
+            if (generation) {
+                const bool completed = runner.step<true>();
+                if (completed) probe.complete(generation, serve::BackendProof::work_completion);
+            } else runner.step();
+        };
+        bool named_engine_failed = false;
+        native.named = [&](serve::GenerationJob& job) {
+            if (!runner.session_run) throw std::logic_error("named session requires an idle session runner");
+            MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false,
+                probing ? &probe : nullptr, options.product_profile);
+            named_engine_failed = false;
+            try { return engine.generate(job); }
+            catch (...) { named_engine_failed = engine.failed(); throw; }
+        };
+        native.named_failed = [&] { return named_engine_failed; };
+        native.fail_requests = [&](const std::string& error) { runner.fail_requests(error); };
+        native.abandon = [&] { runner.abandon(); };
+        native.failed = [&] { failed.store(true); if (probing) probe.fail(); };
+        native.stop_requested = [&] { return http_serve_stop_requested().load(); };
+        native.session_mutex = runner.session_mutex;
+        const auto capacity = std::max(runner.slots(), runner.slots_capacity);
+        if (capacity > UINT32_MAX) throw std::invalid_argument("Qwen owner slot capacity overflow");
+        qwen::HttpSessionOwner owner(queue, options.context_tokens, static_cast<std::uint32_t>(capacity), std::move(native));
+        // Qwen native-control binding end.
+        serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
+        serve::HttpServerConfig http;
+        http.bind_address = options.http_bind;
+        http.port = static_cast<std::uint16_t>(options.http_port);
+        http.max_connections = options.http_max_connections;
+        serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+            api.handle(request, response);
         });
-        struct ClearAdmission {
-            MtpBatchRunner& runner;
-            ~ClearAdmission(){runner.set_service_admission({},{});}
-        } clear_admission{runner};
+        if(before_listen) before_listen();
+        server.listen();
+        api.set_state("ready");
+        std::cerr << "strix serve: listening on " << options.http_bind << ':' << server.port() << " model " << config.model_id
+                  << " batch " << runner.slots() << std::endl;
+
+        http_serve_stop_requested().store(false);
+        const auto previous_int = std::signal(SIGINT, http_serve_signal);
+        const auto previous_term = std::signal(SIGTERM, http_serve_signal);
+        std::atomic<bool> finished{false};
+        std::thread http_thread([&server] { server.serve(); });
+        std::thread watcher([&] {
+            while (!finished.load() && !http_serve_stop_requested().load() && !failed.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (failed.load()) api.set_state("failed");
+            server.stop();
+            queue.shutdown();
+        });
         std::string failure;
-        try {
-            for (;;) {
-                runner.add_slot(queue.snapshot().queued != 0U);
-                while (runner.has_free_slot()) {
-                    if (deferred && runner.active()) break;
-                    auto job = deferred ? std::move(deferred) : queue.take(runner.active() == 0U);
-                    deferred.reset();
-                    if (!job) break;
-                    if (!job->job.session_id.empty() && runner.active()) { deferred = std::move(job); break; }
-                    admit(std::move(*job),[&](MtpBatchRequest request){runner.admit(std::move(request));});
-                }
-                // The admitted prompt's first unit runs in this step: build the spare slot now so a request arriving
-                // during that unit finds a free slot (nested admission).
-                runner.add_slot(queue.snapshot().queued != 0U);
-                if (!runner.active()) {
-                    if (queue.stopping()) break;
-                    continue;
-                }
-                const auto generation = probing ? probe.pending_generation() : 0;
-                if (generation) {
-                    const bool completed = runner.step<true>();
-                    if (completed) probe.complete(generation, serve::BackendProof::work_completion);
-                } else runner.step();
-                if (!runner.active() && batch_lock.owns_lock()) batch_lock.unlock();
-            }
-        } catch (const std::exception& e) {
-            failure = e.what()[0] ? e.what() : "engine failure";
-        } catch (...) {
-            failure = "engine failure";
-        }
-        if (!failure.empty()) {
-            // The target state of every slot is unknown: fail the requests in flight and stop.
-            failed.store(true);
-            if (probing) probe.fail();
-            runner.fail_requests(failure);
-            for (auto& taken : std::vector<std::shared_ptr<serve::TakenJob>>(live)) queue.finish(*taken, {}, failure);
-            live.clear();
-            if (deferred) { queue.finish(*deferred, {}, failure); deferred.reset(); }
-            runner.abandon();
-        }
-        if (batch_lock.owns_lock()) batch_lock.unlock();
+        try { owner.run(); }
+        catch (const std::exception& e) { failure = e.what()[0] ? e.what() : "engine failure"; }
+        catch (...) { failure = "engine failure"; }
         finished.store(true);
         watcher.join();
         http_thread.join();

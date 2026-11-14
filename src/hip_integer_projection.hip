@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_arch_caps.hpp"
 #include "strix/hip_integer_projection.hpp"
 #include <hip/hip_runtime.h>
@@ -13,7 +14,7 @@ using int2=int __attribute__((ext_vector_type(2)));
 using int4=int __attribute__((ext_vector_type(4)));
 using int8=int __attribute__((ext_vector_type(8)));
 __device__ __constant__ int book[16]={-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
-void check(hipError_t e,const char* op){if(e!=hipSuccess)throw std::runtime_error(std::string(op)+": "+hipGetErrorString(e));}
+using strix::hip_check;
 void require(bool ok,const char* reason){if(!ok)throw std::invalid_argument(reason);}
 // One thread per actual row/group. Canonical sequential absmax and exact
 // binary64 division; no cross-row statistics, reciprocal, fast math or atomics.
@@ -111,14 +112,14 @@ template<class T> T* pointer(const ExecutionBindings& b,BufferRole role) {
 void target(const DeviceIdentity& device,hipStream_t stream) {
     const auto* override_arch=std::getenv("HSA_OVERRIDE_GFX_VERSION");
     require(!override_arch||!*override_arch,"architecture override prevents gfx1151 attribution");
-    int active=-1;check(hipGetDevice(&active),"projection active device");
+    int active=-1;hip_check(hipGetDevice(&active),"projection active device");
     require(active==device.index,"projection active HIP device changed");
     // The legacy/default stream is a current-device sentinel, not an object.
     hipDevice_t stream_device=active;
     if(stream!=nullptr&&stream!=hipStreamLegacy)
-        check(hipStreamGetDevice(stream,&stream_device),"projection stream device");
+        hip_check(hipStreamGetDevice(stream,&stream_device),"projection stream device");
     require(stream_device==device.index,"projection stream belongs to another device");
-    hipDeviceProp_t properties{};check(hipGetDeviceProperties(&properties,device.index),"projection device properties");
+    hipDeviceProp_t properties{};hip_check(hipGetDeviceProperties(&properties,device.index),"projection device properties");
     const std::string architecture=properties.gcnArchName;
     require(device.architecture=="gfx1151"&&architecture.substr(0,architecture.find(':'))==device.architecture,
         "projection requires exact gfx1151");
@@ -133,11 +134,11 @@ std::uint64_t native_extents(const ExecutionPlan& p,const ExecutionBindings& b) 
         bool seen=false;for(std::size_t j=0;j<i;++j)if(b[j].allocation.identity==allocation.identity)seen=true;
         if(seen)continue;
         hipPointerAttribute_t attributes{};
-        check(hipPointerGetAttributes(&attributes,reinterpret_cast<const void*>(allocation.base)),"projection pointer attributes");
+        hip_check(hipPointerGetAttributes(&attributes,reinterpret_cast<const void*>(allocation.base)),"projection pointer attributes");
         require(attributes.type==hipMemoryTypeDevice&&!attributes.isManaged&&attributes.device==p.request().device.index,
             "projection requires device-local HIP allocation on the bound device");
         hipDeviceptr_t base=nullptr;std::size_t bytes=0;
-        check(hipMemGetAddressRange(&base,&bytes,reinterpret_cast<hipDeviceptr_t>(allocation.base)),"projection native allocation extent");
+        hip_check(hipMemGetAddressRange(&base,&bytes,reinterpret_cast<hipDeviceptr_t>(allocation.base)),"projection native allocation extent");
         require(reinterpret_cast<std::uintptr_t>(base)==allocation.base&&bytes>=allocation.bytes,
             "projection declared allocation is not pinned within its native extent");
         require(bytes<=p.request().maximum_device_bytes&&actual<=p.request().maximum_device_bytes-bytes,
@@ -169,9 +170,9 @@ std::shared_ptr<const HipProjectionReadyEvent> HipProjectionReadyEvent::record(
     for(std::size_t i=0;i<buffer_count;++i){
         require(event->impl_->recorded_bindings[i].device==recorded_device,"input ready event requires exact-device allocation pins");}
     target(recorded_device,stream);
-    check(hipEventCreateWithFlags(&event->impl_->event,hipEventDisableTiming),"projection producer event create");
+    hip_check(hipEventCreateWithFlags(&event->impl_->event,hipEventDisableTiming),"projection producer event create");
     validate_allocation_snapshots(event->impl_->producer_pins,event->impl_->recorded_bindings);
-    check(hipEventRecord(event->impl_->event,native_stream(stream)),"projection producer event record");event->impl_->recorded=true;
+    hip_check(hipEventRecord(event->impl_->event,native_stream(stream)),"projection producer event record");event->impl_->recorded=true;
     validate_allocation_snapshots(event->impl_->producer_pins,event->impl_->recorded_bindings);
     return event;
 }
@@ -210,9 +211,9 @@ struct HipIntegerProjectionLauncher::Impl {
             (void)native_extents(retained->plan,retained->inputs.buffers);}
     }
     void status() {
-        check(hipMemcpyAsync(host_status.data(),pointer<unsigned>(retained->inputs.buffers,BufferRole::status_u32),
+        hip_check(hipMemcpyAsync(host_status.data(),pointer<unsigned>(retained->inputs.buffers,BufferRole::status_u32),
             sizeof(host_status),hipMemcpyDeviceToHost,native_stream(stream)),"projection status readback");
-        check(hipStreamSynchronize(native_stream(stream)),"projection stage completion");
+        hip_check(hipStreamSynchronize(native_stream(stream)),"projection stage completion");
         live();
         require(host_status[1]==32,"projection kernel did not report Wave32");
         require(host_status[0]==0,"projection finite/preparation/integer/output status rejected execution");
@@ -254,27 +255,27 @@ HipProjectionOutcome HipIntegerProjectionLauncher::execute(const ExecutionPlan& 
     try {
         const auto& b=impl_->retained->inputs.buffers;const auto& r=p.request();const auto& a=p.accounting();
         const auto rows=static_cast<std::uint32_t>(r.shape.rows),columns=static_cast<std::uint32_t>(r.shape.columns),k=static_cast<std::uint32_t>(r.shape.inner);
-        check(hipStreamWaitEvent(native_stream(impl_->stream),impl_->retained->inputs.producer_ready->native_handle(),0),"projection input producer dependency");
-        check(hipMemsetAsync(pointer<unsigned>(b,BufferRole::status_u32),0,8,native_stream(impl_->stream)),"projection status initialization");
+        hip_check(hipStreamWaitEvent(native_stream(impl_->stream),impl_->retained->inputs.producer_ready->native_handle(),0),"projection input producer dependency");
+        hip_check(hipMemsetAsync(pointer<unsigned>(b,BufferRole::status_u32),0,8,native_stream(impl_->stream)),"projection status initialization");
         hipLaunchKernelGGL(validate_weight_scales,dim3(a.weight_scale_blocks),dim3(128),0,native_stream(impl_->stream),
             pointer<const double>(b,BufferRole::weight_scales_f64),static_cast<std::uint64_t>(columns)*(k/32U),pointer<unsigned>(b,BufferRole::status_u32));
-        check(hipGetLastError(),"projection weight validation launch");
+        hip_check(hipGetLastError(),"projection weight validation launch");
         hipLaunchKernelGGL(prepare_kernel,dim3(a.preparation_blocks),dim3(128),0,native_stream(impl_->stream),
             pointer<const double>(b,BufferRole::input_f64),pointer<std::uint8_t>(b,BufferRole::activation_codes),
             pointer<double>(b,BufferRole::activation_scales_f64),pointer<std::int32_t>(b,BufferRole::activation_sums_i32),
             pointer<unsigned>(b,BufferRole::status_u32),rows,k,r.activations==low_precision::ActivationEncoding::symmetric_a4);
-        check(hipGetLastError(),"projection preparation launch");impl_->status();
+        hip_check(hipGetLastError(),"projection preparation launch");impl_->status();
         const dim3 grid(a.grid_columns,a.grid_rows),threads(32);
 #define LAUNCH(Four,IQ,A4) hipLaunchKernelGGL((project_kernel<Four,IQ,A4>),grid,threads,0,native_stream(impl_->stream),pointer<const std::uint8_t>(b,BufferRole::activation_codes),pointer<const double>(b,BufferRole::activation_scales_f64),pointer<const std::int32_t>(b,BufferRole::activation_sums_i32),pointer<const std::uint8_t>(b,BufferRole::packed_weights),pointer<const double>(b,BufferRole::weight_scales_f64),pointer<double>(b,BufferRole::staged_output_f64),pointer<std::int32_t>(b,BufferRole::integer_groups_i32),pointer<unsigned>(b,BufferRole::status_u32),rows,columns,k)
         if(r.instruction==Instruction::iu4){LAUNCH(true,false,true);}
         else if(r.weights==WeightEncoding::iq4_xs){if(r.activations==low_precision::ActivationEncoding::symmetric_a4){LAUNCH(false,true,true);}else{LAUNCH(false,true,false);}}
         else{if(r.activations==low_precision::ActivationEncoding::symmetric_a4){LAUNCH(false,false,true);}else{LAUNCH(false,false,false);}}
 #undef LAUNCH
-        check(hipGetLastError(),"integer projection launch");impl_->status();
+        hip_check(hipGetLastError(),"integer projection launch");impl_->status();
         impl_->live();commit_started=true;
-        check(hipMemcpyAsync(pointer<double>(b,BufferRole::destination_f64),pointer<const double>(b,BufferRole::staged_output_f64),
+        hip_check(hipMemcpyAsync(pointer<double>(b,BufferRole::destination_f64),pointer<const double>(b,BufferRole::staged_output_f64),
             static_cast<std::size_t>(a.buffers[index(BufferRole::destination_f64)].bytes),hipMemcpyDeviceToDevice,native_stream(impl_->stream)),"projection destination commit");
-        check(hipStreamSynchronize(native_stream(impl_->stream)),"projection destination completion");impl_->live();
+        hip_check(hipStreamSynchronize(native_stream(impl_->stream)),"projection destination completion");impl_->live();
         result.evidence.stream_quiescent=true;result.evidence.destination_copy_complete=true;
         result.evidence.destination_owner=impl_->retained->inputs.pins[index(BufferRole::destination_f64)];
         validate_completed_output(p,b,result.evidence);impl_->retained.reset();result.status=HipProjectionStatus::complete;return result;

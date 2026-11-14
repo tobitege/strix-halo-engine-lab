@@ -13,7 +13,7 @@
 namespace strix::qpf2k {
 
 enum class Item : unsigned {
-    sched, dense, gdn, gdn_gates_batch, gdn_core16, qsa, qsa_mask,
+    sched, dense, gdn, gdn_gates_batch, qsa, qsa_mask,
     hc, hc_mask, hc_output3, hc_output3_band, moe_da16, moe_route, ple_reclaim, dense_rows, pipe, attend_batch, score_park,
     norm_group, index_rows, cohort_lean, rows_lean, dispatch_fuse, score_rows, ple_batch, shared_pre, moe_mc, moe_hdr,
     moe_xor64, hc_lowband,
@@ -30,7 +30,6 @@ inline constexpr std::array defaults{
     Default{Item::dense, "STRIX_QPF2K_DENSE", "1"},
     Default{Item::gdn, "STRIX_QPF2K_GDN", "1"},
     Default{Item::gdn_gates_batch, "STRIX_QPF2K_GDN_GATES_BATCH", "1"},
-    Default{Item::gdn_core16, "STRIX_QPF2K_GDN_CORE16", "1"},
     Default{Item::qsa, "STRIX_QPF2K_QSA", "1"},
     Default{Item::qsa_mask, "STRIX_QPF2K_QSA_MASK", "0x2257"},
     Default{Item::hc, "STRIX_QPF2K_HC", "1"},
@@ -164,7 +163,7 @@ unsigned initialize(Get get, Put put, unsigned allowed = ~0U) {
 }
 // The historical set is restricted to known-input tiled kernels/scheduling:
 // SCHED selects tile/tail owners; DENSE batches tiled projections; GDN,
-// GATES_BATCH and CORE16 group tiled recurrence/gates; QSA/MASK select tiled
+// GATES_BATCH groups tiled recurrence/gates; QSA/MASK select tiled
 // attention; HC/MASK/OUTPUT3/BAND select tiled hyper-mix; MOE_DA16/ROUTE
 // select tiled expert work. Each reader filters injected values per GSQ owner.
 inline constexpr unsigned historical_items = bit(Item::moe_route) * 2U - 1U;
@@ -181,6 +180,66 @@ inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item
 // launchers (including serving/MTP priming); defer them too, preserving fixture defaults.
 // HC_LOWBAND also waits for decoder admission; its route guard retains unsupported layouts.
 inline constexpr unsigned startup_items = historical_items | bit(Item::ple_reclaim);
+// The admitted prefill organisation is ONE policy value: the exact launch/layout items a tiled prompt owner takes
+// after its route is admitted (row-loop and tap-copy batching, attention stage batching, table batching, expert
+// header/merge policies). Same arithmetic per element; only launches, copies and scheduling change. The
+// single-request owner and the resident server both apply it through apply_organization, so one cannot drift.
+inline constexpr unsigned prefill_organization_items = bit(Item::pipe) | bit(Item::attend_batch) |
+    bit(Item::score_park) | bit(Item::norm_group) | bit(Item::index_rows) | bit(Item::score_rows) |
+    bit(Item::ple_batch) | bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64) |
+    bit(Item::dense_rows) | bit(Item::hc_lowband);
+// The resident owner takes the current row-pipeline bits of the single-request cursor. With bits 2|16 only, the
+// per-block binding/scope validation (bit 8) and the per-row view lookups (bit 128) ran on the host inside the block
+// and the device waited for them: 0.4 s of an 8,192-row block, measured on both entry points with the same mask.
+// Future bits require serving lifecycle/cancellation/capacity/concurrency qualification.
+inline constexpr unsigned serving_pipe_mask = 0xffU;
+
+enum class PrefillConstruction { startup, on_demand };
+
+// Only pre-listen construction may eagerly admit the full tile. Lazy slots keep
+// request-time admission, including partial/tail geometry. Admission may poison
+// its owner on failure: propagate before the caller publishes the slot.
+template<class Owner, class Session, class Handoff>
+bool prepare_first_block_admission(bool early_setup, PrefillConstruction construction,
+    Owner& owner, const Session& live, Handoff&& hand_off) {
+    if (!early_setup || construction == PrefillConstruction::on_demand || live.next_position != 0)
+        return false;
+    auto setup_session = live;
+    hand_off(setup_session);
+    owner.prepare_prefill_geometry(setup_session);
+    return true;
+}
+enum class PrefillOwner : unsigned { single_request, resident_server };
+struct Organization {
+    unsigned items = 0U;      // defaults this owner may take
+    unsigned pipe_mask = ~0U; // bits of the default row-pipeline mask this owner takes
+};
+// The single-request owner also takes its reclamation and decoding items; a resident server keeps its own
+// (historical items at startup, decode organisation from its own admission) and adds only the organisation.
+constexpr Organization admitted_organization(PrefillOwner owner) noexcept {
+    return owner == PrefillOwner::single_request ? Organization{~0U, ~0U}
+        : Organization{prefill_organization_items, serving_pipe_mask};
+}
+// Every default the single-request owner takes and the resident server does not, with the reason serving requires
+// it. An item without a reason here is an unexplained difference: the parity host test fails on it.
+constexpr const char* serving_exclusion_reason(Item item) noexcept {
+    switch (item) {
+    case Item::ple_reclaim: return "resident weights stay registered; reclamation keeps its own route admission";
+    case Item::cohort_lean: case Item::rows_lean: case Item::dispatch_fuse:
+        return "decode organisation belongs to the batch runner's own admission";
+    default: return nullptr;
+    }
+}
+// Applies one admitted organisation. Explicit values (including every "0" off control), the baseline and
+// STRIX_QPF2K_DEFAULTS=0 keep their meaning: initialize never overrides them.
+template<class Get, class Put>
+unsigned apply_organization(const Organization& policy, Get get, Put put) {
+    return initialize(get, [&](const char* name, const char* value) {
+        if (std::string_view(name) != "STRIX_PREFILL_PIPE" || policy.pipe_mask == ~0U) return put(name, value);
+        const auto mask = static_cast<unsigned>(std::strtoul(value, nullptr, 0)) & policy.pipe_mask;
+        return mask != 0U && put(name, std::to_string(mask).c_str());
+    }, policy.items);
+}
 // Startup injection writes into the real environment, so a process that re-executes itself before
 // undo_pre_injected (eager code loading restarts the image) hands its injected values to the new image, which
 // would find them set and treat them as user values. This marker carries the injected set (items, plus

@@ -1,0 +1,4 @@
+D:/tmp/fix-pr567/.pr567-host/CMakeFiles/strix-row-layout-tests.dir
+D:/tmp/fix-pr567/.pr567-host/CMakeFiles/RUN_TESTS.dir
+D:/tmp/fix-pr567/.pr567-host/CMakeFiles/ALL_BUILD.dir
+D:/tmp/fix-pr567/.pr567-host/CMakeFiles/ZERO_CHECK.dir

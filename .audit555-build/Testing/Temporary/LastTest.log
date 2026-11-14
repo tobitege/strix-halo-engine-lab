@@ -1,0 +1,270 @@
+Start testing: Nov 13 10:30 Hora estándar romance
+----------------------------------------------------------
+1/8 Testing: audit555-flags
+1/8 Test: audit555-flags
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "flags"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-flags" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-flags" end time: Nov 13 10:30 Hora estándar romance
+"audit555-flags" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/8 Testing: audit555-control
+2/8 Test: audit555-control
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "control"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-control" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 25 logits a401387fcf11a05d state aefd5a191d95e3f7
+embed-identity control  PASS
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: PASS
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity control  FAIL
+embed-identity control inconclusive: choose an interval with distinct embedding rows
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 2) of 4, width 1, staging 0.00 MiB: FAIL
+embed-identity identity next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity control  FAIL
+embed-identity control inconclusive: choose an interval with distinct embedding rows
+embed-identity cut-f16  next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity cut-bf16 next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 2 logits 7468977f22fd4eac state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 2 logits 7468977f22fd4eac state aefd5a191d95e3f7
+embed-identity text     next 26 logits 4d55527f9df6fa8b state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity control  FAIL
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-control" end time: Nov 13 10:30 Hora estándar romance
+"audit555-control" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/8 Testing: audit555-image
+3/8 Test: audit555-image
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "image"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-image" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 25 logits a401387fcf11a05d state aefd5a191d95e3f7
+embed-identity control  PASS
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router FAIL
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 25 logits a401387fcf11a05d state aefd5a191d95e3f7
+embed-identity control  PASS
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead FAIL
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity PASS
+embed-identity control  next 25 logits a401387fcf11a05d state aefd5a191d95e3f7
+embed-identity control  PASS
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity image-router FAIL
+embed-identity image-dead FAIL
+embed-identity image    FAIL
+embed-identity image    logits equal to the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-image" end time: Nov 13 10:30 Hora estándar romance
+"audit555-image" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/8 Testing: audit555-hashes
+4/8 Test: audit555-hashes
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "hashes"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-hashes" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+embed-identity identity next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity identity FAIL
+embed-identity control  next 25 logits a401387fcf11a05d state aefd5a191d95e3f7
+embed-identity control  PASS
+embed-identity cut-f16  next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity cut-bf16 next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity bf16     PASS
+embed-identity image    next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity image-router PASS
+embed-identity image-dead PASS
+embed-identity image    PASS
+embed-identity image    logits differ from the plain run
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text     PASS
+embed-identity image-again next 25 logits 6c95137dfc875ed0 state aefd5a191d95e3f7
+embed-identity text     next 18 logits 6fa91e7fb150b4af state aefd5a191d95e3f7
+embed-identity text-after-short-splice PASS
+embed-identity rows [1, 4) of 4, width 1, staging 0.00 MiB: FAIL
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-hashes" end time: Nov 13 10:30 Hora estándar romance
+"audit555-hashes" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/8 Testing: audit555-dispatch
+5/8 Test: audit555-dispatch
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "dispatch"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-dispatch" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-dispatch" end time: Nov 13 10:30 Hora estándar romance
+"audit555-dispatch" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/8 Testing: audit555-engram
+6/8 Test: audit555-engram
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "engram"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-engram" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-engram" end time: Nov 13 10:30 Hora estándar romance
+"audit555-engram" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/8 Testing: audit555-capacity
+7/8 Test: audit555-capacity
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/audit555-host.exe" "capacity"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"audit555-capacity" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"audit555-capacity" end time: Nov 13 10:30 Hora estándar romance
+"audit555-capacity" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/8 Testing: session-embed-splice
+8/8 Test: session-embed-splice
+Command: "D:/tmp/fix-pr555/.audit555-build/Release/session-embed-splice.exe"
+Directory: D:/tmp/fix-pr555/.audit555-build
+"session-embed-splice" start time: Nov 13 10:30 Hora estándar romance
+Output:
+----------------------------------------------------------
+session embed splice tests passed
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"session-embed-splice" end time: Nov 13 10:30 Hora estándar romance
+"session-embed-splice" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 13 10:30 Hora estándar romance

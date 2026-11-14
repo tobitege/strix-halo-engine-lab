@@ -29,6 +29,7 @@
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
 #include "qwen_mtp_bundle.hpp"
+#include "strix/session/speculation_default.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
 #include <fstream>
@@ -246,6 +247,8 @@ struct Options {
     strix::qwen::profile::Inputs product_profile_inputs;
     strix::qwen::profile::Resolution product_profile;
     std::string mtp_bundle_path;
+    // The bundle was selected on the native (non-YaRN) route; the automatic prompt route may keep it.
+    bool mtp_native_bundle = false;
     std::string yarn_decode_source = "explicit";
     bool early_setup = true;
     bool eager_code_load = true;
@@ -873,10 +876,13 @@ inline void validate_prefill_numerical_profile_cli(const Options& options) {
             "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
     const auto option_mask = options.resolved_prefill_option_mask.value_or(resolve_prefill_options(
         [](const char* name) { return std::getenv(name); }, options.prefill_exact_fp16, options.prefill_disabled));
-    if (options.mtp.enabled && (pair.fast_components & strix::kFastPrefillHc) &&
+    // The default drafter bundle keeps the automatic prompt route's own prefill options: MTP replaces only the
+    // decode rows, which are verified against the target from the state those blocks produce.
+    const bool governed_mtp = options.mtp.enabled && !(options.mtp_native_bundle && options.automatic_prefill);
+    if (governed_mtp && (pair.fast_components & strix::kFastPrefillHc) &&
         (option_mask & strix::prefill_option_bit(strix::PrefillOption::hc_output_wmma)))
         throw std::invalid_argument("MTP fast HC output WMMA is unqualified; use --prefill-disable hc_output_wmma");
-    if (options.mtp.enabled && strix::index_wmma_unqualified_route(option_mask, pair.fast_components))
+    if (governed_mtp && strix::index_wmma_unqualified_route(option_mask, pair.fast_components))
         throw std::invalid_argument((option_mask & strix::prefill_option_bit(strix::PrefillOption::index_score_wmma)) ?
             "MTP index score WMMA is unqualified; use --prefill-disable index_proj_wmma,index_score_wmma" :
             "MTP index projection WMMA is unqualified; use --prefill-disable index_proj_wmma");
@@ -1550,7 +1556,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     // HTTP can supply its tiled owner after host memory admission. Validate the
     // calibration/asset contract here; validate_http_serve requires the owner
     // again after resolution and before device work.
-    const bool tiled=mtp_tiled_prompt(o) || http_prefill_pending(o);
+    const bool tiled=mtp_tiled_prompt(o) || http_prefill_pending(o) ||
+        (!resolved && o.mtp_native_bundle && !o.known_prefix_window); // the automatic prompt route tiles it
     if(!m.enabled){if(m.supplied)throw std::invalid_argument("MTP parameters require --mtp");return;}
     if(o.execution.mode!=DecodeExecutionMode::eager || o.execution.integer_head!=DecodeIntegerHead::none ||
        o.prepared_eager || o.moe_shared_overlap || o.moe_token_cost_policy || o.gdn_islands || o.gpu_greedy_token ||
@@ -1834,8 +1841,23 @@ inline Options parse_options(
         const char* inherited_baseline=std::getenv("STRIX_BASELINE");
         bool baseline=inherited_baseline && std::string_view(inherited_baseline)=="1";
         std::vector<std::string> expanded;
+        // The plain production command: MODEL, prompt tokens, a generation budget and nothing that owns a route.
+        bool no_mtp=false, plain=true, value_next=false;
+        std::size_t prompt_tokens=0;
+        std::uint64_t generate=0;
         for (int i=0;i<argc;++i) {
             const std::string arg=argv[i];
+            if (strix::session::speculation_opt_out_argument(arg)) {no_mtp=true;continue;}
+            if (i>=2) {
+                if (value_next) {
+                    value_next=false;
+                    if (argv[i-1]==std::string_view("--generate")) generate=std::strtoull(arg.c_str(),nullptr,10);
+                } else if (arg=="--generate" || arg=="--context") value_next=true;
+                else if (arg.starts_with("--generate=")) generate=std::strtoull(arg.c_str()+11,nullptr,10);
+                else if (arg.starts_with("--")) plain &= arg.starts_with("--context=") || arg=="--unqualified-context" ||
+                    arg=="--print-effective-config" || arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=");
+                else ++prompt_tokens;
+            }
             if (arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=")) {
                 if (!bundle.empty()) throw std::invalid_argument("duplicate --mtp-bundle");
                 if (arg=="--mtp-bundle") {
@@ -1854,11 +1876,23 @@ inline Options parse_options(
         yarn &= !baseline;
         if (!bundle.empty() && explicit_mtp) throw std::invalid_argument("explicit MTP flags and bundle are mutually exclusive");
         const char* env=std::getenv("STRIX_QWEN_YARN_MTP");
-        const bool off=yarn_bundle_serial_retry || (env && std::string_view(env)=="0");
-        if (yarn && !explicit_mtp && bundle.empty() && !off) {
-            const std::string discovered=std::string(argv[1])+".mtp-bundle.json";
-            if (std::filesystem::exists(discovered)) bundle=discovered;
-        }
+        // Shared default resolution; this engine declares an exact, faster path that needs a drafter bundle.
+        constexpr strix::session::SpeculationCapability capability{"qwen",true,true,true,true};
+        strix::session::SpeculationRequest speculation;
+        speculation.cli_opt_out=no_mtp;
+        speculation.environment=std::getenv(strix::session::speculation_environment);
+        speculation.baseline=baseline;
+        speculation.explicit_speculation=explicit_mtp || !bundle.empty();
+        // 16 calibration rows and the first generated row need 17 prompt tokens.
+        speculation.explicit_route=!yarn && (!plain || prompt_tokens<17U || generate<2U);
+        const std::string discovered=std::string(argv[1])+".mtp-bundle.json";
+        speculation.assets_found=!bundle.empty() || std::filesystem::exists(discovered);
+        const auto decision=strix::session::resolve_speculation_default(capability,speculation);
+        const bool off=yarn_bundle_serial_retry || (yarn && env && std::string_view(env)=="0") ||
+            decision.source=="cli-opt-out" || decision.source=="env-opt-out";
+        if (!explicit_mtp && bundle.empty() && !off && decision.source=="default") bundle=discovered;
+        if (!yarn && !yarn_bundle_serial_retry && decision.report_fallback)
+            std::cerr << strix::session::speculation_fallback_line(capability,"no drafter bundle at "+discovered) << '\n';
         if (yarn && !explicit_mtp && !off && bundle.empty() && env && std::string_view(env)=="1")
             throw std::invalid_argument("STRIX_QWEN_YARN_MTP=1 requires an MTP bundle");
         if ((!bundle.empty() || yarn_bundle_serial_retry) && !explicit_mtp) {
@@ -1866,6 +1900,9 @@ inline Options parse_options(
                 if (!off) {
                     auto loaded=read_mtp_bundle(bundle);
                     expanded.insert(expanded.end(),loaded.argv.begin(),loaded.argv.end());
+                    // The native tiled prompt qualifies the predictor on its first rows.
+                    if (!yarn && std::find(loaded.argv.begin(),loaded.argv.end(),"--mtp-calibration-rows")==loaded.argv.end())
+                        expanded.insert(expanded.end(),{"--mtp-calibration-rows","16"});
                 }
                 std::vector<char*> pointers;
                 for (auto& arg:expanded) pointers.push_back(arg.data());
@@ -1944,6 +1981,7 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--baseline") { options.baseline = true; continue; }
+        if (strix::session::speculation_opt_out_argument(argument)) continue;
         if (argument == "--rope-yarn" || argument.starts_with("--rope-yarn=")) {
             if (yarn_cli) throw std::invalid_argument("duplicate --rope-yarn");
             const auto equal = argument.find('=');
@@ -2010,7 +2048,10 @@ inline Options parse_options(
             options.route_owned = true;
             // The documented MTP window organization owns the MTP route itself; any other option owns a route of
             // its own.
-            if (!mtp_window_organization_option(argument)) options.route_owned_beyond_mtp = true;
+            // A bundle's own calibration rows belong to the bundle route.
+            if (!mtp_window_organization_option(argument) &&
+                (options.mtp_bundle_path.empty() || argument != "--mtp-calibration-rows"))
+                options.route_owned_beyond_mtp = true;
         }
 
         options.any_low_level_flag = options.any_low_level_flag ||
@@ -3357,8 +3398,7 @@ inline Options parse_options(
     }
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);
-    if (!options.mtp_bundle_path.empty() && options.rotary.mode()!=strix::RotaryMode::yarn)
-        throw std::invalid_argument("MTP bundles require YaRN");
+    options.mtp_native_bundle = !options.mtp_bundle_path.empty() && options.rotary.mode()!=strix::RotaryMode::yarn;
     if (options.rotary.mode() == strix::RotaryMode::yarn) {
         const auto reason = yarn_route_refusal(options);
         if (!reason.empty()) throw std::invalid_argument(reason);

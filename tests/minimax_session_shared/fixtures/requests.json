@@ -1,0 +1,7 @@
+[
+ {"eos":9,"body":{"prompt":"abc","max_tokens":4,"return_token_ids":true}},
+ {"eos":9,"body":{"prompt":"abc","max_tokens":4,"return_token_ids":true,"stream":true,"stream_options":{"include_usage":true}}},
+ {"eos":100,"body":{"prompt":"abc","max_tokens":1,"return_token_ids":true}},
+ {"eos":100,"body":{"prompt":"abc","max_tokens":4,"return_token_ids":true,"stream":true}},
+ {"eos":9,"body":{"prompt":"abc","max_tokens":4,"return_token_ids":true,"temperature":0.8,"top_p":0.9}}
+]

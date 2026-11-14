@@ -1,0 +1,8 @@
+{
+  "statuses": [200,200,200,400,400,400,400,404,200,200,200,200,200],
+  "cache_tokens": [0,2,2,null,null,null,null,null,2,2,0,0,4],
+  "text": "AB",
+  "stop_ids": [65,66,0],
+  "length_ids": [65,66],
+  "identity": "fixture-state-v1"
+}

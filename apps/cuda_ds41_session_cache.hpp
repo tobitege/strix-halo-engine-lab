@@ -1,6 +1,7 @@
 #pragma once
 // Host-only envelope around the existing attention serializer. No CUDA dependency.
 #include "strix/model_content_hash.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -25,16 +26,14 @@
 #endif
 #include <windows.h>
 #else
-#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/file.h>
-#include <unistd.h>
 #endif
 namespace strix::ds41::session {
+namespace io = strix::session::checkpoint_io;
 #ifdef STRIX_SESSION_CONSTRUCTION_TEST
 inline std::uint64_t session_filesystem_operations=0;
-// Observe every filesystem entry point used by session policy/storage, including
-// queries before resources exist. Production uses the standard namespace directly.
+// Observe family filesystem policy. Shared mechanics have their own activity()
+// witness; tests must check both. Production uses the standard namespace directly.
 namespace fs {
 using namespace std::filesystem;
 #define STRIX_SESSION_FS(name) template<class... A> auto name(A&&... a) { \
@@ -139,6 +138,7 @@ inline bool explicit_request(const std::vector<std::string>& args) {
 using Bytes = std::vector<std::uint8_t>;
 struct Error : std::runtime_error {
     std::string code;int status;
+    io::Operation operation=io::Operation::none;
     Error(std::string c,int n,const std::string& m):std::runtime_error(m),code(std::move(c)),status(n){}
 };
 inline Error protocol_error(const std::string& m) {
@@ -156,41 +156,21 @@ inline Error protocol_error(const std::string& m) {
 inline void require(bool ok, const char* message) { if (!ok) throw protocol_error(message); }
 // One shared lock serializes quota accounting, publication, reads and eviction.
 class DirectoryLock {
-#ifdef _WIN32
-    HANDLE handle_=INVALID_HANDLE_VALUE;OVERLAPPED offset_{};
-#else
-    int handle_=-1;
-#endif
+    std::unique_ptr<io::DirectoryLock> lock_;
 public:
     explicit DirectoryLock(fs::path dir,bool owner=false) {
         if(dir.empty())dir=".";
-        fs::create_directories(dir);
-        const auto file=dir/(owner?".owner.lock":".session.lock");
-#ifdef _WIN32
-        handle_=CreateFileW(file.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,
-                            nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
-        require(handle_!=INVALID_HANDLE_VALUE,"session lock open failed");
-        if(!LockFileEx(handle_,LOCKFILE_EXCLUSIVE_LOCK|(owner?LOCKFILE_FAIL_IMMEDIATELY:0),0,1,0,&offset_)) {
-            CloseHandle(handle_);if(owner)throw Error("session_tier_busy",409,"managed session tier is owned by another worker");
-            throw std::runtime_error("session lock failed");
+        try {
+            lock_=std::make_unique<io::DirectoryLock>(dir,
+                owner?io::LockMode::nonblocking:io::LockMode::blocking,
+                owner?".owner.lock":".session.lock",io::LockRange::first_byte);
+        } catch(const io::Error& e) {
+            if(owner&&e.lock_busy)throw Error("session_tier_busy",409,"managed session tier is owned by another worker");
+            auto error=protocol_error(e.what());error.operation=e.operation;throw error;
         }
-#else
-        handle_=::open(file.c_str(),O_CREAT|O_RDWR,0600);
-        require(handle_>=0,"session lock open failed");
-        if(::flock(handle_,LOCK_EX|(owner?LOCK_NB:0))!=0){::close(handle_);
-            if(owner)throw Error("session_tier_busy",409,"managed session tier is owned by another worker");
-            throw std::runtime_error("session lock failed");}
-#endif
     }
     DirectoryLock(const DirectoryLock&)=delete;
     DirectoryLock& operator=(const DirectoryLock&)=delete;
-    ~DirectoryLock(){
-#ifdef _WIN32
-        UnlockFileEx(handle_,0,1,0,&offset_);CloseHandle(handle_);
-#else
-        ::flock(handle_,LOCK_UN);::close(handle_);
-#endif
-    }
 };
 inline std::string sha(std::span<const std::uint8_t> b) {
     return model_content_identity_hex(sha256_bytes_fast(std::as_bytes(b)));
@@ -404,39 +384,20 @@ public:
     std::size_t size()const{return names_.size();}
     bool known(const std::string& id)const{return names_.count(id)!=0;}
 };
-inline void sync_file(const fs::path& p) {
-#ifdef _WIN32
-    HANDLE h=CreateFileW(p.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
-    require(h!=INVALID_HANDLE_VALUE,"checkpoint flush open failed");
-    const bool ok=FlushFileBuffers(h)!=0;CloseHandle(h);require(ok,"checkpoint flush failed");
-#else
-    int fd=::open(p.c_str(),O_RDONLY);require(fd>=0,"checkpoint flush open failed");
-    const bool ok=::fsync(fd)==0;::close(fd);require(ok,"checkpoint flush failed");
-#endif
-}
-inline void sync_dir(const fs::path& p) {
-#ifndef _WIN32
-    int fd=::open(p.c_str(),O_RDONLY|O_DIRECTORY);require(fd>=0,"checkpoint directory open failed");
-    const bool ok=::fsync(fd)==0;::close(fd);require(ok,"checkpoint directory flush failed");
-#else
-    (void)p; // MoveFileExW(MOVEFILE_WRITE_THROUGH) publishes the directory.
-#endif
+template<class F> inline void checkpoint_io_call(F&& f) {
+    try {f();}catch(const io::Error& e){auto error=protocol_error(e.what());error.operation=e.operation;throw error;}
 }
 inline void write_file(const fs::path& p,std::span<const std::uint8_t> b) {
-    std::ofstream o(p,std::ios::binary|std::ios::trunc);require(bool(o),"checkpoint write open failed");
-    o.write(reinterpret_cast<const char*>(b.data()),static_cast<std::streamsize>(b.size()));
-    o.flush();require(bool(o),"checkpoint write failed");o.close();sync_file(p);
+    checkpoint_io_call([&]{io::atomic_write(p,std::as_bytes(b));});
 }
 inline Bytes read_file(const fs::path& p,std::uint64_t limit,const Progress& progress={}) {
-    auto n=fs::file_size(p);require(n<=limit&&n<=std::uint64_t(SIZE_MAX),"checkpoint exceeds admission budget");
-    Bytes b(static_cast<std::size_t>(n));std::ifstream in(p,std::ios::binary);require(bool(in),"checkpoint read open failed");
-    for(std::size_t at=0;at<b.size();) {
-        const auto count=std::min<std::size_t>(8U*1024U*1024U,b.size()-at);
-        in.read(reinterpret_cast<char*>(b.data()+at),static_cast<std::streamsize>(count));
-        require(bool(in),"checkpoint truncated or changed");at+=count;
-        if(progress)progress("restore-read:"+p.filename().string(),at,b.size());
-    }
-    require(bool(in)&&in.peek()==std::char_traits<char>::eof(),"checkpoint truncated or changed");return b;
+    Bytes b;
+    checkpoint_io_call([&]{io::read(p,0,limit,[&](auto n){
+        b.resize(static_cast<std::size_t>(n));return std::as_writable_bytes(std::span(b));
+    },io::DirectIo::buffered,[&](auto chunk,auto at){
+        if(progress)progress("restore-read:"+p.filename().string(),at+chunk.size(),b.size());
+    },8U*1024U*1024U);});
+    return b;
 }
 // New immutable directory only. Interrupted .tmp directories remain inspectable.
 // Publish manifest last, flush every file, then atomic directory rename.
@@ -453,13 +414,9 @@ inline void publish_unlocked(const fs::path& dest,const Snapshot& s,const std::f
         text(manifest,name);u64(manifest,0);text(manifest,"replicated");u64(manifest,0);u64(manifest,b.size());text(manifest,sha(b));
         write_file(tmp/name,b);
     }
-    const auto root=sha(manifest);text(manifest,root);write_file(tmp/"manifest.bin",manifest);sync_dir(tmp);
+    const auto root=sha(manifest);text(manifest,root);write_file(tmp/"manifest.bin",manifest);checkpoint_io_call([&]{io::sync_directory(tmp);});
     if(flushed)flushed();
-#ifdef _WIN32
-    require(MoveFileExW(tmp.c_str(),dest.c_str(),MOVEFILE_WRITE_THROUGH)!=0,"checkpoint atomic publish failed");
-#else
-    fs::rename(tmp,dest);sync_dir(dest.parent_path().empty()?fs::path("."):dest.parent_path());
-#endif
+    checkpoint_io_call([&]{io::publish_directory(tmp,dest);});
 }
 inline void publish(const fs::path& dest,const Snapshot& s) {
     DirectoryLock lock(dest.parent_path());
@@ -620,15 +577,39 @@ class Disk {
     std::unique_ptr<DirectoryLock> owner_;
     std::optional<Error> unavailable_;
     void check_owner()const{if(busy_)throw Error("session_tier_busy",409,"managed session tier is owned by another worker");}
+    static bool linked(const fs::directory_entry& e) {
+#ifdef _WIN32
+#ifdef STRIX_SESSION_CONSTRUCTION_TEST
+        ++session_filesystem_operations;
+#endif
+        // MSVC reports directory junctions as directories, not symlinks. They
+        // are still aliases and must never become cleanup victims or quota owners.
+        const auto attributes=GetFileAttributesW(e.path().c_str());
+        require(attributes!=INVALID_FILE_ATTRIBUTES,"checkpoint entry attributes failed");
+        if(attributes&FILE_ATTRIBUTE_REPARSE_POINT)return true;
+#endif
+        return e.is_symlink();
+    }
     static bool generation_name(const std::string& name,std::string& id) {
         auto at=name.rfind(".g");if(at==std::string::npos)return false;
         auto digits=name.substr(at+2);if(digits.ends_with(".tmp"))digits.resize(digits.size()-4);
         if(digits.empty()||digits.find_first_not_of("0123456789")!=std::string::npos)return false;
         id=name.substr(0,at);try{valid_id(id);}catch(...){return false;}return true;
     }
+    static bool pointer_temporary(const std::string& filename) {
+        const auto at=filename.find(".current.tmp");if(at==std::string::npos)return false;
+        try{valid_id(filename.substr(0,at));}catch(...){return false;}
+        const auto tail=filename.substr(at+12);
+        if(tail.empty())return true;
+        if(tail.front()!='-')return false;
+        const auto split=tail.find('-',1);
+        return split!=std::string::npos&&split>1&&split+1<tail.size()&&
+            tail.substr(1,split-1).find_first_not_of("0123456789")==std::string::npos&&
+            tail.substr(split+1).find_first_not_of("0123456789")==std::string::npos;
+    }
     std::vector<fs::path> entries()const {
         std::vector<fs::path> out;if(dir_.empty())return out;
-        for(const auto& e:fs::directory_iterator(dir_))if(!e.is_symlink()&&e.is_regular_file()&&e.path().extension()==".current") {
+        for(const auto& e:fs::directory_iterator(dir_))if(!linked(e)&&e.is_regular_file()&&e.path().extension()==".current") {
             const auto id=e.path().stem().string();try{valid_id(id);out.push_back(dir_/id);}catch(...){}
         }
         return out;
@@ -639,17 +620,17 @@ class Disk {
     }
     std::uint64_t used_unlocked()const {
         std::uint64_t n=0;
-        if(!dir_.empty())for(auto& e:fs::directory_iterator(dir_))if(!e.is_symlink()&&
-            (e.is_directory()||e.path().extension()==".current"||e.path().string().ends_with(".current.tmp")))n+=size(e.path());
+        if(!dir_.empty())for(auto& e:fs::directory_iterator(dir_))if(!linked(e)&&
+            (e.is_directory()||e.path().extension()==".current"||pointer_temporary(e.path().filename().string())))n+=size(e.path());
         return n;
     }
     void erase_unlocked(const fs::path& name) {
-        const auto p=read_pointer(name);fs::remove(pointer_path(name));sync_dir(dir_);
+        const auto p=read_pointer(name);fs::remove(pointer_path(name));checkpoint_io_call([&]{io::sync_directory(dir_);});
         fs::remove_all(dir_/p.directory);
     }
     void cleanup_unlocked() {
         for(const auto& e:fs::directory_iterator(dir_)) {
-            if(e.is_symlink())continue;
+            if(linked(e))continue;
             const auto filename=e.path().filename().string();std::string id;
             if(e.is_directory()&&generation_name(filename,id)) {
                 const auto name=dir_/id;
@@ -658,7 +639,7 @@ class Disk {
                     try{if(read_pointer(name).directory==filename)continue;}catch(...){continue;}
                 }
                 fs::remove_all(e.path());
-            } else if(e.is_regular_file()&&filename.ends_with(".current.tmp"))fs::remove(e.path());
+            } else if(e.is_regular_file()&&pointer_temporary(filename))fs::remove(e.path());
         }
     }
 public:
@@ -731,13 +712,11 @@ public:
         const auto point=[&](Point p){if(fault)fault(p);};
         publish_unlocked(generation,s,[&]{point(Point::files_flushed);});point(Point::generation_published);
         Pointer next{id,generation.filename().string(),s.lineage,sha(read_file(generation/"manifest.bin",65536)),s.committed_generation};
-        const auto current=pointer_path(name),tmp=fs::path(current.string()+".tmp");
-        write_file(tmp,next.encode());point(Point::pointer_flushed);
-#ifdef _WIN32
-        require(MoveFileExW(tmp.c_str(),current.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0,"checkpoint pointer commit failed");
-#else
-        fs::rename(tmp,current);sync_dir(dir_);
-#endif
+        const auto current=pointer_path(name);const auto encoded=next.encode();
+        checkpoint_io_call([&]{
+            io::Publication pointer(current);pointer.write(std::as_bytes(std::span(encoded)));
+            pointer.commit([&]{point(Point::pointer_flushed);});
+        });
         point(Point::pointer_committed);
         if(previous)fs::remove_all(dir_/previous->directory);
         point(Point::old_removed);

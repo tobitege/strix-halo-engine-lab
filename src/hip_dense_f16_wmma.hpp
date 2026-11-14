@@ -355,7 +355,7 @@ template <class Site> void launch_dense_f16(const Site& site, hipStream_t stream
     const auto run = [&]<unsigned BM, unsigned BN, unsigned WM, unsigned WN>() {
         if constexpr (Site::rows % BM == 0U) {
             const unsigned blocks = Site::rows / BM * ((site.outputs + BN - 1U) / BN);
-            static const unsigned tune = env_unsigned("STRIX_INTPREFILL_DENSE_F16_TUNE", 4U);
+            static const unsigned tune = strix::env_number<unsigned>("STRIX_INTPREFILL_DENSE_F16_TUNE", 4U);
             const auto launch = [&]<unsigned T>() {
                 // Bit 2 covers tiles of up to 128 rows (the 256-row tile keeps the base pipeline).
                 if constexpr ((T & 4U) != 0U && BM <= 128U)
@@ -370,7 +370,7 @@ template <class Site> void launch_dense_f16(const Site& site, hipStream_t stream
             return true;
         } else return false;
     };
-    static const unsigned forced = env_unsigned("STRIX_DENSE_F16_TILE", 0U);
+    static const unsigned forced = strix::env_number<unsigned>("STRIX_DENSE_F16_TILE", 0U);
     const auto blocks_of = [&](unsigned bm, unsigned bn) { return Site::rows / bm * ((site.outputs + bn - 1U) / bn); };
     if (forced == 1U && run.template operator()<256U, 128U, 64U, 64U>()) return;
     if (forced == 2U && run.template operator()<128U, 128U, 64U, 32U>()) return;

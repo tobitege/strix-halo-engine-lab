@@ -97,7 +97,7 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
         const auto compact = build_indexed_attention_workspace_layout(model,256,false,1,true,true);
         plan.compact_qsa_output_savings = fp32.total_bytes - compact.total_bytes;
     }
-    const char* dump=std::getenv("STRIX_QRTX_STEP_DUMP");
+    static const char* const dump=std::getenv("STRIX_QRTX_STEP_DUMP"); // R2-13: read once
     plan.terminal_logits_arena=request.exact_memory && !serial.device_graph_inputs &&
         request.output_policy!=KnownWindowOutputPolicy::all_rows && (!dump || !*dump) &&
         ctx_exact_memory_enabled("STRIX_TERMINAL_LOGITS_ARENA");

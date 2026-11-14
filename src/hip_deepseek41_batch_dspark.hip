@@ -1,6 +1,7 @@
 #include "strix/deepseek41_batch_dspark.hpp"
 
 #include "strix/ds41_dspark_vocab.hpp"
+#include "strix/hip_check.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -22,7 +23,7 @@ using clock_type = std::chrono::steady_clock;
 double since(clock_type::time_point t) { return std::chrono::duration<double>(clock_type::now() - t).count(); }
 
 void check(hipError_t e, const char* what) {
-    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 batch dspark: ") + what + ": " + hipGetErrorString(e));
+    ::strix::hip_check_prefixed("deepseek41 batch dspark: ", e, what);
 }
 
 constexpr std::uint32_t stage_rows = 128;  // kept rows staged per slot before they go to its drafting context

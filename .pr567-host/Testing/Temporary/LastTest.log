@@ -1,0 +1,19 @@
+Start testing: Nov 13 14:17 Hora estándar romance
+----------------------------------------------------------
+1/1 Testing: strix-row-layout-tests
+1/1 Test: strix-row-layout-tests
+Command: "D:/tmp/fix-pr567/.pr567-host/Release/strix-row-layout-tests.exe"
+Directory: D:/tmp/fix-pr567/.pr567-host
+"strix-row-layout-tests" start time: Nov 13 14:17 Hora estándar romance
+Output:
+----------------------------------------------------------
+row layout tests passed
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"strix-row-layout-tests" end time: Nov 13 14:17 Hora estándar romance
+"strix-row-layout-tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 13 14:17 Hora estándar romance

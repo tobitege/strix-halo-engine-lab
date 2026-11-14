@@ -4,14 +4,139 @@
 #include <sstream>
 #include <functional>
 #include <chrono>
+#include <source_location>
 using namespace strix::ds41::session;
+#ifdef NDEBUG
+#error CUDA DS41 host tests require active assertions
+#endif
 static int checks=0;
-void check(bool ok) {++checks;if(!ok)throw std::runtime_error("test check failed");}
+void check(bool ok,std::source_location at=std::source_location::current()) {++checks;if(!ok)throw std::runtime_error("test check failed at line "+std::to_string(at.line()));}
 void refuses(const std::function<void()>& f) {bool rejected=false;try{f();}catch(const std::exception&){rejected=true;}check(rejected);}
+// Optional independent codec oracle. Fixed lineage and turn counters are deliberate.
+static Snapshot oracle_snapshot(bool draft,bool advanced=false) {
+    Snapshot s;s.compat=sha(bytes("r12-fixed-compat"));s.lineage="0123456789abcdef0123456789abcdef";
+    s.committed_generation=advanced?8:7;
+    strix::deepseek41::AttentionState a;a.position=3;a.next_token=advanced?29:23;
+    a.tokens={1,7,11};a.layers.resize(40);
+    for(auto& l:a.layers)l.ring.resize(136*528,17);
+    s.attention=strix::deepseek41::serialize_attention_state(a);
+    s.frontier.consumed=s.frontier.accepted=3;s.frontier.pending=a.next_token;
+    s.frontier.emitted=advanced?19:17;s.frontier.turns=advanced?5:4;
+    if(draft) {
+        DraftState d;d.start=0;d.next=3;d.core=128;d.extra={128,900};
+        for(unsigned i=0;i<3;++i)d.rings[i].resize(128*528,static_cast<std::uint8_t>(i+31));
+        s.drafter=d.encode();s.frontier.dspark=true;s.frontier.fixed=3;s.frontier.draft=3;
+    }
+    return s;
+}
+static void oracle_equal(const Snapshot& a,const Snapshot& b) {
+    check(a.attention==b.attention&&a.drafter==b.drafter&&a.frontier.encode()==b.frontier.encode());
+    check(a.compat==b.compat&&a.lineage==b.lineage&&a.committed_generation==b.committed_generation);
+}
+static int oracle(const std::string& mode,const fs::path& root) {
+    const bool emit=mode=="--capture";
+    if(emit) {check(!fs::exists(root));fs::create_directories(root);}
+    for(bool draft:{false,true}) {
+        const auto folder=root/(draft?"draft":"plain");auto old=oracle_snapshot(draft),next=oracle_snapshot(draft,true);
+        Config c;c.dir=folder/"managed";c.disk=true;c.disk_explicit=true;c.disk_bytes=32*1024*1024;
+        if(emit) {
+            publish(folder/"immutable",old);
+            Disk disk;disk.open(c,1024);check(disk.enabled());disk.put("A",old);
+            oracle_equal(restore(disk.path("A"),old.compat,16*1024*1024),old);
+            disk.put("A",next);refuses([&]{disk.put("A",old);});
+        }
+        oracle_equal(restore(folder/"immutable",old.compat,16*1024*1024),old);
+        Disk restart;restart.open(c,1024);check(restart.enabled());
+        oracle_equal(restore(restart.path("A"),old.compat,16*1024*1024),next);
+        check(read_pointer(restart.path("A")).directory=="A.g2");
+    }
+    std::cout<<"independent oracle "<<mode<<" PASS\n";return 0;
+}
+#ifdef _WIN32
+struct Child {
+    PROCESS_INFORMATION process{};
+    Child(const std::wstring& mode,const fs::path& path) {
+        wchar_t exe[32768];check(GetModuleFileNameW(nullptr,exe,32768)>0);
+        auto command=L"\""+std::wstring(exe)+L"\" "+mode+L" \""+fs::absolute(path).wstring()+L"\"";
+        STARTUPINFOW startup{};startup.cb=sizeof(startup);
+        check(CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process)!=0);
+    }
+    ~Child(){if(process.hProcess){if(WaitForSingleObject(process.hProcess,0)==WAIT_TIMEOUT){TerminateProcess(process.hProcess,99);WaitForSingleObject(process.hProcess,10000);}
+        CloseHandle(process.hThread);CloseHandle(process.hProcess);}}
+    DWORD finish(){check(WaitForSingleObject(process.hProcess,10000)==WAIT_OBJECT_0);DWORD code=99;check(GetExitCodeProcess(process.hProcess,&code)!=0);return code;}
+};
+static std::array<DWORD,3> inode(const fs::path& path) {
+    const auto h=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    check(h!=INVALID_HANDLE_VALUE);BY_HANDLE_FILE_INFORMATION i{};check(GetFileInformationByHandle(h,&i)!=0);CloseHandle(h);
+    return {i.dwVolumeSerialNumber,i.nFileIndexHigh,i.nFileIndexLow};
+}
+static void process_publication_boundaries(const fs::path& root) {
+    for(unsigned stop=0;stop<5;++stop) {
+        const auto tier=root/std::to_string(stop);
+        {Child crash(L"--crash-publish-"+std::to_wstring(stop),tier);check(crash.finish()==0);}
+        {Child restart(L"--verify-crash-"+std::to_wstring(stop),tier);check(restart.finish()==0);}
+    }
+}
+static void legacy_process_locks(const fs::path& root) {
+    fs::create_directories(root);
+    for(const auto* name:{L".owner.lock",L".session.lock"}) {
+        const auto file=root/name;
+        const auto h=CreateFileW(file.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+        check(h!=INVALID_HANDLE_VALUE);const auto identity=inode(file);
+        for(DWORD offset:{0U,1U}) {
+            OVERLAPPED ov{};ov.Offset=offset;check(LockFileEx(h,LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY,0,1,0,&ov)!=0);
+            {
+                Child child(name==std::wstring(L".owner.lock")?L"--owner-only-child":L"--transaction-child",root);
+                if(offset==0&&name==std::wstring(L".session.lock")) {
+                    check(WaitForSingleObject(child.process.hProcess,100)==WAIT_TIMEOUT);
+                    check(!fs::exists(root/"transaction-acquired"));
+                    check(UnlockFileEx(h,0,1,0,&ov)!=0);check(child.finish()==0);
+                } else {
+                    check(child.finish()==(offset==0?9U:0U));check(UnlockFileEx(h,0,1,0,&ov)!=0);
+                }
+            }
+            check(inode(file)==identity);fs::remove(root/"transaction-acquired");
+        }
+        CloseHandle(h);
+    }
+    // Child owns a real Disk until process exit; the next process reopens it.
+    {Child first(L"--exit-owner-child",root);check(first.finish()==0);}
+    {Child transaction(L"--exit-transaction-child",root);check(transaction.finish()==0);}
+    {Child released(L"--transaction-child",root);check(released.finish()==0);}
+    {Child restart(L"--lock-child",root);check(restart.finish()==0);}
+    check(fs::exists(root/".owner.lock")&&fs::exists(root/".session.lock"));
+}
+#endif
 int main(int argc,char** argv) {
  try {
+    if(argc==3&&(std::string(argv[1])=="--capture"||std::string(argv[1])=="--verify"))return oracle(argv[1],argv[2]);
 #ifdef _WIN32
-    if(argc==3&&std::string(argv[1])=="--lock-child") {
+    if(argc==3&&(std::string(argv[1]).starts_with("--crash-publish-")||std::string(argv[1]).starts_with("--verify-crash-"))) {
+        const std::string mode=argv[1];const auto stop=unsigned_value(mode.substr(mode.rfind('-')+1));check(stop<5);
+        Config c;c.dir=argv[2];c.disk=true;c.disk_explicit=true;c.disk_bytes=32*1024*1024;
+        Disk d;d.open(c,1024);check(d.enabled());
+        const auto old=oracle_snapshot(true),next=oracle_snapshot(true,true);
+        if(mode.starts_with("--crash")) {
+            d.put("A",old);d.put("A",next,[&](auto p){if(static_cast<unsigned>(p)==stop)ExitProcess(0);});
+            return 1;
+        }
+        oracle_equal(restore(d.path("A"),old.compat,16*1024*1024),stop>=3?next:old);
+        const auto selected=read_pointer(d.path("A"));unsigned generations=0;
+        for(const auto& e:fs::directory_iterator(c.dir)) {
+            check(e.path().filename().string().find(".tmp")==std::string::npos);
+            if(e.is_directory()){++generations;check(e.path().filename()==selected.directory);}
+        }
+        check(generations==1);return 0;
+    }
+    if(argc==3&&(std::string(argv[1])=="--transaction-child"||std::string(argv[1])=="--exit-transaction-child")) {
+        DirectoryLock lock(argv[2]);write_file(fs::path(argv[2])/"transaction-acquired",bytes("ok"));
+        if(std::string(argv[1])=="--exit-transaction-child")ExitProcess(0);return 0;
+    }
+    if(argc==3&&std::string(argv[1])=="--owner-only-child") {
+        try{DirectoryLock lock(argv[2],true);return 0;}
+        catch(const Error& e){check(e.code=="session_tier_busy"&&e.status==409);return 9;}
+    }
+    if(argc==3&&(std::string(argv[1])=="--lock-child"||std::string(argv[1])=="--exit-owner-child")) {
         Config child_config;child_config.enabled=true;child_config.disk=true;child_config.dir=argv[2];
         child_config.disk_explicit=true;child_config.disk_bytes=128*1024;
         Disk child_disk;
@@ -20,16 +145,27 @@ int main(int argc,char** argv) {
         }
         require(child_disk.enabled(),"child disk open");
         Snapshot snapshot;snapshot.compat=sha(bytes("child"));snapshot.attention=bytes("child-state");
-        child_disk.put("child",snapshot);
+        child_disk.erase("child");child_disk.put("child",snapshot);
         require(child_disk.used()<=child_disk.budget(),"child quota");
         child_disk.touch("child");require(child_disk.erase("child"),"child eviction");
         child_disk.put("child",snapshot);
-        write_file(fs::path(argv[2])/"child-acquired",bytes("ok"));return 0;
+        write_file(fs::path(argv[2])/"child-acquired",bytes("ok"));
+        if(std::string(argv[1])=="--exit-owner-child")ExitProcess(0);return 0;
     }
 #endif
     const auto dir=fs::path(argc>1?argv[1]:"session-cache-test-output") /
         ("run-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     require(!fs::exists(dir),"test output must be a fresh directory");fs::create_directories(dir);
+    {
+        const Bytes large(8U*1024U*1024U+3U,19);write_file(dir/"read-progress",large);
+        std::vector<std::uint64_t> chunks;
+        check(read_file(dir/"read-progress",large.size(),[&](const auto& stage,auto done,auto total){
+            check(stage=="restore-read:read-progress"&&total==large.size());chunks.push_back(done);
+        })==large);
+        check(chunks==std::vector<std::uint64_t>({8U*1024U*1024U,large.size()}));
+        try{(void)read_file(dir/"read-progress",1);check(false);}
+        catch(const Error& e){check(e.code=="session_budget"&&e.status==507);}
+    }
     check(sha(bytes("abc"))=="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     // CPU injection of CUDA-resolved identity: selector spellings have no role.
     const auto compat=[&](const std::wstring& selector,const std::wstring& cache,
@@ -324,6 +460,11 @@ int main(int argc,char** argv) {
         Config released;released.dir=shared;released.disk=true;released.disk_explicit=true;released.disk_bytes=128*1024;
         Disk next;next.open(released,1024);check(next.enabled());next.put("released",s);
     }
+#endif
+#ifdef _WIN32
+    legacy_process_locks(dir/"external-locks");process_publication_boundaries(dir/"process-boundaries");
+#else
+    std::cout<<"NOT RUN Windows byte-range/process interoperability on this platform\n";
 #endif
     std::cout<<"PASS "<<checks<<" CPU checks; artifacts "<<dir.string()<<"\n";return 0;
  } catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}

@@ -1,0 +1,6 @@
+Versión de MSBuild 17.14.60+43b635718 para .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule D:/tmp/fix-pr567/tests/pr567_host/CMakeLists.txt
+  row_layout_tests.cpp
+  strix-row-layout-tests.vcxproj -> D:\tmp\fix-pr567\.pr567-host\Release\strix-row-layout-tests.exe

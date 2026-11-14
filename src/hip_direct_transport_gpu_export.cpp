@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_direct_transport_gpu_export.hpp"
 
 #include <hip/hip_runtime_api.h>
@@ -16,9 +17,7 @@
 
 namespace strix::transport {
 namespace {
-void check(hipError_t result, const char* operation) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 [[maybe_unused, noreturn]] void unsupported() { throw std::logic_error("HIP DMA-BUF FD export requires supported Linux HIP/kernel/device"); }
 } // namespace
 HipDirectGpuExportCalls HipDirectGpuExportCalls::native() {
@@ -57,10 +56,10 @@ HipDirectGpuExportIo::HipDirectGpuExportIo(HipDirectGpuExportCalls calls) : call
 DirectGpuExportDevice HipDirectGpuExportIo::inspect_device() {
     DirectGpuExportDevice result;
     int device = -1, runtime = 0, driver = 0;
-    check(calls_.get_device(&device), "HIP export active device");
-    hipUUID uuid{}; check(calls_.device_uuid(&uuid, device), "HIP export device UUID");
-    check(calls_.runtime_version(&runtime), "HIP export runtime version");
-    check(calls_.driver_version(&driver), "HIP export driver version");
+    hip_check(calls_.get_device(&device), "HIP export active device");
+    hipUUID uuid{}; hip_check(calls_.device_uuid(&uuid, device), "HIP export device UUID");
+    hip_check(calls_.runtime_version(&runtime), "HIP export runtime version");
+    hip_check(calls_.driver_version(&driver), "HIP export driver version");
     static_assert(sizeof(uuid.bytes) == result.uuid.size());
     std::memcpy(result.uuid.data(), uuid.bytes, result.uuid.size());
     result.index = device; result.runtime_version = runtime; result.driver_version = driver;
@@ -68,9 +67,9 @@ DirectGpuExportDevice HipDirectGpuExportIo::inspect_device() {
 }
 DirectGpuExportAllocation HipDirectGpuExportIo::inspect_allocation(const TransportBufferView& view) {
     hipPointerAttribute_t attributes{};
-    check(calls_.pointer_attributes(&attributes, reinterpret_cast<const void*>(view.address)), "HIP export pointer attributes");
+    hip_check(calls_.pointer_attributes(&attributes, reinterpret_cast<const void*>(view.address)), "HIP export pointer attributes");
     hipDeviceptr_t base = nullptr; std::size_t bytes = 0;
-    check(calls_.address_range(&base, &bytes, reinterpret_cast<hipDeviceptr_t>(view.address)), "HIP export native allocation extent");
+    hip_check(calls_.address_range(&base, &bytes, reinterpret_cast<hipDeviceptr_t>(view.address)), "HIP export native allocation extent");
     return {reinterpret_cast<std::uintptr_t>(base), bytes, attributes.device,
             attributes.type == hipMemoryTypeDevice, attributes.isManaged != 0};
 }
@@ -80,7 +79,7 @@ void HipDirectGpuExportIo::export_dma_buf(const DirectGpuExportAllocation& alloc
         allocation.bytes > std::numeric_limits<std::size_t>::max()) throw std::invalid_argument("HIP export requires an empty FD slot and bounded native range");
     // HIP returns an owned DMA-BUF fd, distinct from a generic VMM/opaque fd.
     // The owner has adopted the output slot before the native call can fail.
-    check(calls_.dma_buf_range_export(&descriptor, reinterpret_cast<hipDeviceptr_t>(allocation.base),
+    hip_check(calls_.dma_buf_range_export(&descriptor, reinterpret_cast<hipDeviceptr_t>(allocation.base),
         static_cast<std::size_t>(allocation.bytes)), "HIP DMA-BUF range export");
     if (descriptor < 0) throw std::runtime_error("HIP export returned no owned descriptor");
     const auto flags = calls_.get_fd_flags(descriptor);

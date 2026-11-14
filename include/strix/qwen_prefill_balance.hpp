@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/serve/json.hpp"
 #include "strix/pair/balance.hpp"
+#include "strix/pair/pipe.hpp"
 #include <array>
 #include <algorithm>
 #include <vector>
@@ -20,8 +21,15 @@ inline std::uint32_t validate_cut(std::uint32_t cut, const LegalCuts& legal) {
         throw std::invalid_argument("pair prefill cut requires an interior folded attention-HC boundary of the reference kind");
     return cut;
 }
+// Unset STRIX_QWEN_PF_PIPE_CUT: stage A ends after layer 22 (cut 23), measured fastest with 4,096-row chunks
+// (32K 12.08 s vs 12.44-12.51 s at 24; 128K 47.53-47.55 s vs 49.36-50.15 s; 20-22 slower), because stage A also
+// runs the embedding/PLE prelude and the seam pack. Falls back to 24 when 23 is not a legal boundary.
+// STRIX_QWEN_PF_PIPE_CUT=24 restores the even split. With stage B timed honestly (it drains the device before
+// waiting for a frame) the stages at 23 are 10.0-10.1 s and 10.2 s at 32K; half-layer cuts 22.5 and 23.5 measured
+// 11.82-11.85 s against 11.61-11.69 s at 23, so 23 stays.
+inline constexpr std::uint32_t measured_default_cut = 23U;
 inline std::uint32_t parse_cut(const char* value, const LegalCuts& legal) {
-    std::uint32_t cut = 24;
+    std::uint32_t cut = legal[measured_default_cut] ? measured_default_cut : 24U;
     if (value) {
         const std::string_view text(value);
         const auto parsed = std::from_chars(text.data(), text.data() + text.size(), cut);
@@ -30,8 +38,40 @@ inline std::uint32_t parse_cut(const char* value, const LegalCuts& legal) {
     }
     return validate_cut(cut, legal);
 }
+// STRIX_QWEN_PF_PIPE_CUT=N.5 cuts inside layer N, after its attention sub-block (stage A runs the attention of
+// layer N, stage B its expert half). `legal_half[N]` marks layers whose feed-forward mix can carry the seam.
+inline pair::StageCut parse_stage_cut(const char* value, const LegalCuts& legal, const LegalCuts& legal_half) {
+    if (!value || std::string_view(value).find('.') == std::string_view::npos) return parse_cut(value, legal);
+    pair::StageCut cut;
+    try { cut = pair::StageCut::parse(value); }
+    catch (const std::invalid_argument&) {
+        throw std::invalid_argument("STRIX_QWEN_PF_PIPE_CUT requires a layer number or a half layer (N.5)");
+    }
+    if (cut.layer == 0U || cut.layer >= 48U || !legal_half[cut.layer])
+        throw std::invalid_argument("pair prefill half-layer cut requires an interior feed-forward HC boundary");
+    return cut;
+}
+// Whole cuts (first = true): the layer opens with `mix` and has `inject`. Half cuts: it has both, in that order.
+template<class Steps, class Op> LegalCuts legal_cuts(const Steps& steps, Op mix, Op inject, bool first) {
+    LegalCuts legal{};
+    for (std::uint32_t layer = 1; layer < 48U; ++layer) {
+        bool opened = false, mixed = false, injected = false, valid = true;
+        for (const auto& step : steps) {
+            if (step.layer != layer) continue;
+            if (step.op == mix) { if (first && opened) valid = false; mixed = true; }
+            else if (step.op == inject) { if (!mixed) valid = false; injected = true; }
+            opened = true;
+        }
+        legal[layer] = valid && mixed && injected;
+    }
+    return legal;
+}
 struct LayerCosts {
     std::array<double, 48> layers{};
+    // Optional "attention": per-layer cost of the attention sub-block (part of `layers`); enables half-layer cuts
+    // in the cost-model choice. Without it an explicit half cut is predicted as half of its layer.
+    std::array<double, 48> attention{};
+    bool has_attention = false;
     double lm_head = 0;
     std::uint64_t context = 0;
     // Measured sender staging/CRC/wire cost; optional for old compute-only files.
@@ -84,6 +124,16 @@ inline LayerCosts parse_costs(std::string_view text, std::uint64_t context) {
             candidate.layers[layer] = cost_number(cost_field(layers, std::to_string(layer)));
             total += candidate.layers[layer];
         }
+        if (const auto* attention = bucket.find("attention")) {
+            if (!attention->is_object() || attention->as_object().size() != candidate.attention.size())
+                throw std::invalid_argument("pair prefill costs require exactly 48 attention costs");
+            for (std::size_t layer = 0; layer < candidate.attention.size(); ++layer) {
+                candidate.attention[layer] = cost_number(cost_field(*attention, std::to_string(layer)));
+                if (candidate.attention[layer] > candidate.layers[layer])
+                    throw std::invalid_argument("pair prefill attention cost exceeds its layer cost");
+            }
+            candidate.has_attention = true;
+        }
         candidate.lm_head = cost_number(cost_field(bucket, "lm_head"));
         if (!std::isfinite(total + candidate.lm_head) || total <= 0)
             throw std::invalid_argument("pair prefill costs require positive finite layer work");
@@ -100,15 +150,27 @@ inline LayerCosts load_costs(const char* path, std::uint64_t context) {
     const std::string text{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     return parse_costs(text, context);
 }
-struct CutPrediction { std::uint32_t cut = 24; double a = 0; double b = 0; };
-inline CutPrediction predict_cut(const LayerCosts& costs, std::uint32_t cut) {
-    const auto split = pair::predict_split(costs.layers, costs.lm_head, cut);
-    return {split.cut, split.a, split.b};
+struct CutPrediction {
+    std::uint32_t cut = 24; double a = 0; double b = 0; bool half = false;
+    pair::StageCut stage() const noexcept { return {cut, half}; }
+};
+inline std::array<double, 48> attention_costs(const LayerCosts& costs) {
+    if (costs.has_attention) return costs.attention;
+    auto front = costs.layers;
+    for (auto& value : front) value *= 0.5;
+    return front;
 }
-inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal) {
+inline CutPrediction predict_cut(const LayerCosts& costs, pair::StageCut cut) {
+    const auto split = pair::predict_split(costs.layers, attention_costs(costs), costs.lm_head, cut.layer, cut.half);
+    return {split.cut, split.a, split.b, split.half};
+}
+// Half-layer cuts compete only when the costs carry the attention sub-block times.
+inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal, const LegalCuts& legal_half = {}) {
     try {
-        const auto split = pair::balance_split(costs.layers, costs.lm_head, [&](std::uint32_t cut) { return legal[cut]; });
-        return {split.cut, split.a, split.b};
+        const auto split = pair::balance_split(costs.layers, attention_costs(costs), costs.lm_head,
+            [&](std::uint32_t cut) { return legal[cut]; },
+            [&](std::uint32_t cut) { return costs.has_attention && legal_half[cut]; });
+        return {split.cut, split.a, split.b, split.half};
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument("pair prefill model has no legal folded attention-HC cut");
     }

@@ -79,12 +79,55 @@ when it stops.
 
 ## Default prompt prefill
 
-On the qualified native Qwen checkpoint and target, HTTP serving now resolves a known-prefix
-T8192 owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
-pins and window budgets; tiled-prefill organization flags and budgets can be omitted. Unlike
-single-request auto prefill, the server cannot choose T from an incoming prompt at startup.
-It preserves the resolved decode/prefill numerical profiles and explicit context capacity;
-this does not enable automatic FP16 arithmetic. Request prompts must still fit that capacity.
+On the qualified native Qwen checkpoint and target, HTTP serving resolves its known-prefix
+owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
+pins and window budgets; tiled-prefill organization flags and budgets can be omitted.
+
+The server and the single-request command take the route from one rule (`resolve_prompt_route`
+in `apps/qwen_effective_config.hpp`). The single-request command passes its prompt; the server
+cannot see a prompt at startup, so it passes the largest request its context admits, plus its
+own constraints. The server therefore resolves:
+
+- **the primary tile**: T8192, or T16384 when the context admits a request of at least 32,768
+  tokens (the single-request threshold; `STRIX_QPF2K_T16K=1` asks for it from 16,384, any other
+  value disables it) and the T16384 owner fits in memory beside every requested slot
+  (`--http-batch`: each slot's bridge cost plus the retained decode stack of every slot after the
+  first, the equation the runtime slot capacity uses) with the file-backed table still resident. Otherwise it falls back to T8192
+  and then to smaller tiles. `STRIX_QPF2K_T16K=1` keeps the plain memory bound;
+- **the prefill arithmetic**: the automatic FP16 prefill profile of the single-request route
+  whenever the decode profile is the dense-A8 profile and no prefill profile is explicit
+  (`STRIX_PREFILL_F16=0` declines it). A server whose MTP owner is an explicit sidecar keeps this
+  arithmetic with `hc_output_wmma`, `index_proj_wmma`, `index_score_wmma` and `gdn_fp16_chunk` off, the
+  exclusion verified bundles already take (`STRIX_SERVE_FP16_MTP=0` declines the arithmetic instead);
+- **the decode profile**: a server that sets no `--numerical-profile` and no low-level
+  organization flag takes the single-request decode profile and organization. An explicit
+  profile or organization is preserved as before.
+
+The `Qwen serve-prefill:` line printed at load names the tile and the arithmetic, and gives the
+reason whenever T16384 or the automatic arithmetic is declined. `STRIX_SERVE_T16K=0` keeps the
+T8192 owner. `STRIX_SERVE_ROUTE=0` restores the earlier server rule (T8192, resolved arithmetic
+unchanged). Explicit context capacity is preserved; request prompts must still fit it.
+
+An admitted server owner also takes the prefill organization of the single-request route: one
+policy value, applied by both after route admission. It covers row-loop steps as registered
+batches and one strided tap copy (`STRIX_PREFILL_PIPE` bits 16 and 2), attention stage batching
+(`STRIX_QSA_NORM_GROUP`, `STRIX_QSA_ATTEND_BATCH`, `STRIX_QSA_INDEX_ROWS`, `STRIX_QSA_SCORE_PARK`,
+`STRIX_QPF2K_SCORE_ROWS`), table batching (`STRIX_PREFILL_PLE_BATCH`) and the expert header and
+merge policies (`STRIX_QPF2K_MOE_HDR`, `STRIX_QPF2K_MOE_XOR64`, `STRIX_QPF2K_MOE_MC`,
+`STRIX_QPF2K_SHARED_PRE`). These change launches, copies and scheduling, not arithmetic. The
+server does not take the reclamation or decoding items of the single-request route. The load
+line reports how many items were applied and the row-pipeline mask. `STRIX_SERVE_PREFILL_ORG=0`
+keeps the startup items only; each item keeps its own `0` switch, and `STRIX_QPF2K_DEFAULTS=0`
+disables all of them.
+
+Measured on one Strix Halo node (same binary, `STRIX_SERVE_ROUTE=0` as the earlier rule, context
+33,280, four slots, explicit-sidecar MTP, interleaved runs): time to first token through the
+resident server 6.74-7.35 s versus 9.72-10.10 s for an 8,192-token prompt and 27.4-29.6 s versus
+39.5-41.2 s for a 32,768-token prompt. The served token IDs equal the single-request command's
+for both prompts; with the earlier rule the 32,768-token prompt did not. On that node the
+T16384 owner is declined (it would cost one of four slots), and the load line says so. Decode
+cost per MTP cycle is unchanged; short prompts can produce a different greedy continuation than
+the earlier server arithmetic did, because the prompt arithmetic now is the single-request one.
 
 Automatic candidates that would create an extra `STRIX_PROMPT_BATCH_ROWS` owner decline
 with an actionable notice before allocation in both startup and inspection. Unset that
@@ -131,6 +174,16 @@ Later HTTP slot admission refuses zero capacity, including explicit `--http-batc
 headroom, and rechecks available memory before lazy growth; a larger shared prefill arena can
 reduce admitted slot capacity. The default context remains 8192; longer contexts require the
 existing explicit context contract and do not acquire a new qualification claim.
+
+The slot arithmetic is shared by every serving family (`include/strix/serve/slot_capacity.hpp`):
+a slot has retained bytes (persistent state, paid by every built slot) and an active peak
+(scratch while it runs); each memory pool gives a slot count and the smallest one is the limiting
+term. Two opt-in switches, both off by default (slot counts and outputs are unchanged without them):
+
+| Switch | Effect |
+|---|---|
+| `STRIX_SERVE_CENSUS=1` | With `--http-serve`, prints `serve-census point=before_load\|after_load\|probe` lines to stderr: host total/available, device-visible limit/used/free, kernel counters (`MemFree`, `Cached`, `Shmem`, `AnonPages`, `Mapped`, `Unevictable`, `Mlocked`, slab), the process (`self_VmRSS`, `self_RssAnon`, `self_RssFile`, `self_RssShmem`, `self_VmLck`, `self_VmPin`), registered model bytes and what the slot fit charged. `serve-census-delta` lines give the signed change between points, and one `serve-capacity` line gives the slot count each pool allows and the limiting term. All values are bytes. Use it to see where host memory goes between startup and the slot probe. |
+| `STRIX_SERVE_SLOT_EXACT=1` | Charges the prompt tap buffers a slot really allocates (one, or two with `STRIX_PREFILL_PIPE` bit 1) instead of always two. The measured probe and the headroom rule still bound the slot count. Not yet qualified on device. |
 
 For a configured prefix cache, omitted `--prefix-cache-block-rows` selects 1024 when it divides T.
 This changes checkpoint granularity, not automatic cache-budget qualification (which remains
@@ -295,6 +348,13 @@ window stream shared by all slots. The calibration replay runs once.
   decode rounds between its units; it then decodes with the others and the long block resumes. One nested
   prompt per pause; T8192 with the default tails and the dense-A8 prefill only (other routes decline, counted
   in `nest_skip_reasons`).
+- Join rule (`include/strix/serve/prompt_join.hpp`, `STRIX_BATCH_NEST_RATIO`, default 4, `0` = always nest): a
+  request is nested only when its uncached rows are at most 1/ratio of the paused unit's rows (a short prompt
+  behind a long block). A larger one waits for the unit boundary, where its blocks join the other prompts' next
+  blocks in one segmented prefill ([prompt groups](../prefill/prompt-batch.md)); it is counted under
+  `nest_skip_reasons.group`. Nesting every arrival made a burst a serial stack of whole prompts, each alone, with
+  the paused prompt waiting for all of them. Scheduling only: a prompt's units, rows and bits are those of a solo
+  run under either choice.
 - Cancellation (`STRIX_BATCH_CANCEL_POINTS`, default 1) is observed at those layer boundaries: the request's
   partial block is discarded (nothing is published to the prefix cache), the shared prefill storage is reset
   and the slot starts fresh. Groups and window cohorts finish their unit first.
@@ -365,7 +425,13 @@ window stream shared by all slots. The calibration replay runs once.
 - The reply is split into `reasoning_content` (the thinking block), `content` and `tool_calls`.
   Parameter values of a tool call are typed by the tool's JSON schema (strings stay strings, other
   types are parsed as JSON); `finish_reason` is `tool_calls` when the reply contains calls.
-- `tool_choice: "none"` renders no tools.
+- `tool_choice: "none"` (Anthropic: `{"type":"none"}`) renders no tool definitions and returns no tool call, on
+  Chat Completions, Responses and Messages alike. Earlier calls and their results stay in the prompt. When the
+  history holds a tool call or a tool result, a closing instruction ("Tools are disabled for this reply. ...") is
+  appended to the last user message, or added as a user message after a closing tool result, so the model does not
+  imitate the earlier calls. A call the model still emits is withheld: the reply keeps the text before it and ends
+  with `[tool call to <name> withheld: tool_choice is "none"]` (streamed as a final text delta), with finish reason
+  `stop` / `end_turn` and no call item. Requests without `tool_choice: "none"` are not affected.
 - Other fields: `max_tokens` / `max_completion_tokens`, `stop` (string or list), `stream`,
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
 - Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:
@@ -568,6 +634,57 @@ directly. Rows with a nonfinite logit or a refused maximum, and requests with sc
 selected on the full row; token IDs are identical either way. One difference to `--http-selection-fast
 off` (every row walks the full mask): a full walk can stop a request on a mask-walk evaluation limit
 reached by another token, which a membership check does not walk; all routes of one setting behave the same.
+
+Ranked membership extends argmax-first to rows whose maximum is refused. Masked greedy is the first
+admitted token in the order "logit descending, lowest ID among equals", so the row checks the next-best
+logits in that order with the same one-token membership test and takes the first admitted one; no mask is
+walked. It is opt-in: `STRIX_CONSTRAINT_RANKED=N` sets how many next-best logits are checked (a decimal
+number in 0..4096; default 0 = off, the row walks the mask); a row whose N next-best tokens are all
+refused walks the full mask as before. It applies where argmax-first applies (finite row, answer phase,
+no scores or transforms). Token IDs equal those of the mask walk wherever the walk completes. It is off
+by default because refusals are not equal: with argmax-first alone a row whose maximum is refused walks
+the full mask, and that walk stops the request when any token reaches a schema evaluation limit; ranked
+membership only checks the tokens it tries, so such a request continues with the first admitted one.
+Schemas whose walks stay inside their evaluation limits (the usual case) select the same tokens either
+way. A full mask walk visits the whole token trie, which in a permissive state (inside a string) costs
+far more than a decode step, so on such schemas the setting keeps output at plain decode speed. The
+profile reports these rows as `ranked_rows`.
+
+Both settings are read through the shared environment registry: unset or empty means the default, a
+`STRIX_CONSTRAINT_RANKED` value that is not a whole decimal number in range stops the server at startup
+with an error naming the variable, and the resolved values are recorded with the other switches of the run.
+
+Schema programs are shared between requests (`ConstraintProgramCache`, default on;
+`STRIX_CONSTRAINT_PROGRAM_CACHE=0` compiles per request as before). A compiled program is immutable and
+does not depend on the request, so requests with the same schema and limits use one program: the schema is
+compiled once, and concurrent requests for a schema that is being compiled wait for that one compilation.
+The key is the semantics version, every limit and the schema text (`Json::dump()`), compared in full; the
+cache holds at most 16 entries and 4 MiB of keys, including pending compilations. Ready entries leave
+least recently used first; when pending entries fill either bound, new keys compile without retention.
+A failed compilation is not kept. These bounds cover cache retention, not programs still held by requests.
+Each shared program carries a mask memo (`STRIX_CONSTRAINT_MASK_MEMO_BYTES`, 8 MiB by default, `0` off)
+keyed by the exact serialized cursor state and the identity of the token trie, so a request that reaches a
+state another request with the same tokenizer already walked takes the stored mask instead of walking the
+trie again. The cursor, the output budget and the EOS overlay stay per request, and the masks are the ones
+a per-request compilation produces (`strix-serve-json-constraint-tests`; `--bench-program-cache` measures
+compile, first mask and first string-state mask for repeated identical-schema requests). Both cache
+settings resolve once on first use and enter the environment registry then; startup inspection before
+that point does not report them.
+
+Masks one step ahead (default on; `STRIX_CONSTRAINT_MASK_AHEAD=0` turns it off) covers the requests that
+still walk one mask per answer row: scores (`logprobs`), logit transforms, and `--http-selection-fast
+off`. A mask depends only on the schema program, the cursor, the token trie and the stop IDs, and the
+cursors a step can reach are known before its logits are: the committed state for a serial row, the
+committed state advanced over drafts 0..r-1 for row r of an MTP window. When the step is launched those
+walks are handed to a host worker and run while the GPU executes; the row takes the finished mask, waits
+for the one in progress, or walks an unstarted one itself, and a walk whose step is over is abandoned.
+Planning a draft chain stops at the first draft the schema refuses or whose transition reaches an
+evaluation limit; such a limit stops the request only when a row really takes that draft.
+The mask words, the refusals and where they surface are those of the walk on the selecting thread, so
+token IDs and receipts are identical with the switch on or off. Requests in the argmax-first regime do
+not use the worker: their rows almost never walk a mask, and walks nobody takes only load the host. The
+profile adds `ahead_rows` (rows served by the worker; their `mask_ms` is only the wait), `ahead_masks`
+and `ahead_ms` (every mask the worker walked and its own time, including masks no row needed).
 
 Every policy response reports `strix.selection_execution` (`mtp-host` or
 `serial-host`) and `strix.selection_fallback` (null when admitted). Fallbacks are
@@ -1149,6 +1266,18 @@ budget to rank 1. While no request decodes and no other admitted prompt waits, r
 budget 0 instead: both ranks run the rest of the current piece at once (same bits; up to
 16384 rows with `--prefill-rows auto`), so a request that arrives meanwhile, an abort or an
 import waits for that piece. `STRIX_DS41_SERVE_IDLE_WHOLE=0` restores bounded units while idle.
+
+**Admit-first order.** While admitted prompts still wait for their prefill, a decode step runs with fewer rows and
+pays its fixed cost for them. From five live requests (admitted or queued) the lead therefore prefills the waiting
+prompts before the next decode step, and the decoding requests wait at most one second. Below five live requests the
+order is unchanged: drafting fills the spare rows there, so an early step is as productive as a late one. Every prompt
+keeps its prefill path, pieces and units, so the generated tokens are the same in either order. Eight concurrent chat
+prompts of 128 tokens: 92.3 to 94.2 tokens/s against 91.0 to 93.4 (+1.0 to +1.5 %, four pairs), median time to first
+token 1.6 s against 1.8 s; one to four concurrent requests run the same order (no held step).
+`STRIX_SERVE_ADMIT_FIRST=0` keeps decode first at every concurrency, `=1` forces admit-first,
+`STRIX_SERVE_ADMIT_FIRST_MIN_LIVE` moves the crossover and `STRIX_SERVE_ADMIT_FIRST_GAP_MS` the wait bound.
+`STRIX_DS41_SERVE_STEP_TRACE=1` prints one line per decode step, device prefill and held step. The rule is
+`serve::AdmitFirst` in `include/strix/serve/prompt_service.hpp`, engine neutral.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

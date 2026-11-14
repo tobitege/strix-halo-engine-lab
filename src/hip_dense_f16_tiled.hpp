@@ -21,6 +21,7 @@
 // Stage width, tiling, grid order and LDS layout do not change any (row, output) value: each accumulator sees
 // the same operands in the same K16 order whatever block, launch or row count it lands in.
 
+#include "strix/env_flags.hpp"
 #include <atomic>
 #include <cstdio>
 #include <map>
@@ -47,7 +48,7 @@ static_assert((kBM / kWM) * kWavesN == kThreadsT / 32U);
 __host__ __device__ constexpr std::uint32_t scratch_pitch(std::uint32_t width) { return width + 64U; }
 
 inline bool enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_DENSE", false);
     // GSQ owners must keep their typed projections; these tiled loaders assume Q8_0.
     return on && !qpf2k::suppressed(qpf2k::Item::dense);
 }
@@ -62,7 +63,7 @@ inline bool site_enabled(unsigned bit) {
 // T 512) had them slower than the engine launches (GDN in cold 1.019 / warm 1.042, shared gate|up warm 1.103), every
 // other site and every T >= 1024 faster. Routing only: a call runs either form, the bits are the same.
 inline unsigned min_rows(unsigned bit = 0U) {
-    static const int n = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_MIN_ROWS"); return v ? std::atoi(v) : -1; }();
+    static const int n = strix::envcfg::integer("STRIX_QPF2K_DENSE_MIN_ROWS", -1);
     if (n >= 0) return static_cast<unsigned>(n);
     return bit == 1U || bit == 16U ? 1024U : 512U;
 }
@@ -94,6 +95,10 @@ __device__ __forceinline__ u32x2 dequant4(unsigned codes, h2 scale) {
     const h2 a = (__builtin_bit_cast(h2, lo) - bias) * scale, b = (__builtin_bit_cast(h2, hi) - bias) * scale;
     return u32x2{__builtin_bit_cast(unsigned, a), __builtin_bit_cast(unsigned, b)};
 }
+
+template <class Site> struct DenseVectorEpilogue : Site {
+    static constexpr bool dense_vector_epilogue = true;
+};
 
 // Sites address row r at input0 + r * input_stride.
 template <class Site> __device__ __forceinline__ const typename Site::Input* tiled_row_input(const Site& site, std::uint32_t r) {
@@ -158,7 +163,11 @@ template <unsigned BN> struct TileShape {
 // zero scratch and <= 192 VGPRs on each built code object. "+&v": the WMMA's tied, early-clobber D (as LLVM's builtin), so
 // D never shares registers with A/B. Same instruction on the same values: only the register assignment changes.
 inline bool wmma_pin() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_WMMA_PIN"); return !v || v[0] != '0'; }();
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_WMMA_PIN", true);
+    return on;
+}
+inline bool gdn_vec_epilogue() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_VEC_EPILOGUE"); return !v || v[0] != '0' || v[1] != '\0'; }();
     return on;
 }
 template <unsigned BSlot> __device__ __forceinline__ f8 wmma_pinned(Frag a, Frag b, f8 c) {
@@ -381,6 +390,34 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
         compute(1U);
         if (more) store.template operator()<false>(0U);
         lds_barrier();
+    }
+    if constexpr (requires { Site::dense_vector_epilogue; } && !NoStores) {
+        // Reuse the dead A/B LDS arena. Each wave scatters a 16x64 FP32
+        // accumulator strip, then reads four adjacent output columns per lane.
+        // XOR the low row bit into column bit 4 to avoid two-way LDS conflicts.
+        // 16 waves * 16 rows * 64 floats = the existing 64 KiB, no new LDS.
+        auto* image = reinterpret_cast<float*>(lds);
+        const auto at = [=](unsigned row, unsigned col) {
+            return wave * 1024U + row * 64U + (col ^ ((row & 1U) * 16U));
+        };
+#pragma unroll
+        for (unsigned t = 0; t < kMT; ++t) {
+#pragma unroll
+            for (unsigned u = 0; u < kNT; ++u)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e)
+                    image[at(2U * e + lane / 16U, 16U * u + lane % 16U)] = acc[t][u][e];
+            lds_barrier();
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) {
+                const unsigned linear = 4U * lane + 128U * j, rr = linear / 64U, cc = linear % 64U;
+                const auto r = m0 + wm * kWM + 16U * t + rr, out = n0 + wn * kWN + cc;
+                const f4 value = *reinterpret_cast<const f4*>(image + at(rr, cc));
+                if (r < rows && out + 3U < outputs) site.store4(out, r, value);
+            }
+            lds_barrier(); // every reader finishes before the next strip
+        }
+        return;
     }
 #pragma unroll
     for (unsigned t = 0; t < kMT; ++t)
@@ -636,7 +673,7 @@ template <class Site> unsigned form(unsigned mode) {
 template <class Site> unsigned mode_of(const Site& site) {
     if constexpr (sizeof(typename Site::Input) == 4U) return kF32;
     else {
-        static const int forced = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_INLINE"); return v ? std::atoi(v) : -1; }();
+        static const int forced = strix::envcfg::integer("STRIX_QPF2K_DENSE_INLINE", -1);
         if (forced == 0 || forced == 1) return forced ? kBf16 : kPre;
         // rev 6c: BF16 rows always convert while staging. With form 4 (two blocks per WGP) the staging VALU is hidden
         // and the convert launch's DRAM pass is gone (t8 bench: GDN in 17.02 vs 17.80 ms, QSA q|k|v 14.31 vs 15.23 ms
@@ -675,6 +712,17 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
     if (form_id >= 3U)  // 256-output tiles: every segment boundary a multiple of 256, else form 0 (same bits)
         for (unsigned m = 1; m < site.segments.count; ++m) if (site.segments.first[m] % 256U) form_id = 0U;
     if (Mode == kF32 && form_id == 4U) form_id = 3U;  // FP32 A staged inline does not fit 192 VGPRs: form 3 (same bits)
+    if constexpr (Probe == 0U && requires { site.vector_store_supported(); } && !requires { Site::dense_vector_epilogue; }) {
+        // Unpinned scratch-A + Q8 + the vector epilogue spills; preserve the
+        // original scalar route there. Decide once before wrapping the site.
+        if (gdn_vec_epilogue() && (Mode != kPre || wmma_pin()) &&
+            (form_id == 4U || (Mode == kBf16 && form_id == 0U)) && site.vector_store_supported()) {
+            DenseVectorEpilogue<Site> vector_site{};
+            static_cast<Site&>(vector_site) = site;
+            launch_projection<decltype(vector_site), Mode, Probe>(vector_site, rows, stream, any_order, form_id, raster_m, a16);
+            return;
+        }
+    }
     const std::uint32_t bn = form_id >= 3U ? 256U : kBN;
     const std::uint32_t tiles = ((rows + kBM - 1U) / kBM) * ((site.outputs + bn - 1U) / bn);
     unsigned* const overflow = Mode == kPre ? nullptr : dense_f16_overflow_counter();
@@ -683,16 +731,35 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
             hipExtLaunchKernelGGL(kernel, dim3(tiles), dim3(threads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, rows, a16, raster_m, overflow);
         else hipLaunchKernelGGL(kernel, dim3(tiles), dim3(threads), 0, stream, site, rows, a16, raster_m, overflow);
     };
-    if (form_id == 1U) go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U);
-    else if (form_id == 2U) go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U);
-    else if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
-    else if (form_id == 4U) {
-        if constexpr (Mode != kF32) {
-            if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
-            else go(project_kernel<Site, Mode, Probe, 256U, true>, 512U);
+    if constexpr (requires { Site::dense_vector_epilogue; }) {
+        const auto lean = [&] {
+            if constexpr (Mode != kF32) {
+                if constexpr (Mode == kPre)
+                    go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
+                else {
+                    if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
+                    else go(project_kernel<Site, Mode, Probe, 256U, true>, 512U);
+                }
+            }
+        };
+        if constexpr (Mode == kF32) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
+        else if constexpr (Mode == kPre) lean();
+        else {
+            if (form_id == 0U) go(project_kernel<Site, Mode, Probe>, kThreadsT);
+            else lean();
         }
+    } else {
+        if (form_id == 1U) go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U);
+        else if (form_id == 2U) go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U);
+        else if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
+        else if (form_id == 4U) {
+            if constexpr (Mode != kF32) {
+                if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
+                else go(project_kernel<Site, Mode, Probe, 256U, true>, 512U);
+            }
+        }
+        else go(project_kernel<Site, Mode, Probe>, kThreadsT);
     }
-    else go(project_kernel<Site, Mode, Probe>, kThreadsT);
 }
 // One launch over all rows (plus the convert launch in kPre mode). The site supplies Input (std::uint16_t BF16 or
 // float), input0 / input_stride (row r at input0 + r * input_stride), segments, width, outputs and store(out, r, value).
@@ -716,7 +783,7 @@ void launch(const Site& site, std::uint32_t rows, hipStream_t stream, bool any_o
     if (!supported(site, rows, mode)) throw std::invalid_argument("q8_rows tiled: unsupported dense projection");
     if (!raster_m) raster_m = raster(mode);
     // STRIX_QPF2K_DENSE_TRACE=1: one stderr line per site type on its first launch (route witness).
-    static const bool trace = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE_TRACE"); return v && v[0] == '1'; }();
+    static const bool trace = strix::envcfg::flag("STRIX_QPF2K_DENSE_TRACE", false);
     if (trace) {
         static std::atomic<unsigned> launches{0};
         if (launches.fetch_add(1U, std::memory_order_relaxed) == 0U)

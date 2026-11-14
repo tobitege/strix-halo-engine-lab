@@ -13,6 +13,7 @@
 #include "strix/glm/engine.hpp"
 
 #include <array>
+#include <atomic>
 #include <memory>
 
 namespace strix::glm::xfer {
@@ -88,6 +89,8 @@ public:
     }
     bool fused_boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flags,
                              unsigned rows, unsigned flag_stride, hipStream_t s) override;
+    // The next reduction's TX slot for a producer that writes and publishes it (boundary_rows then only posts it).
+    ProducerSlot producer_slot(unsigned rows, hipStream_t s) override;
     // Completion point for callers that end without the head (prefill chunks, gate_residual, G3 dumps): waits for every
     // posted exchange, seals the last deferred CRC and throws if any exchange failed. Results of the call are trusted
     // only after this (argmax() calls it itself). The engine's seam has no such hook yet: proposed as
@@ -103,6 +106,9 @@ public:
         attention_bytes_ = bytes;
     }
 
+    // Exchange row fold (xport/row_fold.hpp; STRIX_GLMX_FOLD=rows gives the module its fold slots): process-wide
+    // switch for in-process A/B runs. Same bits either way.
+    static void set_fold_enabled(bool on) { fold_enabled_.store(on, std::memory_order_relaxed); }
 private:
     void boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flags,
                        unsigned rows, unsigned flag_stride, hipStream_t s);
@@ -115,8 +121,10 @@ private:
     std::size_t attention_bytes_ = 0;
     std::unique_ptr<Exchanger> xf_;
     std::uint64_t step_ = 0, layer_ = 0;
+    const float* produced_ = nullptr;  // the TX slot handed out by producer_slot() for the next boundary
     float* bracket_ = nullptr;  // [max_rows][4][4096], allocated on first boundary()
     bool kwait_ = true, use_bracket_ = false;
+    static inline std::atomic<bool> fold_enabled_{true};
 };
 
 }  // namespace strix::glm::xfer

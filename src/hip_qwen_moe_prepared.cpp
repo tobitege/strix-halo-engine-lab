@@ -1,5 +1,6 @@
 #include "strix/hip_qwen_moe_prepared.hpp"
 #include "strix/hip_model_residency.hpp"
+#include "strix/hip_check.hpp"
 #include <hip/hip_runtime.h>
 #include <limits>
 #include <stdexcept>
@@ -8,7 +9,7 @@
 namespace strix::qwen_moe_prepared {
 namespace {
 void check(hipError_t result) {
-    if (result != hipSuccess) throw std::runtime_error(std::string("prepared MoE HIP allocation/upload: ") + hipGetErrorString(result));
+    ::strix::hip_check(result, "prepared MoE HIP allocation/upload");
 }
 class HipAllocation final : public Allocation {
     void* data_ = nullptr;

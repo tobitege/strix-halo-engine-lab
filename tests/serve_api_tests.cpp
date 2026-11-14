@@ -2,6 +2,7 @@
 // HTTP API contract tests with a scripted engine (no GPU): OpenAI chat/completions (plain and
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
+#include "strix/power/sampler.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/constraint_selection.hpp"
 
@@ -14,17 +15,51 @@
 #include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define MSG_NOSIGNAL 0
+#else
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <atomic>
 #include <iostream>
-#include <netinet/in.h>
 #include <mutex>
 #include <set>
-#include <sys/socket.h>
 #include <thread>
-#include <unistd.h>
 
 namespace {
+#ifdef _WIN32
+using TestSocket = SOCKET;
+constexpr TestSocket invalid_socket = INVALID_SOCKET;
+void close_socket(TestSocket fd) { (void)::closesocket(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,int size) {
+    return ::setsockopt(fd,level,option,static_cast<const char*>(value),size);
+}
+struct SocketRuntime {
+    SocketRuntime() { WSADATA data{}; if (WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Winsock initialization failed"); }
+    ~SocketRuntime() { WSACleanup(); }
+};
+#else
+using TestSocket = int;
+constexpr TestSocket invalid_socket = -1;
+void close_socket(TestSocket fd) { (void)::close(fd); }
+int socket_option(TestSocket fd,int level,int option,const void* value,socklen_t size) {
+    return ::setsockopt(fd,level,option,value,size);
+}
+struct SocketRuntime {};
+#endif
+void set_receive_timeout(TestSocket fd,unsigned seconds) {
+#ifdef _WIN32
+    const DWORD timeout=seconds*1000;
+#else
+    timeval timeout{};timeout.tv_sec=seconds;
+#endif
+    (void)socket_option(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+}
 using namespace strix::serve;
 int failures = 0;
 void check(bool ok, const std::string& what) {
@@ -99,6 +134,9 @@ public:
                      "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>";
         if (prompt.find("LONG") != std::string::npos) { script.clear(); for (int i = 0; i < 400; ++i) script += "word "; }
         if (prompt.find("<think>\n\n</think>") != std::string::npos) script = "Plain answer.<|im_end|>";
+        if (prompt.find("IMITATE") != std::string::npos)  // a history with an earlier call: the model repeats it
+            script = "Need weather.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n"
+                     "</function>\n</tool_call><|im_end|>";
         const auto ids = tokenizer_->encode(script, true);
         GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
@@ -230,12 +268,12 @@ struct Reply { int status = 0; std::string headers, body; };
 // Plain HTTP/1.1 client; decodes chunked bodies. `abort_after` closes the socket after that many body bytes.
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body,
     const std::string& extra = {}, std::size_t abort_after = 0, std::atomic<bool>* headers_seen = nullptr) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { ::close(fd); return {}; }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) { close_socket(fd); return {}; }
     const auto request = method + " " + path + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\n" + extra +
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
     (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
@@ -248,7 +286,7 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         if (headers_seen && raw.find("\r\n\r\n") != std::string::npos) headers_seen->store(true);
         if (abort_after && raw.size() > abort_after) break;
     }
-    ::close(fd);
+    close_socket(fd);
     Reply out;
     const auto end = raw.find("\r\n\r\n");
     if (end == std::string::npos) return out;
@@ -419,6 +457,79 @@ void test_batched_queue() {
     queue.shutdown();
     check(!queue.take(true) && queue.stopping(), "batched queue after shutdown");
     check(!queue.has_queued_work(), "shutdown queue hint");
+}
+
+// I2: idle owner loops block in wait_work_until instead of a 2 ms poll. It must return at once for queued work, wake on a
+// submit or shutdown from another thread, time out at the deadline, and ignore wake_control (take(false) never clears it).
+void test_queue_wait_work_until() {
+    using namespace std::chrono_literals;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    {
+        GenerationQueue queue;
+        const auto t0 = now();
+        check(!queue.wait_work_until(t0 + 20ms) && now() - t0 >= 20ms, "wait_work_until times out on an empty queue");
+        queue.wake_control();
+        const auto t1 = now();
+        check(!queue.wait_work_until(t1 + 20ms) && now() - t1 >= 20ms, "wait_work_until ignores a control wake");
+        GenerationJob job;
+        job.prompt = {1U};
+        check(queue.submit(std::move(job)) != nullptr, "wait_work_until submit");
+        const auto t2 = now();
+        check(queue.wait_work_until(t2 + 10s) && now() - t2 < 5s, "wait_work_until returns at once for queued work");
+    }
+    {
+        GenerationQueue queue;
+        std::thread producer([&] {
+            std::this_thread::sleep_for(30ms);
+            GenerationJob job;
+            job.prompt = {2U};
+            static_cast<void>(queue.submit(std::move(job)));
+        });
+        const auto t0 = now();
+        const bool woke = queue.wait_work_until(t0 + 10s);
+        producer.join();
+        check(woke && now() - t0 < 5s, "wait_work_until wakes on a submit from another thread");
+    }
+    {
+        GenerationQueue queue;
+        std::thread stopper([&] { std::this_thread::sleep_for(30ms); queue.shutdown(); });
+        const auto t0 = now();
+        const bool woke = queue.wait_work_until(t0 + 10s);
+        stopper.join();
+        check(!woke && queue.stopping() && now() - t0 < 5s, "wait_work_until wakes on shutdown");
+    }
+}
+
+// GenerationTicket::wake ends one wait() without tokens (set before the wait counts, so no lost wakeup), and a
+// cancelled ticket waited with wake_on_cancel=false blocks until the finish instead of returning at once.
+void test_ticket_wake() {
+    using namespace std::chrono_literals;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    GenerationQueue queue;
+    GenerationJob job;
+    job.prompt = {1U};
+    const auto ticket = queue.submit(std::move(job));
+    check(ticket != nullptr, "ticket wake submit");
+    bool done = true;
+    ticket->wake();
+    auto t0 = now();
+    check(ticket->wait(10s, done).empty() && !done && now() - t0 < 5s, "wake before wait ends the next wait");
+    t0 = now();
+    (void)ticket->wait(20ms, done);
+    check(!done && now() - t0 >= 20ms, "a consumed wake does not end later waits");
+    std::thread waker([&] { std::this_thread::sleep_for(30ms); ticket->wake(); });
+    t0 = now();
+    (void)ticket->wait(10s, done);
+    waker.join();
+    check(!done && now() - t0 < 5s, "wake from another thread ends the wait");
+    ticket->cancel();
+    t0 = now();
+    (void)ticket->wait(20ms, done, false);
+    check(!done && now() - t0 >= 20ms, "cancelled ticket without wake_on_cancel keeps waiting");
+    t0 = now();
+    (void)ticket->wait(10s, done);
+    check(now() - t0 < 5s, "cancelled ticket with wake_on_cancel returns at once");
+    queue.shutdown();
 }
 
 // Destroying a cancelled job's token callback acts as a deterministic producer between
@@ -749,7 +860,14 @@ void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenize
     check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','a'}, "composition tie resolves to the lowest id");
 }
 
+struct AuthorizationPowerSource final : strix::power::Source {
+    strix::power::SourceStatus probe() override { return {"authorization-test", true, "deterministic power"}; }
+    void read(strix::power::Sample& sample) noexcept override { sample.add_power(strix::power::Domain::accelerator, 100.0); }
+};
+
 int main() try {
+    strix::power::register_source("authorization-test", [](const std::string&) { return std::make_unique<AuthorizationPowerSource>(); });
+    [[maybe_unused]] SocketRuntime sockets;
     {
         // Large objects: repeated keys keep their first position and the last value (serving parser) or fail (unique
         // parser), with or without the key index; a large object parses in linear time.
@@ -822,15 +940,13 @@ int main() try {
         {
             // Pipelined keep-alive requests: a stream interrupted by an exception must end the connection, so the
             // second response can never appear inside the unfinished chunked body.
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(boom.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "pipelined client connects");
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;  // a regression keeps the connection open: fail fast instead of the 300 s idle wait
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             const std::string requests = "GET /stream-boom HTTP/1.1\r\nHost: x\r\n\r\nGET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
             (void)::send(fd, requests.data(), requests.size(), MSG_NOSIGNAL);
             std::string raw;
@@ -840,7 +956,7 @@ int main() try {
                 if (n <= 0) break;
                 raw.append(buffer, static_cast<std::size_t>(n));
             }
-            ::close(fd);
+            close_socket(fd);
             std::size_t responses = 0;
             for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
             check(responses == 1 && raw.find("data: x") != std::string::npos, "interrupted stream closes the connection");
@@ -871,18 +987,16 @@ int main() try {
         timed.listen();
         std::thread timed_thread([&] { timed.serve(); });
         const auto connect_local = [&] {
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(timed.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "deadline client connects");
             return fd;
         };
-        const auto read_all = [](int fd) {
+        const auto read_all = [](TestSocket fd) {
             std::string raw;
             char buffer[4096];
             for (;;) {
@@ -893,17 +1007,17 @@ int main() try {
             return raw;
         };
         {
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const std::string partial = "GET /ok HTTP/1.1\r\nHo";
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request header answers 408");
         }
         {
             // A kept-alive connection: a first request, idle longer than the request deadline, then a second request
             // that is answered; a third that stalls is refused with 408 even though the connection already responded.
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const auto read_response = [&] {
                 std::string raw;
                 char buffer[4096];
@@ -924,24 +1038,24 @@ int main() try {
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "a stalled request on a kept-alive connection answers 408");
-            ::close(fd);
+            close_socket(fd);
         }
         {
             // A body that stops arriving is refused once the request deadline passes.
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const std::string partial = "POST /ok HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
             (void)::send(fd, partial.data(), partial.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 408", 0) == 0, "stalled request body answers 408");
         }
         {
             // Framing that cannot be read unambiguously is refused and the connection closed (one response only).
             const auto answer = [&](const std::string& raw_request) {
-                const int fd = connect_local();
+                const TestSocket fd = connect_local();
                 (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
-                ::close(fd);
+                close_socket(fd);
                 std::size_t responses = 0;
                 for (auto at = raw.find("HTTP/1.1 "); at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1U)) ++responses;
                 return responses == 1U ? raw.substr(9, 3) : "x" + std::to_string(responses);
@@ -961,11 +1075,11 @@ int main() try {
             check(answer("G(T /ok HTTP/1.1\r\n\r\n") == "400", "non-token method answers 400");
             {
                 // The refusal survives unread request bytes (no reset before the client reads it) and is complete JSON.
-                const int fd = connect_local();
+                const TestSocket fd = connect_local();
                 const std::string raw_request = "POST /ok HTTP/1.1\r\nContent-Length: x\r\n\r\n" + std::string(200000, 'z');
                 (void)::send(fd, raw_request.data(), raw_request.size(), MSG_NOSIGNAL);
                 const auto raw = read_all(fd);
-                ::close(fd);
+                close_socket(fd);
                 const auto body_at = raw.find("\r\n\r\n");
                 bool json = false;
                 try { json = body_at != std::string::npos && parse_json(raw.substr(body_at + 4U)).find("error") != nullptr; } catch (...) {}
@@ -979,27 +1093,25 @@ int main() try {
             HttpServer small(small_config, [](const HttpRequest&, HttpResponseWriter& w) { w.send(200, "text/plain", "ok"); });
             small.listen();
             std::thread small_thread([&] { small.serve(); });
-            const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            const TestSocket fd = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in address{};
             address.sin_family = AF_INET;
             address.sin_port = htons(small.port());
             ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
-            timeval receive_limit{};
-            receive_limit.tv_sec = 20;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+            set_receive_timeout(fd,20);  // preserve the bounded receive deadline
             check(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "header-limit client connects");
             const std::string big = "GET /ok HTTP/1.1\r\nX-Pad: " + std::string(4000, 'a') + "\r\n\r\n";
             (void)::send(fd, big.data(), big.size(), MSG_NOSIGNAL);
             const auto raw = read_all(fd);
-            ::close(fd);
+            close_socket(fd);
             check(raw.rfind("HTTP/1.1 431", 0) == 0, "header over the limit answers 431 whatever the read sizes");
             // A header of exactly the limit gets the same answer whole and split inside its terminator.
             const auto at_limit = [&](std::size_t extra, bool split) {
                 const std::string prefix = "GET /ok HTTP/1.1\r\nConnection: close\r\nX-Pad: ";
                 const std::string head = prefix + std::string(1024U + extra - prefix.size(), 'a');
                 const std::string request = head + "\r\n\r\n";
-                const int c = ::socket(AF_INET, SOCK_STREAM, 0);
-                ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &receive_limit, sizeof(receive_limit));
+                const TestSocket c = ::socket(AF_INET, SOCK_STREAM, 0);
+                set_receive_timeout(c,20);
                 (void)::connect(c, reinterpret_cast<sockaddr*>(&address), sizeof(address));
                 const auto cut = split ? request.size() - 2U : request.size();
                 (void)::send(c, request.data(), cut, MSG_NOSIGNAL);
@@ -1008,7 +1120,7 @@ int main() try {
                     (void)::send(c, request.data() + cut, request.size() - cut, MSG_NOSIGNAL);
                 }
                 const auto reply = read_all(c);
-                ::close(c);
+                close_socket(c);
                 return reply.substr(0, 12);
             };
             check(at_limit(0, false) == "HTTP/1.1 200" && at_limit(0, true) == "HTTP/1.1 200", "a header at the limit is accepted whole or split");
@@ -1017,16 +1129,16 @@ int main() try {
             small_thread.join();
         }
         {
-            const int fd = connect_local();
+            const TestSocket fd = connect_local();
             const int small = 4096;
-            ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+            socket_option(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
             const std::string request = "GET /flood HTTP/1.1\r\nHost: x\r\n\r\n";
             (void)::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
             const auto begin = std::chrono::steady_clock::now();
             while (flood_result.load() == 0 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(30))
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));  // never read: the server's send stalls
             check(flood_result.load() == 1, "a client that stops reading is marked gone within the write timeout");
-            ::close(fd);
+            close_socket(fd);
         }
         timed.stop();
         timed_thread.join();
@@ -1046,6 +1158,8 @@ int main() try {
         check(silent.progress().phase == GenerationPhase::queued, "no fabricated engine report");
     }
     test_batched_queue();
+    test_queue_wait_work_until();
+    test_ticket_wake();
     test_queue_caller_orders();
     test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();
@@ -1795,6 +1909,24 @@ int main() try {
         check(at(incomplete, "status").as_string() == "incomplete" && at(at(incomplete, "incomplete_details"), "reason").as_string() == "max_output_tokens", "responses non-stream incomplete");
         const auto status = parse_json(http(port, "GET", "/api/status", "").body);
         check(at(at(status, "requests").as_array()[0], "route").as_string() == "responses", "responses recent request route");
+        // Host power telemetry is not part of the open status: with an API key configured it needs the key.
+        check(!status.find("power"), "power telemetry served without the API key");
+        for (const auto& recent : at(status, "requests").as_array()) check(!recent.find("power"), "request power receipt served without the API key");
+        check(strix::power::sampler_enabled(), "authorization fixture needs the sampler enabled");
+        const auto keyed = parse_json(http(port, "GET", "/api/status", "", auth).body);
+        check(keyed.find("power") && at(*keyed.find("power"), "schema").as_string() == "strix-power-status-v1", "power view with the API key");
+        const auto& keyed_recent = at(keyed, "requests").as_array();
+        check(!keyed_recent.empty() && keyed_recent[0].find("power"), "keyed recent request must carry an actual power receipt");
+        const auto wrong = parse_json(http(port, "GET", "/api/status", "", "Authorization: Bearer wrong\r\n").body);
+        check(!wrong.find("power"), "power telemetry with a wrong key");
+        for (const auto* view : {&status, &wrong}) {
+            const auto& recent = at(*view, "requests").as_array();
+            check(recent.size() == keyed_recent.size(), "authorization views cover the same requests");
+            for (std::size_t i = 0; i < recent.size(); ++i) {
+                check(at(recent[i], "id").dump() == at(keyed_recent[i], "id").dump(), "same request in authorization views");
+                check(!recent[i].find("power"), "request power receipt requires the correct key");
+            }
+        }
         for (const char* input : {"Hi", "TOOL", "ENGINE_ERROR", "length"}) {
             Json request = Json::object(); request.set("input", Json(input)); request.set("stream", Json(true));
             if (std::string(input) == "TOOL") request.set("tools", parse_json(R"([{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"days":{"type":"integer"}}}}])"));
@@ -2175,6 +2307,74 @@ int main() try {
         const auto content = stream_text(r.body, &reasoning, &finish, &usage, nullptr);
         check(content == "Hello there, friend." && reasoning == "Let me think.", "chat stream deltas [" + content + "] [" + reasoning + "]");
         check(finish == "stop" && usage && r.body.ends_with("data: [DONE]\n\n"), "chat stream finish, usage and [DONE]");
+    }
+    {
+        // tool_choice "none" after a history with tool calls (Chat, Responses, Messages; streamed or not): the scripted
+        // model imitates the earlier call, the reply carries no call and no frame text, and the prompt closes with the
+        // instruction. The same history without tool_choice "none" keeps its prompt and its call.
+        const std::string held = "Checking.\n\n[tool call to get_weather withheld: tool_choice is \"none\"]";
+        const std::string history = R"("messages":[{"role":"user","content":"IMITATE please"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Oslo\"}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"sunny"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}}])";
+        const auto plain = parse_json("{" + history + "}"), automatic = parse_json("{" + history + R"(,"tool_choice":"auto"})"),
+            none = parse_json("{" + history + R"(,"tool_choice":"none"})");
+        check(api.chat_prompt(plain) == api.chat_prompt(automatic), "tool_choice auto renders the default prompt");
+        const auto off = tokenizer->decode(api.chat_prompt(none));
+        check(off.find(no_tools_hint) != std::string::npos && off.find("sunny") < off.find(no_tools_hint) && off.find("\"parameters\"") == std::string::npos,
+            "tool_choice none prompt: history, instruction, no definitions");
+        const auto kept = first_choice(parse_json(http(port, "POST", "/v1/chat/completions", plain.dump(), auth).body));
+        check(at(kept, "finish_reason").as_string() == "tool_calls" && at(kept, "message").find("tool_calls"), "history without tool_choice none still calls");
+        const auto j = parse_json(http(port, "POST", "/v1/chat/completions", none.dump(), auth).body);
+        const auto& choice = first_choice(j);
+        check(at(choice, "finish_reason").as_string() == "stop" && !at(choice, "message").find("tool_calls") &&
+                  at(at(choice, "message"), "content").as_string() == held, "chat tool_choice none withholds the call " + j.dump());
+        auto streamed = none; streamed.set("stream", Json(true));
+        std::string text, finish; bool called = false;
+        for (const auto& event : sse_data(http(port, "POST", "/v1/chat/completions", streamed.dump(), auth).body)) {
+            const auto* choices = event.find("choices");
+            if (!choices || choices->size() == 0U) continue;
+            const auto& c = choices->as_array()[0];
+            if (const auto* f = c.find("finish_reason"); f && f->is_string()) finish = f->as_string();
+            const auto* delta = c.find("delta");
+            if (!delta) continue;
+            if (delta->find("tool_calls")) called = true;
+            if (const auto* content = delta->find("content"); content && content->is_string()) text += content->as_string();
+        }
+        check(text == held && finish == "stop" && !called, "chat stream tool_choice none withholds the call [" + text + "] " + finish);
+
+        const std::string input = R"("input":[{"role":"user","content":"IMITATE please"},
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Oslo\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}],
+            "tools":[{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}],"tool_choice":"none")";
+        for (const bool stream : {false, true}) {
+            auto request = parse_json("{" + input + "}"); request.set("stream", Json(stream));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+            bool call = false; std::string message;
+            for (const auto& item : at(response, "output").as_array()) {
+                if (at(item, "type").as_string() == "function_call") call = true;
+                if (at(item, "type").as_string() == "message") message = at(at(item, "content").as_array().at(0), "text").as_string();
+            }
+            check(!call && message == held && at(response, "status").as_string() == "completed",
+                std::string("responses tool_choice none withholds the call") + (stream ? " (stream) " : " ") + response.dump());
+            if (stream) check(r.body.find("function_call_arguments") == std::string::npos && r.body.find("withheld") != std::string::npos, "responses stream sends the notice, no call events");
+        }
+
+        const std::string turns = R"("max_tokens":1000,"messages":[{"role":"user","content":"IMITATE please"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Oslo"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}],
+            "tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"tool_choice":{"type":"none"})";
+        const auto m = parse_json(http(port, "POST", "/v1/messages", "{" + turns + "}", "x-api-key: secret\r\n").body);
+        bool used = false; std::string said;
+        for (const auto& block : at(m, "content").as_array()) {
+            if (at(block, "type").as_string() == "tool_use") used = true;
+            if (at(block, "type").as_string() == "text") said = at(block, "text").as_string();
+        }
+        check(!used && said == held && at(m, "stop_reason").as_string() == "end_turn", "messages tool_choice none withholds the call " + m.dump());
+        const auto events = http(port, "POST", "/v1/messages", "{" + turns + R"(,"stream":true})", "x-api-key: secret\r\n").body;
+        check(events.find("tool_use") == std::string::npos && events.find("input_json_delta") == std::string::npos &&
+                  events.find("withheld: tool_choice") != std::string::npos && events.find("\"end_turn\"") != std::string::npos, "messages stream tool_choice none withholds the call");
     }
     {
         const std::string body = R"({"messages":[{"role":"user","content":"TOOL please"}],"tools":[{"type":"function","function":{"name":"get_weather",

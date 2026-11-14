@@ -2,6 +2,7 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/env_flags.hpp"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -377,6 +378,34 @@ int main() try {
             std::cout << "q8_rows T=16/32/64 payloads equal the R1 kernels bitwise: " << cases << " cases\n";
         }
         if (std::getenv("STRIX_Q8_ROWS_BENCH")) wide_bench(stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
+    // STRIX_Q8_ROWS_GEMV_FIXTURE=1: small-row decode fixture only. Per GDN shape and row count: the
+    // FNV-1a hash of the R1 row loop and of the rows launch (equal = bitwise), warm and cold median
+    // time, and the bytes of weights and of one copy of the rows.
+    if (strix::envcfg::flag("STRIX_Q8_ROWS_GEMV_FIXTURE", false)) {
+        Buffer flush(256ULL << 20U);
+        check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+        const auto hash = [](const std::vector<std::vector<std::uint8_t>>& rows) {
+            std::uint64_t h = 1469598103934665603ULL;
+            for (const auto& row : rows) for (const auto byte : row) h = (h ^ byte) * 1099511628211ULL;
+            return h;
+        };
+        for (const auto site : {Site::gdn_input, Site::gdn_output}) {
+            const auto [width, outputs] = model_shape(site);
+            Fixture warmup(site, 1U, width, outputs); warmup.prepare(0);
+            static_cast<void>(median_us(warmup, Mode::rows, false, flush, stream));
+            for (const unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 16U}) {
+                Fixture f(site, rows, width, outputs); f.prepare(0);
+                const auto reference = hash(f.run(Mode::row_loop, stream)), actual = hash(f.run(Mode::rows, stream));
+                const auto warm = median_us(f, Mode::rows, false, flush, stream), cold = median_us(f, Mode::rows, true, flush, stream);
+                std::cout << "{\"site\":\"" << name(site) << "\",\"inputs\":" << width << ",\"outputs\":" << outputs << ",\"rows\":" << rows
+                          << ",\"hash_r1\":\"" << std::hex << reference << "\",\"hash\":\"" << actual << std::dec << "\",\"warm_us\":" << warm
+                          << ",\"cold_us\":" << cold << ",\"weight_bytes_sweep\":" << static_cast<std::uint64_t>(width / 32U) * outputs * 34U
+                          << ",\"activation_bytes_copy\":" << static_cast<std::uint64_t>(rows) * width * (bf16_input(site) ? 2U : 4U) << "}" << std::endl;
+            }
+        }
         check(hipStreamDestroy(stream), "destroy stream");
         return 0;
     }

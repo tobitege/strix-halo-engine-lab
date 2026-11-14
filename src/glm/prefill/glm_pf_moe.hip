@@ -37,7 +37,7 @@ constexpr unsigned kE = Traits::kE, kTop = Traits::kTop, kH = Traits::kH, kI = T
 constexpr unsigned kHB = Traits::kHB, kIB = Traits::kIB;
 constexpr unsigned kG3Blocks = Traits::kG3Blocks;
 
-template <int Bits, int MT, int K, int N, bool V2, int PF>
+template <int Bits, int MT, int K, int N>
 __global__ __launch_bounds__(128) void grouped_kernel(const Item* items, unsigned count) {
     unsigned lo = 0, hi = count;  // last item with cta_begin <= blockIdx.x
     while (hi - lo > 1) {
@@ -48,9 +48,10 @@ __global__ __launch_bounds__(128) void grouped_kernel(const Item* items, unsigne
     const Item it = items[lo];
     constexpr unsigned gx = N / 128;
     const unsigned local = blockIdx.x - it.cta_begin;
-    // MT 8 at PF 4 spills (256 VGPR + scratch): ring of 2 there for Bits <= 4, 1 above (Bits 5/6 spill even at 2)
-    constexpr int kPF = MT == 8 && PF > 1 ? (Bits <= 4 ? 2 : 1) : PF;
-    Core::item_core<Bits, MT, K, N, V2, kPF>(it, local % gx, local / gx);
+    // Prefetch ring of 4 k tiles; MT 8 at 4 spills (256 VGPR + scratch): 2 there for Bits <= 4, 1 above (Bits 5/6
+    // spill even at 2). Same bits for every ring size.
+    constexpr int kPF = MT == 8 ? (Bits <= 4 ? 2 : 1) : 4;
+    Core::item_core<Bits, MT, K, N, kPF>(it, local % gx, local / gx);
 }
 
 // Row-tile class of a group with `rows` rows: MT in {1, 2, 4, 8} (index 0..3).
@@ -218,32 +219,14 @@ bool gather_v3() {  // default gather v3 (same bits; measurement: -12/-13 % at T
     }();
     return v3;
 }
-unsigned core_version() {  // default core v3 (same bits; measurement: gate/up and down -6 % at T 2048, -3 % at 1024, ~-1 %
-    // at 4096); STRIX_GLM_PF_MOE_CORE=1 / 2: core v1 / v2
-    static const unsigned v = [] {
-        const char* e = std::getenv("STRIX_GLM_PF_MOE_CORE");
-        if (e != nullptr && std::string(e) == "1") return 1U;
-        if (e != nullptr && std::string(e) == "2") return 2U;
-        return 3U;
-    }();
-    return v;
-}
-template <int Bits, int K, int N, bool V2, int PF>
-void launch_class_v(const Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream) {
-    switch (cls) {
-        case 0: hipLaunchKernelGGL((grouped_kernel<Bits, 1, K, N, V2, PF>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 1: hipLaunchKernelGGL((grouped_kernel<Bits, 2, K, N, V2, PF>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        case 2: hipLaunchKernelGGL((grouped_kernel<Bits, 4, K, N, V2, PF>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-        default: hipLaunchKernelGGL((grouped_kernel<Bits, 8, K, N, V2, PF>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
-    }
-}
 template <int Bits, int K, int N>
 void launch_class(const Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream) {
     if (n == 0) return;
-    switch (core_version()) {
-        case 3: launch_class_v<Bits, K, N, true, 4>(items_d, n, ctas, cls, stream); break;
-        case 2: launch_class_v<Bits, K, N, true, 1>(items_d, n, ctas, cls, stream); break;
-        default: launch_class_v<Bits, K, N, false, 1>(items_d, n, ctas, cls, stream); break;
+    switch (cls) {
+        case 0: hipLaunchKernelGGL((grouped_kernel<Bits, 1, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 1: hipLaunchKernelGGL((grouped_kernel<Bits, 2, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        case 2: hipLaunchKernelGGL((grouped_kernel<Bits, 4, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
+        default: hipLaunchKernelGGL((grouped_kernel<Bits, 8, K, N>), dim3(ctas), dim3(128), 0, stream, items_d, n); break;
     }
 }
 template <int K, int N>

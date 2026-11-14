@@ -12,10 +12,13 @@
 // Options (both ranks must pass the same engine options; hello refuses a mismatch):
 //   --slots S (default 8, <= 8 rows per step) --capacity C (positions per slot, default 8192)
 //   --serial or STRIX_GLM_SERVE_BATCH=0: serial admission (one request at a time; the OFF switch of batching)
+//   --short-first on|off or STRIX_GLM_SERVE_SHORT_FIRST=0|1 (default on; flag > env): shortest waiting prompt admitted first
+//   (shared 8-overtake starvation bound); off = FIFO. Reorders admission only, never changes tokens.
 //   --prefill-chunk N (decode-first prefill interleave: while requests decode, one N-token chunk of a new prompt per
 //   decode step, default 512; with nothing decoding the whole prompt in one call; 0 = always whole, the OFF switch) --prefill-chunk-mtp 0|1 (chunk MTP-bootstrap prompts too, default 1)
 //   --heartbeat-ms MS (idle heartbeat, default 1000)
 //   --identity / --prefill / --max-rows / --decode-xch / --baseline / --print-effective-config as strix-glm5-rank
+//   --profile default|fast|quality [--allow-pending]: product profile, as strix-glm5-rank (shared resolver)
 //   rank 0: --host ADDR (127.0.0.1) --port P (8080) --model-id ID --max-tokens N (default max_tokens) --api-key-file F
 //   rank 0: --selftest N [--selftest-tokens M] [--selftest-long L (multi-chunk prompt tokens, default 2048; 0 = skip the
 //           interleave levels)] [--selftest-skip-basic (only the long-prompt reference and the staggered arms)]: no HTTP; N built-in prompts at once, then each alone (C=1), then the
@@ -44,15 +47,19 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
+#include "glm_route_levers.hpp"
 #include "strix/glm/engine.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
+#include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
 
 #include "glm/engine/glm_mem.hpp"
@@ -228,6 +235,7 @@ struct EngineOps {
         eng.reset(slot);
         spec.at(slot) = {};
     }
+    static std::uint64_t prefix_state_bound(std::uint64_t p) { return gs::prefix_snapshot_bound(p); }
     std::vector<std::uint8_t> state_bytes_upto(std::uint32_t slot, std::uint64_t p) {
         return eng.state_bytes_upto(slot, p);
     }
@@ -624,6 +632,14 @@ struct EngineOps {
             eng.flush(slot);
         }
     }
+    // Fatal owner cleanup only: no new collective against an unknown peer.
+    // ImportStager cancels and joins its receivers before physical engine teardown.
+    // Tentative device state is abandoned with the failing engine, never reused.
+    void owner_abandon() {
+        dec.reset();
+        seed.reset();
+        stager.reset();
+    }
 };
 
 // Metadata only (no tensor payload): config.json bytes, then every *.json / *.safetensors name and size, sorted.
@@ -720,12 +736,16 @@ static int import_gate_empty(const std::string& list) {
 }
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     try {
         if (argc < 2) {
             std::fprintf(stderr, "usage: %s MODEL_DIR --world 1|2 [--rank R --transport T] [--slots S] [--capacity C] [--serial] "
-                                 "[--host H] [--port P] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
+                                 "[--host H] [--port P] [--profile default|fast|quality] [--deploy FILE|auto] [--deploy-check] [--prefix-cache-gib G] [--selftest N [--selftest-tokens M] [--selftest-prefix [--selftest-prefix-long L]]] "
                                  "[--import-listen IP:PORT --import-key FILE --import-model-sha HEX (operator attestation of the producer's "
                                  "model, compared with its hand-off header, not computed from the loaded tensors)]\n", argv[0]);
             return 2;
@@ -736,14 +756,19 @@ int main(int argc, char** argv) {
         opt.model_dir = argv[1];
         opt.slots = 8;
         std::string transport_spec, host = "127.0.0.1", model_id = "glm-5.3-flash", api_key_file;
-        unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1, prefill_chunk = 512;
+        unsigned port = 8080, selftest = 0, selftest_tokens = 128, heartbeat_ms = 1000, mtp_cycles = 1;
+        // --prefill-chunk: resolved after the engine options (strix::glm::record_prefill_chunk, the shared resolver).
+        unsigned prefill_chunk = strix::glm::pf::dense_policy::kServeChunk;
+        bool prefill_chunk_explicit = false;
         std::uint64_t prefix_cache_bytes = 4ULL << 30;  // default 4 GiB per rank; --prefix-cache-gib 0 = off
+        bool prefix_cache_pinned = false;                // named by the operator: a deployment plan must hold it
         bool selftest_prefix = false;
         unsigned selftest_long = 2048, selftest_prefix_long = 0;
         bool prefill_chunk_mtp = true, selftest_skip_basic = false;
         bool serve_mtp = true;
         std::uint32_t max_tokens = 4096;
-        bool serial = false, print_config = false;
+        bool serial = false, print_config = false, short_first = true;
+        int short_first_flag = -1;  // --short-first on|off (-1: unset); overrides STRIX_GLM_SERVE_SHORT_FIRST
         // RTX prefill route: every rank receives its hand-off on --import-listen; rank 0 asks the RTX producer
         // (--rtx-prefill host:port) for prompts of >= --import-min-tokens and names rank 1's --import-peer endpoint.
         std::string import_listen, import_key_file, import_model_sha, import_node, rtx_prefill, import_peer;
@@ -769,17 +794,32 @@ int main(int argc, char** argv) {
                 rank_args.push_back(next());
             }
             else if (a == "--baseline") rank_args.push_back(a);
+            // Product profile: resolved by the shared resolver in rd::scan, the same rule as strix-glm5-rank.
+            else if (a == "--allow-pending") rank_args.push_back(a);
+            else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
+                const std::string name = a == "--profile" ? next() : a.substr(10);
+                if (!strix::profile::is_name(name))
+                    throw std::invalid_argument("--profile must be default, fast or quality (got '" + name + "')");
+                rank_args.push_back("--profile");
+                rank_args.push_back(name);
+            }
             else if (a == "--print-effective-config") { rank_args.push_back(a); print_config = true; }
             else if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--transport") transport_spec = next();
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--serial") serial = true;
+            else if (a == "--short-first") {
+                const std::string v = next();
+                if (v != "on" && v != "off") throw std::invalid_argument("--short-first must be on|off");
+                short_first_flag = v == "on" ? 1 : 0;
+            }
             else if (a == "--mtp-cycles") mtp_cycles = static_cast<unsigned>(std::stoul(next()));
-            else if (a == "--prefill-chunk") prefill_chunk = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--prefill-chunk") { prefill_chunk = static_cast<unsigned>(std::stoul(next())); prefill_chunk_explicit = true; }
             else if (a == "--prefill-chunk-mtp") prefill_chunk_mtp = std::stoul(next()) != 0;
             else if (a == "--prefix-cache-gib") {
                 prefix_cache_bytes = gs::prefix_budget_bytes(next());
+                prefix_cache_pinned = true;
             }
             else if (a == "--selftest-prefix") selftest_prefix = true;
             else if (a == "--selftest-prefix-long") selftest_prefix_long = static_cast<unsigned>(std::stoul(next()));
@@ -807,10 +847,14 @@ int main(int argc, char** argv) {
             }
             else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--import-dsa-once") import_dsa_once = true;
+            else if (strix::session::speculation_opt_out_argument(a)) serve_mtp = false;
             else throw std::invalid_argument("unknown option " + a);
         }
         if (const char* b = std::getenv("STRIX_GLM_SERVE_BATCH"); b != nullptr && std::string(b) == "0") serial = true;
+        if (const char* s = std::getenv("STRIX_GLM_SERVE_SHORT_FIRST"); s != nullptr && *s != '\0') short_first = std::string(s) != "0";
+        if (short_first_flag >= 0) short_first = short_first_flag != 0;
         if (const char* m = std::getenv("STRIX_GLM_SERVE_MTP"); m != nullptr && std::string(m) == "0") serve_mtp = false;
+        if (strix::session::speculation_environment_off(std::getenv(strix::session::speculation_environment))) serve_mtp = false;
         bool serve_g2 = true;
         if (const char* g = std::getenv("STRIX_GLM_SERVE_G2"); g != nullptr && std::string(g) == "0") serve_g2 = false;
         if (mtp_cycles == 0 || mtp_cycles > gs::kMaxMtpCycles) throw std::invalid_argument("--mtp-cycles 1..64");
@@ -845,15 +889,23 @@ int main(int argc, char** argv) {
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
             std::string refusal;
-            if (prefix_cache_bytes || !import_listen.empty() || !rtx_prefill.empty())
-                refusal = "GLM deployment: prefix cache/import peak owners not sized; disable those routes";
+            if (!import_listen.empty() || !rtx_prefill.empty())
+                refusal = "GLM deployment: import peak owners not sized; disable those routes";
+            deployment.prefix_keep = prefix_cache_bytes; deployment.prefix_keep_pinned = prefix_cache_pinned;
             deployment.prepare(opt, eff, transport_spec, refusal);
             if (deployment.check || print_config) return deployment.inspect(opt.rank);
         }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
-            std::printf("serve slots=%u capacity=%llu batch=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
-                        opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", prefill_chunk,
+            {   // Dry run: the shared chunk resolver over the resolved (not yet applied) environment.
+                const auto chunk = strix::glm::pending_prefill_chunk(
+                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
+                    [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
+                std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
+                prefill_chunk = chunk.tokens;
+            }
+            std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
+                        opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
                         prefill_chunk_mtp ? 1 : 0,
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
@@ -888,11 +940,15 @@ int main(int argc, char** argv) {
             if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
             (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
             (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-            std::string receipt;
-            auto transport = strix::glm::rank_transport::open_transport(transport_spec, opt.rank, receipt);
-            if (deployment.provider) deployment.resolve_live(opt, *transport);
+            auto opened = strix::dist::open_pair(transport_spec, opt.rank);
+            auto transport = std::move(opened.host);
+            const auto& receipt = opened.receipt;
+            if (deployment.provider) {
+                deployment.resolve_live(opt, *transport);
+                prefix_cache_bytes = deployment.prefix_keep;  // the plan grant (elastic: may be smaller, or 0 = off)
+            }
             if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
-            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), opt.exchange_rows);
+            comm = strix::glm::rank_transport::make_communicator(opt.rank, std::move(transport), std::move(opened.direct), opt.exchange_rows);
             std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(),
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
         }
@@ -933,6 +989,19 @@ int main(int argc, char** argv) {
                      " kmax " + std::to_string(eff.kmax) + " adaptive " + std::to_string(eff.adaptive ? 1 : 0) + "\n";
             hello.identity_hash = gs::fnv1a64(ident);
             if (deployment.plan) hello.identity_hash = gs::fnv1a64(deployment.plan->hash(), hello.identity_hash);
+        }
+        {
+            // Shared route receipt: the same lever keys as the rank CLI. The fingerprint rides in the hello, so two
+            // ranks on different numerical routes refuse to pair.
+            const std::uint64_t fp = strix::glm::record_route_levers("http", opt.rank, eff.prefill, prefill_mode,
+                                                                     ge::identity_mode_name(eng.identity_mode()), opt.max_rows);
+            // One resolver for the interleave chunk: both ranks print the value and what its dense calls take, and a
+            // declined route says why here instead of disappearing under load.
+            const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
+            prefill_chunk = chunk.tokens;
+            std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
+            hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
+            std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
         hello.capacity = opt.capacity;
         hello.slots = opt.slots;
@@ -1064,7 +1133,10 @@ int main(int argc, char** argv) {
         lc.slots = opt.slots;
         lc.capacity = opt.capacity;
         lc.batch = !serial;
+        lc.short_first = short_first;
         lc.prefix_cache_bytes = prefix_cache_bytes;
+        // Reply-end snapshots (opt-in, exactly "1"; plain decode only: refused under MTP). Rank 1 follows the lead.
+        lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
@@ -1334,7 +1406,7 @@ int main(int argc, char** argv) {
                             selftest_prefix_long > 0 ? selftest_long_prompts(*tokenizer, std::min(selftest, opt.slots), selftest_prefix_long) : prompts;
                         result.exact = gs::run_prefix_selftest(queue, prefix_prompts, selftest_tokens, gs::default_stop_ids(), tokenizer->encode("\nPlease continue briefly.", false),
                             [&lead] { lead.clear_prefix_cache(); }, [&lead] { return lead.stats().prefix_hits; },
-                            [](const std::string& line) { std::printf("%s\n", line.c_str()); });
+                            [](const std::string& line) { std::printf("%s\n", line.c_str()); }, lc.prefix_reply_store && !lc.mtp);
                     } else result = gs::run_selftest(queue, prompts, selftest_tokens, gs::default_stop_ids(), serial ? 1U : opt.slots,
                                               [](const std::string& line) { std::printf("%s\n", line.c_str()); }, hooks);
                 } catch (const std::exception& e) {
@@ -1474,8 +1546,8 @@ int main(int argc, char** argv) {
         http.listen();
         std::thread http_thread([&] { http.serve(); });
         api.set_state("ready");
-        std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu batch %s\n", host.c_str(), http.port(), model_id.c_str(),
-                    opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on");
+        std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu batch %s short-first %s\n", host.c_str(), http.port(), model_id.c_str(),
+                    opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off");
         try {
             lead.loop();
         } catch (...) {

@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/ds41_pipeline_front.hpp"
@@ -495,6 +496,10 @@ int run(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];

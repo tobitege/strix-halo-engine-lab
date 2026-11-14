@@ -59,7 +59,7 @@ void same(const std::vector<float>& a, const std::vector<float>& b, const std::s
             throw std::runtime_error("EXL3 panel route byte mismatch");
         }
 }
-std::size_t cases = 0, ffn_cases = 0;
+std::size_t cases = 0, ffn_cases = 0, packed_cases = 0;
 // Panel route == the pack's WMMA kernel (on the same panels): outputs, failure bits, input maximum.
 void compare(const Pack& w, unsigned rows, unsigned seed) {
     const auto x = inputs(std::size_t(rows) * w.view.inputs, seed);
@@ -81,6 +81,22 @@ void compare(const Pack& w, unsigned rows, unsigned seed) {
     same(download(reference, count), download(candidate, count),
          "linear I " + std::to_string(w.view.inputs) + " O " + std::to_string(w.view.outputs) + " K " +
          std::to_string(ex::bits(w.view)) + " rows " + std::to_string(rows));
+    // The same kernel reading its B fragments from the packed trellis (no resident panels): the same bytes.
+    if (rows <= 129) {
+        gpu::Buffer direct(count * 4), direct_failure(4), direct_maximum(4);
+        direct.upload(poison.data(), count * 4);
+        direct_failure.zero(); direct_maximum.zero();
+        ex::device_prefill(w.view, dx.as<float>(), rows, direct.as<float>(), scratch.data(), direct_failure.as<unsigned>(),
+                           direct_maximum.as<unsigned>(), nullptr);
+        gpu::synchronize();
+        unsigned direct_flag = 0, direct_max = 0;
+        direct_failure.download(&direct_flag, 4); direct_maximum.download(&direct_max, 4);
+        if (direct_flag != flags[0] || direct_max != maxima[0]) throw std::runtime_error("packed WMMA failure bits or maximum differ");
+        same(download(reference, count), download(direct, count),
+             "packed I " + std::to_string(w.view.inputs) + " O " + std::to_string(w.view.outputs) + " K " +
+             std::to_string(ex::bits(w.view)) + " rows " + std::to_string(rows));
+        ++packed_cases;
+    }
     ++cases;
 }
 // Fused panel FFN == linear(gate), linear(up), gelu_product, linear(down) on the panel route.
@@ -158,9 +174,10 @@ void bench() {
         const double exact = timed([&] { (void)ex::device_linear_rows(w.view, dx.as<float>(), rows, out.as<float>(), scratch.data(), scratch.size(), f); });
         const double kernel = timed([&] { ex::device_prefill(w.view, dx.as<float>(), rows, out.as<float>(), scratch.data(), f, maximum.as<unsigned>(), w.prepared->panels().data()); });
         const double panel = timed([&] { pf::linear(w.view, dx.as<float>(), rows, out.as<float>(), scratch.data(), f, maximum.as<unsigned>(), nullptr, true, w.prepared.get()); });
+        const double packed = timed([&] { ex::device_prefill(w.view, dx.as<float>(), rows, out.as<float>(), scratch.data(), f, maximum.as<unsigned>(), nullptr); });
         const double macs = double(rows) * s.in * s.out;
         std::cout << std::setprecision(5) << "{\"bench\":\"" << s.name << "\",\"rows\":" << rows << ",\"exact_ms\":" << exact
-                  << ",\"wmma64_ms\":" << kernel << ",\"panel_ms\":" << panel << ",\"panel_tflops\":" << 2 * macs / (panel * 1e9)
+                  << ",\"wmma64_ms\":" << kernel << ",\"wmma64_packed_ms\":" << packed << ",\"panel_ms\":" << panel << ",\"panel_tflops\":" << 2 * macs / (panel * 1e9)
                   << ",\"exact_tflops\":" << 2 * macs / (exact * 1e9) << "}\n";
     }
     const unsigned hidden = 2560, inter = 10240;
@@ -188,7 +205,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "bench") { bench(); return 0; }
         tests();
         std::cout << "{\"gate\":\"exl3-panels-vs-wmma64\",\"identity\":\"" << ex::prefill_identity << "\",\"cases\":" << cases
-                  << ",\"ffn_cases\":" << ffn_cases << ",\"verdict\":\"EXACT\"}\n";
+                  << ",\"ffn_cases\":" << ffn_cases << ",\"packed_cases\":" << packed_cases << ",\"verdict\":\"EXACT\"}\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

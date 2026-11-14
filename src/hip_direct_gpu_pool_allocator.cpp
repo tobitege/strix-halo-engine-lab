@@ -1,3 +1,4 @@
+#include "strix/hip_check.hpp"
 #include "strix/hip_direct_gpu_pool_allocator.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 
@@ -9,9 +10,7 @@
 
 namespace strix::transport {
 namespace {
-void check(hipError_t result, const char* operation) {
-    if (result != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(result));
-}
+using strix::hip_check;
 bool same_view(const TransportBufferView& a, const TransportBufferView& b) {
     return a.address == b.address && a.bytes == b.bytes && a.allocation_generation == b.allocation_generation &&
         a.domain == b.domain && a.access == b.access;
@@ -107,7 +106,7 @@ std::uintptr_t HipDirectGpuPoolAllocator::allocate_device(std::uint64_t bytes, s
     try {
         // Slot adopts output before an error or exception can obscure partial
         // allocation success. This is policy requested, not cache qualification.
-        check(impl_->calls.allocate_with_flags(&found->raw, static_cast<std::size_t>(total), hipDeviceMallocUncached), "HIP uncached transport allocation");
+        hip_check(impl_->calls.allocate_with_flags(&found->raw, static_cast<std::size_t>(total), hipDeviceMallocUncached), "HIP uncached transport allocation");
         if (!found->raw) throw std::runtime_error("HIP uncached allocation returned no owning pointer");
         impl_->current(); found->allocation = impl_->inspect(*found); found->identified = true;
         const auto& native = found->allocation; const auto raw = reinterpret_cast<std::uintptr_t>(found->raw);

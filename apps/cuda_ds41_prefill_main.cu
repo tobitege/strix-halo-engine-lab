@@ -38,6 +38,7 @@
 // --batch-fa-min-rows (default 8192, the service's). Each repeat runs every prompt alone (run(), context 0, unless
 // --batch-no-solo), then the batch, and prints per prompt: solo / batch seconds, logits FNV, state digest and
 // "state_equal" / "logits_equal" (the batch's serialized state and logits byte-compared with the solo run's).
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/cuda_ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
@@ -92,6 +93,9 @@ std::vector<std::uint32_t> read_ids(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     CudaPrefillOptions o;

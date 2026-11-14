@@ -87,6 +87,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             list(APPEND gemma4_b_hip_targets strix-gemma4-device-rows-linear-tests)
             add_test(NAME strix-gemma4-device-rows-linear-tests COMMAND strix-gemma4-device-rows-linear-tests)
             set_tests_properties(strix-gemma4-device-rows-linear-tests PROPERTIES TIMEOUT 120 LABELS "gpu;gemma4")
+            # Small-row decode GEMV fixture (hash, time and bytes per call at 1..16 rows; diagnostic, not a ctest).
+            add_executable(strix-gemma4-gemv-rows-fixture tests/gemma4_gpu/gemv_rows.hip)
+            target_link_libraries(strix-gemma4-gemv-rows-fixture PRIVATE strix_gemma4_device)
+            list(APPEND gemma4_b_hip_targets strix-gemma4-gemv-rows-fixture)
             # Prompt-prefill fused epilogues: byte gate against the separate launches (odd and chunk row counts).
             add_executable(strix-gemma4-device-fused-epilogue-tests tests/gemma4_gpu/fused_epilogue.hip)
             target_link_libraries(strix-gemma4-device-fused-epilogue-tests PRIVATE strix_gemma4_device)

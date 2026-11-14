@@ -1,3 +1,4 @@
+#include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-deepseek41-serve: DeepSeek V4.1 Flash served by a two-node engine group (EP experts, TP attention).
 // Rank 0 runs the OpenAI/Anthropic-compatible HTTP front end (strix_serve) and the continuous-batching scheduler; rank
@@ -103,12 +104,14 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_state_frames.hpp"
 #include "strix/handoff.hpp"
+#include "strix/pair/lockstep.hpp"
 #include "strix/deepseek41_batch_dspark.hpp"
 
 #include "ds41_hetero_stage.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/session/speculation_default.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -118,6 +121,7 @@
 #include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
+#include "deepseek41/http_session_owner.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deploy/binding.hpp"
 #include "strix/deepseek41_serve_observe.hpp"
@@ -344,13 +348,20 @@ constexpr std::uint32_t kPoolRelease = 1U, kPoolReserve = 2U;
 constexpr std::size_t kImportChunk = std::size_t{64} << 10U;  // BatchForward::exchange_host's message limit
 static_assert(offsetof(Control, extra_rows) <= 512U);
 
+// Lockstep round of this rank's Control channel. Each rank runs its whole Control conversation on one thread (lead() /
+// follow(); the --emulate peer is a second thread in the same process), so the counter is per thread.
+thread_local std::uint64_t control_round = 0;
+
 Control exchange(BatchForward& fwd, const Control& out) {
     std::array<std::byte, 512> o{}, i{};
     std::memcpy(o.data(), &out, offsetof(Control, extra_rows));
+    std::memcpy(o.data() + offsetof(Control, round), &control_round, sizeof control_round);
     fwd.exchange_host(o, i);
     Control in;
     std::copy_n(i.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&in, 1)).begin());
     if (in.magic != out.magic) throw std::runtime_error("control channel: bad magic from the peer");
+    strix::pair::check_round(control_round, in.round);
+    ++control_round;
     if (std::max(out.rows, in.rows) > BatchForward::max_rows) {
         if (std::max(out.rows, in.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
         fwd.exchange_host(std::as_bytes(std::span(out.extra_rows)), std::as_writable_bytes(std::span(in.extra_rows)));
@@ -1120,6 +1131,20 @@ void warm_up(const Args& a, BatchForward& fwd, SlotPrefill* prefill, const strix
     plans_at_ready = strix::ds41::trellis_plan_stats();
 }
 
+// Diagnostic token-stream checksum for this rank (FNV-1a over token ids in step order).
+// Omits row/slot identity and step boundaries; collisions are possible. Matching checksums
+// do not establish exactness: qualification still needs complete token/logit/state comparisons.
+struct StepTokenDigest {
+    std::uint64_t hash = 0xcbf29ce484222325ULL, tokens = 0;
+    template <typename Tokens>
+    void add(const Tokens& step) {
+        for (const std::uint32_t id : step) {
+            for (unsigned b = 0; b < 32U; b += 8U) hash = (hash ^ ((id >> b) & 0xFFU)) * 0x100000001b3ULL;
+            ++tokens;
+        }
+    }
+};
+
 // Plans created after READY (misses of the warm-up; all of them when it is off).
 std::string plans_since_ready() {
     const auto now = strix::ds41::trellis_plan_stats();
@@ -1237,7 +1262,9 @@ std::optional<SessionCheckpoint> session_operation(const Args &a, BatchForward &
 using PrefillFactory = std::function<std::unique_ptr<SlotPrefill>(std::uint32_t& rows)>;
 
 // ---- rank 1: no API; runs what rank 0 sends ----
-void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
+            StepTokenDigest& step_tokens) {
+    control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
     const auto first = exchange(fwd, mine);
@@ -1291,7 +1318,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
                          o.pieces, o.next_token, static_cast<unsigned long long>(o.logits), o.seconds);
     };
     for (;;) {
-        reply.round += 1U;
+        reply.round = control_round;
         std::array<std::byte, 512> out{}, in{};
         std::memcpy(out.data(), &reply, offsetof(Control, extra_rows));
         fwd.exchange_host(out, in);
@@ -1307,6 +1334,8 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         Control c;
         std::copy_n(in.begin(), offsetof(Control, extra_rows), std::as_writable_bytes(std::span(&c, 1)).begin());
         if (c.magic != reply.magic) throw std::runtime_error("control channel: bad magic from the peer");
+        strix::pair::check_round(control_round, c.round);  // draft packets above neither check nor advance the round
+        ++control_round;
         if (std::max(reply.rows, c.rows) > BatchForward::max_rows) {  // as exchange(): the rows past 8 follow
             if (std::max(reply.rows, c.rows) > fwd.row_limit()) throw std::runtime_error("control channel: step row limit differs");
             fwd.exchange_host(std::as_bytes(std::span(reply.extra_rows)), std::as_writable_bytes(std::span(c.extra_rows)));
@@ -1439,7 +1468,6 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
             if (hit.disk) {  // all or nothing: both ranks read their files
                 Control ack;
                 ack.command = static_cast<std::uint32_t>(Command::prefill);
-                ack.round = reply.round;
                 ack.pflags = ok ? 0U : 2U;
                 const auto peer = exchange(fwd, ack);
                 if (!ok || (peer.pflags & 2U) != 0U) {
@@ -1475,6 +1503,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         const auto rows = std::span<const BatchRow>(step_rows.data(), c.rows);
         if (spec) spec->follow_lookup_windows(c.pend);  // for follow_stage of these rows (after this step)
         const auto& tokens = stage ? stage->step(rows) : fwd.step(rows);
+        step_tokens.add(tokens);
         last_rows.assign(rows.begin(), rows.end());
         spec_rows = last_rows;
         last_tokens = tokens;
@@ -1485,7 +1514,8 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
 
 // ---- rank 0: HTTP + the scheduler ----
 struct Running {
-    serve::TakenJob job;
+    strix::session::KvHandle owner;
+    serve::PendingSession pending; // only while this candidate awaits native admission
     BatchSequence seq;
     std::size_t published = 0;
     Clock::time_point start, first_token;
@@ -1770,7 +1800,9 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
     s.reply(0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
 }
 
-void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage) {
+void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, const PrefillFactory& make_prefill, strix::ds41::hetero::Stage* stage,
+          StepTokenDigest& step_tokens) {
+    control_round = 0;
     Args a = initial;
     const auto mine = hello(a);
     const auto peer = exchange(fwd, mine);
@@ -1790,6 +1822,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
 
     std::fprintf(stderr, "sched: effective %s, service target %.1f ms, budget source %s, short-first %u, nesting disabled\n",
                  strix::deepseek41::sched::mode_name(sched.mode), sched.service_ms, sched.budget_source(), sched.short_first ? 1U : 0U);
+    std::fprintf(stderr, "sched: admit-first %s (from %zu live requests, decode gap <= %.0f ms)\n", sched.admit_first.name(), sched.admit_first.min_live,
+                 sched.admit_first.max_decode_gap_ms);
     const auto tokenizer = serve::BpeTokenizer::load_gguf(a.model);
     // the drafter is loaded before READY (requests may come as soon as READY is out)
     std::unique_ptr<strix::ds41::dspark::DeviceDrafter> drafter;
@@ -1841,6 +1875,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         policy.set("service_target_ms", serve::Json(sched.service_ms));
         policy.set("effective_unit_target_ms", serve::Json(sched.mode == strix::deepseek41::sched::Mode::interleave ? sched.target_ms() : 0.0));
         policy.set("budget_source", serve::Json(sched.budget_source()));
+        policy.set("admit_first", serve::Json(sched.admit_first.name()));
+        policy.set("admit_first_min_live", serve::Json(static_cast<std::uint64_t>(sched.admit_first.min_live)));
+        policy.set("admit_first_max_decode_gap_ms", serve::Json(sched.admit_first.max_decode_gap_ms));
         policy.set("short_first", serve::Json(sched.short_first));
         policy.set("nested_prefill", serve::Json(false));
         policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
@@ -2101,6 +2138,20 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         }
         return m.str();
     };
+    // Construct logical ownership before starting HTTP or native request work.
+    std::function<void(serve::SessionRuntime&)> native_turn;
+    std::function<void()> native_failed;
+    std::function<void()> native_stop_http;
+    bool native_drained = false;
+    strix::deepseek41::HttpSessionOwner request_owner(queue, a.context, a.slots,
+        [&](serve::SessionRuntime& r) { native_turn(r); }, [&] { return native_drained; },
+        [&] { if (native_failed) native_failed(); },
+        [&] { if (state.failed.load() && native_stop_http) native_stop_http(); });
+    auto& runtime = request_owner.runtime();
+    const auto request = [&](const Running& r) -> const serve::TakenJob& {
+        return r.owner.valid() ? runtime.inspect(r.owner) : runtime.inspect(r.pending);
+    };
+    // DS41 request ownership binding ends.
     serve::ApiService api(config, tokenizer, queue, a.context, false);
     serve::HttpServerConfig http;
     http.bind_address = a.http_bind;
@@ -2108,12 +2159,16 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     http.max_connections = a.max_connections;
     ImportBox imports;
     SessionBox session_jobs;
-    serve::HttpServer server(http, [&](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-        if (strix::deepseek41::sched::session_admin_route(a.session_ram_bytes != 0, request.path))
-            return handle_session(a, config, session_jobs, request, response);
-        if (request.path == "/admin/import-state") return handle_import(a, config, state, imports, request, response);
-        api.handle(request, response);
+    serve::HttpServer server(http, [&](const serve::HttpRequest& http_request, serve::HttpResponseWriter& response) {
+        if (strix::deepseek41::sched::session_admin_route(a.session_ram_bytes != 0, http_request.path))
+            return handle_session(a, config, session_jobs, http_request, response);
+        if (http_request.path == "/admin/import-state") return handle_import(a, config, state, imports, http_request, response);
+        api.handle(http_request, response);
     });
+    bool http_stopped = false;
+    native_stop_http = [&] {
+        if (!http_stopped) { server.stop(); http_stopped = true; }
+    };
     server.listen();
     // --import-frames PORT: the frames import listener lives as long as this function (destroyed on every exit path)
     std::unique_ptr<strix::deepseek41::pieces::FramesImportListener> frames;
@@ -2196,7 +2251,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     std::uint32_t pending_resets = 0;
     std::uint32_t pending_snaps = 0;  // session snapshots rank 0 took after the last step (rank 1 takes them on the next control)
     std::vector<std::uint32_t> pool_ops;              // KV pool operations since the last step (sent to rank 1)
-    std::deque<serve::TakenJob> pool_waiting;         // taken from the queue, waiting for room in the KV pool (FIFO)
+    std::deque<serve::PendingSession> pool_waiting;         // taken from the queue, waiting for room in the KV pool (FIFO)
     const auto publish_pool = [&] {
         if (!a.pool) return;
         const auto bytes = fwd.pool_free_bytes();
@@ -2265,16 +2320,16 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         st.decode_ms = r.has_first ? std::chrono::duration<double, std::milli>(now - r.first_token).count() : 0.0;
         st.finish = reason;
         st.sampling = "greedy";
-        if (r.job.job.observation_complete()) {  // its armed period held to here: the drafts of every step were attributed
+        if (request(r).job.observation_complete()) {  // its armed period held to here: the drafts of every step were attributed
             st.proposed = r.proposed;
             st.accepted = r.accepted;
-            if (r.has_first) st.first_token_ms = std::chrono::duration<double, std::milli>(r.first_token - r.job.submitted).count();
+            if (r.has_first) st.first_token_ms = std::chrono::duration<double, std::milli>(r.first_token - request(r).submitted).count();
         }
         std::string session_error = error;
-        if (sessions && !r.job.job.session_id.empty() && error.empty() && reason != "cancelled" && !r.seq.generated.empty()) {
+        if (sessions && !request(r).job.session_id.empty() && error.empty() && reason != "cancelled" && !r.seq.generated.empty()) {
             auto message = serve::Json::object();
             message.set("op", serve::Json("capture"));
-            message.set("id", serve::Json(r.job.job.session_id));
+            message.set("id", serve::Json(request(r).job.session_id));
             message.set("generation", serve::Json(strix::deepseek41::session_generation()));
             message.set("pending", serve::Json(static_cast<std::uint64_t>(r.seq.generated.back())));
             message.set("emitted", serve::Json(r.session_emitted + r.seq.generated.size()));
@@ -2290,12 +2345,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 session_error = e.what();
             }
         }
-        if (!r.job.job.session_id.empty() && !session_error.empty()) {
+        if (!request(r).job.session_id.empty() && !session_error.empty()) {
             const auto failure = serve::session_failure(session_error);
             st.error_status = failure.status;
             st.error_code = failure.code;
         }
-        queue.finish(r.job, st, session_error);
+        runtime.complete_native(r.owner, st, session_error);
         pool_release(r.seq.slot);
         free_slots.push_back(r.seq.slot);
         running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
@@ -2309,8 +2364,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             if (r.seq.generated.size() == r.published) continue;
             {  // a window emits several tokens: the ones after a stop token or past max_tokens are dropped
                 auto& g = r.seq.generated;
-                const auto& stops = r.job.job.stop_tokens;
-                std::size_t end = std::min<std::size_t>(g.size(), std::max<std::size_t>(r.job.job.max_tokens, r.published + 1U));
+                const auto& stops = request(r).job.stop_tokens;
+                std::size_t end = std::min<std::size_t>(g.size(), std::max<std::size_t>(request(r).job.max_tokens, r.published + 1U));
                 for (std::size_t k = r.published; k < end; ++k)
                     if (std::find(stops.begin(), stops.end(), g[k]) != stops.end()) {
                         end = k + 1U;
@@ -2324,12 +2379,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             }
             const std::span<const std::uint32_t> fresh(r.seq.generated.data() + r.published, r.seq.generated.size() - r.published);
             r.published = r.seq.generated.size();
-            const bool more = r.job.job.on_tokens ? r.job.job.on_tokens(fresh) : true;
-            const auto& stops = r.job.job.stop_tokens;
+            const bool more = runtime.publish(r.owner, fresh, true, true);
+            const auto& stops = request(r).job.stop_tokens;
             const bool stop = std::find(stops.begin(), stops.end(), fresh.back()) != stops.end();
             if (!more) finish(i, "cancelled", {});
             else if (stop) finish(i, "stop", {});
-            else if (r.seq.generated.size() >= r.job.job.max_tokens) finish(i, "length", {});
+            else if (r.seq.generated.size() >= request(r).job.max_tokens) finish(i, "length", {});
             else if (r.seq.position + 1U >= a.context) finish(i, "context", {});
         }
     };
@@ -2501,7 +2556,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         c.pshared = hit.shared;
         c.pkey = hit.key;
         // the stable prefix in blocks (only the in-run snapshots use it); rank 1 plans the same snapshot points
-        const std::uint32_t stable = a.prefix_inrun ? std::min<std::uint32_t>(r.job.job.stable_prefix, static_cast<std::uint32_t>(prompt.size())) : 0U;
+        const std::uint32_t stable = a.prefix_inrun ? std::min<std::uint32_t>(request(r).job.stable_prefix, static_cast<std::uint32_t>(prompt.size())) : 0U;
         const std::uint32_t stable_blocks = std::min<std::uint32_t>(stable / a.prefix_block, 0xFFFFFFU);
         c.pflags = (insert ? 1U : 0U) | (as_task ? kPrefillTask : 0U) | (stable_blocks << kPrefillHintShift);
         c.snaps = pending_snaps;
@@ -2625,6 +2680,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     };
     // one batch step of `seqs` on both ranks, then the new tokens published
     double step_ema = 0.0;  // seconds per step (recent), for the deferred admission's W
+    Clock::time_point decode_gap_from = Clock::now();  // throughput policy: when the decoding requests last advanced
+    // STRIX_DS41_SERVE_STEP_TRACE=1: one stderr line per decode step, device prefill and held step (ms since start)
+    const bool step_trace = std::getenv("STRIX_DS41_SERVE_STEP_TRACE") != nullptr && std::string(std::getenv("STRIX_DS41_SERVE_STEP_TRACE")) == "1";
+    const auto trace_t0 = Clock::now();
+    const auto trace_ms = [&](Clock::time_point t) { return std::chrono::duration<double, std::milli>(t - trace_t0).count(); };
     bool worked = false;  // a step or a prefill since the last quiesce (GPU-direct: a receive may be posted early)
     const bool comm_direct = comm.device_exchange() != nullptr;
     strix::deepseek41::serve_observe::StepDraftTally<BatchSequence> tally;  // armed: drafts per request of a step
@@ -2635,7 +2695,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             std::vector<std::uint32_t> remaining;
             for (const auto& r : running) {
                 if (std::find(seqs.begin(), seqs.end(), &r->seq) == seqs.end()) continue;  // not in this step (interleave)
-                const std::uint64_t left = r->job.job.max_tokens > r->seq.generated.size() ? r->job.job.max_tokens - r->seq.generated.size() : 1U;
+                const std::uint64_t left = request(*r).job.max_tokens > r->seq.generated.size() ? request(*r).job.max_tokens - r->seq.generated.size() : 1U;
                 const std::uint64_t room = a.context > r->seq.position + 1U ? a.context - r->seq.position - 1U : 1U;
                 remaining.push_back(static_cast<std::uint32_t>(std::max<std::uint64_t>(1U, std::min(left, room))));
             }
@@ -2692,6 +2752,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         prof.control += std::chrono::duration<double>(t0 - t_planned).count();
         if (stage && !pre) stage->submit(plan.rows);
         const auto& tokens = stage ? stage->step(plan.rows) : fwd.step(plan.rows);
+        step_tokens.add(tokens);
         dog.progress();
         last_round = Clock::now();
         hetero_step_seconds = std::chrono::duration<double>(last_round - t0).count();
@@ -2710,7 +2771,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 for (auto& r : running) {
                     if (i == seqs.size()) break;
                     if (seqs[i] != &r->seq) continue;
-                    if (r->job.job.observed) {
+                    if (request(*r).job.observed) {
                         const auto d = tally.after(i, r->seq);
                         r->proposed += d.proposed;
                         r->accepted += d.accepted;
@@ -2720,7 +2781,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 for (; i < seqs.size(); ++i)  // not reached by the callers: a sequence out of order is paired by a search
                     for (auto& r : running)
                         if (seqs[i] == &r->seq) {
-                            if (r->job.job.observed) {
+                            if (request(*r).job.observed) {
                                 const auto d = tally.after(i, r->seq);
                                 r->proposed += d.proposed;
                                 r->accepted += d.accepted;
@@ -2759,6 +2820,13 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (++prof.steps % 100U == 0U) prof.print(spec.get());
         const double dt = std::chrono::duration<double>(last_round - t0).count();
         step_ema = step_ema == 0.0 ? dt : 0.8 * step_ema + 0.2 * dt;  // the deferred admission's W
+        if (step_trace) {
+            std::size_t generated = 0;
+            for (const auto* q : seqs) generated += q->generated.size();
+            std::fprintf(stderr, "steptrace step t %.1f running %zu seqs %zu rows %zu decode %u plan_ms %.2f step_ms %.2f end %.1f gen %zu\n",
+                         trace_ms(t_loop), running.size(), seqs.size(), plan.rows.size(), decode,
+                         std::chrono::duration<double, std::milli>(t_planned - t_loop).count(), dt * 1e3, trace_ms(Clock::now()), generated);
+        }
         // a status or metrics read asked for fresh copies (one relaxed load per step otherwise); the pool's free list
         // changes on this thread only, so its scan runs here, before the lock
         const bool wanted = state.stats_wanted.load(std::memory_order_relaxed);
@@ -2838,7 +2906,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     };
     // deferred admission (STRIX_DS41_SERVE_SCHED=defer): taken jobs waiting to be admitted, and the ones admitted again
     struct Deferred {
-        serve::TakenJob job;
+        serve::PendingSession job;
         Clock::time_point taken;
     };
     std::deque<Deferred> deferred, admit_ready;
@@ -2852,7 +2920,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             if (!r->device_prefill) {
                 ++decoding;
                 const auto g = r->seq.generated.size();
-                remaining.push_back(r->job.job.max_tokens > g ? r->job.job.max_tokens - g : 0U);
+                remaining.push_back(request(*r).job.max_tokens > g ? request(*r).job.max_tokens - g : 0U);
             }
         const double W = strix::deepseek41::sched::wait_estimate(remaining, step_ema > 0.0 ? step_ema : 0.06);
         const auto d = strix::deepseek41::sched::admit(sched, prompt.size(), decoding, waited, W, state.draining.load());
@@ -2865,8 +2933,19 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     };
     std::uint64_t session_hits = 0, session_misses = 0, session_refusals = 0;
     std::string failure;
-    try {
-        for (;;) {
+    enum class ControlPhase { before_admission, admission };
+    ControlPhase control_phase = ControlPhase::before_admission;
+    bool imported_first = false;
+    native_failed = [&] {
+        try { throw; }
+        catch (const std::exception& e) { failure = e.what(); }
+        catch (...) { failure = "engine failure"; }
+        state.failed.store(true);
+        api.set_state("failed");
+        while (!running.empty()) finish(running.size() - 1U, "length", "engine failure: " + failure);
+    };
+    native_turn = [&](serve::SessionRuntime&) {
+        if (control_phase == ControlPhase::before_admission) {
             if (sessions) {
                 std::deque<std::shared_ptr<SessionJob>> jobs;
                 {
@@ -2882,7 +2961,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                         if (op == "list") {
                             std::map<std::string, serve::Json> rows;
                             for (const auto &id : sessions->list()) {
-                                if (std::any_of(running.begin(), running.end(), [&](const auto& r) { return r->job.job.session_id == id; })) continue;
+                                if (std::any_of(running.begin(), running.end(), [&](const auto& r) { return request(*r).job.session_id == id; })) continue;
                                 const auto info = sessions->inspect(id);
                                 const auto &c = info.checkpoint;
                                 auto row = serve::Json::object();
@@ -2903,7 +2982,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                                 const auto position = active && active->r == r.get() ? active->task->rows() : r->seq.position;
                                 std::optional<std::uint32_t> pending;  // not a conditional: gcc 14 -O3 reports the empty arm as maybe-uninitialized
                                 if (!r->seq.generated.empty()) pending = r->seq.generated.back();
-                                serve::session_inventory_live(rows, r->job.job.session_id, position, pending,
+                                serve::session_inventory_live(rows, request(*r).job.session_id, position, pending,
                                     r->session_emitted + r->seq.generated.size(), true);
                             }
                             auto ids = serve::Json::array();
@@ -2911,7 +2990,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             out.set("sessions", std::move(ids));
                         } else if (op != "stats") {
                             const auto id = j->message.find("id")->as_string();
-                            if (std::any_of(running.begin(), running.end(), [&](const auto &r) { return r->job.job.session_id == id; }))
+                            if (std::any_of(running.begin(), running.end(), [&](const auto &r) { return request(*r).job.session_id == id; }))
                                 throw std::runtime_error("session has an active turn");
                             const auto names = sessions->list();
                             if (std::find(names.begin(), names.end(), id) == names.end())
@@ -2991,19 +3070,19 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 for (auto* d : {&deferred, &admit_ready})
                     for (; !d->empty(); d->pop_front()) {
                         serve::GenerationStats st;
-                        st.prompt_tokens = d->front().job.job.prompt.size();
+                        st.prompt_tokens = runtime.inspect(d->front().job).job.prompt.size();
                         st.finish = "cancelled";
-                        queue.finish(d->front().job, st, "draining");
+                        runtime.refuse_pending(d->front().job, st, "draining");
                     }
-            if (stopping && running.empty()) break;  // SIGINT/SIGTERM: drained
+            if (stopping && running.empty()) { native_drained = true; return; }  // SIGINT/SIGTERM: drained
             if (sched.mode == strix::deepseek41::sched::Mode::defer)  // deferred jobs: cancelled, continuing a parked state, or admitted now
                 for (auto it = deferred.begin(); it != deferred.end();) {
-                    const auto& job = it->job.job;
-                    if (it->job.ticket->cancelled()) {
+                    const auto& job = runtime.inspect(it->job).job;
+                    if (runtime.pending_cancelled(it->job)) {
                         serve::GenerationStats st;
                         st.prompt_tokens = job.prompt.size();
                         st.finish = "cancelled";
-                        queue.finish(it->job, st, {});
+                        runtime.refuse_pending(it->job, st, {});
                         it = deferred.erase(it);
                         continue;
                     }
@@ -3018,9 +3097,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     }
                 }
             // admission between steps: oldest queued jobs into free slots
-            bool imported_first = false;
-            while (!state.draining.load() && (!free_slots.empty() || !parked.empty())) {
-                std::optional<serve::TakenJob> job;
+            imported_first = false;
+            control_phase = ControlPhase::admission;
+        }
+        if (control_phase == ControlPhase::admission) {
+            // One candidate per owner turn; yielding performs no native work.
+            // The cursor resumes this SAME admission sweep before decode/admin.
+            const auto admit_one = [&]() -> bool {
+                std::optional<serve::PendingSession> job;
                 bool from_queue = false;
                 Clock::time_point taken = Clock::now();
                 if (!pool_waiting.empty()) {
@@ -3031,31 +3115,31 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     taken = admit_ready.front().taken;
                     admit_ready.pop_front();
                 } else {
-                    job = queue.take(false, sched.short_first);
+                    if (runtime.reserve_fifo(false, sched.short_first)) job = runtime.hold_reservation();
                     from_queue = true;
                 }
-                if (!job) break;
+                if (!job) return false;
                 if (hetero_pipeline) hetero_flush();  // the new request may take a slot: the plans in flight first
                 if (from_queue) taken = Clock::now();
                 auto r = std::make_unique<Running>();
-                r->job = std::move(*job);
+                r->pending = *job;
                 r->start = taken;
-                const auto& prompt = r->job.job.prompt;
+                const auto& prompt = request(*r).job.prompt;
                 if (prompt.empty() || prompt.size() + 1U >= a.context) {
                     serve::GenerationStats st;
                     st.prompt_tokens = prompt.size();
                     st.finish = "context";
-                    queue.finish(r->job, st, "prompt is empty or fills the context");
-                    continue;
+                    runtime.refuse_pending(r->pending, st, "prompt is empty or fills the context");
+                    return true;
                 }
-                if (!r->job.job.session_id.empty()) {
-                    const auto &id = r->job.job.session_id;
-                    if (std::any_of(running.begin(), running.end(), [&](const auto &run) { return run->job.job.session_id == id; })) {
+                if (!request(*r).job.session_id.empty()) {
+                    const auto &id = request(*r).job.session_id;
+                    if (std::any_of(running.begin(), running.end(), [&](const auto &run) { return request(*run).job.session_id == id; })) {
                         serve::GenerationStats st; st.finish = "cancelled";
                         st.error_status = 409; st.error_code = "session_incompatible";
-                        queue.finish(r->job, st, "session has an active turn"); continue;
+                        runtime.refuse_pending(r->pending, st, "session has an active turn"); return true;
                     }
-                    if (match_parked(prompt, r->job.job.max_tokens, id) < 0) {
+                    if (match_parked(prompt, request(*r).job.max_tokens, id) < 0) {
                         // A changed transcript is a normal miss. Release stale staged slots.
                         for (auto it = parked.begin(); it != parked.end();) {
                             if (it->session_id == id) { pool_release(it->slot); free_slots.push_back(it->slot); it = parked.erase(it); }
@@ -3087,10 +3171,12 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                             // Explicit resume reports validation errors; chat lookup falls back to prefill.
                         }
                     }
-                    if (match_parked(prompt, r->job.job.max_tokens, id) >= 0) ++session_hits;
+                    if (match_parked(prompt, request(*r).job.max_tokens, id) >= 0) ++session_hits;
                     else ++session_misses;
                 }
-                if (const auto m = parked.empty() ? -1 : match_parked(prompt, r->job.job.max_tokens, r->job.job.session_id); m >= 0) {  // continues an imported state
+                if (const auto m = parked.empty() ? -1 : match_parked(prompt, request(*r).job.max_tokens, request(*r).job.session_id); m >= 0) {  // continues an imported state
+                    r->owner = runtime.promote(r->pending).state;
+                    r->pending = {};
                     const auto p = parked[static_cast<std::size_t>(m)];
                     parked.erase(parked.begin() + m);
                     r->seq.slot = p.slot;
@@ -3105,65 +3191,71 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     }
                     std::fprintf(stderr, "import: request of %zu prompt tokens continues the state in slot %u (position %u)\n", prompt.size(), p.slot,
                                  p.position);
-                    if (!r->job.job.session_id.empty() && r->job.job.on_admitted) r->job.job.on_admitted();
+                    if (!request(*r).job.session_id.empty()) runtime.notify_admitted(r->owner);
                     running.push_back(std::move(r));
                     worked = true;
                     const std::lock_guard lock(state.mutex);
                     state.busy = static_cast<std::uint32_t>(running.size());
                     ++state.admitted;
-                    continue;
+                    return true;
                 }
                 if (sched.mode == strix::deepseek41::sched::Mode::defer && from_queue && device_path(prompt) &&
                     decide(prompt, 0.0) == strix::deepseek41::sched::Admit::defer) {  // its prefill would stall the decoding requests: wait
-                    deferred.push_back({std::move(r->job), taken});
-                    continue;
+                    deferred.push_back({r->pending, taken});
+                    return true;
                 }
                 if (free_slots.empty()) unpark_oldest();  // a parked state gives its slot to a request that needs one
                 if (a.pool != 0U) {  // room for the prompt and every token it may generate, or wait (FIFO)
-                    const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{r->job.job.max_tokens} + 1U));
+                    const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{request(*r).job.max_tokens} + 1U));
                     if (!pool_reserve(free_slots.back(), want)) {
                         if (want > a.pool) {  // never fits
                             serve::GenerationStats st;
                             st.prompt_tokens = prompt.size();
                             st.finish = "context";
-                            queue.finish(r->job, st, "prompt + max_tokens exceed the KV pool");
-                            continue;
+                            runtime.refuse_pending(r->pending, st, "prompt + max_tokens exceed the KV pool");
+                            return true;
                         }
-                        pool_waiting.push_front(std::move(r->job));
-                        break;
+                        pool_waiting.push_front(r->pending);
+                        return false;
                     }
                     pool_ops.push_back(kPoolReserve << 30U | free_slots.back() << 24U | want);
                 }
+                r->owner = runtime.promote(r->pending).state;
+                r->pending = {};
                 r->seq.slot = free_slots.back();
                 free_slots.pop_back();
                 r->seq.prompt = prompt;
                 r->device_prefill = device_path(prompt);
                 if (spec && !r->device_prefill) spec->start(r->seq.slot, prompt);  // device prefill: imported() after it
                 pending_resets |= 1U << r->seq.slot;
-                if (!r->job.job.session_id.empty() && r->job.job.on_admitted) r->job.job.on_admitted();
+                if (!request(*r).job.session_id.empty()) runtime.notify_admitted(r->owner);
                 running.push_back(std::move(r));
                 worked = true;
                 const std::lock_guard lock(state.mutex);
                 state.busy = static_cast<std::uint32_t>(running.size());
                 ++state.admitted;
-            }
+                return true;
+            };
+            if (!state.draining.load() && (!free_slots.empty() || !parked.empty()) && admit_one()) return;
+            control_phase = ControlPhase::before_admission;
+        }
             if (state.draining.load())  // taken jobs still waiting for pool room end with the drain
                 for (; !pool_waiting.empty(); pool_waiting.pop_front()) {
                     serve::GenerationStats st;
-                    st.prompt_tokens = pool_waiting.front().job.prompt.size();
+                    st.prompt_tokens = runtime.inspect(pool_waiting.front()).job.prompt.size();
                     st.finish = "cancelled";
-                    queue.finish(pool_waiting.front(), st, "draining");
+                    runtime.refuse_pending(pool_waiting.front(), st, "draining");
                 }
             if (imported_first) publish();  // the first token of a request that continues an imported state is known
             // cancelled requests leave before the step
             if (hetero_pipeline && !in_flight.empty())
                 for (const auto& r : running)
-                    if (r->job.ticket->cancelled()) {
+                    if (runtime.ticket_cancelled(r->owner)) {
                         hetero_flush();
                         break;
                     }
             for (std::size_t i = running.size(); i-- > 0U;)
-                if (running[i]->job.ticket->cancelled()) {
+                if (runtime.ticket_cancelled(running[i]->owner)) {
                     if (active && active->r == running[i].get()) abort_task();
                     finish(i, "cancelled", {});
                 }
@@ -3173,24 +3265,32 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 if (!parked.empty())
                     for (auto& r : running)
                         if (r->device_prefill)
-                            if (const auto m = match_parked(r->seq.prompt, r->job.job.max_tokens, r->job.job.session_id); m >= 0) {
+                            if (const auto m = match_parked(r->seq.prompt, request(*r).job.max_tokens, request(*r).job.session_id); m >= 0) {
                                 take_parked(*r, static_cast<std::size_t>(m));
                                 swapped = true;
                             }
                 if (swapped) publish();
+                // the decode gap starts when requests are ready to step, not while nothing decodes
+                if (std::none_of(running.begin(), running.end(), [](const auto& r) { return !r->device_prefill; })) decode_gap_from = Clock::now();
+                bool prefilled_now = false;
                 if (!active) {
                     std::vector<Running*> waiting;
                     for (auto& r : running)
                         if (r->device_prefill) waiting.push_back(r.get());
-                    std::stable_sort(waiting.begin(), waiting.end(), [](const auto* a0, const auto* b0) {
-                        return a0->job.submitted < b0->job.submitted;
+                    std::stable_sort(waiting.begin(), waiting.end(), [&](const auto* a0, const auto* b0) {
+                        return request(*a0).submitted < request(*b0).submitted;
                     });
                     if (!waiting.empty()) {
                         const auto pick = serve::select_waiting(waiting, sched.short_first,
                             [](const auto* r) { return r->seq.prompt.size(); },
                             [](auto* r) -> std::uint32_t& { return r->prefill_overtakes; });
                         auto& r = *waiting[pick];
+                        const auto t_pf = Clock::now();
                         device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
+                        if (step_trace)
+                            std::fprintf(stderr, "steptrace prefill t %.1f slot %u tokens %zu end %.1f task %d\n", trace_ms(t_pf), r.seq.slot,
+                                         r.seq.prompt.size(), trace_ms(Clock::now()), active ? 1 : 0);
+                        prefilled_now = true;
                         if (!active) publish();
                     }
                 }
@@ -3198,17 +3298,27 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 std::vector<BatchSequence*> seqs;
                 for (auto& r : running)
                     if (!r->device_prefill) seqs.push_back(&r->seq);
-                if (!seqs.empty()) {
+                // admit-first (serve::AdmitFirst, selected by the live concurrency): prompts that wait for their prefill go
+                // before the next decode step, on the same prefill path and units, so the tokens are the same. A request
+                // still in the queue after a prefill counts once: the loop admits it before the others step.
+                const std::size_t queued = sched.admit_first.select == serve::AdmitFirst::Select::never ? 0U : static_cast<std::size_t>(queue.snapshot().queued);
+                const auto waiting_prefill = static_cast<std::size_t>(std::count_if(running.begin(), running.end(), [](const auto& r) { return r->device_prefill; }));
+                const bool hold = sched.admit_first.prompt_before_decode(running.size() + queued, waiting_prefill + (prefilled_now && queued != 0U ? 1U : 0U),
+                    seqs.size(), std::chrono::duration<double, std::milli>(Clock::now() - decode_gap_from).count());
+                if (hold) {
+                    if (step_trace) std::fprintf(stderr, "steptrace hold t %.1f seqs %zu waiting %zu queued %zu\n", trace_ms(Clock::now()), seqs.size(), waiting_prefill, queued);
+                } else if (!seqs.empty()) {
                     decode_step(seqs);
+                    decode_gap_from = Clock::now();
                     if (active) ++active->steps_between;
                 }
                 if (active) {
                     // phase B (resumable): the default pieces, a few units per tick; else pieces of unit_rows rows
                     run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()), !seqs.empty());
                     if (!active) publish();  // its first token
-                    continue;
+                    return;
                 }
-                if (!running.empty()) continue;
+                if (!running.empty()) return;
             } else {
                 // device prefills of the admitted prompts, then their first tokens
                 bool prefilled = false;
@@ -3219,7 +3329,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     }
                 if (prefilled) {
                     publish();
-                    continue;  // admit again, then step the requests that are decoding
+                    return;  // admit again, then step the requests that are decoding
                 }
             }
             if (running.empty()) {
@@ -3245,15 +3355,23 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                     dog.progress();
                     last_round = Clock::now();
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                continue;
+                // Idle: a submit wakes the loop at once (was a 2 ms poll); the cap bounds how late the drain flag and
+                // other-thread state are seen, and the heartbeat deadline keeps its 1 s cadence. Work that is queued
+                // but not admitted (draining) keeps the 2 ms poll so the loop never spins.
+                if (queue.has_queued_work()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                else (void)queue.wait_work_until(std::min(last_round + std::chrono::seconds(1), Clock::now() + std::chrono::milliseconds(20)));
+                return;
             }
             std::vector<BatchSequence*> seqs;
             for (auto& r : running) seqs.push_back(&r->seq);
             decode_step(seqs);
-        }
+    };
+    try {
+        runtime.run();
     } catch (const std::exception& e) {
         failure = e.what();
+    } catch (...) {
+        failure = "engine failure";
     }
     if (!failure.empty()) {
         state.failed.store(true);
@@ -3270,24 +3388,10 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             failure = std::string("shutdown of rank 1: ") + e.what();
         }
     }
-    server.stop();
+    native_stop_http();
     queue.shutdown();
     http_thread.join();
     if (!failure.empty()) poisoned(0U, failure);
-}
-
-// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (null: host path).
-std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
-
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
-    strix::dist::OpenTransportOptions options;
-    options.spellings = strix::dist::TransportSpellings{"usb4auto", "usb4gpu"};
-    options.usb.rank = rank;
-    options.usb.timeout = std::chrono::seconds(timeout);
-    auto opened = strix::dist::open_transport(spec, options);
-    gpu_direct = std::move(opened.direct);
-    if (!opened.receipt.empty()) std::fprintf(stderr, "usb4 topology: %s\n", opened.receipt.c_str());
-    return std::move(opened.host);
 }
 
 // --prefill-rows auto (the pair default): the largest piece of 32768 / 16384 / 8192 / 4096 rows (at most the context) that both
@@ -3332,10 +3436,11 @@ std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::C
 
 #include "deepseek41_deploy.inc"
 
-void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
+void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport,
+              std::unique_ptr<strix::dist::DeviceExchange> direct = nullptr) {
     if (a.deploy_spec) resolve_live_deployment(a, rank, *transport);
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
     std::fprintf(stderr, "rank %u: dist %s\n", rank, comm.transport_name().c_str());
     strix::profile::check_peer(strix::deepseek41::pair_defaults::profile_resolution(), [&](std::span<const std::byte> profile_out, std::span<std::byte> profile_in) {
@@ -3390,10 +3495,13 @@ void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport
                                         std::to_string(a.context));
         dog.pause(false);
     }
-    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get());
-    else follow(a, fwd, dog, make_prefill, stage.get());
+    StepTokenDigest step_tokens;
+    if (rank == 0U) lead(a, fwd, comm, dog, make_prefill, stage.get(), step_tokens);
+    else follow(a, fwd, dog, make_prefill, stage.get(), step_tokens);
     if (stage) stage->close();
     std::fprintf(stderr, "rank %u: %s\n", rank, plans_since_ready().c_str());
+    std::fprintf(stderr, "rank %u: step tokens %llu digest %016llx\n", rank, static_cast<unsigned long long>(step_tokens.tokens),
+                 static_cast<unsigned long long>(step_tokens.hash));
     serve::Json stopped = serve::Json::object();
     stopped.set("event", serve::Json("STOPPED"));
     stopped.set("rank", serve::Json(static_cast<std::uint64_t>(rank)));
@@ -3469,6 +3577,10 @@ void describe(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
     for (int i = 1; i < argc; ++i)
         if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;
@@ -3498,7 +3610,7 @@ int main(int argc, char** argv) try {
         else if (s == "--pool-positions") a.pool = u32();
         else if (s == "--prompt-rows") a.prompt_rows = u32();
         else if (s == "--dspark") a.dspark = next();
-        else if (s == "--no-dspark") a.dspark.clear();
+        else if (s == "--no-dspark" || strix::session::speculation_opt_out_argument(s)) a.dspark.clear();
         else if (s == "--dspark-window") a.dspark_window = next();
         else if (s == "--dspark-vocab") a.dspark_vocab = next();
         else if (s == "--dspark-ranks") a.dspark_ranks = u32();
@@ -3668,12 +3780,13 @@ int main(int argc, char** argv) try {
         return 0;
     }
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
+    auto opened = strix::dist::open_pair(a.transport, a.rank, {std::chrono::seconds(a.connect_timeout), strix::dist::all_transport_capabilities, true});
+    auto transport = std::move(opened.host);
     ::alarm(0);
     std::fprintf(stderr, "connected (%s)\n", transport->name().c_str());
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);
-    run_rank(a, a.rank, std::move(transport));
+    run_rank(a, a.rank, std::move(transport), std::move(opened.direct));
     return 0;
 } catch (const std::exception& e) {
     serve::Json ev = serve::Json::object();

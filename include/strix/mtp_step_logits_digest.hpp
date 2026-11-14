@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/model_content_hash.hpp"
 #include <algorithm>
 #include <array>
@@ -8,7 +9,12 @@
 
 namespace strix {
 inline bool mtp_step_logits_digest_enabled() noexcept {
-    static const bool enabled=[] {const char* v=std::getenv("STRIX_MTP_STEP_LOGITS_DIGEST");return v && v[0]=='1';}();
+    static const bool enabled=strix::envcfg::flag("STRIX_MTP_STEP_LOGITS_DIGEST", false);
+    return enabled;
+}
+// STRIX_MTP_LOGITS_DIGEST=1 (first character '1'): read once (R2-13; was per step).
+inline bool mtp_logits_digest_enabled() noexcept {
+    static const bool enabled=strix::envcfg::flag("STRIX_MTP_LOGITS_DIGEST", false);
     return enabled;
 }
 // All serial ticket consumers retain the same actual completed full-vocabulary

@@ -1,0 +1,10 @@
+D:\tmp\fix-pr567\tests\row_layout_tests.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\row_layout_tests.obj
+D:\tmp\fix-pr567\src\execution_arena.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\execution_arena.obj
+D:\tmp\fix-pr567\src\execution_buffers.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\execution_buffers.obj
+D:\tmp\fix-pr567\src\execution_io.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\execution_io.obj
+D:\tmp\fix-pr567\src\ple_workspace.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\ple_workspace.obj
+D:\tmp\fix-pr567\src\indexed_attention_workspace.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\indexed_attention_workspace.obj
+D:\tmp\fix-pr567\src\model_contract.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\model_contract.obj
+D:\tmp\fix-pr567\src\qsa_selection_plan.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\qsa_selection_plan.obj
+D:\tmp\fix-pr567\src\q6p_registry.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\q6p_registry.obj
+D:\tmp\fix-pr567\src\moe_q4k_a8_runtime.cpp;D:\tmp\fix-pr567\.pr567-host\strix-row-layout-tests.dir\Release\moe_q4k_a8_runtime.obj

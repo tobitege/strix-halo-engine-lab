@@ -10,6 +10,8 @@
 #include "strix/hip_minimax_msa.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -1555,9 +1557,120 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
 
 }  // namespace
 
+// FAST flash mode (msa_rework 11, shared key-split WMMA core) against the exact in-block kernel (mode 10) on the same
+// caches, selection and block lists. Lossy by design (BF16 queries / probabilities, WMMA sums), so the check is a
+// tolerance: per (row, head) L2 error relative to the exact output's L2 norm.
+// kind 0 = random, 1 = one dominant key per block (K row x 6), 2 = all-equal scores (every K row zero),
+// 3 = all-equal non-zero scores (cached K rows identical), 4 = identical cached V rows (output = that row whatever the
+// weights: isolates the normalisation). Kinds 3 / 4 only shape the cached positions below pos0.
+void prefill_flash_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, int kind, unsigned mode = 11) {
+    Prefill p = make_prefill(std::uint64_t{pos0} + n, rng);
+    {
+        const std::vector<float> w(512, -0.5F);  // norm scale 0.5: score spread of a few units, like the model
+        hip_ok(hipMemcpy(p.dw, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice), "flash weights");
+        if (kind == 2) hip_ok(hipMemset(p.dk, 0, p.k.size() * sizeof(float)), "flash zero K");
+    }
+    const std::size_t nkv = p.T * 256, nik = p.T * 128;
+    std::vector<std::uint16_t> initial_k(nkv), initial_v(nkv), initial_i(nik);
+    std::normal_distribution<float> g(0.0F, 1.0F);
+    for (std::size_t row = 0; row < p.T * 2; ++row) {
+        const float scale = kind == 2 ? 0.0F : kind == 1 && (row / 2) % 128 == 5 ? 3.0F : 0.5F;
+        for (std::size_t d = 0; d < 128; ++d) {
+            initial_k[row * 128 + d] = kind == 3 && row >= 2 ? initial_k[(row % 2) * 128 + d] : msa::float_to_bf16(g(rng) * scale);
+            initial_v[row * 128 + d] = kind == 4 && row >= 2 ? initial_v[(row % 2) * 128 + d] : msa::float_to_bf16(g(rng));
+        }
+    }
+    for (auto& x : initial_i) x = static_cast<std::uint16_t>(0x3e00U + (rng() & 0x3ffU));
+    const unsigned windows = (n + 15) / 16;
+    const unsigned max_scratch = static_cast<unsigned>((512ULL * 1024 * 1024) / mf::prefill_window_bytes(p.max_blocks));
+    const unsigned scratch_windows = std::min(windows, max_scratch);
+    const std::size_t rows = std::size_t{scratch_windows} * 16;
+    float* scores = dalloc<float>(rows * 2 * p.max_blocks);
+    float* partial = dalloc<float>(rows * 32 * msa::kMaxChunks * 130);
+    auto* idx = dalloc<std::uint32_t>(rows * 2 * msa::kTopK);
+    auto* cnt = dalloc<std::uint32_t>(rows * 2);
+    auto* ticket = dalloc<std::uint32_t>(rows * 2 * 4);
+    std::vector<float> out[2];
+    double best_ms[2] = {1e30, 1e30};  // whole prefill call (prep + index + selection + attend), best of the repeats
+    const unsigned reps = n >= 1024 ? 3U : 1U;
+    for (unsigned pass = 0; pass < 2 * reps; ++pass) {
+        const unsigned arm = pass & 1U;
+        hip_ok(hipMemcpy(p.kc, initial_k.data(), nkv * 2, hipMemcpyHostToDevice), "flash reset K");
+        hip_ok(hipMemcpy(p.vc, initial_v.data(), nkv * 2, hipMemcpyHostToDevice), "flash reset V");
+        hip_ok(hipMemcpy(p.ikc, initial_i.data(), nik * 2, hipMemcpyHostToDevice), "flash reset IK");
+        hip_ok(hipMemset(p.o, 0, p.q.size() * sizeof(float)), "flash reset O");
+        hip_ok(hipMemset(ticket, 0, rows * 2 * 4 * sizeof(std::uint32_t)), "flash reset tickets");
+        auto v = prefill_view(p, pos0, std::min(n, 16U), 3, 0);
+        v.scores = scores;
+        v.partial = partial;
+        v.idx = idx;
+        v.idx_count = cnt;
+        v.ticket = ticket;
+        hip_ok(hipDeviceSynchronize(), "flash sync before");
+        const auto t0 = std::chrono::steady_clock::now();
+        mf::enqueue_prefill({v, n, pos0, scratch_windows, 0, false, 32U, arm == 0 ? 10U : mode}, nullptr);
+        hip_ok(hipDeviceSynchronize(), "flash sync after");
+        best_ms[arm] = std::min(best_ms[arm], std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        out[arm] = host(p.o, p.q.size());
+    }
+    double worst = 0.0, sum = 0.0, worst_abs = 0.0;
+    std::size_t heads = 0, bad = 0;
+    for (std::size_t h = 0; h * 128 < out[0].size(); ++h) {
+        double ref = 0.0, err = 0.0, peak = 0.0, dpeak = 0.0;
+        for (std::size_t d = 0; d < 128; ++d) {
+            const double a = out[0][h * 128 + d], b = out[1][h * 128 + d];
+            if (!(std::isfinite(a) && std::isfinite(b))) ++bad;
+            ref += a * a;
+            err += (a - b) * (a - b);
+            peak = std::max(peak, std::fabs(a));
+            dpeak = std::max(dpeak, std::fabs(a - b));
+        }
+        if (ref == 0.0) {
+            if (err != 0.0) ++bad;  // a head the exact kernel left untouched
+            continue;
+        }
+        ++heads;
+        const double rel = std::sqrt(err / ref);
+        worst = std::max(worst, rel);
+        worst_abs = std::max(worst_abs, dpeak / peak);
+        sum += rel;
+    }
+    const double mean = heads != 0 ? sum / static_cast<double>(heads) : 0.0;
+    // The BF16 query rounding error grows with the logit size: the dominant-key case (logits x 6) gets a wider bound.
+    const bool ok = bad == 0 && heads == std::size_t{n} * 32 && worst <= (mode == 12 ? 1e-4 : kind == 1 ? 1.2e-2 : 4e-3);
+    check(ok, "flash prefill pos0=" + std::to_string(pos0) + " n=" + std::to_string(n) + " kind=" + std::to_string(kind) + " mode=" + std::to_string(mode));
+    std::printf("flash%u prefill pos0=%u n=%u kind=%d heads=%zu bad=%zu rel_l2 max %.3e mean %.3e max_abs/peak %.3e exact %.2f ms flash %.2f ms: %s\n",
+                mode, pos0, n, kind, heads, bad, worst, mean, worst_abs, best_ms[0], best_ms[1], ok ? "ok" : "FAIL");
+    for (void* x : {static_cast<void*>(scores), static_cast<void*>(partial), static_cast<void*>(idx), static_cast<void*>(cnt),
+                    static_cast<void*>(ticket)})
+        hip_ok(hipFree(x), "flash free");
+    release_prefill(p);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed process keeps its log
+    // This suite compares the index score buffer byte for byte between the VALU kernels. The default index mode
+    // (WMMA scores + exact rescoring of the cut-off band) keeps the selection, not every score value; its
+    // selection identity is covered by tests/hip_idx_wmma_tests.hip. An explicit STRIX_IDX_WMMA is kept.
+    setenv("STRIX_IDX_WMMA", "0", 0);
     std::mt19937 rng(20261024);
+    // FAST flash kernel vs the exact in-block kernel: dense rows, the dense/sparse boundary, sparse rows with a
+    // partial last block (masked tail), a dominant key, all-equal scores.
+    if (const char* flash = std::getenv("STRIX_MSA_TEST_FLASH"); flash != nullptr && std::strcmp(flash, "1") == 0) {
+        for (unsigned mode : {11U, 12U}) {
+            for (int kind : {0, 1, 2}) {
+                prefill_flash_case(0, 300, rng, kind, mode);
+                prefill_flash_case(2000, 100, rng, kind, mode);
+                prefill_flash_case(8197, 129, rng, kind, mode);
+            }
+            for (int kind : {3, 4}) prefill_flash_case(8192, 16, rng, kind, mode);
+            for (unsigned n : {9U, 16U, 64U}) prefill_flash_case(0, n, rng, 0, mode);
+            prefill_flash_case(30000, 65, rng, 0, mode);
+            prefill_flash_case(4096, 4096, rng, 0, mode);
+        }
+        std::printf("strix-mmattn-fused-tests: flash cases, %d failure(s)\n", g_fail);
+        return g_fail != 0 ? 1 : 0;
+    }
     // Focused producer/index byte checks; omit the unrelated decode suite
     // and the exhaustive complete-prefill matrix. Optional list: pos0:n,pos0:n.
     if (const char* quick = std::getenv("STRIX_MSA_TEST_QUICK"); quick != nullptr && std::strcmp(quick, "1") == 0) {

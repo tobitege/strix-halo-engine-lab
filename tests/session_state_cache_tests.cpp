@@ -1,4 +1,5 @@
 #include "strix/session_state_cache.hpp"
+#include "strix/session/checkpoint_io.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/unbuffered_file.hpp"
 #include "state_file_fixtures.inc"
@@ -24,6 +25,48 @@ void check(bool b,const char* why) { if(!b) throw std::runtime_error(why); }
 template<class F> void refused(F f,const char* why) {
     bool threw=false; try { f(); } catch(const std::exception&) { threw=true; } check(threw,why);
 }
+void set_env(const char* key,const char* value) {
+#ifdef _WIN32
+    check(_putenv_s(key,value?value:"")==0,"environment update");
+#else
+    check((value?setenv(key,value,1):unsetenv(key))==0,"environment update");
+#endif
+}
+struct EnvGuard {
+    const char* key; std::optional<std::string> saved;
+    explicit EnvGuard(const char* k) : key(k) { if(const char* v=std::getenv(k)) saved=v; }
+    ~EnvGuard() {
+#ifdef _WIN32
+        (void)_putenv_s(key,saved?saved->c_str():"");
+#else
+        if(saved) (void)setenv(key,saved->c_str(),1); else (void)unsetenv(key);
+#endif
+    }
+};
+namespace io=strix::session::checkpoint_io;
+struct FaultGuard {
+    io::Faults shared=io::faults();
+    bool direct=strix::state_file_io::fault_injection().refuse_direct.load();
+    std::uint64_t cap=strix::state_file_io::fault_injection().max_syscall_bytes.load();
+    std::uint64_t offset=strix::state_file_io::fault_injection().fail_at_offset.load();
+    FaultGuard() {
+        io::faults()={};
+        auto& f=strix::state_file_io::fault_injection();
+        f.refuse_direct=false; f.max_syscall_bytes=0; f.fail_at_offset=UINT64_MAX;
+    }
+    ~FaultGuard() {
+        io::faults()=shared;
+        auto& f=strix::state_file_io::fault_injection();
+        f.refuse_direct=direct; f.max_syscall_bytes=cap; f.fail_at_offset=offset;
+    }
+};
+template<class F> void io_refused(F f,io::Operation operation,const char* message) {
+    bool named=false;
+    try { f(); } catch(const io::Error& e) {
+        named=e.operation==operation && std::string_view(e.what())==message;
+    }
+    check(named,"selected publication path did not trigger the named IO fault");
+}
 strix::PrefixCacheBuffer heap(std::uint64_t n) {
     return {std::shared_ptr<std::byte>(new std::byte[static_cast<std::size_t>(n?n:1)],std::default_delete<std::byte[]>()),n};
 }
@@ -37,16 +80,8 @@ void reroot(strix::PrefixCacheBuffer& b) {
 }
 }
 void session_tail_plan_test() {
-    const char* previous=std::getenv("STRIX_QPF2K_SCHED");
-    const std::optional<std::string> saved=previous?std::optional<std::string>{previous}:std::nullopt;
-    const auto set=[](const char* v) {
-#ifdef _WIN32
-        check(_putenv_s("STRIX_QPF2K_SCHED",v?v:"")==0,"tail environment update");
-#else
-        check((v?setenv("STRIX_QPF2K_SCHED",v,1):unsetenv("STRIX_QPF2K_SCHED"))==0,"tail environment update");
-#endif
-    };
-    set("8");
+    EnvGuard restore_env("STRIX_QPF2K_SCHED");
+    set_env("STRIX_QPF2K_SCHED","8");
     const auto make=[](std::size_t n) {
         strix::decode_cli::Options o; o.known_prefix_window=true; o.known_prefix_prefill_explicit=true;
         o.known_prefix_full_rows=true; o.known_prefix_prefill_rows=2048; o.tokens.resize(n); return o;
@@ -68,21 +103,8 @@ void session_tail_plan_test() {
     strix::decode_cli::apply_default_known_prefill_tails(a);
     strix::decode_cli::apply_default_known_prefill_tails(b);
     check(a.known_prefix_tail_rows!=b.known_prefix_tail_rows,"non-session pruning changed");
-    set(saved?saved->c_str():nullptr);
 }
 namespace {
-void set_env(const char* key,const char* value) {
-#ifdef _WIN32
-    check(_putenv_s(key,value?value:"")==0,"environment update");
-#else
-    check((value?setenv(key,value,1):unsetenv(key))==0,"environment update");
-#endif
-}
-struct EnvGuard {
-    const char* key; std::optional<std::string> saved;
-    explicit EnvGuard(const char* k) : key(k) { if(const char* v=std::getenv(k)) saved=v; }
-    ~EnvGuard() { set_env(key,saved?saved->c_str():nullptr); }
-};
 std::vector<char> file_bytes(const std::filesystem::path& p) {
     std::ifstream in(p,std::ios::binary); return {std::istreambuf_iterator<char>(in),std::istreambuf_iterator<char>()};
 }
@@ -190,8 +212,9 @@ void sequential_reader_tests(const std::filesystem::path& root) {
 // restore, short writes complete, failed writes leave the published checkpoint intact, and
 // the written file does not stay in the page cache.
 void unbuffered_session_io_tests(const std::filesystem::path& root,const strix::SessionCompatibility& compat) {
-    EnvGuard restore_env("STRIX_SESSION_DIRECT_IO");
-    auto& faults=strix::state_file_io::fault_injection();
+    EnvGuard restore_env("STRIX_SESSION_DIRECT_IO"), restore_chunked_env("STRIX_SESSION_CHUNKED");
+    FaultGuard restore_faults;
+    [[maybe_unused]] auto& faults=strix::state_file_io::fault_injection();
     // Sizes: sub-block, just under one staging chunk, multi-chunk with an unaligned tail.
     for(const std::uint64_t payload:{std::uint64_t{1000},std::uint64_t{(8U<<20)-600},std::uint64_t{(20U<<20)+12345}}) {
         const auto blob=strix::encode_session_checkpoint(large_checkpoint(compat,payload,static_cast<unsigned>(payload%97+1)),heap);
@@ -228,20 +251,47 @@ void unbuffered_session_io_tests(const std::filesystem::path& root,const strix::
         }
         set_env("STRIX_SESSION_DIRECT_IO","1"); set_env("STRIX_SESSION_CHUNKED",nullptr);
         std::filesystem::remove_all(root/"bad");
-        // Short writes (block-sized and odd-sized) still produce the same file.
+        // Every platform executes the selected buffered writer through the shared seam.
+        set_env("STRIX_SESSION_DIRECT_IO","0");
+        const auto replacement=strix::encode_session_checkpoint(
+            large_checkpoint(compat,payload,static_cast<unsigned>(payload%97+2)),heap);
+        for(const std::uint64_t cap:{std::uint64_t{3*4096},std::uint64_t{1000}}) {
+            io::faults().max_write=cap;
+            strix::publish_session_checkpoint(root/"short",blob);
+            io::faults()={};
+            check(file_bytes(root/"short"/"session.bin")==a,"short-write publication differs");
+        }
+        const auto intact=[&] {
+            check(file_bytes(on/"session.bin")==a,"failed write replaced the publication");
+            for(const auto& e:std::filesystem::directory_iterator(on))
+                check(e.path().filename()=="session.bin","failed write left a temporary");
+        };
+        io::faults().fail_write_at=replacement.bytes/2;
+        io_refused([&]{strix::publish_session_checkpoint(on,replacement);},
+            io::Operation::write,"checkpoint write failed");
+        io::faults()={}; intact();
+        for(auto op:{io::Operation::write,io::Operation::sync,io::Operation::replace}) {
+            io::faults().fail=op;
+            io_refused([&]{strix::publish_session_checkpoint(on,replacement);},
+                op,"checkpoint IO injected failure");
+            io::faults()={}; intact();
+        }
+#if defined(__linux__)
+        // The real Linux direct/fallback helper has its own syscall seam.
+        set_env("STRIX_SESSION_DIRECT_IO","1");
         for(const std::uint64_t cap:{std::uint64_t{3*4096},std::uint64_t{1000}}) {
             faults.max_syscall_bytes=cap;
             strix::publish_session_checkpoint(root/"short",blob);
             faults.max_syscall_bytes=0;
-            check(file_bytes(root/"short"/"session.bin")==a,"short-write publication differs");
+            check(file_bytes(root/"short"/"session.bin")==a,"Linux short-write publication differs");
         }
-        // A failing write keeps the previous publication and removes its temporary.
-        faults.fail_at_offset=blob.bytes/2;
-        refused([&]{strix::publish_session_checkpoint(on,blob);},"failed unbuffered write accepted");
+        faults.fail_at_offset=replacement.bytes/2;
+        bool named=false;
+        try { strix::publish_session_checkpoint(on,replacement); }
+        catch(const std::runtime_error& e) { named=std::string_view(e.what())=="state file write failed"; }
         faults.fail_at_offset=UINT64_MAX;
-        check(file_bytes(on/"session.bin")==a,"failed write replaced the publication");
-        for(const auto& e:std::filesystem::directory_iterator(on))
-            check(e.path().filename()=="session.bin","failed write left a temporary");
+        check(named,"failed unbuffered write accepted"); intact();
+#endif
         // Truncated files are refused on the unbuffered read as on the buffered one.
         std::filesystem::resize_file(on/"session.bin",blob.bytes-7);
         refused([&]{(void)strix::read_session_checkpoint(on,compat,heap,blob.bytes);},"unbuffered truncated file accepted");
@@ -269,7 +319,8 @@ void unbuffered_session_io_tests(const std::filesystem::path& root,const strix::
                  <<"; saved file direct="<<direct<<" resident "<<saved.first<<"/"<<saved.second
                  <<"; buffered save resident "<<saved_off.first<<"/"<<saved_off.second<<'\n';
         check(after.first>=before.first,"save evicted resident table pages");
-        check(direct!=refuse,"fallback selection");
+        if(refuse) check(!direct,"fallback selection");
+        else if(!direct) std::cout<<"NOT RUN: real O_DIRECT unavailable on this filesystem; fallback executed\n";
         // EINVAL when O_DIRECT is set on the created file (no direct I/O here): exclusive creation
         // still publishes, buffered, and leaves no temporary behind.
         for(const auto& e:std::filesystem::directory_iterator(root/"big"))
@@ -283,6 +334,8 @@ void unbuffered_session_io_tests(const std::filesystem::path& root,const strix::
         faults.refuse_direct=false;
         std::filesystem::remove(table); std::filesystem::remove_all(root/"big"); std::filesystem::remove_all(root/"big-off");
     }
+#else
+    std::cout<<"NOT RUN: Linux direct/fallback syscall and page-residency checks; buffered publication/restore executed\n";
 #endif
 }
 int main() {
@@ -292,6 +345,16 @@ int main() {
         session_tail_plan_test();
         sequential_reader_tests(dir/"reader");
         old_format_session_tests(dir/"old-format");
+        {
+            strix::SessionCheckpoint c;
+            strix::SessionCompatibility compat{hash("family model"),hash("family executable"),"family settings",false};
+            c.compatibility=compat;
+            auto envelope=strix::encode_session_checkpoint(c,heap);
+            auto other=compat; other.family="minimax";
+            refused([&]{(void)strix::decode_session_checkpoint(envelope,other);},"family tag ignored");
+            other=compat; other.format_version=2;
+            refused([&]{(void)strix::decode_session_checkpoint(envelope,other);},"schema tag ignored");
+        }
         unbuffered_session_io_tests(dir/"unbuffered",strix::SessionCompatibility{hash("full model content"),hash("exe"),"compiled plan;all env",false});
         const auto aligned=strix::plan_session_suffix(32768,1024,1024,true);
         check(aligned.tiled && aligned.serial_rows==0,"aligned suffix did not tile");
@@ -304,6 +367,7 @@ int main() {
         strix::SessionCheckpoint c;
         c.compatibility=compat; c.frontier.consumed=3; c.frontier.accepted=3;
         c.frontier.emitted=2; c.frontier.pending=99; c.frontier.tokens={7,8,9};
+
         auto payload=heap(4096);
         for(std::uint64_t i=0;i<payload.bytes;++i) payload.data.get()[i]=static_cast<std::byte>(i&255U);
         c.sections.push_back({"target.kv",payload}); c.sections.push_back({"target.fixed",heap(0)});
@@ -446,6 +510,7 @@ int main() {
         check(first==strix::sha256_file_content(model) && first==strix::session_cached_file_hash(model),"full-content cached digest");
         { std::ofstream f(model,std::ios::binary|std::ios::trunc); f<<"second complete file, different length"; }
         check(first!=strix::session_cached_file_hash(model),"file identity cache failed to invalidate");
+        EnvGuard restore_test_env("STRIX_SESSION_CPU_TEST");
         const char* old_env = std::getenv("STRIX_SESSION_CPU_TEST");
         const std::optional<std::string> old_value = old_env ? std::optional<std::string>{old_env} : std::nullopt;
         const auto set_test_env = [](const char* value) {
@@ -461,6 +526,7 @@ int main() {
         check(env_one!=env_two,"all-STRIX environment config failed to invalidate");
         check(env_two!=strix::session_numerical_config("different effective CLI"),"effective CLI not bound");
         for (const auto key : {"HIP_SESSION_CPU_TEST", "HSA_SESSION_CPU_TEST", "AMD_SESSION_CPU_TEST", "ROCR_SESSION_CPU_TEST", "GPU_SESSION_CPU_TEST"}) {
+            EnvGuard restore_runtime_env(key);
             const char* old = std::getenv(key);
             const std::optional<std::string> saved = old ? std::optional<std::string>{old} : std::nullopt;
             const auto set = [&](const char* value) {
@@ -477,6 +543,7 @@ int main() {
         }
         for(const auto* key:{"STRIX_PREFIX_CACHE_INFLIGHT","STRIX_PREFIX_CACHE_DISK","STRIX_PREFIX_CACHE_DURABLE","STRIX_PREFIX_FAIR_RECLAIM_IDLE",
                 "STRIX_SESSION_DIRECT_IO","STRIX_SESSION_READAHEAD","STRIX_SESSION_CHUNKED"}) {
+            EnvGuard restore_operational_env(key);
             const char* previous=std::getenv(key);
             const std::optional<std::string> saved=previous?std::optional<std::string>{previous}:std::nullopt;
             const auto set=[&](const char* value) {
@@ -489,9 +556,10 @@ int main() {
             set(nullptr);const auto absent=strix::session_numerical_config("same CLI");
             set("0");check(absent==strix::session_numerical_config("same CLI"),"operational off must preserve numerical signature");
             set("1");check(absent==strix::session_numerical_config("same CLI"),"operational on must preserve numerical signature");
-            set(saved?saved->c_str():nullptr);
+            set(saved ? saved->c_str() : nullptr);
         }
-        for (const char* key : {"STRIX_QPF2K_T16K", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_QPF2K_HC_LOWBAND", "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QSA_CACHE_ONLY"}) {
+        for (const char* key : {"STRIX_QPF2K_T16K", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_QPF2K_HC_LOWBAND", "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QSA_CACHE_ONLY", "STRIX_PREFILL_FINAL_CONE", "STRIX_HOST_WAIT"}) {
+            EnvGuard restore_startup_env(key);
             const char* old = std::getenv(key);
             const std::optional<std::string> saved = old ? std::optional<std::string>{old} : std::nullopt;
             const auto set = [&](const char* value) {

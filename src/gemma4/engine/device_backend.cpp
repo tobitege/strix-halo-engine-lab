@@ -6,6 +6,7 @@
 #include "gemma4/kernels/a8.hpp"
 #include "gemma4/kernels/attention_fast_decode.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -19,14 +20,26 @@ bool enabled(const char* name) {
 }
 class DeviceState final : public StreamState {
 public:
-    DeviceState(const ModelConfig& config, std::uint32_t admitted) : owned_(std::make_unique<gpu::DeviceStream>(config,admitted)), state_(*owned_) {}
-    explicit DeviceState(std::unique_ptr<gpu::DeviceStream> stream) : owned_(std::move(stream)), state_(*owned_) {}
+    DeviceState(const ModelConfig& config, std::uint32_t admitted, bool accounted)
+        : owned_(std::make_unique<gpu::DeviceStream>(config,admitted)), state_(*owned_), accounted_(accounted) {}
+    DeviceState(std::unique_ptr<gpu::DeviceStream> stream, bool accounted)
+        : owned_(std::move(stream)), state_(*owned_), accounted_(accounted) {}
     std::unique_ptr<StreamState> fork(std::uint32_t admitted) const override {
-        return std::make_unique<DeviceState>(state_.fork(admitted));
+        return std::make_unique<DeviceState>(state_.fork(admitted),accounted_);
     }
     std::unique_ptr<KvTxn> begin() override { return state_.begin(); }
     std::uint64_t frontier() const override { return state_.frontier(); }
     std::string digest() const override { return state_.digest(); }
+    std::optional<std::uint64_t> retained_bytes() const override {
+        const auto p=native_payload();return p?std::optional<std::uint64_t>(p->total()):std::nullopt;
+    }
+    std::optional<memory::Payload> native_payload() const override {
+        // Legacy default callers retain their historical estimate-only receipt
+        // bytes. Complete accounting is used only by explicit native activation.
+        if(!accounted_)return {};
+        auto p=state_.memory_payload();if(!p)return {};
+        memory::add(p->host,sizeof(DeviceState));return p;
+    }
     bool kv_view(std::uint32_t layer, const KvTxn* transaction, KvView& out) const override {
         // "No KV on this layer"/poisoned = unavailable; a foreign transaction (std::invalid_argument) propagates.
         try { out = state_.kv_view(layer,transaction); return true; } catch (const std::runtime_error&) { return false; }
@@ -34,10 +47,11 @@ public:
 private:
     std::unique_ptr<gpu::DeviceStream> owned_;
     gpu::DeviceStream& state_;
+    bool accounted_ = false;
 };
 class DeviceBackend final : public Backend {
 public:
-    DeviceBackend(const ModelManifest& model, RopeTables tables, bool inspect)
+    DeviceBackend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation)
         : config_(model.config), host_embedding_(bind_host_weights(model).embedding), host_head_(bind_host_weights(model).head), metadata_(strix::serve::Json::object()) {
         metadata_.set("backend","gfx1151-device"); metadata_.set("identity",model.identity);
         metadata_.set("model_hash",model.model_hash); metadata_.set("rope_hash",tables.hash);
@@ -99,6 +113,18 @@ public:
         if (a8_route) std::cerr << "gemma4 prefill route a8-many-row (g4-a8-v1 linears, 512-row chunks)\n";
         // Exact and a8 linears match their decode identity; WMMA routes never do.
         const auto linears = exl3_wmma || wmma_route ? prefill::Linears::wmma : a8_route ? prefill::Linears::a8 : prefill::Linears::exact;
+        // Admission uses the resolved numerical route, not an asserted user label.
+        // Exclude changed-weight/core-order packs and every nonmatching prompt route.
+        const bool exl3_pack = bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
+        const bool eligible = continuation == NativeInputContinuation::off ||
+            (model.identity == arithmetic_id && decode_identity == arithmetic_id &&
+            decode_attention == "exact" && linears == prefill::Linears::exact && !exl3_pack &&
+            std::none_of(model.tensors.begin(),model.tensors.end(),[](const auto& tensor) {
+                return tensor.view.format == WeightFormat::exl3_mul1;
+            }) && model.cache_dtype == "F32");
+        if (continuation != NativeInputContinuation::off &&
+            (continuation != NativeInputContinuation::exact_g4_v1 || !eligible))
+            throw std::invalid_argument("native input continuation requires g4-v1, exact attention/linears, FP32 KV and non-EXL3 weights");
         // Read-only inspection must never initialize HIP or upload weights.
         if (!inspect) {
             gpu::DeviceOptions options; options.identity = selected && *selected ? selected : arithmetic_id;
@@ -122,11 +148,54 @@ public:
         metadata_.set("prefill_matches_decode",prefill_matches_decode_);
         // Batched passes have byte records on three routes only: prefill-exact on non-EXL3 packs, g4-wmma-pf-v1 and
         // g4-wmma-pf-v2. Every other route (a8, EXL3 wmma or exact core order, any later identity) keeps one call per stream.
-        const bool exl3_pack = bind_host_weights(model).layer.front().gate.format == WeightFormat::exl3_mul1;
         prefill_batch_ = prefill_ && !exl3_pack && !exl3_wmma &&
                          (wmma_route ? route == "v1" || route == "v2" : linears == prefill::Linears::exact);
+        // Verify the executor's actual resolved arithmetic before exposing support.
+        input_continuation_ = continuation == NativeInputContinuation::exact_g4_v1 && target_ &&
+            target_->stats().identity == arithmetic_id && !target_->stats().a8 && prefill_matches_decode_;
+        // Preserve default identity/receipt bytes. Only explicit library callers get this record.
+        if (continuation != NativeInputContinuation::off) {
+            auto policy = strix::serve::Json::object();
+            policy.set("requested","exact-g4-v1"); policy.set("effective",input_continuation_);
+            policy.set("reason",inspect ? "inspection-only; executor not created" : "exact route; eager rollback copies");
+            metadata_.set("native_input_continuation",policy);
+        }
         metadata_.set("prefill_batch",prefill_batch_);
         if (prefill_ && !prefill_batch_) std::cerr << "gemma4 prefill batching off on this route (one call per stream)\n";
+    }
+    bool input_continuation_supported() const override { return input_continuation_; }
+    std::optional<memory::Payload> native_buffer_payload() const override {
+        if(!input_continuation_ || !target_ || prefill_)return {};
+        const auto p=target_->cache_work_bound();if(!p)return {};
+        auto n=p->active;
+        for(const auto* b:{&head_input_,&head_output_,&head_failure_,&head_scratch_})memory::add(n.device,b->size());
+        return n;
+    }
+    std::optional<std::uint64_t> native_turn_work_bound() const override {
+        // Input activation is necessary, never sufficient. Do not alter resolved
+        // settings to fit this profile: many-row prefill remains explicit OFF.
+        if(!input_continuation_ || !target_ || prefill_) return {};
+        const auto target=target_->cache_work_bound();
+        const auto stream=gpu::DeviceStream::allocation_bound(config_,config_.max_positions);
+        if(!target || !stream) return {};
+        try {
+            auto n=target->additional.total();
+            // Restore installation may allocate the NEW request's full admitted
+            // capacity, larger than the stored prefix. Old active slot and a
+            // failed-install replacement can coexist. Never size these from F.
+            memory::add(n,stream->additional.total(),2);
+            memory::add(n,sizeof(DeviceState),2);
+            // Canonical digest stages one complete producer at a time; the
+            // full stream device payload safely covers its K/V/tag vectors.
+            memory::add(n,stream->additional.device,2);
+            // A restored NEW request can be much longer than the cached prefix.
+            // Its by-value request, reserved generated IDs and shared consumed/
+            // publication history can coexist with the old slot metadata. Four
+            // vectors at <=2x full-context capacity are separate from KV bytes.
+            memory::add(n,config_.max_positions,8*sizeof(std::uint32_t));
+            memory::add(n,sizeof(Request),2);
+            return n;
+        } catch(const std::overflow_error&) {return {};}
     }
     bool prefill_batch_supported() const override { return prefill_batch_; }
     // STRIX_G4_PREFILL_CHUNK (64..512, a multiple of 64; default 512): prompt rows per prefill chunk. Linears are
@@ -193,7 +262,7 @@ public:
     std::unique_ptr<StreamState> create_stream() override { return create_stream(config_.max_positions); }
     std::unique_ptr<StreamState> create_stream(std::uint32_t admitted) override {
         if (!target_) throw std::logic_error("inspection backend cannot execute");
-        return std::make_unique<DeviceState>(config_,admitted);
+        return std::make_unique<DeviceState>(config_,admitted,input_continuation_);
     }
     ForwardResult forward_rows(std::span<const RowPlan> rows) override {
         if (!target_) throw std::logic_error("inspection backend cannot execute");
@@ -224,7 +293,7 @@ private:
     strix::serve::Json metadata_;
     std::unique_ptr<gpu::DeviceTarget> target_;
     std::unique_ptr<prefill::DevicePrefill> prefill_;
-    bool prefill_matches_decode_ = false, prefill_batch_ = false;
+    bool prefill_matches_decode_ = false, prefill_batch_ = false, input_continuation_ = false;
     gpu::Buffer head_input_, head_output_, head_failure_, head_scratch_;
 };
 struct DraftAssets {
@@ -308,8 +377,8 @@ private:
     std::unique_ptr<dflash::DeviceDrafter> drafter_;
 };
 }
-std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect) {
-    return std::make_unique<DeviceBackend>(model,tables,inspect);
+std::unique_ptr<Backend> make_device_backend(const ModelManifest& model, RopeTables tables, bool inspect, NativeInputContinuation continuation) {
+    return std::make_unique<DeviceBackend>(model,tables,inspect,continuation);
 }
 DraftFactory device_drafts(const dflash::Weights& weights, dflash::RopeView rope, LinearView embedding,
     Backend* backend, bool prepare, LinearView head) {

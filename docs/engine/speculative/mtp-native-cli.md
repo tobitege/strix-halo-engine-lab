@@ -200,6 +200,49 @@ and pending selection. MTP predictor extensions and opaque lineage remain in
 the separate complete-session diagnostics. Missing or incomplete evidence is
 NO-REFERENCE; compare complete tokens, ledgers and target state before timing.
 
+### Default MTP (drafter bundle)
+
+The plain production command uses exact MTP speculative decoding by default:
+
+```bash
+strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256
+```
+
+The drafter is a versioned model asset, resolved beside the model:
+
+| File | Role |
+| --- | --- |
+| `MODEL.gguf.mtp-bundle.json` | the bundle: sidecar name, size and SHA-256, target pins, provenance, policy and budgets |
+| the sidecar named by the bundle | drafter weights; size and SHA-256 are verified (persistent content-hash cache) |
+| `draft-vocab/` | draft vocabulary packs named by the bundle |
+
+Copy [the distill-g recipe](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json) to
+`MODEL.gguf.mtp-bundle.json`; the same file serves the native and the YaRN route. `--mtp-bundle FILE` names
+another bundle. The distill-g sidecar is not downloaded by the fetcher: it is the distilled draft registered in
+`include/strix/mtp_draft_profiles.hpp` (round 2 of the draft distillation, see
+[draft profiles](decode-defaults.md#draft-profiles-includestrixmtp_draft_profileshpp)); the base draft published with
+the model is a different file and must not be renamed.
+
+Selection is the shared default resolution in `include/strix/session/speculation_default.hpp`; the engine only
+declares that its path is exact, faster and needs assets:
+
+- The command must be the plain one: model, at least 17 prompt tokens, `--generate N` with N >= 2, and
+  optionally `--context`, `--unqualified-context`, `--print-effective-config`. Any other option owns its route
+  and keeps the previous behaviour.
+- The automatic prompt route is unchanged (same tiling, same automatic prefill profile, same context). MTP
+  replaces only the serial decode rows, and its windows are verified against the target, so the tokens equal the
+  plain command's.
+- `--no-mtp` or `STRIX_MTP=0` selects plain decode. `--baseline` / `STRIX_BASELINE=1` also does.
+- No bundle beside the model: plain decode and one line,
+  `MTP default (qwen) unavailable; using plain decode: no drafter bundle at ...`.
+- A bundle whose sidecar is missing or does not match, or a route that cannot be admitted: plain decode and one
+  line, `MTP bundle setup unavailable; using serial decode: ...`. Neither case is a failure.
+- The first run of a prompt family generates the 16-row calibration golden once and caches it under
+  `$XDG_CACHE_HOME/strix-engine/goldens` (or `~/.cache`); a `goldens/` directory beside the bundle is read first.
+
+Other engines use the same opt-out for their exact drafters (GLM MTP self-speculation, DeepSeek and MiniMax
+DSpark, Gemma4/Nemotron MTP drafter), which were already on by default.
+
 ### YaRN MTP bundles
 
 Use `--mtp-bundle FILE` or place the JSON at `<model>.mtp-bundle.json`. Bundle

@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/qwen_target_state_digest.hpp"
 #include "qwen_cache_admission.hpp"
 #include "prefix_state_cache_identity.hpp"
@@ -101,7 +102,7 @@ inline const std::optional<RtxStateExportRequest>& rtx_state_export_request() {
 // prefix cache (no capture, no lookup), so its receipt carries the end-of-prompt state digest (target state, predictor
 // rows and held row) on every route; STRIX_PREFIX_CACHE_DIGEST=1 prints it.
 inline bool prompt_state_digest_request(bool batch_cert=false) {
-    static const bool on = [] { const char* v = std::getenv("STRIX_PROMPT_STATE_DIGEST"); return v && v[0] == '1'; }();
+    static const bool on = strix::envcfg::flag("STRIX_PROMPT_STATE_DIGEST", false);
     const char* digest=std::getenv("STRIX_PREFIX_CACHE_DIGEST");
     return on || (batch_cert && digest && digest[0]=='1');
 }
@@ -427,7 +428,11 @@ public:
     }
     // SHA-256 of the state a session holds after `position` prompt rows: every row component's rows
     // [0, position - shift) and every fixed range (diagnostic, STRIX_PREFIX_CACHE_DIGEST=1).
-    [[nodiscard]] ModelContentIdentity state_digest(std::uint64_t position,std::optional<std::uint64_t> predictor={}) {
+    // target_only: the target components alone (those registered before any add_rows / add_fixed_device
+    // extension). That digest is a function of the committed tokens only; the proposer extensions also
+    // record how the request was split into cycles (see docs/engine/speculative/mtp-depth-controller.md).
+    [[nodiscard]] ModelContentIdentity state_digest(std::uint64_t position,std::optional<std::uint64_t> predictor={},
+        bool target_only=false) {
         check(hipDeviceSynchronize(), "prefix digest fence");
         std::vector<std::byte> frame;
         std::vector<std::byte> chunk;
@@ -439,11 +444,15 @@ public:
             frame.insert(frame.end(), reinterpret_cast<const std::byte*>(digest.bytes.data()),
                 reinterpret_cast<const std::byte*>(digest.bytes.data()) + 32);
         };
-        for (const auto& row : rows_) {
+        const auto row_count = target_only ? target_rows_ : rows_.size();
+        const auto fixed_count = target_only ? target_fixed_ : fixed_.size();
+        for (std::size_t j = 0; j < row_count; ++j) {
+            const auto& row = rows_[j];
             const auto count = predictor && row.shift ? *predictor : position > row.shift ? position - row.shift : 0U;
             if (count) append(reinterpret_cast<const void*>(row.address), count * row.bytes, true);
         }
-        for (const auto& fixed : fixed_) append(reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
+        for (std::size_t j = 0; j < fixed_count; ++j)
+            append(reinterpret_cast<const void*>(fixed_[j].address), fixed_[j].bytes, fixed_[j].device);
         return sha256_bytes(frame);
     }
     // Cross-route numerical digest: frozen target registry, occupied ranges,
@@ -679,7 +688,7 @@ public:
         return 0;
     }
     [[nodiscard]] bool joining_allowed() const {
-        static const bool lookup=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_LOOKUP");return !v || v[0]!='0';}();
+        static const bool lookup=strix::envcfg::flag("STRIX_PREFIX_CACHE_LOOKUP", true);
         return store_ && !store_->policy().legacy && certified_path_ && plan_enabled_ &&
             plan_route_==2 && allow_restore_ && !batch_config_.groups && !policy_selection_ &&
             lookup && !imported_ && qwen_prefix_join_grid(block_rows_,plan_.rows);
@@ -715,7 +724,7 @@ public:
             if (auto state = rtx_registry_->take(prompt)) return restore_rtx_state(session, std::move(state));
         if (!store_) return 0;
         // STRIX_PREFIX_CACHE_LOOKUP=0: capture only (diagnostic; every request prefills from position 0).
-        static const bool lookup = [] { const char* v = std::getenv("STRIX_PREFIX_CACHE_LOOKUP"); return !v || v[0] != '0'; }();
+        static const bool lookup = strix::envcfg::flag("STRIX_PREFIX_CACHE_LOOKUP", true);
         if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {
             certificate_decline(PrefixCertificateDecline::serial_plan_unsupported);return 0;
         }

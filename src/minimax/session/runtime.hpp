@@ -3,6 +3,7 @@
 #include "strix/minimax/engine.hpp"
 #include "strix/minimax/session_cache.hpp"
 #include <memory>
+#include <optional>
 namespace strix::minimax::session {
 struct RunOptions {
   std::string directory, id = "session", save, load, prompt, suffix, output,
@@ -20,7 +21,8 @@ public:
           const std::string &executable, RunOptions,
           const std::string &draft_dir = {},
           const std::string &draft_exl3 = {},
-          const LoaderSnapshot& draft_snapshot = {});
+          const LoaderSnapshot& draft_snapshot = {},
+          std::shared_ptr<PrefixStateCache> owner = {});
   void start(std::span<const std::uint32_t>);
   void suffix(std::span<const std::uint32_t>);
   std::vector<std::uint32_t> generate(unsigned, const std::string &dump = {},
@@ -41,8 +43,14 @@ public:
   bool disk_enabled() const { return options_.disk_enabled; }
   // A request's state is in the slot and not yet parked.
   bool active() const { return active_; }
+  std::span<const std::uint32_t> canonical_tokens() const { return frontier_.tokens; }
+  std::optional<std::uint32_t> canonical_pending() const {
+    return active_ && frontier_.control && frontier_.pending.has_value() ?
+        std::optional<std::uint32_t>(*frontier_.pending) : std::nullopt;
+  }
   std::vector<std::string> list() const { return cache_->list(); }
   Stats stats() const { return cache_->stats(); }
+  const std::shared_ptr<PrefixStateCache>& owner() const noexcept { return cache_->owner(); }
   std::string digest();
 
 private:
@@ -53,8 +61,7 @@ private:
   std::unique_ptr<Cache> cache_;
   std::uint32_t slot_ = 0;
   bool active_ = false;
-  Frontier frontier_;
-  std::vector<std::uint32_t> history_;
+  Frontier frontier_ = initial_frontier();
   std::vector<float> logits_;
   std::uint64_t windows_ = 0, verified_ = 0, accepted_ = 0;
   Checkpoint capture(const std::string &);

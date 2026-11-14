@@ -13,14 +13,12 @@
 // kernel; neither the tier split nor the LDS epilogue reproduces its stores, so
 // both controls stand down whenever it is requested.
 inline bool prefill_route_ctrl_requested() {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_ROUTE_CTRL");return v&&v[0]=='1'&&v[1]=='\0';}();
-    return env;
+    return strix::prefill_moe_policy().route_ctrl;
 }
 inline int& prefill_tiers_override(){static int v=-1;return v;}
 inline int prefill_tiers() {
     if(prefill_route_ctrl_requested())return 0;
-    static const int env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_TIERS");
-        return v&&(v[0]=='1'||v[0]=='2')&&v[1]=='\0'?v[0]-'0':0;}();
+    const int env=strix::prefill_moe_policy().tiers;
     return prefill_tiers_override()<0?env:prefill_tiers_override();
 }
 inline int& prefill_tiers_flag(){static thread_local int v=0;return v;}
@@ -30,11 +28,11 @@ inline const std::array<hipEvent_t,3>*& prefill_da16_events() {
     static thread_local const std::array<hipEvent_t,3>* events=nullptr;return events;
 }
 inline void prefill_da16_mark(unsigned index,hipStream_t stream) {
-    if(const auto* events=prefill_da16_events())check(hipEventRecord((*events)[index],stream),"DA16 timing event");
-    if(const auto* events=prefill_test_events())check(hipEventRecord(events[index],stream),"DA16 tile64 timing event");
+    if(const auto* events=prefill_da16_events())hip_check(hipEventRecord((*events)[index],stream),"DA16 timing event");
+    if(const auto* events=prefill_test_events())hip_check(hipEventRecord(events[index],stream),"DA16 tile64 timing event");
 }
 inline bool prefill_down_lds() {
-    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DOWN_LDS_EPI");return v&&v[0]=='1'&&v[1]=='\0';}();
+    const bool env=strix::prefill_moe_policy().down_lds;
     if(prefill_route_ctrl_requested())return false;
     return prefill_down_lds_override()<0?env:prefill_down_lds_override()==1;
 }
@@ -45,10 +43,9 @@ inline bool prefill_down_lds_admitted(const PrefillRows& rows) {
 }
 template<auto Kernel> void prefill_tier_resources() {
     static const bool once=[] {
-        const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");
-        if(v&&v[0]=='1') {
+        if(strix::prefill_moe_policy().resources) {
             hipFuncAttributes a{};
-            check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(Kernel)),"DA16 tier resources");
+            hip_check(hipFuncGetAttributes(&a,reinterpret_cast<const void*>(Kernel)),"DA16 tier resources");
             std::fprintf(stderr,"DA16 tier resource %s: vgpr=%d lds=%zu scratch=%zu\n",__PRETTY_FUNCTION__,a.numRegs,a.sharedSizeBytes,a.localSizeBytes);
         }
         return true;
@@ -99,10 +96,14 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_da16_tier
     [[maybe_unused]] constexpr unsigned route_top_k=0U;
     if constexpr(Certificate) {
 #define STRIX_DA16_CERTIFICATE
+#define STRIX_DA16_UNIFORM_A false
 #include "moe_core/hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
 #undef STRIX_DA16_CERTIFICATE
     } else {
+#define STRIX_DA16_UNIFORM_A false
 #include "moe_core/hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_UNIFORM_A
     }
 #undef STRIX_DA16_BATCH_TILE
 #undef STRIX_DA16_GUARD
@@ -121,7 +122,7 @@ void launch_prefill_tier(const unsigned char* gate,const unsigned char* up,Prefi
     };
     if(q5k){if(reuse)project.template operator()<true,true>();else project.template operator()<true,false>();}
     else {if(reuse)project.template operator()<false,true>();else project.template operator()<false,false>();}
-    check(hipGetLastError(),"DA16 tier gate/up");
+    hip_check(hipGetLastError(),"DA16 tier gate/up");
     // Down is deliberately launched later, after BOTH gate/up tiers. A global
     // projection failure must suppress every down batch, including the first tier.
 }
@@ -144,6 +145,6 @@ void launch_prefill_down_tier(const unsigned char* down,PrefillRows rows,unsigne
     } else {
         if(q51)kind.template operator()<true,false>();else kind.template operator()<false,false>();
     }
-    check(hipGetLastError(),"DA16 tier down");
+    hip_check(hipGetLastError(),"DA16 tier down");
     if(lds)prefill_down_lds_flag()=true;
 }

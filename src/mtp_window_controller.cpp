@@ -1,5 +1,7 @@
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
+#include "strix/serve/row_budget.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -183,7 +185,17 @@ std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool baseline) {
     const char* v=std::getenv("STRIX_MTP_JOINT_PLAN");
+    if(!v && !baseline && mtp_serve_row_budget_enabled()) return parse_rule("budget");
     return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
+}
+std::uint32_t mtp_serve_row_budget_max_lanes() noexcept {
+    static const std::uint32_t lanes=[]{
+        try {return envcfg::number<std::uint32_t>("STRIX_SERVE_ROW_BUDGET_MAX_LANES",6U,0U,8U);} catch(...) {return 6U;}}();
+    return lanes;
+}
+bool mtp_serve_row_budget_enabled() noexcept {
+    static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
+    return on;
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_view text) {
     Rule rule;
@@ -192,6 +204,7 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("calibrated-c3")!=std::string_view::npos) rule.calibrated_min_members=3;
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
+    if(text.find("budget")!=std::string_view::npos) rule.budget=true;
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -272,6 +285,120 @@ std::vector<std::uint32_t> MtpBatchWindowController::search(std::span<const Requ
     }
     return best;
 }
+MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() const {
+    static const BudgetCost pinned=[]{
+        BudgetCost c;const char* v=envcfg::text("STRIX_SERVE_ROW_COST");
+        if(v) {char* end=nullptr;const double f=std::strtod(v,&end);
+            if(end && *end==',') {char* next=nullptr;const double r=std::strtod(end+1,&next);
+                const double l=next && *next==','?std::strtod(next+1,nullptr):0.0;
+                if(f>0.0 && r>0.0 && l>=0.0 && std::isfinite(f) && std::isfinite(r) && std::isfinite(l)) {
+                    c.fixed_ms=f;c.row_ms=r;c.lane_ms=l;c.fitted=true;}}}
+        return c;}();
+    if(pinned.fitted) return {pinned.fixed_ms,pinned.row_ms,pinned.lane_ms,false};
+    // Least squares of the measured topologies' cycle ms on (1, physical rows, lanes).
+    double a[3][4]{};
+    for(const auto& [k,v]:costs_) {
+        if(!v.samples()) continue;
+        const double x[3]{1.0,2.0*k[0]+4.0*k[1]+8.0*k[2],static_cast<double>(k[0]+k[1]+k[2])},y=v.value();
+        for(int i=0;i<3;++i) {for(int j=0;j<3;++j) a[i][j]+=x[i]*x[j];a[i][3]+=x[i]*y;}
+    }
+    // Gaussian elimination with partial pivoting; a pivot that vanishes relative to its column's scale
+    // means rows and lanes did not move independently, and the priors stay.
+    for(int i=0;i<3;++i) {
+        int pivot=i;
+        for(int r=i+1;r<3;++r) if(std::abs(a[r][i])>std::abs(a[pivot][i])) pivot=r;
+        const double scale=std::max({std::abs(a[0][i]),std::abs(a[1][i]),std::abs(a[2][i]),1.0});
+        if(!(std::abs(a[pivot][i])>1e-9*scale)) return {};
+        for(int j=0;j<4;++j) std::swap(a[i][j],a[pivot][j]);
+        for(int r=0;r<3;++r) if(r!=i) {
+            const double f=a[r][i]/a[i][i];
+            for(int j=i;j<4;++j) a[r][j]-=f*a[i][j];
+        }
+    }
+    const double fixed=a[0][3]/a[0][0],row=a[1][3]/a[1][1],lane=a[2][3]/a[2][2];
+    if(!(row>0.0) || !(fixed>0.0) || !(lane>=0.0) || !std::isfinite(row) || !std::isfinite(fixed) || !std::isfinite(lane)) return {};
+    return {fixed,row,lane,true};
+}
+std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
+    PlanInfo* info) const {
+    if(q.empty() || q.size()>8U || budget<2U*q.size())
+        throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
+    for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
+        throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    // Regime selection: above the lane bound the measured cycle is faster with the fixed table's two rows per
+    // request (the cost of a deeper row exceeds its yield there), so the budget plans only up to the bound.
+    if(q.size()>mtp_serve_row_budget_max_lanes()) {
+        std::vector<std::uint32_t> fixed(q.size(),2U);
+        if(info) *info=estimate(q,fixed,prior);
+        return fixed;
+    }
+    // accept[0] is the committed target row; row d + 2 is useful when draft d is accepted. Before drafting the
+    // draft's chance is the 0.8 prior, afterwards its own probability, both blended with the slot's history
+    // (the production rule's blend).
+    std::vector<std::array<float,8>> accept(q.size());
+    std::vector<serve::LaneDemand> lanes(q.size());
+    for(std::size_t k=0;k<q.size();++k) {
+        const auto& h=history_.at(q[k].slot);
+        std::uint32_t most=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
+        accept[k][0]=1.0F;
+        for(std::size_t d=0;d<7U;++d) {
+            const double p=prior?0.8:d<q[k].probabilities.size()?std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0):0.0;
+            accept[k][d+1U]=static_cast<float>((h.hits[d]+4.0*p)/(h.seen[d]+4.0));
+        }
+        lanes[k]={q[k].slot,most,2U,most,std::span<const float>(accept[k]),0.0};
+    }
+    const auto model=budget_cost();
+    const double draft_ms=prior?(draft_.samples()?draft_.value():1.2):0.0;
+    const serve::CycleCost cost{model.fixed_ms,model.row_ms,model.lane_ms,draft_ms};
+    const serve::RowLimits limits{budget,{},static_cast<std::uint32_t>(q.size()),0.0};
+    const auto plan=serve::plan_rows(lanes,cost,limits);
+    // Owners hold 2, 4 or 8 rows: each lane keeps the largest owner inside its planned rows.
+    std::vector<std::uint32_t> out(q.size(),2U);
+    std::uint32_t used=0;
+    for(std::size_t k=0;k<q.size();++k) {
+        const auto r=k<plan.rows.size()?plan.rows[k]:2U;
+        out[k]=r>=8U?8U:r>=4U?4U:2U;
+        used+=out[k];
+    }
+    // Small primaries have exactly four or eight rows (see search): pad the most promising two-row lane, or
+    // keep the two-row chunks when no lane can take four.
+    if(used<9U && used!=4U && used!=8U) {
+        std::size_t best=q.size();
+        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && q[k].limit>=4U && (!prior || rule_.cap>=4U) && used+2U<=budget &&
+            (best==q.size() || accept[k][1]>accept[best][1])) best=k;
+        if(best!=q.size() && (used+2U==4U || used+2U==8U)) {out[best]=4U;used+=2U;}
+        else {std::fill(out.begin(),out.end(),2U);used=2U*static_cast<std::uint32_t>(q.size());}
+    }
+    // Rows the owner sizes left unused: a lane moves to its next owner (2 -> 4 -> 8) while the budget holds it
+    // and the added rows yield more tokens per millisecond than the cycle does; most promising lane first.
+    const auto value=[&](std::size_t k,std::uint32_t from,std::uint32_t to) {
+        double chance=1.0,tokens=0.0;
+        for(std::uint32_t r=0;r<to;++r) {chance*=static_cast<double>(accept[k][r]);if(r>=from) tokens+=chance;}
+        return tokens;
+    };
+    double tokens=0.0;
+    for(std::size_t k=0;k<q.size();++k) tokens+=value(k,0U,out[k]);
+    while(used>=8U) {
+        const double ms=model.fixed_ms+model.row_ms*used+model.lane_ms*static_cast<double>(q.size())+draft_ms*(used-static_cast<double>(q.size()));
+        std::size_t best=q.size();double best_gain=0.0;
+        for(std::size_t k=0;k<q.size();++k) {
+            const auto next=out[k]*2U;
+            if(next>lanes[k].max_rows || used+out[k]>budget) continue;
+            const double gain=value(k,out[k],next)/((model.row_ms+draft_ms)*out[k]);
+            if(gain>tokens/ms && gain>best_gain) {best=k;best_gain=gain;}
+        }
+        if(best==q.size()) break;
+        tokens+=value(best,out[best],out[best]*2U);used+=out[best];out[best]*=2U;
+    }
+    if(prior) {
+        // Two physical rows are the minimum either way; the one draft that fills the second row is bought only
+        // when its chance beats its cost at the plan's rate.
+        const double rate=plan.expected_ms>0.0?plan.expected_tokens/plan.expected_ms:0.0;
+        for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && static_cast<double>(accept[k][1])<=draft_ms*rate) out[k]=0U;
+    }
+    if(info) *info=estimate(q,out,prior);
+    return out;
+}
 MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<const Request> q,
     std::span<const std::uint32_t> rows,bool prior) const {
     double e=0.0;std::uint32_t drafts=0;
@@ -280,8 +407,9 @@ MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<
 }
 std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Request> q,std::uint32_t budget) {
     plan_members_=q.size();
-    auto out=search(q,budget,true,&last_);
+    auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
+    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) return out;
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
     // region. It does not borrow another request's acceptance history.
@@ -309,7 +437,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
 }
 std::vector<std::uint32_t> MtpBatchWindowController::choose(std::span<const Request> q,std::uint32_t budget) const {
     if(!probe_.empty()) return probe_;
-    return search(q,budget,false);
+    return rule_.budget?budget_rows(q,budget,false):search(q,budget,false);
 }
 void MtpBatchWindowController::observe(std::span<const Request> q,std::span<const std::uint32_t> rows,
     std::span<const std::uint32_t> accepted,double draft_ms,double target_ms,std::uint32_t steps) {

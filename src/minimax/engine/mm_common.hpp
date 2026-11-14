@@ -4,6 +4,8 @@
 // bit for bit; the safetensors reader replaces the gate's mmap Pack with O_DIRECT reads (the DS DirectLoader pattern):
 // no file page is ever handed to HIP, and resident weights do not compete with the page cache.
 #include <cstdint>
+#include <memory>
+#include "core/weight_file_source.hpp"
 #include "strix/file_snapshot.hpp"
 #include <map>
 #include <stdexcept>
@@ -37,6 +39,10 @@ public:
     void read(const TensorInfo& t, std::uint64_t offset, std::uint64_t n, void* dst);
     // Plain tensors (BF16 / F16 / F32) converted to FP32, as the gates' Pack::floats.
     std::vector<float> floats(const std::string& name);
+    // The tensor's file for core::WeightLoadQueue: the same descriptor and O_DIRECT mode, read without the bounce
+    // buffer from any number of workers. count_read keeps gib_read() covering the bytes the queue reads.
+    const strix::core::WeightSource& source(const TensorInfo& t) const { return *sources_.at(t.file); }
+    void count_read(std::uint64_t n) { bytes_read_ += n; }
     const LoaderSnapshot& loader_snapshot() const { return snapshot_; }
     double gib_read() const { return static_cast<double>(bytes_read_) / 1073741824.0; }
 
@@ -45,6 +51,7 @@ private:
     std::string dir_;
     std::vector<int> fds_;
     std::vector<int> direct_;  // 1 if opened with O_DIRECT
+    std::vector<std::unique_ptr<strix::core::FileWeightSource>> sources_;
     std::map<std::string, TensorInfo> tensors_;
     std::uint8_t* bounce_ = nullptr;
     std::uint64_t bytes_read_ = 0;

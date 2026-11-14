@@ -19,6 +19,7 @@
 // docs/rtx-state-import.md "Chunk encoding"), --handoff-encode-threads N (4), --handoff-connections N (default 2: chunk
 // POSTs in flight), --handoff-chunk-mib N (32). Release per layer (default; --no-release-by-layer: after each block):
 // every block's rows and the last block's GDN recurrent/conv slices are sent per layer while the next layers compute.
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
 
@@ -337,6 +338,9 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     qp::Config c;
     c.model_gguf = "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     std::string bind = "127.0.0.1", port = "8096", api_key, handoff_key;

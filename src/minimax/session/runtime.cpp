@@ -30,7 +30,7 @@ std::vector<std::uint32_t> tokens(const std::string &path) {
 Runtime::Runtime(engine::Engine &e, dspark::DeviceDrafter *d,
                  const engine::Options &eo, const std::string &exe,
                  RunOptions o, const std::string &draft_dir,
-                 const std::string &draft_exl3, const LoaderSnapshot& draft_snapshot)
+                 const std::string &draft_exl3, const LoaderSnapshot& draft_snapshot, std::shared_ptr<PrefixStateCache> owner)
     : eng_(e), dd_(o.draft ? d : nullptr), options_(std::move(o)) {
   need(options_.budget > 0 && eo.slots >= 2,
        "explicit budget and at least two slots required");
@@ -76,7 +76,7 @@ Runtime::Runtime(engine::Engine &e, dspark::DeviceDrafter *d,
   cache_ =
       std::make_unique<Cache>(std::move(compat), e.rank(), 2, options_.budget,
                               options_.disk_enabled ? options_.directory : std::string{}, exchange_,
-                              options_.max_parked, options_.disk_budget);
+                              options_.max_parked, options_.disk_budget, std::move(owner));
   // Taps are scoped to named requests; construction leaves ordinary serving untouched.
 }
 bool Runtime::begin_request(const std::string& id, std::span<const std::uint32_t> prompt) {
@@ -86,9 +86,9 @@ bool Runtime::begin_request(const std::string& id, std::span<const std::uint32_t
   const auto peer_exists = eng_.peer(exists ? 1U : 0U);
   if (exists && peer_exists) {
     restore_auto(id);
-    const auto prefix = history_.size() + (frontier_.control ? 1U : 0U);
-    if (prompt.size() >= prefix && std::equal(history_.begin(), history_.end(), prompt.begin()) &&
-        (!frontier_.control || prompt[history_.size()] == frontier_.pending)) {
+    const auto prefix = frontier_.tokens.size() + (frontier_.control ? 1U : 0U);
+    if (prompt.size() >= prefix && std::equal(frontier_.tokens.begin(), frontier_.tokens.end(), prompt.begin()) &&
+        (!frontier_.control || prompt[frontier_.tokens.size()] == *frontier_.pending)) {
       suffix(prompt.subspan(prefix));
       return true;
     }
@@ -111,8 +111,8 @@ void Runtime::start(std::span<const std::uint32_t> prompt) {
   auto t = Clock::now();
   auto next = eng_.prefill(slot_, prompt, 0);
   eng_.set_prefill_tap_sink({});
-  history_.assign(prompt.begin(), prompt.end());
-  frontier_ = {};
+  frontier_ = initial_frontier();
+  frontier_.tokens.assign(prompt.begin(), prompt.end());
   frontier_.consumed = frontier_.accepted = prompt.size();
   frontier_.pending = next;
   frontier_.drafter_ready = dd_ != nullptr;
@@ -135,7 +135,7 @@ std::vector<std::uint32_t> Runtime::step(std::span<const engine::Row> rows, std:
     dspark::DeviceDrafter::device_synchronize();
   }
   for (std::size_t i = 0; i < consumed; ++i)
-    history_.push_back(rows[i].token);
+    frontier_.tokens.push_back(rows[i].token);
   frontier_.consumed += consumed;
   frontier_.accepted = frontier_.consumed;
   frontier_.drafter = dd_ ? frontier_.consumed : 0;
@@ -159,7 +159,7 @@ void Runtime::suffix(std::span<const std::uint32_t> input) {
   // Consume the pending token only when it was emitted; after a suffix the
   // pending prediction is un-emitted.
   if (frontier_.control) {
-    engine::Row row{slot_, frontier_.pending, frontier_.consumed};
+    engine::Row row{slot_, *frontier_.pending, frontier_.consumed};
     (void)step(std::span(&row, 1));
   }
   for (auto token : input) {
@@ -174,12 +174,12 @@ void Runtime::suffix(std::span<const std::uint32_t> input) {
                input.size());
 }
 std::uint32_t Runtime::draft() {
-  dd_->forward_block(slot_, eng_.embed_row(frontier_.pending),
+  dd_->forward_block(slot_, eng_.embed_row(*frontier_.pending),
                      eng_.embed_row(dspark::noise_token), frontier_.consumed,
                      nullptr);
   const auto range = eng_.vocab_range();
   auto base = eng_.head_logits(dd_->y(), dspark::block);
-  auto mine = dd_->markov_step_host(frontier_.pending, base, range.first,
+  auto mine = dd_->markov_step_host(*frontier_.pending, base, range.first,
                                     range.first + range.second, nullptr);
   auto other = eng_.peer2(std::bit_cast<std::uint32_t>(mine.value), mine.id);
   return dspark::combine(mine, {std::bit_cast<float>(other[0]), other[1]}).id;
@@ -226,11 +226,11 @@ std::vector<std::uint32_t> Runtime::generate(unsigned count,
     if (std::find(stops.begin(), stops.end(), token) != stops.end()) stopped = true;
   };
   if (!frontier_.control) {
-    emit(frontier_.pending, logits_);
+    emit(*frontier_.pending, logits_);
     if (publish || !stops.empty()) publish_chunk(std::span(result).last(1));
   }
   while (emitted < count && !stopped) {
-    engine::Row rows[2] = {{slot_, frontier_.pending, frontier_.consumed},
+    engine::Row rows[2] = {{slot_, *frontier_.pending, frontier_.consumed},
                            {slot_, 0, frontier_.consumed + 1}};
     unsigned n = 1;
     if (dd_ && count - emitted >= 2) {
@@ -274,7 +274,6 @@ Checkpoint Runtime::capture(const std::string &id) {
   c.id = id;
   c.generation = "unpublished";
   c.frontier = frontier_;
-  c.history = history_;
   c.rank = eng_.rank();
   c.world = 2;
   Bytes raw(static_cast<std::size_t>(frontier_.consumed * 76800));
@@ -310,7 +309,7 @@ void Runtime::checkpoint(const std::string &id, bool disk) {
 void Runtime::park(const std::string &id) {
   checkpoint(id, false);
   active_ = false;
-  std::vector<std::uint32_t>().swap(history_);
+  std::vector<std::uint32_t>().swap(frontier_.tokens);
   std::vector<float>().swap(logits_);
 }
 void Runtime::erase(const std::string& id) {
@@ -328,40 +327,41 @@ void Runtime::restore_auto(const std::string& id) {
 void Runtime::restore(const std::string &id, bool disk) {
   auto begin = Clock::now();
   agree(!disk || options_.disk_enabled, exchange_, "session_budget: disk tier disabled");
-  eng_.set_taps(dd_ != nullptr);
   auto c = cache_->resume(id, disk);
   auto copied = Clock::now();
   bool ok = true;
   auto staging = 1U - slot_;
+  std::vector<float> restored_logits;
+  dspark::ContextSnapshot draft_state;
+  std::vector<std::uint64_t> counters;
   try {
     need(c.frontier.consumed <= eng_.capacity() &&
              c.frontier.drafter_ready == (dd_ != nullptr),
          "restore capacity/draft");
-    auto raw = join_state(c.sections);
-    eng_.import_rows(staging, 0, c.frontier.consumed, raw.data());
+    restored_logits = values<float>(c.sections[180].bytes);
     if (dd_) {
-      dspark::ContextSnapshot s;
-      s.k = values<std::uint16_t>(c.sections[181].bytes);
-      s.v = values<std::uint16_t>(c.sections[182].bytes);
-      s.positions = values<std::int64_t>(c.sections[183].bytes);
-      auto counters = values<std::uint64_t>(c.sections[184].bytes);
+      draft_state.k = values<std::uint16_t>(c.sections[181].bytes);
+      draft_state.v = values<std::uint16_t>(c.sections[182].bytes);
+      draft_state.positions = values<std::int64_t>(c.sections[183].bytes);
+      counters = values<std::uint64_t>(c.sections[184].bytes);
       need(counters[0] == 1, "draft continuation policy");
-      dd_->import_context(staging, s, c.frontier.consumed);
     }
+    auto raw = join_state(c.sections);
+    eng_.set_taps(dd_ != nullptr);
+    eng_.import_rows(staging, 0, c.frontier.consumed, raw.data());
+    if (dd_) dd_->import_context(staging, draft_state, c.frontier.consumed);
   } catch (...) {
     ok = false;
   }
   agree(ok, exchange_, "import-unpublished-slot");
   slot_ = staging;
   active_ = true;
-  frontier_ = c.frontier;
-  history_ = std::move(c.history);
-  logits_ = values<float>(c.sections[180].bytes);
+  frontier_ = std::move(c.frontier);
+  logits_ = std::move(restored_logits);
   if (dd_) {
-    auto v = values<std::uint64_t>(c.sections[184].bytes);
-    windows_ = v[1];
-    verified_ = v[2];
-    accepted_ = v[3];
+    windows_ = counters[1];
+    verified_ = counters[2];
+    accepted_ = counters[3];
   }
   std::fprintf(
       stderr,

@@ -25,6 +25,7 @@
 #define SHUT_RDWR SD_BOTH
 #define SHUT_WR SD_SEND
 #else
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -87,6 +88,36 @@ void set_timeout(Socket fd, int option, long long micros) {
 }
 std::string socket_error() { return std::strerror(errno); }
 #endif
+// Blocking Winsock recv/send need not be interrupted by shutdown(). Use
+// nonblocking descriptors and bounded readiness waits, retaining the configured
+// per-progress deadlines. Only the connection thread closes its descriptor.
+bool nonblocking(Socket fd) {
+#ifdef _WIN32
+    u_long enabled = 1;
+    return ::ioctlsocket(fd, FIONBIO, &enabled) == 0;
+#else
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+#endif
+}
+using IoClock = std::chrono::steady_clock;
+using IoDeadline = std::optional<IoClock::time_point>;
+enum class Ready { yes, closed, late };
+Ready wait_ready(Socket fd, short events, const std::atomic<bool>& stopping, IoDeadline deadline) {
+    while (!stopping.load()) {
+        int slice = 50;
+        if (deadline) {
+            const auto left = std::chrono::duration_cast<std::chrono::microseconds>(*deadline - IoClock::now()).count();
+            if (left <= 0) return Ready::late;
+            slice = static_cast<int>(std::min<long long>(slice, (left + 999) / 1000));
+        }
+        pollfd p{fd, events, 0};
+        const int rc = ::poll(&p, 1, slice);
+        if (rc < 0) { if (interrupted()) continue; return Ready::closed; }
+        if (rc > 0) return Ready::yes; // recv/send also report EOF or socket errors
+    }
+    return Ready::closed;
+}
 template <class T> void set_option(Socket fd, int level, int name, const T& value) {
     ::setsockopt(fd, level, name, reinterpret_cast<const char*>(&value), sizeof(value));
 }
@@ -122,7 +153,6 @@ void close_gracefully(Socket fd, const std::atomic<bool>& stopping) {
         if (n <= 0) break;
         drained += static_cast<std::size_t>(n);
     }
-    ::close(fd);
 }
 std::string trim(std::string_view text) {
     std::size_t a = 0, b = text.size();
@@ -133,12 +163,25 @@ std::string trim(std::string_view text) {
 
 class Connection final : public HttpResponseWriter {
 public:
-    Connection(Socket fd, bool cors) : fd_(fd), cors_(cors) {}
+    Connection(Socket fd, bool cors, const std::atomic<bool>& stopping, int write_seconds)
+        : fd_(fd), cors_(cors), stopping_(stopping), write_seconds_(write_seconds) {}
     bool send_all(std::string_view data) {
+        IoDeadline deadline;
+        const auto renew = [&] {
+            if (write_seconds_ > 0) deadline = IoClock::now() + std::chrono::seconds(write_seconds_);
+        };
+        renew();
         while (!data.empty()) {
+            if (stopping_.load()) { gone_ = true; return false; }
             const auto n = ::send(fd_, data.data(), static_cast<IoSize>(std::min<std::size_t>(data.size(), 1U << 30U)), MSG_NOSIGNAL);
-            if (n < 0) { if (interrupted()) continue; gone_ = true; return false; }
+            if (n < 0) {
+                if (interrupted()) continue;
+                if (timed_out() && wait_ready(fd_, POLLOUT, stopping_, deadline) == Ready::yes) continue;
+                gone_ = true; return false;
+            }
+            if (n == 0) { gone_ = true; return false; }
             data.remove_prefix(static_cast<std::size_t>(n));
+            renew();
         }
         return true;
     }
@@ -205,6 +248,8 @@ public:
 private:
     Socket fd_;
     bool cors_;
+    const std::atomic<bool>& stopping_;
+    int write_seconds_;
     bool responded_ = false, streaming_ = false, gone_ = false;
     std::vector<std::pair<std::string, std::string>> extra_;  // add_response_header() of the current request
 };
@@ -213,8 +258,9 @@ private:
 struct HttpServer::Impl {
     HttpServerConfig config;
     HttpHandler handler;
-    Socket listen_fd = kNoSocket;
-    std::uint16_t bound_port = 0;
+    Socket listen_fd = kNoSocket; // mutex; stop closes only after pollers retire
+    unsigned listener_pollers = 0; // mutex; pins listen_fd across unlocked poll
+    std::atomic<std::uint16_t> bound_port{0};
     std::atomic<bool> stopping{false};
     std::atomic<unsigned> connections{0};
     std::atomic<std::uint64_t> inflight_body{0};  // Content-Length of requests being received or handled
@@ -238,17 +284,7 @@ struct HttpServer::Impl {
         set_option(fd, IPPROTO_TCP, TCP_KEEPIDLE, keep_idle);
         set_option(fd, IPPROTO_TCP, TCP_KEEPINTVL, keep_interval);
         set_option(fd, IPPROTO_TCP, TCP_KEEPCNT, keep_count);
-        Connection connection(fd, config.cors);
-        // Declared after the connection: unregisters the descriptor before the connection closes it.
-        struct Registration {
-            Impl& impl; Socket fd;
-            Registration(Impl& i, Socket f) : impl(i), fd(f) {
-                const std::lock_guard lock(impl.mutex);
-                impl.open_fds.insert(fd);
-                if (impl.stopping.load()) ::shutdown(fd, SHUT_RDWR);
-            }
-            ~Registration() { const std::lock_guard lock(impl.mutex); impl.open_fds.erase(fd); }
-        } registration(*this, fd);
+        Connection connection(fd, config.cors, stopping, config.write_timeout_seconds);
         std::string buffer;
         char chunk[16384];
         using Clock = std::chrono::steady_clock;
@@ -257,18 +293,23 @@ struct HttpServer::Impl {
         enum class Read { data, closed, late };
         const auto expired = [&] { return deadline && Clock::now() >= *deadline; };
         const auto receive = [&]() {
+            long long limit = static_cast<long long>(config.idle_timeout_seconds) * 1000000;
+            if (deadline) {
+                const auto left = std::chrono::duration_cast<std::chrono::microseconds>(*deadline - Clock::now()).count();
+                if (left <= 0) return Read::late;
+                limit = left;
+            }
+            IoDeadline read_until;
+            if (limit > 0) read_until = Clock::now() + std::chrono::microseconds(limit);
             for (;;) {
-                long long limit = static_cast<long long>(config.idle_timeout_seconds) * 1000000;
-                if (deadline) {
-                    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(*deadline - Clock::now()).count();
-                    if (left <= 0) return Read::late;
-                    limit = left;
-                }
-                set_timeout(fd, SO_RCVTIMEO, limit);
+                const auto ready = wait_ready(fd, kPeerData, stopping, read_until);
+                if (ready == Ready::late) return deadline ? Read::late : Read::closed;
+                if (ready == Ready::closed) return Read::closed;
+                if (stopping.load()) return Read::closed;
                 const auto n = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
                 if (n > 0) { buffer.append(chunk, static_cast<std::size_t>(n)); return Read::data; }
-                if (n < 0 && interrupted()) continue;  // the remaining time is recomputed
-                return deadline && n < 0 && timed_out() ? Read::late : Read::closed;
+                if (n < 0 && (interrupted() || timed_out())) continue;
+                return Read::closed;
             }
         };
         const auto start_request = [&] {
@@ -443,6 +484,8 @@ HttpServer::~HttpServer() {
 }
 
 void HttpServer::listen() {
+    const std::lock_guard lock(impl_->mutex);
+    if (impl_->stopping.load() || impl_->listen_fd != kNoSocket) return;
 #ifdef _WIN32
     static const bool started = [] { WSADATA data; return WSAStartup(MAKEWORD(2, 2), &data) == 0; }();
     if (!started) throw std::runtime_error("WSAStartup failed");
@@ -470,39 +513,69 @@ void HttpServer::listen() {
     ::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &size);
     impl_->bound_port = ntohs(bound.ss_family == AF_INET6 ? reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port :
                                                             reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
+    if (!nonblocking(fd)) { ::close(fd); throw std::runtime_error("HTTP nonblocking listener failed"); }
     impl_->listen_fd = fd;
 }
 
 void HttpServer::serve() {
     auto& impl = *impl_;
-    if (impl.listen_fd == kNoSocket) listen();
+    listen();
     while (!impl.stopping.load()) {
-        pollfd p{impl.listen_fd, POLLIN, 0};
-        if (::poll(&p, 1, 200) <= 0) continue;
         sockaddr_storage peer{};
         socklen_t size = sizeof(peer);
-        const Socket fd = ::accept(impl.listen_fd, reinterpret_cast<sockaddr*>(&peer), &size);
-        if (fd == kNoSocket) continue;
+        Socket fd = kNoSocket;
+        bool admitted = false;
+        Socket listener = kNoSocket;
+        {
+            const std::lock_guard lock(impl.mutex);
+            if (impl.stopping.load() || impl.listen_fd == kNoSocket) break;
+            listener = impl.listen_fd;
+            ++impl.listener_pollers;
+        }
+        // A counted poll pins the descriptor without holding the admission
+        // mutex. stop waits for these native operations before closing it.
+        pollfd p{listener, POLLIN, 0};
+        const int ready = ::poll(&p, 1, 200);
+        {
+            const std::lock_guard lock(impl.mutex);
+            --impl.listener_pollers;
+            impl.idle.notify_all();
+            if (impl.stopping.load()) break;
+            if (ready <= 0) continue;
+            fd = ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &size);
+            if (fd == kNoSocket) continue;
+            if (!nonblocking(fd)) { ::close(fd); continue; }
+            if (impl.connections.load() < impl.config.max_connections) {
+                // Admission is atomic with stop, before a handler can start.
+                try { impl.open_fds.insert(fd); }
+                catch (...) { ::close(fd); continue; }
+                ++impl.connections;
+                admitted = true;
+            }
+        }
         char host[NI_MAXHOST] = "";
         ::getnameinfo(reinterpret_cast<sockaddr*>(&peer), size, host, sizeof(host), nullptr, 0, NI_NUMERICHOST);
-        if (impl.connections.load() >= impl.config.max_connections) {
+        if (!admitted) {
             // Closed at once, not drained: the accept loop never waits on one client (the 503 is best effort).
             const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             (void)::send(fd, busy, static_cast<IoSize>(std::strlen(busy)), MSG_NOSIGNAL);
             ::close(fd);
             continue;
         }
-        ++impl.connections;
-        const auto retire = [](Impl& shared) {
+        const auto retire = [fd](Impl& shared) {
             {
                 const std::lock_guard lock(shared.mutex);
+                // Keep registration through graceful drain and final close.
+                // stop/shutdown and close/erase are serialized against reuse.
+                ::close(fd);
+                shared.open_fds.erase(fd);
                 --shared.connections;
             }
             shared.idle.notify_all();
         };
         try {
             std::thread([shared = impl_, fd, peer_name = std::string(host), retire] {
-                // A failure inside one connection ends that connection only; handle() has unregistered fd on exit.
+                // A failure inside one connection ends that connection only.
                 try { shared->handle(fd, peer_name); } catch (...) {}
                 close_gracefully(fd, shared->stopping);
                 retire(*shared);
@@ -511,23 +584,25 @@ void HttpServer::serve() {
             // No thread for this connection (e.g. EAGAIN): refuse it like a full server and keep serving.
             const char* busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             (void)::send(fd, busy, static_cast<IoSize>(std::strlen(busy)), MSG_NOSIGNAL);
-            ::close(fd);
             retire(impl);
         }
     }
 }
 
 void HttpServer::stop() {
+    std::unique_lock lock(impl_->mutex);
     impl_->stopping.store(true);
+    if (impl_->listen_fd != kNoSocket) ::shutdown(impl_->listen_fd, SHUT_RDWR);
+    for (const Socket fd : impl_->open_fds) ::shutdown(fd, SHUT_RDWR);
+    // No new poll can start after stopping. Existing pollers retire within
+    // their 200 ms slice, without starvation of stop or connection retirement.
+    impl_->idle.wait(lock, [&] { return impl_->listener_pollers == 0; });
     if (impl_->listen_fd != kNoSocket) {
-        ::shutdown(impl_->listen_fd, SHUT_RDWR);
         ::close(impl_->listen_fd);
         impl_->listen_fd = kNoSocket;
     }
-    const std::lock_guard lock(impl_->mutex);
-    for (const Socket fd : impl_->open_fds) ::shutdown(fd, SHUT_RDWR);
 }
-std::uint16_t HttpServer::port() const noexcept { return impl_->bound_port; }
+std::uint16_t HttpServer::port() const noexcept { return impl_->bound_port.load(); }
 unsigned HttpServer::active_connections() const noexcept { return impl_->connections.load(); }
 
 }  // namespace strix::serve

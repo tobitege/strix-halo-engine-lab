@@ -10,7 +10,8 @@
 // partials are reduced in ascending split order before the output Hadamard, as output_transform does.
 //
 // Launches: gather+transform, gate/up (grouped WMMA), gate/up finish + SwiGLU + down transform, down (grouped WMMA,
-// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk).
+// one launch per row-tile class), down finish + combine. Routes come from the host (as in G4; one D2H per chunk), or
+// stay on the device with the device plan (enqueue_prefill_moe_device).
 #include "minimax/moe/mmx_moe.hpp"
 
 #include <array>
@@ -66,6 +67,8 @@ bool prefill_iu4();
 // STRIX_MMX_FAKEQ_A4=1 (quality study only, default off): the exact v4 path with the gate/up and down inputs
 // fake-quantised to A4 g64 after their input transforms (iu4_fake128); EXL3 weights unchanged.
 bool prefill_fakeq_a4();
+// Per-call shadow controls; environment preserves each planner's existing behavior.
+enum class PrefillFakeq { environment, off, on };
 
 struct PrefillMoeView {
     std::uint32_t rows = 0;                     // T
@@ -77,6 +80,9 @@ struct PrefillMoeView {
     float* out = nullptr;                       // T x 6144 (device)
     const I4Layer* i4 = nullptr;                // FAST_I4 layer pack (null: EXL3 path)
     bool i4_all = true;                         // false: IU4 gate/up, original EXL3 down
+    unsigned i4_a8 = 0;                         // W4A8 planes: bit 0 gate/up input, bit 1 down input (unfused path only)
+    bool i4_chain = false;                      // fused candidate chain (prefill_i4_chain of the prompt)
+    PrefillFakeq fakeq_a4 = PrefillFakeq::environment;
 };
 
 // Dense prefill linears on the v4 core: jobs share one input x [rows][input] (input % 128 == 0, output % 128 == 0)
@@ -100,10 +106,50 @@ std::size_t prefill_moe_workspace_bytes(const PrefillMoeView& v);
 // Upper bound for any routes of T rows.
 std::size_t prefill_moe_workspace_bound(std::uint32_t rows);
 void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
-// WMMA core of the gate/up and down stages (same bits): 0 = library port, 1 = v2, 2 = v3, 3 = v4 (v3 + tile-major
-// transformed rows; mmx_prefill_core.hpp), -1 = the process default from STRIX_MMX_PREFILL_CORE (v4 = default | v3 |
-// v2 | lib). Any other value throws.
-void set_prefill_core(int core);
+// Device plan (default; STRIX_MMX_PF_PLAN=host keeps the host plan above): the same tables and launches built on the
+// GPU from the device routes by the shared moe_core::device_plan, so a call needs no route download, host sync, host
+// table build or upload. Selected with mtfit and without gufuse (the defaults); the workspace is
+// prefill_moe_workspace_bound(rows). Same bits as enqueue_prefill_moe.
+struct PrefillMoeDeviceView {
+    std::uint32_t rows = 0;                 // T
+    const float* y = nullptr;               // T x 6144 normed hidden (device)
+    const std::uint32_t* routes = nullptr;  // device: T x 4 expert ids, then T x 4 float weights (the router layout)
+    const ExpertSlices* experts = nullptr;  // device array [128]
+    ExpertSlices shared{};
+    float* out = nullptr;                   // T x 6144 (device)
+    const I4Layer* i4 = nullptr;
+    bool i4_all = true;
+    bool i4_chain = false;
+    PrefillFakeq fakeq_a4 = PrefillFakeq::environment;
+};
+bool prefill_moe_device_plan(std::uint32_t rows);
+// Group-wide device-planned call: the MoE of one layer over all chunks of a prefill group at once (chunk c = rows
+// [c x seg_rows, ...) of the call, every chunk but the last full). An expert's weights are decoded once for the
+// group's rows instead of once per chunk; the plan keeps each row's per-chunk K splits (rows merge per expert and split
+// class), so every chunk's output is bitwise that of its own enqueue_prefill_moe_device call. Every chunk needs at
+// least prefill_moe_group_min_rows() rows; the workspace is prefill_moe_group_workspace_bound(rows). EXL3 only.
+inline constexpr unsigned kPrefillMoeSegments = 8;
+struct PrefillMoeGroupView {
+    std::uint32_t rows = 0, segments = 0, seg_rows = 0;
+    const float* y[kPrefillMoeSegments] = {};               // per chunk: rows x 6144 normed hidden (device)
+    const std::uint32_t* routes[kPrefillMoeSegments] = {};  // per chunk: the router layout of PrefillMoeDeviceView
+    float* out[kPrefillMoeSegments] = {};                   // per chunk: rows x 6144 (device)
+    const ExpertSlices* experts = nullptr;                  // device array [128]
+    ExpertSlices shared{};
+};
+unsigned prefill_moe_group_min_rows();
+std::size_t prefill_moe_group_workspace_bound(std::uint32_t rows);
+void enqueue_prefill_moe_group(const PrefillMoeGroupView& v, void* workspace, std::size_t workspace_bytes, hipStream_t stream);
+// The fused FAST_I4 candidate chain for a prompt of total_rows rows (0: capability/opt-in checks). Default on at
+// every length (8K -1.7 %, 32K -0.9 % with the global gate save). STRIX_MOE_I4_CHAIN=0/1 overrides. Same bits.
+bool prefill_i4_chain(std::size_t total_rows = 0);
+std::size_t prefill_i4_workspace_bound(std::uint32_t rows);
+void enqueue_prefill_moe_device(const PrefillMoeDeviceView& v, void* workspace, std::size_t workspace_bytes,
+                                hipStream_t stream);
+// After the stream completed: throws (once) when a device-planned call met invalid routes (an id >= 128 or repeated
+// in a row; such a row was planned as experts 0..3 with weight 0). A failed exchange is the only known source.
+void prefill_moe_device_check();
+void cleanup_prefill_device_plan() noexcept;
 // v4 exact-fit row tiles; -1 = STRIX_MMX_PREFILL_MTFIT (default off), 0 = off, 1 = on.
 void set_prefill_mtfit(int on);
 // Pinned H2D table ring; -1 = STRIX_MM_PF_TABLE_RING (default off), 0 = off, 1 = on.
@@ -126,22 +172,21 @@ int prefill_pipe_override();
 // Under PIPE: paired MT8 bands. -1 = STRIX_MMX_PREFILL_PIPE_PAIR (default auto: calls >= 2048 rows), 0 = off,
 // 1 = every call, 2 = auto.
 void set_prefill_pipe_pair(int value);
+// Dense linears under PIPE: tall bands. -1 = STRIX_MMX_PREFILL_DENSE_BAND (default 0 = off), 0 = off, 4 / 8 = bands of
+// 4 / 8 waves over 512 / 1024 rows.
+void set_prefill_dense_band(int value);
 // v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
 // 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
 void set_prefill_tail_stream(int on);
 void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
-// Bench only (tests/hip_mmx_moe_bench.hip stage split): 8 / 9 = v3 without A loads / without decode, WRONG outputs,
-// timing only; never selected by the environment or by set_prefill_core.
-void set_prefill_diagnostic_core(int core);
 // Profiling only: `marker(label, stream, user)` after "start" and each launch ("gather", "gate_up[.mtN]", "finish",
 // "down[.mtN]", "combine"); nullptr = off.
 using PrefillMarker = void (*)(const char* label, hipStream_t stream, void* user);
 void set_prefill_marker(PrefillMarker marker, void* user);
 // Tests: workspace regions of one call (transformed gate/up rows, down input, all split partials), as byte ranges.
-// xt / at are row-major [2][pairs][6144] / [pairs][1536] for the lib, v2 and v3 cores; v4 stores them tile-major
-// [2][tpairs/16][384][16][16] / [tpairs/16][96][16][16] with group g's rows at tbegin.. (the bench un-tiles them;
-// xt_bytes / at_bytes cover the row-major extent).
+// The core stores xt / at tile-major [2][tpairs/16][384][16][16] / [tpairs/16][96][16][16] with group g's rows at
+// tbegin.. (xt_bytes / at_bytes cover the row-major extent [2][pairs][6144] / [pairs][1536]).
 struct PrefillDebugRegions {
     std::size_t xt_offset = 0, xt_bytes = 0, at_offset = 0, at_bytes = 0, part_offset = 0, part_bytes = 0;
     std::size_t pairs = 0, tpairs = 0;

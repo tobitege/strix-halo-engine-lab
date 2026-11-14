@@ -1,4 +1,7 @@
 #include "minimax/engine/route_identity.hpp"
+#include "core/layer_set.hpp"
+#include "core/i4_shadow.hpp"
+#include "core/hip_range_weight_loader.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
 //
@@ -10,6 +13,7 @@
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/minimax/engine.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/pair/prefill_group.hpp"
 
 #include "mm_kernels.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -27,6 +31,8 @@
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/deploy/device.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/route_receipt.hpp"
 
 #include <strix_trellis.h>
 
@@ -38,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -146,11 +153,12 @@ public:
         st_.hip_stream = nullptr;
     }
     ~Lib() {
+        load_.reset();  // the read workers stop and the copy stream is quiet before any destination goes away
+        if (hash_file_ != nullptr) std::fclose(hash_file_);
         (void)hipDeviceSynchronize();
         for (auto w : all_) (void)strix_weights_destroy(w);
         for (void* p : arenas_) (void)hipFree(p);
         if (ws_) (void)hipFree(ws_);
-        release_staging();
         (void)strix_context_destroy(ctx_);
     }
     struct Lin {
@@ -158,67 +166,130 @@ public:
         std::uint64_t rows = 0, cols = 0;  // N outputs, I inputs
         std::uint64_t bits = 0;
     };
-    // One H128-aligned rank slice of an EXL3 linear assembled in the pinned staging buffer (G4 layout): an output
+    // One H128-aligned rank slice of an EXL3 linear assembled in its ticket's pinned staging (G4 layout): an output
     // slice [o0, o0 + n) keeps those outputs' tiles of every input row and the matching svh; an input slice
     // [i0, i0 + n) keeps the contiguous trellis rows and the matching suh (a partial sum to reduce across ranks).
     struct Staged {
         const std::uint8_t *tr = nullptr, *suh = nullptr, *svh = nullptr;
         std::uint64_t tr_bytes = 0, suh_bytes = 0, svh_bytes = 0, rows = 0, cols = 0, bits = 0;
     };
-    Staged stage_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return stage_out(pack_, prefix, o0, n); }
-    // The same from another pack (a draft-only requant of a target tensor, Engine::attach_draft_head).
-    Staged stage_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
+    // A slice as a load-queue manifest (core/weight_load_queue.hpp): its reads, the tile gather of an output slice,
+    // and where each part lands in the ticket's staging. Built here from the pack's metadata; nothing is read yet.
+    struct Plan {
+        strix::core::WeightLoadManifest m;
+        std::uint64_t tr = 0, suh = 0, svh = 0;  // staging offsets
+        std::uint64_t tr_bytes = 0, suh_bytes = 0, svh_bytes = 0, rows = 0, cols = 0, bits = 0;
+    };
+    Plan plan_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
         const TensorInfo &tr = pk.info(prefix + ".trellis"), &suh = pk.info(prefix + ".suh"), &svh = pk.info(prefix + ".svh");
         if (o0 % 128 != 0 || n % 128 != 0 || o0 + n > svh.shape[0]) throw std::invalid_argument("bad output slice " + prefix);
         const std::uint64_t in_tiles = tr.shape[0], out_tiles = tr.shape[1], w = tr.shape[2] * 2;  // bytes per tile
-        const std::uint64_t tr_bytes = in_tiles * (n / 16) * w;
-        if (whole_.size() < tr.bytes) whole_.resize(tr.bytes);
-        pk.read(tr, 0, tr.bytes, whole_.data());
-        std::uint8_t* t = stage(tr_bytes + suh.bytes + n * 2);
-        for (std::uint64_t i = 0; i < in_tiles; ++i)
-            std::memcpy(t + i * (n / 16) * w, whole_.data() + (i * out_tiles + o0 / 16) * w, (n / 16) * w);
-        pk.read(suh, 0, suh.bytes, t + tr_bytes);
-        pk.read(svh, o0 * 2, n * 2, t + tr_bytes + suh.bytes);
-        return {t, t + tr_bytes, t + tr_bytes + suh.bytes, tr_bytes, suh.bytes, n * 2, n, suh.shape[0], tr.shape[2] / 16};
+        Plan p;
+        // The whole trellis is read; the gather then packs this slice's tiles of every input row to the front of the
+        // same staging (in place: row i moves down, never over a row not yet moved).
+        p.tr = p.m.read(pk.source(tr), tr.offset, tr.bytes);
+        const std::uint64_t at = p.tr, row = (n / 16) * w, stride = out_tiles * w, first = (o0 / 16) * w;
+        if (row != stride)
+            p.m.convert([=](std::uint8_t* st) {
+                for (std::uint64_t i = 0; i < in_tiles; ++i) std::memmove(st + at + i * row, st + at + i * stride + first, row);
+            });
+        p.suh = p.m.read(pk.source(suh), suh.offset, suh.bytes);
+        p.svh = p.m.read(pk.source(svh), svh.offset + o0 * 2, n * 2);
+        pk.count_read(tr.bytes + suh.bytes + n * 2);
+        p.tr_bytes = in_tiles * row;
+        p.suh_bytes = suh.bytes;
+        p.svh_bytes = n * 2;
+        p.rows = n;
+        p.cols = suh.shape[0];
+        p.bits = tr.shape[2] / 16;
+        return p;
     }
-    Staged stage_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
+    Plan plan_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
         const TensorInfo &tr = pack_.info(prefix + ".trellis"), &suh = pack_.info(prefix + ".suh"), &svh = pack_.info(prefix + ".svh");
         if (i0 % 128 != 0 || n % 128 != 0 || i0 + n > suh.shape[0]) throw std::invalid_argument("bad input slice " + prefix);
-        const std::uint64_t row_bytes = tr.shape[1] * tr.shape[2] * 2, tr_bytes = (n / 16) * row_bytes;
-        std::uint8_t* t = stage(tr_bytes + n * 2 + svh.bytes);
-        pack_.read(tr, (i0 / 16) * row_bytes, tr_bytes, t);
-        pack_.read(suh, i0 * 2, n * 2, t + tr_bytes);
-        pack_.read(svh, 0, svh.bytes, t + tr_bytes + n * 2);
-        return {t, t + tr_bytes, t + tr_bytes + n * 2, tr_bytes, n * 2, svh.bytes, svh.shape[0], n, tr.shape[2] / 16};
+        const std::uint64_t row_bytes = tr.shape[1] * tr.shape[2] * 2;
+        Plan p;
+        p.tr_bytes = (n / 16) * row_bytes;
+        p.suh_bytes = n * 2;
+        p.svh_bytes = svh.bytes;
+        p.tr = p.m.read(pack_.source(tr), tr.offset + (i0 / 16) * row_bytes, p.tr_bytes);
+        p.suh = p.m.read(pack_.source(suh), suh.offset + i0 * 2, p.suh_bytes);
+        p.svh = p.m.read(pack_.source(svh), svh.offset, p.svh_bytes);
+        pack_.count_read(p.tr_bytes + p.suh_bytes + p.svh_bytes);
+        p.rows = svh.shape[0];
+        p.cols = n;
+        p.bits = tr.shape[2] / 16;
+        return p;
     }
-    Lin out_slice(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return prepared(prefix, stage_out(prefix, o0, n)); }
+    // Prepared linears. The *_later forms only queue the slice: `dst` is filled when its staging is consumed, in
+    // submit order, by a later call or by settle() / publish(), and must stay where it is until then.
+    void out_slice_later(Lin& dst, const std::string& prefix, std::uint64_t o0, std::uint64_t n) { defer(dst, prefix, plan_out(pack_, prefix, o0, n)); }
+    void in_slice_later(Lin& dst, const std::string& prefix, std::uint64_t i0, std::uint64_t n) { defer(dst, prefix, plan_in(prefix, i0, n)); }
+    Lin out_slice(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return out_slice(pack_, prefix, o0, n); }
+    // The same from another pack (a draft-only requant of a target tensor, Engine::attach_draft_head).
     Lin out_slice(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
-        return prepared(prefix, stage_out(pk, prefix, o0, n));
+        Lin l;
+        defer(l, prefix, plan_out(pk, prefix, o0, n));
+        settle();
+        return l;
     }
-    Lin in_slice(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return prepared(prefix, stage_in(prefix, i0, n)); }
+    Lin in_slice(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
+        Lin l;
+        defer(l, prefix, plan_in(prefix, i0, n));
+        settle();
+        return l;
+    }
     // The same slices as raw device buffers in the strix-trellis device layout (= file layout), for the MiniMax MoE
-    // kernels (src/minimax/moe): trellis words, suh / svh FP16.
-    mmoe::Exl3 raw_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return raw(stage_out(prefix, o0, n)); }
+    // kernels (src/minimax/moe): trellis words, suh / svh FP16. The addresses are final at once; the bytes are in
+    // device memory after publish().
+    mmoe::Exl3 raw_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return raw(plan_out(pack_, prefix, o0, n)); }
     // From another pack into its own exact-size device allocation (not the 1 GiB arena chunks: a draft-only copy).
     mmoe::Exl3 raw_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
-        return raw(stage_out(pk, prefix, o0, n), true);
+        const mmoe::Exl3 e = raw(plan_out(pk, prefix, o0, n), true);
+        publish();
+        return e;
     }
-    mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(stage_in(prefix, i0, n)); }
-    // Raw bytes of a plain tensor to device memory through the staging buffer.
+    mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(plan_in(prefix, i0, n)); }
+    // Raw bytes of a plain tensor to device memory; in device memory after publish().
     void upload_raw(const std::string& name, void* dst) {
         const TensorInfo& t = pack_.info(name);
-        constexpr std::uint64_t chunk = std::uint64_t{256} << 20;
+        constexpr std::uint64_t chunk = std::uint64_t{64} << 20;
         for (std::uint64_t off = 0; off < t.bytes; off += chunk) {
             const std::uint64_t n = std::min(chunk, t.bytes - off);
-            std::uint8_t* s = stage(n);
-            pack_.read(t, off, n, s);
-            hip_ok(hipMemcpy(static_cast<std::uint8_t*>(dst) + off, s, n, hipMemcpyHostToDevice), "upload");
+            strix::core::WeightLoadManifest m;
+            m.upload(m.read(pack_.source(t), t.offset + off, n), n, static_cast<std::uint8_t*>(dst) + off);
+            (void)loader().queue.submit(std::move(m));
         }
+        pack_.count_read(t.bytes);
+        note_raw("U:" + name, dst, t.bytes, nullptr, 0, nullptr, 0);
     }
+    // Every queued prepared linear is prepared (its `dst` is filled).
+    void settle() {
+        while (!pending_.empty()) consume_front();
+    }
+    // End-of-load publication: settle(), then the one wait for every raw upload.
+    void publish() {
+        if (!load_) return;
+        settle();
+        load_->queue.publish();
+        close_hashes();
+    }
+    // Publishes, then gives the staging (pinned pool, read workers, copy stream) back.
     void release_staging() {
-        if (stage_) (void)hipHostFree(stage_);
-        stage_ = nullptr;
-        std::vector<std::uint8_t>().swap(whole_);
+        if (!load_) return;
+        publish();
+        const auto st = load_->queue.stats();
+        if (st.tickets > 16)
+            std::fprintf(stderr, "strix-minimax %s\n", strix::core::weight_load_line(st, load_->up.peak_pinned_bytes(), load_->queue.options()).c_str());
+        load_.reset();
+    }
+    // Failure-path cleanup (destructors): the queue is cancelled and its copies drained, nothing is prepared or
+    // published and nothing throws. Linears still pending stay unfilled: their owner is being unwound.
+    void drop_staging() noexcept {
+        if (!load_) return;
+        load_->queue.cancel();
+        pending_.clear();
+        load_.reset();
     }
     // out[t][N] = in[t][I] @ W; gemv (the decode entry point) when `gemv`, else gemm.
     void mm(const Lin& l, const float* in, float* out, std::uint64_t t, bool gemv) {
@@ -276,14 +347,84 @@ public:
     [[nodiscard]] std::uint64_t workspace_bytes() const { return ws_bytes_; }
     [[nodiscard]] std::uint64_t workspace_grows() const { return grows_; }
 
+    // Identity gate (STRIX_LOAD_HASH_OUT): one line per loaded slice, in load order.
+    void note_prepared(const std::string& what, std::uint64_t h) {
+        if (hash_file_ != nullptr) std::fprintf(hash_file_, "P %s %016llx\n", what.c_str(), static_cast<unsigned long long>(h));
+    }
+    struct RawNote {
+        std::string name;
+        const void* p[3];
+        std::uint64_t n[3];
+    };
+    void note_raw(const std::string& name, const void* a, std::uint64_t na, const void* b, std::uint64_t nb, const void* c, std::uint64_t nc) {
+        if (hash_file_ != nullptr) raws_.push_back({name, {a, b, c}, {na, nb, nc}});
+    }
+    void open_hashes() {
+        if (hash_file_ != nullptr) return;
+        if (const char* out = strix::envcfg::text("STRIX_LOAD_HASH_OUT")) {
+            hash_file_ = std::fopen(out, hash_opened_ ? "a" : "w");
+            if (hash_file_ == nullptr) throw std::runtime_error("STRIX_LOAD_HASH_OUT: cannot write the hash file");
+            hash_opened_ = true;
+        }
+    }
+    void close_hashes() {  // device read-back of the raw slices, after their uploads completed
+        if (hash_file_ == nullptr) return;
+        for (const auto& r : raws_) {
+            std::fprintf(hash_file_, "R %s", r.name.c_str());
+            for (int k = 0; k < 3; ++k)
+                if (r.p[k] != nullptr)
+                    std::fprintf(hash_file_, " %016llx", static_cast<unsigned long long>(strix::core::device_weight_hash64(r.p[k], r.n[k])));
+            std::fprintf(hash_file_, "\n");
+        }
+        raws_.clear();
+        std::fclose(hash_file_);
+        hash_file_ = nullptr;
+    }
 private:
     bool reserved_ = false;
     std::uint64_t grows_ = 0;
-    static constexpr std::size_t kStage = std::size_t{768} << 20;  // > the largest slice (lm_head half, ~616 MB)
-    std::uint8_t* stage(std::uint64_t bytes) {
-        if (bytes > kStage) throw std::runtime_error("staging buffer too small");
-        if (!stage_) hip_ok(hipHostMalloc(reinterpret_cast<void**>(&stage_), kStage, hipHostMallocDefault), "staging");
-        return stage_;  // prepare_parts / hipMemcpy finish their upload before returning, so the buffer is free again
+    // Resident pinned staging of a load (STRIX_LOAD_STAGING_MIB overrides): the largest ticket is the whole lm_head
+    // trellis (~1.3 GiB with its size class); the rest is read-ahead for the workers.
+    static constexpr std::uint64_t kStageBudget = std::uint64_t{2} << 30;
+    // How many queued prepared linears may wait for the GPU before a submit prepares the oldest itself.
+    static constexpr std::size_t kBacklog = 1024;
+    struct Load {
+        strix::core::HipWeightUploader up;
+        strix::core::WeightLoadQueue queue;
+        explicit Load(const strix::core::WeightLoadOptions& o) : queue(up, o) {}
+    };
+    Load& loader() {
+        if (!load_) {
+            load_ = std::make_unique<Load>(strix::core::weight_load_options_from_environment(kStageBudget));
+            open_hashes();
+        }
+        return *load_;
+    }
+    struct Pending {
+        strix::core::WeightLoadQueue::Ticket ticket;
+        Lin* dst;
+        std::string what;
+        std::uint64_t tr, suh, svh, tr_bytes, suh_bytes, svh_bytes, rows, cols, bits;
+    };
+    void defer(Lin& dst, const std::string& what, Plan p) {
+        p.m.hold();
+        p.m.output(p.tr, p.tr_bytes);
+        p.m.output(p.suh, p.suh_bytes);
+        p.m.output(p.svh, p.svh_bytes);
+        auto& q = loader().queue;
+        pending_.push_back({q.submit(std::move(p.m)), &dst, what, p.tr, p.suh, p.svh, p.tr_bytes, p.suh_bytes, p.svh_bytes, p.rows, p.cols, p.bits});
+        // Prepare what the workers already read (the reads of the slices behind it go on meanwhile); never wait here
+        // unless the backlog is full.
+        while (!pending_.empty() && (pending_.size() > kBacklog || q.read_done(pending_.front().ticket))) consume_front();
+    }
+    void consume_front() {
+        const Pending p = pending_.front();
+        pending_.pop_front();
+        auto& q = load_->queue;
+        const std::uint8_t* st = q.take(p.ticket);  // prepare_parts finishes its upload before returning
+        if (hash_file_ != nullptr) note_prepared(p.what, q.hash(p.ticket));
+        *p.dst = prepared(p.what, Staged{st + p.tr, st + p.suh, st + p.svh, p.tr_bytes, p.suh_bytes, p.svh_bytes, p.rows, p.cols, p.bits});
+        q.release(p.ticket);
     }
     Lin prepared(const std::string& what, const Staged& g) {
         strix_exl3_parts_desc p{};
@@ -322,7 +463,7 @@ private:
         arena_left_ -= bytes;
         return r;
     }
-    mmoe::Exl3 raw(const Staged& g, bool own = false) {
+    mmoe::Exl3 raw(Plan g, bool own = false) {
         const std::uint64_t bytes = g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes;
         std::uint8_t* d = nullptr;
         if (own) {
@@ -335,9 +476,11 @@ private:
         }
         std::uint8_t* d_suh = d + ((g.tr_bytes + 255) & ~std::uint64_t{255});
         std::uint8_t* d_svh = d_suh + ((g.suh_bytes + 255) & ~std::uint64_t{255});
-        hip_ok(hipMemcpy(d, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis");
-        hip_ok(hipMemcpy(d_suh, g.suh, g.suh_bytes, hipMemcpyHostToDevice), "raw suh");
-        hip_ok(hipMemcpy(d_svh, g.svh, g.svh_bytes, hipMemcpyHostToDevice), "raw svh");
+        g.m.upload(g.tr, g.tr_bytes, d);
+        g.m.upload(g.suh, g.suh_bytes, d_suh);
+        g.m.upload(g.svh, g.svh_bytes, d_svh);
+        (void)loader().queue.submit(std::move(g.m));
+        note_raw("#" + std::to_string(raw_seq_++), d, g.tr_bytes, d_suh, g.suh_bytes, d_svh, g.svh_bytes);
         mmoe::Exl3 e;
         e.trellis = reinterpret_cast<const std::uint32_t*>(d);
         e.suh = reinterpret_cast<const std::uint16_t*>(d_suh);
@@ -362,8 +505,12 @@ private:
     strix_stream st_{};
     void* ws_ = nullptr;
     std::uint64_t ws_bytes_ = 0;
-    std::uint8_t* stage_ = nullptr;
-    std::vector<std::uint8_t> whole_;
+    std::unique_ptr<Load> load_;
+    std::deque<Pending> pending_;
+    std::uint64_t raw_seq_ = 0;
+    std::FILE* hash_file_ = nullptr;
+    bool hash_opened_ = false;
+    std::vector<RawNote> raws_;
     std::vector<strix_weights> all_;
     std::vector<void*> arenas_;
     std::uint8_t* arena_next_ = nullptr;
@@ -503,6 +650,7 @@ struct Engine::Impl {
     std::vector<hipEvent_t> xb_attn_ev;  // per layer: q/k/v and index projections done (the warm's gate), re-recorded each step
     std::uint64_t xb_warm_o_count = 0;
     bool xb_prep = false;      // STRIX_MM_XB_PREP=1: the FFN post_exchange writes the next layer's q/k/v input transform (no prepare launch)
+    bool xb_fold = true;       // exchange row fold when the module has fold slots (STRIX_MMX_FOLD=rows)
     bool xb_prepped = false;   // the next q/k/v call's inputs were transformed by the post_exchange just enqueued
     unsigned xb_layers = 0;    // layers of the current layers_forward call (the fold needs a next layer)
     bool index_attn = true;  // STRIX_MM_INDEX_PROJ (runtime; default attn = index_proj, decode and prefill)
@@ -521,6 +669,11 @@ struct Engine::Impl {
     bool pf_dense_qkv = true;  // STRIX_MM_PF_DENSE_QKV (default ON): prefill q/k/v in one v4-core call from 1024 rows (same bits as strix_gemm); =0 library
     unsigned pf_idx_rows = 32;
     unsigned pf_msa_rework = 10;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 10 (in-block chunk loop, LDS-staged block list/partials, no global partials); =8 (= 7 with the 16-key tile max as an exact ds_swizzle lane tree) / =7 / =6 / =5 / =3 previous defaults, =0 original, =9 DPP diagnostic
+    // STRIX_MM_PF_MSA_FLASH (FAST, lossy, opt-in; 1 | 2): prefill MSA attention of windows > 8 rows on the shared BF16 WMMA key-split
+    // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged.
+    unsigned pf_msa_flash = 0;
+    static constexpr const char* kMsaFlashLayers = "40-59";  // measured on the EXL3 format: passes the 8K FAST gate with either operand form; 20-59 does not
+    strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: kMsaFlashLayers)
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -554,15 +707,26 @@ struct Engine::Impl {
     std::size_t pf_async_min_rows = 2048;
     // Persistent per-member/per-activation-bank fences. Children currently fit
     // one chunk, but must never alias the parked parent's event generations.
+    static constexpr unsigned kPfGroupMax = strix::pair::prefill_group::kMax;  // one 32K prompt (8 x 4096 rows) as one group
     struct PfFences {
-        std::array<hipEvent_t, 4> last_r_use{}, p_free{};
-        std::array<bool, 4> destination_untracked{};
-        std::array<bool, 4> source_pending{};
+        std::array<hipEvent_t, kPfGroupMax> last_r_use{}, p_free{};
+        std::array<bool, kPfGroupMax> destination_untracked{};
+        std::array<bool, kPfGroupMax> source_pending{};
     };
     std::array<PfFences, 2> pf_fences{};
     bool pf_comm_inflight = false;
-    unsigned pf_group = 2;                     // STRIX_MM_PF_GROUP: chunks interleaved together (2..4)
+    bool unaligned_resume = false;             // conversation mode: a resident prefill may restart mid-chunk
+    bool pf_group_explicit = false;            // STRIX_MM_PF_GROUP given (then a narrower exchange depth is an error)
+    unsigned pf_group = strix::pair::prefill_group::kDefault;  // STRIX_MM_PF_GROUP: chunks interleaved together (2..8;
+                                               // clamped to the prompt's chunk count, and to the exchange depth)
     std::vector<float*> grp_h, grp_hn;         // residual / normed rows of group members 1.. (member 0 uses h / hn)
+    // STRIX_MM_PF_MOE_GROUP: chunks of the group per group-wide EXL3 MoE call (strix/pair/prefill_group.hpp moe_width;
+    // 0 = automatic, 1 = one call per chunk). Same bits at every width.
+    unsigned pf_moe_group = strix::pair::prefill_group::kMoeAuto;
+    unsigned pf_moe_cap = 1;                   // widest sub-group the start-up buffers admit
+    std::vector<std::uint32_t*> grp_route;     // router tables of group members 1.. (member 0 uses route_d)
+    void* pf_gws = nullptr;                    // group-wide MoE workspace (pf_moe_cap chunks)
+    std::size_t pf_gws_bytes = 0;
     std::vector<float*> grp_part, grp_remote;  // communicator backend: each member's local / peer partials (member 0: part / remote)
     bool pf_comm_interleave = true;            // the communicator backend is available (start/finish; used when the module is off)
     // DSpark taps: residual after layers 3, 17, 31, 45, 59 of the current call's rows, [rows][5][6144]
@@ -592,6 +756,7 @@ struct Engine::Impl {
         moe::opt::cleanup_prefill_table_ring();
         moe::opt::cleanup_prefill_dense();
         moe::opt::cleanup_prefill_tail_stream();
+        moe::opt::cleanup_prefill_device_plan();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &xb_attn_ev, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
@@ -611,6 +776,8 @@ struct Engine::Impl {
             for (hipEvent_t ev : {j.ready, j.free}) if (ev != nullptr) (void)hipEventDestroy(ev);
         }
         if (jit_stream != nullptr) (void)hipStreamDestroy(jit_stream);
+        if (i4_shadow_outputs != nullptr) (void)hipFree(i4_shadow_outputs);
+        if (i4_shadow_sums != nullptr) (void)hipFree(i4_shadow_sums);
         for (auto& t : jit_timing)
             for (hipEvent_t ev : {t.convert0, t.convert1, t.moe0, t.moe1})
                 if (ev != nullptr) (void)hipEventDestroy(ev);
@@ -620,7 +787,15 @@ struct Engine::Impl {
     // RTX PRO prefill service reproduces bit for bit. Decode steps are unchanged.
     bool fp32_prefill = false;
     bool model_fast_i4 = false;   // STRIX_MMX_MODEL_FORMAT=fast_i4
+    bool i4_shadow = false;      // STRIX_MMX_FAST_I4_SHADOW (measurement only)
+    float* i4_shadow_outputs = nullptr;  // two max_rows x kHidden buffers: exact and fakeq
+    float* i4_shadow_sums = nullptr;     // two pairs of {squared error, exact energy}
     fast_i4::Scope i4_scope = fast_i4::Scope::all;
+    strix::core::LayerSet i4_exl3_layers;  // STRIX_MMX_FAST_I4_EXL3_LAYERS: MoE layers that keep the EXL3 operator
+    unsigned i4_a8 = 0;                    // STRIX_MMX_FAST_I4_A8: bit 0 gate/up input, bit 1 down input as two A4 planes
+    strix::core::LayerSet i4_a8_layers;    // STRIX_MMX_FAST_I4_A8_LAYERS: the layers it applies to (unset: all MoE layers)
+    bool pf_i4_chain = mmoe::prefill_i4_chain(); // per prompt: prefill_begin sets it from the prompt rows
+    std::size_t i4_min_rows = fast_i4::kMinRows;  // STRIX_MMX_FAST_I4_MIN_ROWS: shorter prompts prefill on EXL3
     struct JitSlot {
         std::uint8_t* pack = nullptr;
         mmoe::I4Layer weights{};   // fixed wq/ws and reusable device svh tables
@@ -634,9 +809,8 @@ struct Engine::Impl {
     struct JitTiming {
         hipEvent_t convert0 = nullptr, convert1 = nullptr, moe0 = nullptr, moe1 = nullptr;
         bool convert_pending = false, moe_pending = false, moe_started = false;
-        std::uint64_t converts = 0, moes = 0;
-        double convert_ms = 0, moe_ms = 0;
-    };
+        bool moe_i4 = false;  // arithmetic of the sampled MoE group
+    };  // event handles only: counts and sampled times belong to the task (PfTask::i4_stats)
     std::array<JitTiming, kLayers> jit_timing{};
     float *f32_xt = nullptr, *f32_raw = nullptr, *f32_g = nullptr, *f32_u = nullptr, *f32_ye = nullptr;
     rtxpf::F32Job *f32_jobs_h = nullptr, *f32_jobs_d = nullptr;
@@ -755,10 +929,12 @@ struct Engine::Impl {
         }
         pf_inplace = env_flag("STRIX_MM_PFX_INPLACE", false);
         pf_tx_uncached = env_flag("STRIX_MM_PF_TX_UNCACHED", true);  // ON (measurement: exact, send 0.23 -> 0.002 s); =0
-        if (const char* g = std::getenv("STRIX_MM_PF_GROUP"); g != nullptr && *g != '\0') {
-            pf_group = static_cast<unsigned>(std::stoul(g));
-            if (pf_group < 2 || pf_group > 4) throw std::invalid_argument("STRIX_MM_PF_GROUP must be 2..4");
-        }
+        // Default 4 (was 2): the FAST_I4 slots convert a layer once per group, so a 32K prompt pays 2 instead of
+        // 4 conversion episodes per layer (group 4 vs 2: 32K TTFT -5.1 %, bitwise; 8 is not better than 4). The
+        // width is clamped to the prompt's chunk count at run time; an explicit value is honoured as given.
+        pf_group_explicit = std::getenv("STRIX_MM_PF_GROUP") != nullptr && *std::getenv("STRIX_MM_PF_GROUP") != '\0';
+        pf_group = strix::pair::prefill_group::width_from_env(std::getenv("STRIX_MM_PF_GROUP"), "STRIX_MM_PF_GROUP");
+        pf_moe_group = strix::pair::prefill_group::moe_width_from_env(std::getenv("STRIX_MM_PF_MOE_GROUP"), "STRIX_MM_PF_MOE_GROUP");
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
         fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
@@ -769,6 +945,24 @@ struct Engine::Impl {
             if (m == "fast_i4") model_fast_i4 = true;
             else if (m != "exl3") throw std::invalid_argument("STRIX_MMX_MODEL_FORMAT must be exl3 or fast_i4");
         }
+        i4_shadow = env_flag("STRIX_MMX_FAST_I4_SHADOW", false);
+        // FAST identity (lossy): 1 = one-term BF16 operands, 2 = two-term (hi + lo) queries and probabilities, 0 = the
+        // exact in-block kernel (default: opt-in, also with the FAST_I4 format, whose INT4 layers amplify the change
+        // past the gate). The layer set defaults to the deepest layers (kMsaFlashLayers): the quality gate fails
+        // when shallower layers use it, because every later block selection sees the changed activations.
+        if (const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH")) {
+            const std::string mode = fl;
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_MSA_FLASH must be 0, 1 or 2");
+            pf_msa_flash = static_cast<unsigned>(mode[0] - '0');
+        }
+        {
+            const char* fl = std::getenv("STRIX_MM_PF_MSA_FLASH_LAYERS");
+            pf_msa_flash_layers = strix::core::parse_layer_set(fl == nullptr || fl[0] == 0 ? kMsaFlashLayers : fl, 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+        }
+        if (pf_msa_flash != 0)
+            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
+        if (i4_shadow && !model_fast_i4)
+            throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
             const char* base0 = std::getenv("STRIX_MM_BASELINE");
             const char* why = nullptr;
@@ -778,6 +972,25 @@ struct Engine::Impl {
             else if (!mmoe::iu4_built()) why = "needs a build with the IU4 core (strix_tiled_core)";
             if (why != nullptr) throw std::invalid_argument(std::string("STRIX_MMX_MODEL_FORMAT=fast_i4 ") + why);
             i4_scope = fast_i4::scope(std::getenv("STRIX_MMX_FAST_I4_SCOPE"));
+            {
+                const char* keep = std::getenv("STRIX_MMX_FAST_I4_EXL3_LAYERS");
+                i4_exl3_layers = strix::core::parse_layer_set(keep == nullptr || keep[0] == 0 ? fast_i4::kQualityExl3Layers : keep,
+                                                              kFirstMoe, kLayers, "STRIX_MMX_FAST_I4_EXL3_LAYERS");
+            }
+            {
+                const char* a8 = std::getenv("STRIX_MMX_FAST_I4_A8");
+                const std::string_view s = a8 == nullptr ? "" : a8;
+                if (s.empty() || s == "0") i4_a8 = 0U;
+                else if (s == "gate_up") i4_a8 = 1U;
+                else if (s == "down") i4_a8 = 2U;
+                else if (s == "all") i4_a8 = 3U;
+                else throw std::invalid_argument("STRIX_MMX_FAST_I4_A8 must be 0, gate_up, down or all");
+                if (i4_scope != fast_i4::Scope::all) i4_a8 &= 1U;
+                const char* al = std::getenv("STRIX_MMX_FAST_I4_A8_LAYERS");
+                i4_a8_layers = strix::core::parse_layer_set(al == nullptr || al[0] == 0 ? "!" : al, kFirstMoe, kLayers,
+                                                            "STRIX_MMX_FAST_I4_A8_LAYERS");
+            }
+            i4_min_rows = fast_i4::min_rows(std::getenv("STRIX_MMX_FAST_I4_MIN_ROWS"));
             jit_prefetch = env_flag("STRIX_MMX_FAST_I4_PREFETCH", false);
             jit_stats = env_flag("STRIX_MMX_FAST_I4_STATS", false);
         }
@@ -816,10 +1029,10 @@ struct Engine::Impl {
         static const char* const kMlp[3] = {"gate_proj", "up_proj", "down_proj"};
         static const char* const kExp[3] = {"w1", "w3", "w2"};
         const std::uint32_t rank = opt.rank;
-        auto mlp = [&](const std::string& pre, const char* const* nm, unsigned inter_local) {
-            return Mlp{lib.out_slice(pre + nm[0], rank * inter_local, inter_local),
-                       lib.out_slice(pre + nm[1], rank * inter_local, inter_local),
-                       lib.in_slice(pre + nm[2], rank * inter_local, inter_local)};
+        auto mlp = [&](Mlp& to, const std::string& pre, const char* const* nm, unsigned inter_local) {
+            lib.out_slice_later(to.g, pre + nm[0], rank * inter_local, inter_local);
+            lib.out_slice_later(to.u, pre + nm[1], rank * inter_local, inter_local);
+            lib.in_slice_later(to.d, pre + nm[2], rank * inter_local, inter_local);
         };
         w_in0 = dupload(pack.floats(kP + "layers.0.input_layernorm.weight"));
         {
@@ -832,10 +1045,10 @@ struct Engine::Impl {
         for (unsigned L = 0; L < kLayers; ++L) {
             Layer& y = layers[L];
             const std::string lp = kP + "layers." + std::to_string(L) + ".", a = lp + "self_attn.", b = lp + "block_sparse_moe.";
-            y.q = lib.out_slice(a + "q_proj", rank * kQLocal, kQLocal);
-            y.k = lib.out_slice(a + "k_proj", rank * kKVLocal, kKVLocal);
-            y.v = lib.out_slice(a + "v_proj", rank * kKVLocal, kKVLocal);
-            y.o = lib.in_slice(a + "o_proj", rank * kQLocal, kQLocal);
+            lib.out_slice_later(y.q, a + "q_proj", rank * kQLocal, kQLocal);
+            lib.out_slice_later(y.k, a + "k_proj", rank * kKVLocal, kKVLocal);
+            lib.out_slice_later(y.v, a + "v_proj", rank * kKVLocal, kKVLocal);
+            lib.in_slice_later(y.o, a + "o_proj", rank * kQLocal, kQLocal);
             if (linears_loaded) {
                 y.rq = lib.raw_out(a + "q_proj", rank * kQLocal, kQLocal);
                 y.rk = lib.raw_out(a + "k_proj", rank * kKVLocal, kKVLocal);
@@ -885,7 +1098,7 @@ struct Engine::Impl {
                                                            : kP + "norm.weight"));
             y.moe = L >= kFirstMoe;
             if (!y.moe) {
-                y.dense = mlp(lp + "mlp.", kMlp, kDenseLocal);
+                mlp(y.dense, lp + "mlp.", kMlp, kDenseLocal);
                 if (linears_loaded)
                     y.rdense = mmoe::ExpertSlices{lib.raw_out(lp + "mlp." + kMlp[0], rank * kDenseLocal, kDenseLocal),
                                                   lib.raw_out(lp + "mlp." + kMlp[1], rank * kDenseLocal, kDenseLocal),
@@ -904,25 +1117,27 @@ struct Engine::Impl {
                     y.experts_raw_d = dupload(y.experts_raw);
                     y.shared_raw = raw(b + "shared_experts.", kMlp);
                 } else {
-                    y.experts.reserve(kExperts);
-                    for (unsigned e = 0; e < kExperts; ++e) y.experts.push_back(mlp(b + "experts." + std::to_string(e) + ".", kExp, kExpertLocal));
-                    y.shared = mlp(b + "shared_experts.", kMlp, kExpertLocal);
+                    y.experts.resize(kExperts);  // sized first: the queued slices fill these elements later
+                    for (unsigned e = 0; e < kExperts; ++e) mlp(y.experts[e], b + "experts." + std::to_string(e) + ".", kExp, kExpertLocal);
+                    mlp(y.shared, b + "shared_experts.", kMlp, kExpertLocal);
                 }
             }
-            hip_ok(hipDeviceSynchronize(), "load layer");
+            // No wait per layer: the next layer's slices are read while this one's are prepared and uploaded.
             if (L % 10 == 9) {
-                std::printf("mm rank %u: loaded layers 0-%u, %.1f s, %.1f GiB read, device used %.1f GiB\n", rank, L,
+                std::printf("mm rank %u: queued layers 0-%u, %.1f s, %.1f GiB to read, device used %.1f GiB\n", rank, L,
                             secs(t0, Clock::now()), pack.gib_read(), static_cast<double>(device_used_bytes()) / 1073741824.0);
                 std::fflush(stdout);
             }
         }
         const std::uint64_t v0 = rank == 0 ? 0 : kVocabPad;
         vn = rank == 0 ? kVocabPad : kVocab - kVocabPad;
-        head = lib.out_slice("language_model.lm_head", v0, vn);
+        lib.out_slice_later(head, "language_model.lm_head", v0, vn);
+        lib.publish();  // every linear prepared, every raw slice uploaded: the one wait of the load
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
         if (model_fast_i4) setup_fast_i4();
+        route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
         r.seconds = secs(t0, Clock::now());
         r.gib_read = pack.gib_read();
@@ -959,39 +1174,96 @@ struct Engine::Impl {
         if (jit_prefetch) hip_ok(hipStreamCreateWithFlags(&jit_stream, hipStreamNonBlocking), "fast_i4 prefetch stream");
         std::printf("mm rank %u: fast_i4 (identity minimax-fast-i4, lossy): %zu reusable IU4 layer slots, "
                     "%.3f GiB (%zu bytes) including slot tables; source tables %.3f MiB; prefill workspace %.3f GiB; "
-                    "scope %s, prefetch %u; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
+                    "scope %s, prefetch %u, EXL3 layers %u, min rows %zu; context %zu x %zu slots unchanged; decode EXL3\n", opt.rank,
                     jit.size(), static_cast<double>(jit.size() * pk) / 1073741824.0, jit.size() * pk,
                     static_cast<double>((kLayers - kFirstMoe) * mmoe::i4_source_bytes()) / 1048576.0,
                     static_cast<double>(pf_ws_bytes) / 1073741824.0,
-                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U,
+                    i4_scope == fast_i4::Scope::all ? "all" : "gate_up", jit_prefetch ? 1U : 0U, i4_exl3_layers.count(), i4_min_rows,
                     static_cast<std::size_t>(opt.capacity), static_cast<std::size_t>(opt.slots));
         std::fflush(stdout);
     }
-    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers; }
+    bool i4_jit_layer(unsigned L) const { return model_fast_i4 && L >= kFirstMoe && L < kLayers && !i4_exl3_layers.test(L); }
+    // Shared route receipt (strix/route_receipt.hpp): why a MoE layer's prefill runs IU4 or keeps the EXL3 operator.
+    strix::route::Reason route_i4_reason(unsigned L, bool i4) const {
+        using R = strix::route::Reason;
+        return i4 ? R::selected : !model_fast_i4 || !mmoe::prefill_iu4() ? R::disabled : !task.i4.on ? R::short_call :
+               i4_exl3_layers.test(L) ? R::layer_mask : R::no_match;
+    }
+    void route_levers() const {
+        namespace rr = strix::route;
+        rr::set_engine("minimax");
+        rr::set_rank(static_cast<int>(opt.rank));
+        const char* asked = strix::envcfg::text("STRIX_MMX_MODEL_FORMAT");
+        // Use the same resolved policies as the dispatch sites (including the IU4 override).
+        const bool iu4 = model_fast_i4 && mmoe::prefill_iu4();
+        const auto mask = [](const auto& layers, unsigned first) {
+            std::string value;
+            for (unsigned L = first; L < kLayers; ++L) value += layers.test(L) ? '1' : '0';
+            return value;
+        };
+        std::string effective = "exl3";
+        if (iu4) {
+            effective = std::string("iu4:") + (i4_scope == fast_i4::Scope::all ? "all" : "gate_up") + ":min_rows=" + std::to_string(i4_min_rows) +
+                        ":a8=" + std::to_string(i4_a8) + ":exl3_layers=" + mask(i4_exl3_layers, kFirstMoe);
+            if (i4_a8) effective += ":a8_layers=" + mask(i4_a8_layers, kFirstMoe);
+        }
+        rr::lever("minimax.moe_prefill_format", asked != nullptr && *asked != 0 ? asked : "default", effective,
+                  iu4 ? rr::Reason::selected : rr::Reason::disabled);
+        const unsigned flash = pf_msa_rework != 0 ? pf_msa_flash : 0U;
+        const char* flash_asked = strix::envcfg::text("STRIX_MM_PF_MSA_FLASH");
+        rr::lever("minimax.msa_flash", flash_asked != nullptr ? flash_asked : "default",
+                  std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
+                  flash ? rr::Reason::selected : rr::Reason::disabled);
+        rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
+    }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
     // every sample available; no host fence is introduced for conversion or prefetch.
+    // Samples and counts go to the current task. A task switch settles first (jit_settle), so a pending sample is never
+    // charged to another task.
     void jit_collect(bool report = false) {
         if (!jit_stats) return;
+        double sum_i4 = 0, sum_exl3 = 0, sum_convert = 0;
         for (unsigned L = kFirstMoe; L < kLayers; ++L) {
             auto& t = jit_timing[L];
-            auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, double& total, std::uint64_t& count) {
+            auto& s = task.i4_stats.layer[L];
+            auto collect = [&](bool& pending, hipEvent_t a, hipEvent_t b, auto&& add) {
                 if (!pending) return;
                 const auto status = hipEventQuery(b);
                 if (status == hipErrorNotReady) return;
                 hip_ok(status, "fast_i4 timing query");
                 float ms = 0;
                 hip_ok(hipEventElapsedTime(&ms, a, b), "fast_i4 timing");
-                total += ms;
-                ++count;
+                add(static_cast<double>(ms));
                 pending = false;
             };
-            collect(t.convert_pending, t.convert0, t.convert1, t.convert_ms, t.converts);
-            collect(t.moe_pending, t.moe0, t.moe1, t.moe_ms, t.moes);
-            if (report && t.converts != 0 && t.moes != 0)
-                std::printf("rank %u fast_i4 L%u: converter %.3f ms/layer (%llu), IU4 group %.3f ms/layer (%llu)\n",
-                            opt.rank, L, t.convert_ms / static_cast<double>(t.converts), static_cast<unsigned long long>(t.converts),
-                            t.moe_ms / static_cast<double>(t.moes), static_cast<unsigned long long>(t.moes));
+            collect(t.convert_pending, t.convert0, t.convert1, [&](double ms) { s.converted(ms); });
+            collect(t.moe_pending, t.moe0, t.moe1, [&](double ms) { s.sample(t.moe_i4, ms); });
+            if (!report) continue;
+            if (s.any()) {  // launch counts print without a timing sample (a prompt under the row gate has only EXL3 launches)
+                using S = fast_i4::LayerStats;
+                std::printf("rank %u fast_i4 L%u: launches IU4 %llu EXL3 %llu, MoE group IU4 %.3f ms (%llu) EXL3 %.3f ms (%llu), "
+                            "converter %.3f ms (%llu)\n",
+                            opt.rank, L, static_cast<unsigned long long>(s.i4_calls), static_cast<unsigned long long>(s.exl3_calls),
+                            S::mean(s.i4_ms, s.i4_samples), static_cast<unsigned long long>(s.i4_samples),
+                            S::mean(s.exl3_ms, s.exl3_samples), static_cast<unsigned long long>(s.exl3_samples),
+                            S::mean(s.convert_ms, s.converts), static_cast<unsigned long long>(s.converts));
+                sum_i4 += s.i4_ms;
+                sum_exl3 += s.exl3_ms;
+                sum_convert += s.convert_ms;
+            }
+            s = {};  // one prompt per report
         }
+        if (report)
+            std::printf("rank %u fast_i4 prompt: sampled MoE group time IU4 %.1f ms, EXL3 %.1f ms, converter %.1f ms\n", opt.rank,
+                        sum_i4, sum_exl3, sum_convert);
+    }
+    // Task switch (park, begin, resume). own: the device is idle, so every pending sample is ready and goes to the
+    // current task. Anything still pending afterwards belongs to no live task and is dropped.
+    void jit_settle(bool own) {
+        if (!jit_stats) return;
+        if (own) jit_collect();
+        for (auto& t : jit_timing) t.convert_pending = t.moe_pending = t.moe_started = false;
     }
     void jit_begin() { jit_collect(); jit_schedule.begin(); }
     const mmoe::I4Layer* jit_acquire(unsigned L, unsigned end) {
@@ -1011,16 +1283,31 @@ struct Engine::Impl {
                 if (side) hip_ok(hipEventRecord(j.ready, stream), "fast_i4 prefetch ready");
             },
             [&](unsigned slot) { hip_ok(hipStreamWaitEvent(nullptr, jit[slot].ready, 0), "fast_i4 wait ready"); });
-        auto& t = jit_timing[L];
-        t.moe_started = jit_stats && !t.moe_pending;
-        if (t.moe_started) hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        jit_moe_begin(L, true);
         return &jit[s].weights;
     }
-    void jit_release(unsigned L) {
+    // STATS: the same group timer and launch counts for the layers kept on EXL3, so one run gives both sides.
+    void jit_moe_begin(unsigned L, bool i4 = false) {
+        auto& t = jit_timing[L];
+        t.moe_started = jit_stats && t.moe0 != nullptr && !t.moe_pending;
+        if (t.moe_started) {
+            t.moe_i4 = i4;
+            hip_ok(hipEventRecord(t.moe0, nullptr), "fast_i4 MoE begin");
+        }
+    }
+    void jit_moe_end(unsigned L) {
         if (jit_timing[L].moe_started) {
             hip_ok(hipEventRecord(jit_timing[L].moe1, nullptr), "fast_i4 MoE end");
             jit_timing[L].moe_pending = true;
+            jit_timing[L].moe_started = false;
         }
+    }
+    void jit_count(unsigned L, bool i4, std::size_t calls = 1) {
+        if (!jit_stats) return;
+        task.i4_stats.layer[L].count(i4, calls);
+    }
+    void jit_release(unsigned L) {
+        jit_moe_end(L);
         hip_ok(hipEventRecord(jit[L & 1U].free, nullptr), "fast_i4 slot free");
     }
 
@@ -1101,6 +1388,10 @@ struct Engine::Impl {
             pf_ws_bytes = mmoe::prefill_moe_workspace_bound(opt.max_rows);
             if (model_fast_i4) pf_ws_bytes += mmoe::kI4GroupTableBytes;  // IU4 groups beside gate_up EXL3 down items
             hip_ok(hipMalloc(&pf_ws, pf_ws_bytes), "prefill moe workspace");
+            if (i4_shadow) {
+                i4_shadow_outputs = dalloc<float>(2U * T * kHidden);
+                i4_shadow_sums = dalloc<float>(4);
+            }
         }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
@@ -1128,10 +1419,23 @@ struct Engine::Impl {
         router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
-        if (pf != nullptr && pf->options().depth < pf_group)
-            throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+        if (pf != nullptr && pf->options().depth < pf_group) {
+            if (pf_group_explicit)
+                throw std::invalid_argument("STRIX_MM_PFX_DEPTH must be >= STRIX_MM_PF_GROUP (slot reuse of the interleaved schedule)");
+            // The default width follows a narrower explicit exchange depth (one TX / RX slot per interleaved chunk).
+            pf_group = strix::pair::prefill_group::width_for_depth(pf_group, pf->options().depth);
+            std::fprintf(stderr, "mm rank %u: prefill group width %u (STRIX_MM_PFX_DEPTH)\n", static_cast<unsigned>(opt.rank), pf_group);
+        }
         if (pf != nullptr || pf_comm_interleave) {  // at start-up: no multi-GB allocation inside a prefill (KFD queue eviction)
+            pf_moe_cap = moe_opt ? strix::pair::prefill_group::moe_width(pf_moe_group, pf_group) : 1U;
+            if (pf_moe_cap > 1) {
+                pf_gws_bytes = mmoe::prefill_moe_group_workspace_bound(static_cast<std::uint32_t>(pf_moe_cap * T));
+                hip_ok(hipMalloc(&pf_gws, pf_gws_bytes), "prefill group moe workspace");
+                std::fprintf(stderr, "mm rank %u: prefill MoE sub-group width up to %u (workspace %.2f GiB)\n",
+                             static_cast<unsigned>(opt.rank), pf_moe_cap, static_cast<double>(pf_gws_bytes) / 1073741824.0);
+            }
             for (unsigned g = 1; g < pf_group; ++g) {
+                if (pf_moe_cap > 1) grp_route.push_back(dalloc<std::uint32_t>(2 * T * kTopE));
                 grp_h.push_back(dalloc<float>(T * kHidden));
                 grp_hn.push_back(dalloc<float>(T * kHidden));
                 if (pf_comm_interleave) {
@@ -1392,6 +1696,9 @@ struct Engine::Impl {
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            // STRIX_MMX_FOLD=N (xport row fold): for at most N rows the pair sum p0 + p1 is computed by the exchange
+            // progress thread before the RX flag; post_exchange reads one folded slot (x = h + folded, same bits).
+            if (xb_fold && xf->can_fold(bytes)) xf->fold_next(strix::xport::RowFold::sum_f32);
             const auto xticket = inplace
                 ? backend.post_publish(tag, bytes, self_pub ? mx::Publish::producer : mx::Publish::kernel)
                 : backend.post_copy(tag, local, bytes);
@@ -1414,6 +1721,10 @@ struct Engine::Impl {
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
             pv.part0 = opt.rank == 0 ? local : peer;
             pv.part1 = opt.rank == 0 ? peer : local;
+            if (const void* folded = xf->last_folded()) {
+                pv.part0 = static_cast<const float*>(folded);
+                pv.part1 = nullptr;
+            }
             pv.weights = wts4_d;
             xb_prepped = false;
             if (xb_prep && which == 1 && layer + 1 < xb_layers && linears_opt) {  // fold the next layer's q/k/v prepare
@@ -1575,8 +1886,10 @@ struct Engine::Impl {
         }
         xb_layers = L1;
         xb_prepped = false;
-        const bool i4_on = !gemv && model_fast_i4 && mmoe::prefill_iu4();
+        const bool i4_on = !gemv && model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
+        const bool pf_stats = !gemv && task.open;  // STATS are the prefill task's: decode steps and probes stay out
         if (i4_on) jit_begin();
+        else if (pf_stats) jit_collect();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             float* out = send_buffer(n);
@@ -1589,8 +1902,11 @@ struct Engine::Impl {
                                       hipMemcpyDeviceToDevice, nullptr), "trace ids");
             out = send_buffer(n);
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
+            if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
             stage_ffn(L, n, out, i4);
-            if (i4 != nullptr) jit_release(L);
+            if (y.moe && pf_stats) jit_count(L, i4 != nullptr);
+            if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
             exchange_post(n, L, 1, out, y.w_next, nullptr, nullptr);
             tmark(tmark_at(L, 5));
             if (taps_on) capture_tap(L, n);
@@ -1753,7 +2069,7 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? pf_msa_rework : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                        mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                         break;
                     }
                     mfused::enqueue_decode(dv, nullptr);
@@ -1861,10 +2177,54 @@ struct Engine::Impl {
 
     // Layer L's FFN on hn (after the attention exchange): dense MLP or router-routed experts + shared -> out.
     void stage_ffn(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4 = nullptr) {
+        stage_ffn_impl(L, n, out, prefill_i4);
+        if (!i4_shadow || prefill_i4 == nullptr || !prefill_i4->on()) return;
+        // hn and route_d are read-only. Each enqueue rebuilds its tables and joins
+        // tail-stream work before the next call reuses pf_ws. out is a pure MoE
+        // contribution, before rank exchange / residual add, and stays INT4.
+        float* exact = i4_shadow_outputs;
+        float* fakeq = exact + std::size_t{opt.max_rows} * kHidden;
+        stage_ffn_impl(L, n, exact, nullptr, mmoe::PrefillFakeq::off);
+        hip_ok(strix::core::i4_shadow::reduce(out, exact, n * kHidden, i4_shadow_sums, nullptr), "i4 shadow W4A4");
+        stage_ffn_impl(L, n, fakeq, nullptr, mmoe::PrefillFakeq::on);
+        hip_ok(strix::core::i4_shadow::reduce(fakeq, exact, n * kHidden, i4_shadow_sums + 2, nullptr), "i4 shadow A4");
+        std::array<float, 4> sums{};
+        hip_ok(hipMemcpyAsync(sums.data(), i4_shadow_sums, sizeof(sums), hipMemcpyDeviceToHost, nullptr), "i4 shadow sums");
+        hip_ok(hipStreamSynchronize(nullptr), "i4 shadow sums");
+        if (!task.shadow) throw std::logic_error("i4 shadow: no active prefill task");
+        task.shadow->add(L, n, sums);
+    }
+
+    // Chunks per group-wide MoE call for layer L of a unit of m chunks (1 = one stage_ffn per chunk). The conditions are
+    // those of stage_ffn_impl's device-plan branch for an EXL3 layer; identical on both ranks.
+    std::size_t pf_moe_width(unsigned L, bool i4_layer, std::size_t m) const {
+        if (pf_gws == nullptr || i4_layer || !layers[L].moe || !moe_opt || gemv || fp32_prefill || pf_table_stats || profiling ||
+            !mmoe::prefill_moe_device_plan(opt.max_rows))
+            return 1;
+        return std::min<std::size_t>(pf_moe_cap, strix::pair::prefill_group::moe_width(pf_moe_group, static_cast<unsigned>(m)));
+    }
+    // One group-wide MoE call (gv: the chunks' normed rows, router tables and outputs).
+    void stage_ffn_group(unsigned L, mmoe::PrefillMoeGroupView& gv) {
+        const Layer& y = layers[L];
+        gv.experts = y.experts_raw_d;
+        gv.shared = y.shared_raw;
+        struct TimelineMoe {
+            bool on;
+            ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+        } timeline_moe{tl != nullptr};
+        if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+        mmoe::enqueue_prefill_moe_group(gv, pf_gws, pf_gws_bytes, nullptr);
+    }
+
+    void stage_ffn_impl(unsigned L, std::size_t n, float* out, const mmoe::I4Layer* prefill_i4,
+                        mmoe::PrefillFakeq fakeq_a4 = mmoe::PrefillFakeq::environment) {
         {
             const bool f32 = fp32_prefill && !gemv;  // FP32 prefill identity
             const Layer& y = layers[L];
             const bool lin_opt = gemv && linears_opt;
+            // W4A8 layers run the unfused IU4 path (two A4 planes per GEMM); every other layer keeps the prompt's chain.
+            const unsigned a8 = prefill_i4 != nullptr && i4_a8_layers.test(L) ? i4_a8 : 0U;
+            const bool i4_chain = pf_i4_chain && a8 == 0U;
             const bool moe_marks = y.moe && moe_opt && !gemv && !f32;
             if (tl && !moe_marks) tl->mark(y.moe ? "moe" : "dense-mlp", true);
             if (!y.moe) {
@@ -1907,6 +2267,27 @@ struct Engine::Impl {
                 f32_jobs_used = 0;
                 lap(prof.route_host);
                 f32_moe(y, n, out);
+            } else if (moe_opt && !pf_table_stats && (prefill_i4 == nullptr || (i4_scope == fast_i4::Scope::all && i4_chain)) && mmoe::prefill_moe_device_plan(static_cast<std::uint32_t>(n))) {
+                // prefill, device plan (default): routes stay on the device, the shared moe_core planner builds the
+                // tables on the stream; no host sync per MoE layer. Same bits as the host plan below
+                // (STRIX_MMX_PF_PLAN=host, or profiling / STRIX_MM_PF_TABLE_STATS, which measure the host plan).
+                mmoe::PrefillMoeDeviceView pv;
+                pv.rows = static_cast<std::uint32_t>(n);
+                pv.y = hn;
+                pv.routes = route_d;
+                pv.i4 = prefill_i4;
+                pv.i4_all = i4_scope == fast_i4::Scope::all;
+                pv.i4_chain = pf_i4_chain;
+                pv.fakeq_a4 = fakeq_a4;
+                pv.experts = y.experts_raw_d;
+                pv.shared = y.shared_raw;
+                pv.out = out;
+                struct TimelineMoe {
+                    bool on;
+                    ~TimelineMoe() { if (on) mmoe::set_prefill_marker(nullptr, nullptr); }
+                } timeline_moe{tl != nullptr};
+                if (tl) mmoe::set_prefill_marker(PrefillTimeline::moe_mark, tl);
+                mmoe::enqueue_prefill_moe_device(pv, pf_ws, pf_ws_bytes, nullptr);
             } else if (moe_opt) {  // prefill / gate: grouped launches with the G4 strix_gemm identity
                 hip_ok(hipMemcpyAsync(route_h, route_d, n * kTopE * 8, hipMemcpyDeviceToHost, nullptr), "routes");
                 hip_ok(hipStreamSynchronize(nullptr), "routes");
@@ -1929,6 +2310,9 @@ struct Engine::Impl {
                 pv.out = out;
                 pv.i4 = prefill_i4;
                 pv.i4_all = i4_scope == fast_i4::Scope::all;
+                pv.i4_chain = i4_chain;
+                pv.i4_a8 = a8;
+                pv.fakeq_a4 = fakeq_a4;
                 // The module markers are host callbacks: record one interval
                 // from its first launch to combine, excluding host planning.
                 struct TimelineMoe {
@@ -2060,6 +2444,9 @@ struct Engine::Impl {
         std::uint64_t output_fnv = 14695981039346656037ULL;
         Engine::PfTaskId id = 0, parent = 0;
         std::uint64_t generation = 0;
+        std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
+        fast_i4::RowGate i4;  // per task: a nested child's begin must not change the parked parent's INT4 decision
+        fast_i4::TaskStats<kLayers> i4_stats;  // per task: a nested child's report must not print or clear the parent's
     } task, parked;
     struct ActivationBank { float *h = nullptr, *hn = nullptr, *taps = nullptr; } base_bank, nest_bank;
     bool child_bank = false;
@@ -2080,12 +2467,17 @@ struct Engine::Impl {
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0) {
         if (task.open) throw std::logic_error("prefill: active task");
         if (slot >= opt.slots || toks.empty() || pos0 + toks.size() > opt.capacity) throw std::invalid_argument("prefill: bad slot / range");
+        jit_settle(false);
         task = PfTask{};
+        if (i4_shadow) task.shadow = std::make_unique<strix::core::i4_shadow::Accumulator<kLayers>>();
         last_out = {};
         last_result = {};
         task.slot = slot;
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
+        pf_i4_chain = mmoe::prefill_i4_chain(toks.size());
+        // The kernel route is a property of the whole prompt, not of the suffix a resident restart leaves to compute.
+        task.i4.begin(pos0 + toks.size(), i4_min_rows);
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
@@ -2181,6 +2573,8 @@ struct Engine::Impl {
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
                 if (model_fast_i4) jit_collect(true);
+                mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
+                if (task.shadow) task.shadow->print("mm", opt.rank);
                 if (tl) tl->report(opt.rank);
                 tl = nullptr;
                 ++prof.calls;
@@ -2241,6 +2635,7 @@ struct Engine::Impl {
         retire_prefill();
         if (task.saved) restore_rows();
         hip_ok(hipDeviceSynchronize(), "prefill freeze");
+        jit_settle(true);  // the parent's pending samples, before the child runs
         base_bank = {h, hn, taps_d};
         parked = std::move(task);
         task = PfTask{};
@@ -2250,6 +2645,7 @@ struct Engine::Impl {
         if (task.open || !parked.open || parked.id != id)
             throw std::logic_error("prefill unpark: task identity");
         retire_prefill();
+        jit_settle(false);
         task = std::move(parked);
         parked = PfTask{};
         tap_sink = std::move(parked_sink);
@@ -2305,8 +2701,10 @@ struct Engine::Impl {
         const std::size_t m = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         float* const h0 = h;
         float* const hn0 = hn;
-        std::array<float*, 4> H{}, HN{}, P{}, R{};
-        std::array<std::size_t, 4> N{};
+        std::array<float*, kPfGroupMax> H{}, HN{}, P{}, R{};
+        std::array<std::uint32_t*, kPfGroupMax> RT{};  // router tables (per member when group-wide MoE calls are on)
+        std::array<std::size_t, kPfGroupMax> N{};
+        std::uint32_t* const route0 = route_d;
         auto& fences = pf_fences[child_bank ? 1U : 0U];
         const double pipeline_reuse_before = comm.stats().pipeline_reuse_wait;
         const double host_reuse_before = comm.stats().host_reuse_wait;
@@ -2314,6 +2712,7 @@ struct Engine::Impl {
         for (std::size_t c = 0; c < m; ++c) {
             H[c] = c == 0 ? h0 : grp_h[c - 1];
             HN[c] = c == 0 ? hn0 : grp_hn[c - 1];
+            RT[c] = c == 0 || grp_route.empty() ? route0 : grp_route[c - 1];
             P[c] = !via_comm ? part : c == 0 ? part : grp_part[c - 1];  // the module copies `part` into its TX slot at once
             R[c] = !via_comm ? nullptr : c == 0 ? remote : grp_remote[c - 1];
             N[c] = std::min<std::size_t>(opt.max_rows, toks.size() - c * opt.max_rows);
@@ -2332,18 +2731,21 @@ struct Engine::Impl {
         const auto use = [&](std::size_t c) {
             h = H[c];
             hn = HN[c];
+            route_d = ids_d = RT[c];
             pf_idx_member = c;
             if (tl) tl->context(task.c + c, tl->layer);
         };
         struct Restore {
             Impl& e;
             float *saved_h, *saved_hn;
+            std::uint32_t* saved_route;
             ~Restore() {
                 e.h = saved_h;
                 e.hn = saved_hn;
+                e.route_d = e.ids_d = saved_route;
                 e.pf_idx_member = 0;
             }
-        } restore{*this, h0, hn0};
+        } restore{*this, h0, hn0, route0};
         // Communicator backend: one exchange in flight (its start() / finish() contract). Sends are finished in FIFO
         // order; a receive finishes its exchange if it is the one in flight (the CPU waits while the GPU computes the
         // other chunk's stage, enqueued before).
@@ -2427,8 +2829,10 @@ struct Engine::Impl {
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
             hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(N[c])), dim3(256), 0, nullptr, h, w_in0, hn, kHidden);
         }
-        const bool i4_on = model_fast_i4 && mmoe::prefill_iu4();
+        const bool i4_on = model_fast_i4 && task.i4.on && mmoe::prefill_iu4();
+        const bool pf_stats = task.open;
         if (i4_on) jit_begin();
+        else if (pf_stats) jit_collect();
         for (unsigned L = L0; L < L1; ++L) {
             const Layer& y = layers[L];
             if (tl) tl->context(task.c, L);
@@ -2446,18 +2850,63 @@ struct Engine::Impl {
                 send(c, 0, L, o);
             }
             const auto* i4 = i4_on && i4_jit_layer(L) ? jit_acquire(L, L1) : nullptr;
-            for (std::size_t c = 0; c < m; ++c) {
+            const strix::route::LayerScope route_layer(gemv || L < kFirstMoe ? ~0U : L, route_i4_reason(L, i4 != nullptr));
+            const auto post_router = [&](std::size_t c) {
                 use(c);
                 const auto view = recv(c);
                 if (tl) tl->mark("attention-post-router", true);
                 post_view(N[c], view, y.w_post, y.wr, y.wb);
                 last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
-                float* o = out_of(c);
-                stage_ffn(L, N[c], o, i4);
-                send(c, 1, L, o);
+            };
+            const std::size_t moe_w = pf_moe_width(L, i4 != nullptr, m);
+            if (i4 == nullptr && pf_stats && y.moe) jit_moe_begin(L);  // EXL3 timing does not depend on the row gate
+            for (std::size_t c0 = 0; c0 < m;) {
+                // A sub-group runs as one group-wide MoE call when every member writes its own output buffer (the
+                // module's TX slots in place, or the communicator's per-member partials) and has the rows the
+                // group-wide plan needs; any other span keeps one call per chunk.
+                const std::size_t span = std::min<std::size_t>(moe_w, m - c0);
+                bool grouped = span >= 2;
+                for (std::size_t c = c0; grouped && c < c0 + span; ++c)
+                    grouped = N[c] >= mmoe::prefill_moe_group_min_rows() && (c + 1 == c0 + span || N[c] == opt.max_rows) &&
+                              (via_comm || pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows));
+                if (!grouped) {
+                    for (std::size_t c = c0; c < c0 + span; ++c) {
+                        post_router(c);
+                        float* o = out_of(c);
+                        stage_ffn(L, N[c], o, i4);
+                        if (y.moe) jit_count(L, i4 != nullptr);
+                        send(c, 1, L, o);
+                    }
+                    c0 += span;
+                    continue;
+                }
+                mmoe::PrefillMoeGroupView gv;
+                gv.segments = static_cast<std::uint32_t>(span);
+                gv.seg_rows = static_cast<std::uint32_t>(opt.max_rows);
+                std::array<float*, kPfGroupMax> O{};
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    const std::size_t c = c0 + sm;
+                    post_router(c);
+                    gv.rows += static_cast<std::uint32_t>(N[c]);
+                    gv.y[sm] = HN[c];
+                    gv.routes[sm] = RT[c];
+                }
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    wait_source(c0 + sm);
+                    O[sm] = via_comm ? P[c0 + sm] : static_cast<float*>(pf->tx(static_cast<unsigned>(sm)));
+                    gv.out[sm] = O[sm];
+                }
+                use(c0);
+                stage_ffn_group(L, gv);
+                jit_count(L, false);
+                for (std::size_t sm = 0; sm < span; ++sm) {
+                    use(c0 + sm);
+                    send(c0 + sm, 1, L, O[sm]);
+                }
+                c0 += span;
             }
-            if (i4 != nullptr) jit_release(L);
+            if (i4 != nullptr) jit_release(L); else jit_moe_end(L);
         }
         for (std::size_t c = 0; c < m; ++c) {
             use(c);
@@ -2826,7 +3275,7 @@ struct Engine::Impl {
         }
         struct Release {  // the pinned staging buffer and the whole-trellis host copy go on every exit
             Lib& l;
-            ~Release() { l.release_staging(); }
+            ~Release() { l.drop_staging(); }  // a failed attach: no publication here, a destructor must not throw
         } release{lib};
         const std::uint64_t v0 = opt.rank == 0 ? 0 : kVocabPad;
         std::uint64_t bits = 0;
@@ -2852,6 +3301,7 @@ struct Engine::Impl {
             dheads.push_back(std::move(dh));
             bits = l.bits;
         }
+        lib.release_staging();  // success path: the fallible publication happens here, not in ~Release
         dhead_sel = static_cast<int>(dheads.size()) - 1;
         std::printf("rank %u: DSpark draft-only head #%d %s (K%llu, %s, vocabulary [%llu, %llu)), %.1f ms\n", opt.rank, dhead_sel, dir.c_str(),
                     static_cast<unsigned long long>(bits), spec.c_str(), static_cast<unsigned long long>(v0),
@@ -3012,7 +3462,7 @@ void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t gene
     auto& m = *impl_;
     if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
     if (resident > m.opt.capacity || tokens.size() > m.opt.capacity - resident ||
-        (resident != 0 && resident % prefill_reuse_rows() != 0))
+        (resident != 0 && !m.unaligned_resume && resident % prefill_reuse_rows() != 0))
         throw std::invalid_argument("prefill begin: prefix range / alignment");
     if (parent != 0) {
         if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
@@ -3048,9 +3498,16 @@ LoaderSnapshot Engine::draft_loader_snapshot() const {
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_reuse_rows() const {
-    // A whole group boundary is also a chunk boundary when taps/profiling disable grouping.
-    return std::uint64_t{impl_->opt.max_rows} * impl_->pf_group;
+    // One chunk: a restart at a multiple of max_rows tiles exactly like the cold prefill. A wider group changes the
+    // schedule, not the chunk bits (group 2 and 4 give identical state hashes), and a resumed prefill's first group
+    // is already narrower, so the group width does not enter the alignment (kReuseChunks bounds it at one chunk).
+    return std::uint64_t{impl_->opt.max_rows} * std::min(impl_->pf_group, strix::pair::prefill_group::kReuseChunks);
 }
+bool Engine::prefill_int4_regime(std::uint64_t prompt_rows) const {
+    return impl_->model_fast_i4 && prompt_rows >= impl_->i4_min_rows && mmoe::prefill_iu4();
+}
+void Engine::set_unaligned_resume(bool on) { impl_->unaligned_resume = on; }
+bool Engine::unaligned_resume() const { return impl_->unaligned_resume; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
 const std::uint16_t* Engine::embed_row(std::uint32_t token) const {
     if (token >= kVocab) throw std::out_of_range("embed_row");
@@ -3178,6 +3635,8 @@ void Engine::set_xb_inplace(bool on) { impl_->xb_inplace = on; }
 bool Engine::xb_inplace() const { return impl_->xb_inplace; }
 std::pair<std::uint64_t, std::uint64_t> Engine::xb_counts() const { return {impl_->xb_count[0], impl_->xb_count[1]}; }
 void Engine::set_xb_prep(bool on) { impl_->xb_prep = on; }
+void Engine::set_xb_fold(bool on) { impl_->xb_fold = on; }
+bool Engine::xb_fold() const { return impl_->xb_fold; }
 bool Engine::xb_prep() const { return impl_->xb_prep; }
 std::uint64_t Engine::xb_prep_count() const { return impl_->xb_count[2]; }
 void Engine::set_xb_publish(bool on) {

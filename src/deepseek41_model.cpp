@@ -476,6 +476,12 @@ gguf::Limits reader_limits() noexcept {
     return limits;
 }
 
+gguf::Limits vision_reader_limits() noexcept {
+    gguf::Limits limits = reader_limits();
+    limits.allow_hyphen_in_keys = true;
+    return limits;
+}
+
 gguf::FileInfo read_file(const std::filesystem::path& path) { return gguf::read_file(path, reader_limits()); }
 
 Config parse_config_json(std::string_view json) {
@@ -703,6 +709,93 @@ DraftModel validate_draft(const gguf::FileInfo& info, const Config& c) {
     require(d.noise_token_id < c.vocab_size, "draft noise token outside the vocabulary");
     d.manifest = manifest_of(info, expected_draft_tensors(c), "deepseek41-dspark");
     return d;
+}
+
+std::vector<ExpectedTensor> expected_vision_tensors(const VisionConfig& c) {
+    constexpr std::uint32_t BF16 = 30;
+    const std::uint64_t W = c.hidden_size, M = c.intermediate_size, P = c.projection_size;
+    std::vector<ExpectedTensor> out;
+    add(out, "aligner.w1.bias", {P}, BF16, TensorRole::dense_projection, -1);
+    add(out, "aligner.w1.weight", {c.aligner_inputs(), P}, BF16, TensorRole::dense_projection, -1);
+    add(out, "aligner.w2.bias", {P}, BF16, TensorRole::dense_projection, -1);
+    add(out, "aligner.w2.weight", {P, P}, BF16, TensorRole::dense_projection, -1);
+    add(out, "image_end", {P}, BF16, TensorRole::embedding, -1);
+    add(out, "image_newline", {P}, BF16, TensorRole::embedding, -1);
+    add(out, "image_start", {P}, BF16, TensorRole::embedding, -1);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        const std::string p = "vision.blocks." + std::to_string(l) + ".";
+        const auto layer = static_cast<std::int32_t>(l);
+        add(out, p + "attn.wo.bias", {W}, BF16, TensorRole::attention_projection, layer);
+        add(out, p + "attn.wo.weight", {W, W}, BF16, TensorRole::attention_projection, layer);
+        add(out, p + "attn.wqkv.bias", {3U * W}, BF16, TensorRole::attention_projection, layer);
+        add(out, p + "attn.wqkv.weight", {W, 3U * W}, BF16, TensorRole::attention_projection, layer);
+        add(out, p + "mlp.w1.weight", {W, 2U * M}, BF16, TensorRole::dense_projection, layer);
+        add(out, p + "mlp.w2.weight", {M, W}, BF16, TensorRole::dense_projection, layer);
+        add(out, p + "norm1.weight", {W}, BF16, TensorRole::normalization, layer);
+        add(out, p + "norm2.weight", {W}, BF16, TensorRole::normalization, layer);
+    }
+    add(out, "vision.norm.weight", {W}, BF16, TensorRole::normalization, -1);
+    add(out, "vision.patch_embed.proj.bias", {W}, BF16, TensorRole::dense_projection, -1);
+    add(out, "vision.patch_embed.proj.weight", {c.patch_features(), W}, BF16, TensorRole::dense_projection, -1);
+    return out;
+}
+
+VisionModel validate_vision(const gguf::FileInfo& info) {
+    const std::string a = "deepseek4-vision";
+    require(meta_text(info, "general.architecture") == a, "general.architecture must be " + a);
+    const auto u32 = [&](const std::string& key) {
+        const std::uint64_t v = meta_u64(info, a + "." + key);
+        require(v <= 0xffffffffULL, "metadata " + a + "." + key + " is out of range");
+        return static_cast<std::uint32_t>(v);
+    };
+    VisionModel m;
+    VisionConfig& c = m.config;
+    c.checkpoint_variant = meta_text(info, a + ".checkpoint_variant");
+    c.source_revision = meta_text(info, "general.source.revision");
+    c.num_hidden_layers = u32("block_count");
+    c.hidden_size = u32("embedding_length");
+    c.intermediate_size = u32("feed_forward_length");
+    c.num_attention_heads = u32("attention.head_count");
+    c.projection_size = u32("projection_length");
+    c.patch_size = u32("patch_size");
+    c.downsample_ratio = u32("downsample_ratio");
+    c.max_image_tokens = u32("image.max_tokens");
+    c.min_pixels = u32("image.min_pixels");
+    c.max_wh_ratio = u32("image.max_width_height_ratio");
+    c.image_token_id = u32("image.token_id");
+    c.language_layers = u32("language.block_count");
+    c.language_experts = u32("language.expert_count");
+    c.rope_theta = meta_f64(info, a + ".rope.freq_base");
+    c.rms_norm_eps = meta_f64(info, a + ".attention.layer_norm_rms_epsilon");
+
+    require(c.checkpoint_variant == "v4.1-flash", "vision checkpoint variant must be v4.1-flash");
+    require(c.source_revision == pinned_source_revision, "vision file comes from another source revision");
+    require(c.num_hidden_layers > 0 && c.num_hidden_layers <= 256, "vision block_count is out of range");
+    require(c.num_attention_heads > 0 && c.hidden_size > 0 && c.hidden_size <= 16384 &&
+                c.hidden_size % c.num_attention_heads == 0,
+            "vision width must be a multiple of the head count");
+    require(c.head_dim() % 4U == 0, "vision head dimension must be a multiple of 4 (two rotary axes)");
+    require(c.intermediate_size > 0 && c.intermediate_size <= 65536, "vision feed_forward_length is out of range");
+    require(c.projection_size > 0 && c.projection_size <= 65536, "vision projection_length is out of range");
+    require(c.patch_size > 0 && c.patch_size <= 64, "vision patch_size is out of range");
+    require(c.downsample_ratio > 0 && c.downsample_ratio <= 8, "vision downsample_ratio is out of range");
+    require(c.max_image_tokens > 0 && c.max_image_tokens <= 16384, "vision image.max_tokens is out of range");
+    const std::uint64_t cell = std::uint64_t{c.cell()} * c.cell();
+    require(c.min_pixels >= cell && c.min_pixels <= cell * c.max_image_tokens,
+            "vision image.min_pixels is outside the token range");
+    require(std::isfinite(c.rope_theta) && c.rope_theta > 1.0, "vision rope.freq_base is out of range");
+    require(std::isfinite(c.rms_norm_eps) && c.rms_norm_eps > 0.0 && c.rms_norm_eps < 1e-2,
+            "vision norm epsilon is out of range");
+    m.manifest = manifest_of(info, expected_vision_tensors(c), a);
+    return m;
+}
+
+void require_vision_matches_target(const VisionConfig& v, const Config& t) {
+    require(v.image_token_id == t.image_token_id, "vision image token id differs from the language model");
+    require(v.image_token_id < t.vocab_size, "vision image token id is outside the vocabulary");
+    require(v.projection_size == t.hidden_size, "vision projection width differs from the language hidden size");
+    require(v.language_layers == t.num_hidden_layers, "vision file was released for another language depth");
+    require(v.language_experts == t.n_routed_experts, "vision file was released for another expert count");
 }
 
 const PinnedFile& pinned_file(PinnedFileKind kind) noexcept {

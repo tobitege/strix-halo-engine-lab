@@ -11,6 +11,8 @@
 // single-node prefill on this rank (all experts) and compares y bitwise. Inputs are synthetic and
 // identical on both ranks (fixed seeds); the output is a JSON line per rank.
 
+#include "strix/device/hip_gate.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
@@ -45,24 +47,22 @@ namespace {
 using strix::ds41::WeightFormat;
 using Clock = std::chrono::steady_clock;
 
-void check(hipError_t status, const char* what) {
-    if (status != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(status));
-}
+using strix::hip_check;
 template <class T>
 struct Device {
     T* data = nullptr;
     std::size_t count = 0;
     explicit Device(std::size_t n) : count(n) {
-        check(hipMalloc(reinterpret_cast<void**>(&data), std::max<std::size_t>(n, 1U) * sizeof(T)), "hipMalloc");
+        hip_check(hipMalloc(reinterpret_cast<void**>(&data), std::max<std::size_t>(n, 1U) * sizeof(T)), "hipMalloc");
     }
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
     ~Device() { (void)hipFree(data); }
-    void upload(const T* host, std::size_t n) { check(hipMemcpy(data, host, n * sizeof(T), hipMemcpyHostToDevice), "upload"); }
+    void upload(const T* host, std::size_t n) { hip_check(hipMemcpy(data, host, n * sizeof(T), hipMemcpyHostToDevice), "upload"); }
     void upload(const std::vector<T>& host) { upload(host.data(), host.size()); }
     std::vector<T> download() const {
         std::vector<T> out(count);
-        check(hipMemcpy(out.data(), data, count * sizeof(T), hipMemcpyDeviceToHost), "download");
+        hip_check(hipMemcpy(out.data(), data, count * sizeof(T), hipMemcpyDeviceToHost), "download");
         return out;
     }
 };
@@ -217,8 +217,8 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
     Device<float> shared(n), mine(n), theirs(n), y(n);
 
     hipStream_t compute = nullptr, comm = nullptr;
-    check(hipStreamCreateWithFlags(&compute, hipStreamNonBlocking), "stream");
-    check(hipStreamCreateWithFlags(&comm, hipStreamNonBlocking), "stream");
+    hip_check(hipStreamCreateWithFlags(&compute, hipStreamNonBlocking), "stream");
+    hip_check(hipStreamCreateWithFlags(&comm, hipStreamNonBlocking), "stream");
 
     // Replicated: A8 input, router, shared expert (one expert, every row).
     enqueue_quantize_a8(dx.data, hidden, T, codes.data, deltas.data, sums.data, compute);
@@ -230,7 +230,7 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
         // The shared expert as a one-expert MoE half (top_k 1, weight 1 is not applied: half sums would
         // weight it), so run gate/up/down directly: its raw vectors are the shared output.
         Device<std::uint32_t> zero(T);
-        check(hipMemsetAsync(zero.data, 0, T * sizeof(std::uint32_t), compute), "zero ids");
+        hip_check(hipMemsetAsync(zero.data, 0, T * sizeof(std::uint32_t), compute), "zero ids");
         PrefillRoutesBuffers rb;
         Device<std::uint32_t> c(1), b(2), er(T), es(T), be(prefill_max_batches(T, 1, 1, 16)), bb(be.count + 1U), bc(be.count), bt(1), od(T), lc(T);
         rb = {c.data, b.data, er.data, es.data, be.data, bb.data, bc.data, bt.data, od.data, lc.data};
@@ -248,7 +248,7 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
         dn.weights = sd->data; dn.expert_stride_bytes = sdown.stride; dn.row_bytes = sdown.row_bytes; dn.width = sdown.width;
         dn.outputs = hidden; dn.routes = view; dn.codes = ac.data; dn.deltas = ad.data; dn.out = shared.data;
         enqueue_prefill_down(sdown.format, dn, compute);
-        check(hipStreamSynchronize(compute), "shared expert");
+        hip_check(hipStreamSynchronize(compute), "shared expert");
     }
 
     PrefillMoeWeights mw;
@@ -261,7 +261,7 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
     const std::size_t chunk_bytes = static_cast<std::size_t>(o.chunk) * hidden * 4U;
     strix::dist::Communicator comm_(strix::dist::Group{o.rank, 2U, 1U, 41U}, std::move(transport), chunk_bytes);
     std::vector<hipEvent_t> done(chunks);
-    for (auto& e : done) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "event");
+    for (auto& e : done) hip_check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "event");
 
     float* low = o.rank == 0U ? mine.data : theirs.data;
     float* high = o.rank == 0U ? theirs.data : mine.data;
@@ -271,25 +271,25 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
         // (a) the rank's half alone (no exchange).
         auto t0 = Clock::now();
         for (std::uint32_t c = 0; c < chunks; ++c) moe.enqueue_half(in, c, o.rank, mine.data, compute);
-        check(hipStreamSynchronize(compute), "half");
+        hip_check(hipStreamSynchronize(compute), "half");
         compute_only.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         // (b) the pipeline: chunk c's exchange overlaps chunk c + 1's experts.
         const double wire0 = comm_.stats().wire;
         t0 = Clock::now();
         std::thread mover([&] {
             for (std::uint32_t c = 0; c < chunks; ++c) {
-                check(hipEventSynchronize(done[c]), "chunk done");
+                hip_check(hipEventSynchronize(done[c]), "chunk done");
                 const std::size_t row0 = static_cast<std::size_t>(c) * o.chunk, rows = std::min<std::size_t>(o.chunk, T - row0);
                 const std::size_t at = row0 * hidden;
                 comm_.exchange(comm, mine.data + at, theirs.data + at, rows * hidden * 4U,
                                strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::half_sum), o.layer, rep * 1000U + c});
                 enqueue_canonical_sum(shared.data + at, low + at, high + at, rows * hidden, y.data + at, comm);
             }
-            check(hipStreamSynchronize(comm), "comm");
+            hip_check(hipStreamSynchronize(comm), "comm");
         });
         for (std::uint32_t c = 0; c < chunks; ++c) {
             moe.enqueue_half(in, c, o.rank, mine.data, compute);
-            check(hipEventRecord(done[c], compute), "record");
+            hip_check(hipEventRecord(done[c], compute), "record");
         }
         mover.join();
         overlapped.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -314,7 +314,7 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
         PrefillMoe full(fw, top_k, experts, split, o.chunk);
         Device<float> yref(n);
         for (std::uint32_t c = 0; c < full.chunks(T); ++c) full.enqueue_combine(in, c, yref.data, compute);
-        check(hipStreamSynchronize(compute), "reference");
+        hip_check(hipStreamSynchronize(compute), "reference");
         const auto r = yref.download();
         std::size_t bad = 0;
         for (std::size_t i = 0; i < n; ++i) bad += std::bit_cast<std::uint32_t>(r[i]) != std::bit_cast<std::uint32_t>(y_host[i]);
@@ -329,6 +329,10 @@ std::string run_rank(const Options& o, std::unique_ptr<strix::dist::Transport> t
 } // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
+    // GPU of a node keeps working (declared=implicit).
+    strix::device::bind_hip_main(argc, argv);
     try {
         auto o = parse(argc, argv);
         if (o.transport == "memory") {

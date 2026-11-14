@@ -1,3 +1,6 @@
+#include "strix/env_flags.hpp"
+#include "strix/hip_argmax_core.hpp"
+#include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
@@ -25,13 +28,7 @@ struct Partial {float value;std::uint32_t token,bad,valid;float sum,second;};
 struct Reply {std::uint32_t tokens[max_slots];std::uint32_t status;float probabilities[max_slots];std::uint32_t completed;
     float runner_up[max_slots];};
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
-void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(std::string(message)+": "+hipGetErrorString(e));}
-// Same monotone key and lowest-token tie rule as the full greedy selector.
-__device__ std::uint32_t numeric_key(float value) {
-    auto bits=__float_as_uint(value);
-    if((bits&0x7fffffffU)==0) bits=0;
-    return (bits&0x80000000U)?~bits:(bits^0x80000000U);
-}
+using strix::hip_check;
 __device__ float block_sum(float* values,float value) {
     const auto lane=static_cast<unsigned>(threadIdx.x);
     values[lane]=value;__syncthreads();
@@ -41,12 +38,8 @@ __device__ float block_sum(float* values,float value) {
     }
     return values[0];
 }
-__device__ Partial choose(Partial a,const Partial b) {
-    const auto bad=a.bad|b.bad;
-    if(b.valid && (!a.valid || numeric_key(b.value)>numeric_key(a.value) ||
-        (numeric_key(b.value)==numeric_key(a.value) && b.token<a.token))) a=b;
-    a.bad=bad;return a;
-}
+// Shared first-max rule (strix::argmax, R2-07); sum/second ride along with the winner.
+__device__ Partial choose(Partial a,const Partial b) {return strix::argmax::choose(a,b);}
 // choose() that also keeps the runner-up value: the other partial's best and both seconds compete.
 // Partials cover disjoint rows, so a valid winner's token tells which side it came from.
 __device__ Partial choose_second(Partial a,const Partial b) {
@@ -54,6 +47,9 @@ __device__ Partial choose_second(Partial a,const Partial b) {
     const float loser=a.valid && b.valid?(best.token==a.token?b.value:a.value):-INFINITY;
     const float second=fmaxf(fmaxf(a.second,b.second),loser);
     a=best;a.second=second;return a;
+}
+template<bool Second> __device__ __forceinline__ Partial combine(Partial a,const Partial b) {
+    if constexpr(Second) return choose_second(a,b); else return choose(a,b);
 }
 __global__ __launch_bounds__(threads) void draft_gather_rows(const std::uint8_t* head,const std::uint32_t* ids,
     std::uint32_t first,std::uint32_t count,std::uint32_t row_bytes,std::uint8_t* compact) {
@@ -139,6 +135,7 @@ struct DraftHeadRows {
     Partial* partials[max_batch];
     std::uint32_t* slots[max_batch];
     Reply* reply[max_batch];
+    std::uint32_t* done[max_batch];
 };
 template<unsigned Count>
 __global__ __launch_bounds__(256) void draft_q4_head_shared(DraftHeadRows h,std::uint32_t blocks,std::uint32_t shared) {
@@ -179,55 +176,21 @@ __global__ __launch_bounds__(256) void draft_q4_head_tails(DraftHeadRows h,std::
     const auto t=blockIdx.y;
     draft_q4_head_body(h.hidden[t],h.compact[t],blocks,h.rows[t],h.logits[t],shared+blockIdx.x*8U+threadIdx.x/32U);
 }
-template<bool Second> __device__ __forceinline__ void draft_argmax_partials_body(const float* logits,const std::uint32_t* ids,
-    std::uint32_t rows,Partial* partials) {
-    __shared__ Partial values[threads];
-    const auto lane=static_cast<unsigned>(threadIdx.x);
-    const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
-    __shared__ float sums[threads];
-    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
-    if(index<rows) {
-        value.value=logits[index];value.token=ids?ids[index]:static_cast<std::uint32_t>(index);
-        value.bad=(__float_as_uint(value.value)&0x7f800000U)==0x7f800000U?1U:0U;value.valid=value.bad==0?1U:0U;
-    }
-    values[lane]=value;__syncthreads();
-    for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
-        __syncthreads();
-    }
-    auto best=values[0];
-    best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
-    if(!lane) partials[blockIdx.x]=best;
-}
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
-    std::uint32_t rows,Partial* partials) {
-    draft_argmax_partials_body<Second>(logits,ids,rows,partials);
-}
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials_rows(DraftHeadRows h) {
-    const auto t=blockIdx.y;
-    if(blockIdx.x>=(h.rows[t]-1U)/threads+1U) return;
-    draft_argmax_partials_body<Second>(h.logits[t],h.ids[t],h.rows[t],h.partials[t]);
-}
 template<bool Second> __device__ __forceinline__ void draft_argmax_finish_body(const Partial* partials,std::uint32_t count,
     std::uint32_t step,std::uint32_t* slots,Reply* reply) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
     __shared__ float sums[threads];
     Partial value{0.0F,0,0,0,0.0F,-INFINITY};
-    for(std::uint32_t i=lane;i<count;i+=threads) value=Second?choose_second(value,partials[i]):choose(value,partials[i]);
-    values[lane]=value;__syncthreads();
-    for(unsigned stride=threads/2;stride;stride>>=1U) {
-        if(lane<stride) values[lane]=Second?choose_second(values[lane],values[lane+stride]):choose(values[lane],values[lane+stride]);
-        __syncthreads();
-    }
-    const auto best=values[0];
+    for(std::uint32_t i=lane;i<count;i+=threads) value=combine<Second>(value,partials[i]);
+    const auto best=strix::argmax::block_reduce<threads>(values,lane,value,[](const Partial& a,const Partial& b){return combine<Second>(a,b);});
     float sum=0.0F;
     for(std::uint32_t i=lane;i<count;i+=threads) {
         const auto& p=partials[i];if(p.valid && best.valid) sum+=p.sum*expf(p.value-best.value);
     }
     sum=block_sum(sums,sum);
     if(!lane) {
-        const auto failed=best.bad|(best.valid?0U:2U);
+        const auto failed=strix::argmax::status(best);
         // A failed row still feeds a valid id forward; the chain reader rejects it.
         const auto token=failed?0U:best.token;
         slots[step]=token;reply->tokens[step]=token;reply->probabilities[step]=failed?0.0F:1.0F/sum;
@@ -238,13 +201,44 @@ template<bool Second> __device__ __forceinline__ void draft_argmax_finish_body(c
         __hip_atomic_store(&reply->completed,step+1U,__ATOMIC_RELEASE,__HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
-    std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+// One launch per depth for the argmax (R2-10): every block writes its partial and takes a ticket on `done`;
+// the block holding the last ticket folds the partials exactly as the former separate finish kernel did
+// (same array, same lane/stride order, same tree), so ids and probabilities are unchanged. It then rearms
+// `done` for the next depth (stream order separates launches).
+template<bool Second> __device__ __forceinline__ void draft_argmax_body(const float* logits,const std::uint32_t* ids,
+    std::uint32_t rows,Partial* partials,std::uint32_t* done,std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+    __shared__ Partial values[threads];
+    __shared__ float sums[threads];
+    __shared__ bool last;
+    const auto lane=static_cast<unsigned>(threadIdx.x);
+    const auto index=static_cast<std::uint64_t>(blockIdx.x)*threads+lane;
+    const std::uint32_t count=(rows-1U)/threads+1U;
+    Partial value{0.0F,0,0,0,0.0F,-INFINITY};
+    if(index<rows) {
+        const auto loaded=strix::argmax::load(logits[index],ids?ids[index]:static_cast<std::uint32_t>(index));
+        value.value=loaded.value;value.token=loaded.token;value.bad=loaded.bad;value.valid=loaded.valid;
+    }
+    auto best=strix::argmax::block_reduce<threads>(values,lane,value,[](const Partial& a,const Partial& b){return combine<Second>(a,b);});
+    best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
+    if(!lane) {
+        partials[blockIdx.x]=best;
+        last=__hip_atomic_fetch_add(done,1U,__ATOMIC_ACQ_REL,__HIP_MEMORY_SCOPE_AGENT)==count-1U;
+    }
+    __syncthreads();
+    if(!last) return;
+    // Acquire for every lane: the other blocks' partials are visible past this CU's caches.
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"agent");
     draft_argmax_finish_body<Second>(partials,count,step,slots,reply);
+    if(!lane) __hip_atomic_store(done,0U,__ATOMIC_RELAXED,__HIP_MEMORY_SCOPE_AGENT);
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish_rows(DraftHeadRows h,std::uint32_t step) {
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax(const float* logits,const std::uint32_t* ids,
+    std::uint32_t rows,Partial* partials,std::uint32_t* done,std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+    draft_argmax_body<Second>(logits,ids,rows,partials,done,step,slots,reply);
+}
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_rows(DraftHeadRows h,std::uint32_t step) {
     const auto t=blockIdx.y;
-    draft_argmax_finish_body<Second>(h.partials[t],(h.rows[t]-1U)/threads+1U,step,h.slots[t],h.reply[t]);
+    if(blockIdx.x>=(h.rows[t]-1U)/threads+1U) return;
+    draft_argmax_body<Second>(h.logits[t],h.ids[t],h.rows[t],h.partials[t],h.done[t],step,h.slots[t],h.reply[t]);
 }
 } // namespace
 
@@ -258,6 +252,7 @@ struct HipMtpDraftHead::Impl {
     std::uint32_t* host_ids=nullptr;
     float* logits=nullptr;
     Partial* partials=nullptr;
+    std::uint32_t* done=nullptr; // argmax ticket: the last block to finish folds the partials
     std::uint32_t* slots=nullptr;
     Reply* reply=nullptr;
     Reply* device_reply=nullptr;
@@ -267,13 +262,13 @@ struct HipMtpDraftHead::Impl {
     ~Impl() {
         if(stream) (void)hipStreamSynchronize(stream);
         for(void* p:{static_cast<void*>(compact),static_cast<void*>(ids),static_cast<void*>(logits),
-                     static_cast<void*>(partials),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
+                     static_cast<void*>(partials),static_cast<void*>(done),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
         if(host_ids) (void)hipHostFree(host_ids);
         if(reply) (void)hipHostFree(reply);
         if(runner_logits) (void)hipHostFree(runner_logits);
     }
     template<class T> T* device(std::uint64_t count) {
-        void* p=nullptr;check(hipMalloc(&p,static_cast<std::size_t>(count*sizeof(T))),"MTP draft head allocation");return static_cast<T*>(p);
+        void* p=nullptr;hip_check(hipMalloc(&p,static_cast<std::size_t>(count*sizeof(T))),"MTP draft head allocation");return static_cast<T*>(p);
     }
     // Appends unseen ids to the append-only pinned list, then gathers the new rows.
     std::uint32_t admit(std::span<const std::uint32_t> tokens,std::uint32_t limit) {
@@ -284,11 +279,11 @@ struct HipMtpDraftHead::Impl {
             seen[token]=1U;host_ids[rows++]=token;++added;
         }
         if(rows==first) return 0;
-        check(hipMemcpyAsync(ids+first,host_ids+first,(rows-first)*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream),"MTP draft ids upload");
+        hip_check(hipMemcpyAsync(ids+first,host_ids+first,(rows-first)*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream),"MTP draft ids upload");
         if(config.q4) hipLaunchKernelGGL(draft_gather_rows_q4,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,
             config.hidden_size/32U,compact);
         else hipLaunchKernelGGL(draft_gather_rows,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,row_bytes,compact);
-        check(hipGetLastError(),"MTP draft row gather");
+        hip_check(hipGetLastError(),"MTP draft row gather");
         return added;
     }
 };
@@ -310,24 +305,26 @@ HipMtpDraftHead::HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig confi
     try {
         p.logits=p.device<float>(p.capacity);
         p.partials=p.device<Partial>((p.capacity-1U)/threads+1U);
+        p.done=p.device<std::uint32_t>(1);
+        hip_check(hipMemsetAsync(p.done,0,sizeof(std::uint32_t),p.stream),"MTP draft argmax ticket init");
         p.slots=p.device<std::uint32_t>(max_slots);
-        check(hipMemsetAsync(p.slots,0,max_slots*sizeof(std::uint32_t),p.stream),"MTP draft slot init");
-        check(hipHostMalloc(reinterpret_cast<void**>(&p.reply),sizeof(Reply),hipHostMallocMapped|hipHostMallocCoherent),"MTP draft mapped reply");
-        check(hipHostGetDevicePointer(reinterpret_cast<void**>(&p.device_reply),p.reply,0),"MTP draft mapped reply view");
+        hip_check(hipMemsetAsync(p.slots,0,max_slots*sizeof(std::uint32_t),p.stream),"MTP draft slot init");
+        hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.reply),sizeof(Reply),hipHostMallocMapped|hipHostMallocCoherent),"MTP draft mapped reply");
+        hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&p.device_reply),p.reply,0),"MTP draft mapped reply view");
         *p.reply=Reply{};
         if(!p.config.full) {
             p.seen.assign(p.config.vocab_size,0U);
             p.compact=p.device<std::uint8_t>(static_cast<std::uint64_t>(p.capacity)*(p.config.q4?p.config.hidden_size/32U*18U:p.row_bytes));
             p.ids=p.device<std::uint32_t>(p.capacity);
-            check(hipHostMalloc(reinterpret_cast<void**>(&p.host_ids),p.capacity*sizeof(std::uint32_t),hipHostMallocDefault),"MTP draft pinned ids");
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.host_ids),p.capacity*sizeof(std::uint32_t),hipHostMallocDefault),"MTP draft pinned ids");
             p.base_rows=p.admit(p.config.base_tokens,static_cast<std::uint32_t>(p.config.base_tokens.size()));
             p.context_dropped=0;
             require(p.base_rows || p.config.context_capacity,"MTP draft base vocabulary has no valid id");
         }
         if(const char* v=std::getenv("STRIX_MTP_DRAFT_TOP2");v && v[0]!='0')
-            check(hipHostMalloc(reinterpret_cast<void**>(&p.runner_logits),static_cast<std::size_t>(max_slots)*p.capacity*sizeof(float),
+            hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.runner_logits),static_cast<std::size_t>(max_slots)*p.capacity*sizeof(float),
                 hipHostMallocDefault),"MTP draft runner-up logits");
-        check(hipStreamSynchronize(p.stream),"MTP draft head setup");
+        hip_check(hipStreamSynchronize(p.stream),"MTP draft head setup");
     } catch(...) {impl_.reset();throw;}
 }
 HipMtpDraftHead::~HipMtpDraftHead()=default;
@@ -341,24 +338,20 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
     require(step<p.config.max_depth && stream==p.stream && p.rows,"MTP draft head step/stream is invalid");
     if(p.config.q4) {
         hipLaunchKernelGGL(draft_q4_head,dim3((p.rows+7U)/8U),dim3(256),0,p.stream,hidden,p.compact,p.config.hidden_size/32U,p.rows,p.logits);
-        check(hipGetLastError(),"MTP draft Q4 head");
+        hip_check(hipGetLastError(),"MTP draft Q4 head");
     } else launch_hip_q8_head_rows(hidden,p.config.full?static_cast<const void*>(p.head):p.compact,p.config.hidden_size,p.rows,p.logits,stream);
     if(p.runner_logits) {
         p.runner_rows[step]=p.rows;
-        check(hipMemcpyAsync(p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity,p.logits,p.rows*sizeof(float),
+        hip_check(hipMemcpyAsync(p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity,p.logits,p.rows*sizeof(float),
             hipMemcpyDeviceToHost,p.stream),"MTP draft runner-up logits copy");
     }
     const auto blocks=(p.rows-1U)/threads+1U;
-    if(p.config.runner_up) {
-        hipLaunchKernelGGL(draft_argmax_partials<true>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
-        check(hipGetLastError(),"MTP draft argmax partials");
-        hipLaunchKernelGGL(draft_argmax_finish<true>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
-    } else {
-        hipLaunchKernelGGL(draft_argmax_partials<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
-        check(hipGetLastError(),"MTP draft argmax partials");
-        hipLaunchKernelGGL(draft_argmax_finish<false>,dim3(1),dim3(threads),0,p.stream,p.partials,blocks,step,p.slots,p.device_reply);
-    }
-    check(hipGetLastError(),"MTP draft argmax finish");
+    // One launch: every block writes its partial, the last block to take the ticket folds them.
+    if(p.config.runner_up)
+        hipLaunchKernelGGL(draft_argmax<true>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials,p.done,step,p.slots,p.device_reply);
+    else
+        hipLaunchKernelGGL(draft_argmax<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials,p.done,step,p.slots,p.device_reply);
+    hip_check(hipGetLastError(),"MTP draft argmax");
 }
 std::uint32_t HipMtpDraftHead::shared_rows(std::span<HipMtpDraftHead* const> heads) {
     require(!heads.empty() && heads.size()<=max_batch,"MTP draft head batch size is invalid");
@@ -385,7 +378,7 @@ void HipMtpDraftHead::launch_rows(std::span<HipMtpDraftHead* const> heads,std::s
             p.config.hidden_size==a.config.hidden_size && p.config.runner_up==a.config.runner_up && shared<=p.rows && hidden[t],
             "MTP draft head batch member is incompatible");
         h.hidden[t]=hidden[t];h.compact[t]=p.compact;h.logits[t]=p.logits;h.rows[t]=p.rows;h.ids[t]=p.ids;
-        h.partials[t]=p.partials;h.slots[t]=p.slots;h.reply[t]=p.device_reply;
+        h.partials[t]=p.partials;h.done[t]=p.done;h.slots[t]=p.slots;h.reply[t]=p.device_reply;
         tail_blocks=std::max(tail_blocks,(p.rows-shared+7U)/8U);partial_blocks=std::max(partial_blocks,(p.rows-1U)/threads+1U);
     }
     const auto s=static_cast<hipStream_t>(stream);const auto n=static_cast<unsigned>(heads.size());
@@ -402,22 +395,17 @@ void HipMtpDraftHead::launch_rows(std::span<HipMtpDraftHead* const> heads,std::s
         case 7:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<7U>),grid,dim3(256),0,s,h,blocks,shared);break;
         default:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<8U>),grid,dim3(256),0,s,h,blocks,shared);break;
         }
-        check(hipGetLastError(),"MTP draft Q4 head batch (shared rows)");
+        hip_check(hipGetLastError(),"MTP draft Q4 head batch (shared rows)");
     }
     if(tail_blocks) {
         hipLaunchKernelGGL(draft_q4_head_tails,dim3(tail_blocks,n),dim3(256),0,s,h,blocks,shared);
-        check(hipGetLastError(),"MTP draft Q4 head batch (own rows)");
+        hip_check(hipGetLastError(),"MTP draft Q4 head batch (own rows)");
     }
-    if(a.config.runner_up) {
-        hipLaunchKernelGGL(draft_argmax_partials_rows<true>,dim3(partial_blocks,n),dim3(threads),0,s,h);
-        check(hipGetLastError(),"MTP draft argmax partials batch");
-        hipLaunchKernelGGL(draft_argmax_finish_rows<true>,dim3(1,n),dim3(threads),0,s,h,step);
-    } else {
-        hipLaunchKernelGGL(draft_argmax_partials_rows<false>,dim3(partial_blocks,n),dim3(threads),0,s,h);
-        check(hipGetLastError(),"MTP draft argmax partials batch");
-        hipLaunchKernelGGL(draft_argmax_finish_rows<false>,dim3(1,n),dim3(threads),0,s,h,step);
-    }
-    check(hipGetLastError(),"MTP draft argmax finish batch");
+    if(a.config.runner_up)
+        hipLaunchKernelGGL(draft_argmax_rows<true>,dim3(partial_blocks,n),dim3(threads),0,s,h,step);
+    else
+        hipLaunchKernelGGL(draft_argmax_rows<false>,dim3(partial_blocks,n),dim3(threads),0,s,h,step);
+    hip_check(hipGetLastError(),"MTP draft argmax batch");
 }
 const std::uint32_t* HipMtpDraftHead::device_token(std::uint32_t step) const {
     require(step<impl_->config.max_depth,"MTP draft token slot is invalid");return impl_->slots+step;
@@ -443,7 +431,7 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* raw_stream) const {
     // The stream that carries the step: the head's own, or the multi-session draft batch stream.
     const auto stream=static_cast<hipStream_t>(raw_stream);
     // STRIX_MTP_DRAFT_POLL=0 synchronises the stream as before.
-    static const bool poll=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_POLL");return !v || v[0]!='0';}();
+    static const bool poll=strix::envcfg::flag("STRIX_MTP_DRAFT_POLL", true);
     if(poll) {
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(50);
         for(unsigned spin=0;;++spin) {
@@ -455,19 +443,19 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* raw_stream) const {
             }
         }
     }
-    check(hipStreamSynchronize(stream),"MTP draft early-stop step");
+    hip_check(hipStreamSynchronize(stream),"MTP draft early-stop step");
 }
 void HipMtpDraftHead::read_logits(std::vector<float>& out) const {
     const auto& p=*impl_;out.resize(p.rows);
-    check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
-    check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
+    hip_check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
+    hip_check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
 }
 std::span<const std::uint32_t> HipMtpDraftHead::host_ids() const noexcept {
     const auto& p=*impl_;return p.config.full?std::span<const std::uint32_t>{}:std::span<const std::uint32_t>(p.host_ids,p.rows);
 }
 void HipMtpDraftHead::set_token(std::uint32_t step,std::uint32_t token,void* stream) {
     auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream && token<p.config.vocab_size,"MTP draft token override is invalid");
-    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
+    hip_check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
     p.reply->tokens[step]=token;
 }
 std::uint32_t* HipMtpDraftHead::device_token_slot(std::uint32_t step) {

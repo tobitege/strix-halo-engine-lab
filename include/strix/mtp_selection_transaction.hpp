@@ -30,6 +30,10 @@ class MtpSelectionTransaction {
 public:
     virtual ~MtpSelectionTransaction() = default;
     virtual void reset() = 0;
+    // Optional hint after reset(): the drafts the window is about to verify. Row r is reached only when rows
+    // 0..r-1 selected drafts 0..r-1, so a policy may prepare those rows' work while the device runs. It never
+    // changes what select()/select_known() return.
+    virtual void expect(std::span<const std::uint32_t>) {}
     virtual void discard() noexcept = 0;
     virtual std::uint32_t select(std::span<const float>) = 0;
     // The row's unmasked lowest-ID maximum and finite status (device greedy reply). Returns the selected

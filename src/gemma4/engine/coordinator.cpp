@@ -207,8 +207,16 @@ std::uint32_t CostModel::choose(std::size_t streams, std::uint32_t max_k, std::u
     return chosen;
 }
 struct Coordinator::Slot {
+    [[nodiscard]] std::optional<std::uint64_t> retained_bytes() const;
     Request request;
     Result out;
+    bool input_mode = false, retained = false, sealed = false;
+    std::vector<std::uint32_t> consumed, input;
+    std::size_t input_offset = 0;
+    std::optional<std::uint32_t> pending;
+    std::vector<float> final_logits, final_taps;
+    bool sampler_initialized = false;
+    std::uint32_t input_capacity = 0;
     std::unique_ptr<StreamState> state;
     std::unique_ptr<DraftSession> draft;
     std::size_t prompt_processed = 0;
@@ -222,12 +230,74 @@ struct Coordinator::Slot {
     // Measured confidence-window costs of this stream (decayed): drafting ms, drafted depths, one-row pass ms.
     // Only cycles whose window the confidence rule chose feed it (not prompt-lookup proposals).
     DraftCostRatio conf_cost;
+    std::unique_ptr<Slot> clone() const {
+        auto copy = std::make_unique<Slot>();
+        copy->request=request; copy->out=this->out; copy->prompt_processed=prompt_processed;
+        copy->input_mode=input_mode; copy->retained=retained; copy->consumed=consumed;
+        copy->sealed=sealed;
+        copy->sampler_initialized=sampler_initialized; copy->input_capacity=input_capacity;
+        copy->input=input; copy->input_offset=input_offset; copy->pending=pending;
+        copy->final_logits=final_logits; copy->final_taps=final_taps;
+        if (input_mode) {
+            copy->consumed.reserve(consumed.capacity());
+            copy->out.ids.reserve(out.ids.capacity());
+        }
+        copy->generation=generation; copy->dflash_enabled=dflash_enabled; copy->workload=workload;
+        copy->policy=policy; copy->admitted=admitted; copy->minimum_gain=minimum_gain;
+        copy->confidence=confidence; copy->conf_cost=conf_cost; copy->last_hidden=last_hidden;
+        if (state) {
+            copy->state=state->fork(input_mode ? input_capacity : std::uint32_t(request.prompt.size()+request.max_tokens));
+            if(!copy->state) throw std::invalid_argument("full physical checkpoint unsupported");
+        }
+        if(draft) {
+            copy->draft=draft->clone(*copy->state);
+            if(!copy->draft) throw std::invalid_argument("full drafter checkpoint unsupported");
+        }
+        return copy;
+    }
     std::vector<float> last_hidden; // final hidden row of the last committed position (drafters that read it)
 };
+namespace {
+void retained_add(std::uint64_t& total,std::uint64_t count,std::uint64_t width=1) {
+    if(width && count>(UINT64_MAX-total)/width) throw std::overflow_error("retained size overflow");
+    total+=count*width;
+}
+void retained_string(std::uint64_t& total,const std::string& text) {
+    // Small-string storage is already included in its containing object.
+    const auto data=reinterpret_cast<std::uintptr_t>(text.data());
+    const auto object=reinterpret_cast<std::uintptr_t>(&text);
+    if(data<object || data-object>=sizeof(text)) {
+        retained_add(total,text.capacity());retained_add(total,1);
+    }
+}
+}
+std::optional<std::uint64_t> Coordinator::Slot::retained_bytes() const {
+    if(draft || !out.prefill_levers.empty() || !state) return {};
+    const auto physical=state->retained_bytes();if(!physical) return {};
+    std::uint64_t total=sizeof(Slot);retained_add(total,*physical);
+    for(const auto* v:{&request.prompt,&request.stop_ids,&out.ids,&consumed,&input})
+        retained_add(total,v->capacity(),sizeof(std::uint32_t));
+    for(const auto* v:{&final_logits,&final_taps,&last_hidden})retained_add(total,v->capacity(),sizeof(float));
+    for(const auto* str:{&out.error,&out.digest,&out.prefill_taps,&workload})retained_string(total,*str);
+    return total;
+}
+std::optional<std::uint64_t> PrefixSnapshot::retained_bytes() const {
+    if(!state) return std::nullopt;
+    const auto physical=state->retained_bytes();if(!physical) return std::nullopt;
+    std::uint64_t total=sizeof(PrefixSnapshot);retained_add(total,*physical);
+    retained_add(total,tokens.capacity(),sizeof(std::uint32_t));
+    for(const auto* v:{&hidden,&logits,&taps}) retained_add(total,v->capacity(),sizeof(float));
+    retained_string(total,identity);return total;
+}
 Coordinator::Coordinator(Backend& backend, DraftFactory drafts, std::shared_ptr<CostModel> costs)
     : backend_(backend), drafts_(std::move(drafts)), costs_(costs ? std::move(costs) : std::make_shared<CostModel>()) {}
 Coordinator::~Coordinator() = default;
 std::size_t Coordinator::submit(Request r, std::shared_ptr<const PrefixSnapshot> prefix) {
+    std::size_t slot = 0;
+    while (slot < slots_.size() && slots_[slot]->out.status == Status::running) ++slot;
+    return submit_at(slot,std::move(r),std::move(prefix));
+}
+std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<const PrefixSnapshot> prefix) {
     const auto setup_start = Clock::now();
     const auto& c = backend_.config();
     r.sampling.validate();
@@ -236,13 +306,17 @@ std::size_t Coordinator::submit(Request r, std::shared_ptr<const PrefixSnapshot>
     require(!r.prompt.empty() && r.max_tokens > 0 && r.draft_k <= 7, "invalid prompt/max_tokens/draft_k");
     require(r.prompt.size() <= c.max_positions && r.max_tokens <= c.max_positions-r.prompt.size(), "request exceeds context capacity");
     for (const auto id : r.prompt) require(id < c.vocab, "prompt token outside vocabulary");
-    std::size_t slot = 0;
-    while (slot < slots_.size() && slots_[slot]->out.status == Status::running) ++slot;
-    require(slot < 8, "at most eight live streams");
+    if(prefix && prefix->purpose==PrefixSnapshot::Purpose::complete_turn)
+        require(backend_.input_continuation_supported() && !drafts_ && r.dflash!=DraftMode::on &&
+            prefix->identity==backend_.identity().dump(),"unsupported complete-turn restore identity/drafter");
+    require(slot < 8 && slot <= slots_.size(), "invalid explicit stream slot");
+    require(slot == slots_.size() || slots_[slot]->out.status != Status::running, "cannot replace a live stream lease");
     auto s = std::make_unique<Slot>();
     s->request = std::move(r);
+    s->out.ids.reserve(s->request.max_tokens); // reserve output metadata before any model work
     // Return a completed/cancelled lease before acquiring the replacement.
     // Receipts retain their values; no live transaction crosses this boundary.
+
     if (slot < slots_.size()) slots_[slot]->draft.reset();
     const auto admitted = std::uint32_t(s->request.prompt.size()+s->request.max_tokens);
     const auto& prompt = s->request.prompt;
@@ -282,11 +356,206 @@ std::size_t Coordinator::submit(Request r, std::shared_ptr<const PrefixSnapshot>
             s->out.prefill_frontier = prefix->prefill_written ? F : 0;
             s->out.frontier = F;
             s->last_hidden = prefix->hidden;
+            if(prefix->purpose==PrefixSnapshot::Purpose::complete_turn) {
+                s->final_logits=prefix->logits;s->final_taps=prefix->taps;
+            }
         }
     }
     s->out.setup_ms = elapsed(setup_start);
     if (slot == slots_.size()) slots_.push_back(std::move(s)); else slots_[slot] = std::move(s);
     return slot;
+}
+void Coordinator::submit_input_at(std::size_t slot) {
+    require(backend_.input_continuation_supported() && !drafts_, "input continuation requires qualified backend without drafter assets");
+    require(slot < 8, "invalid input stream slot");
+    while (slots_.size() <= slot) {
+        auto empty=std::make_unique<Slot>(); empty->out.status=Status::cancelled;
+        slots_.push_back(std::move(empty));
+    }
+    require(slot == slots_.size() || !slots_[slot]->state, "input admission requires fresh slot");
+    auto s = std::make_unique<Slot>();
+    s->input_mode = true;
+    s->request.dflash = DraftMode::off;
+    const auto& c = backend_.config();
+    s->input_capacity=c.max_positions;
+    s->consumed.reserve(c.max_positions); s->out.ids.reserve(c.max_positions);
+    s->final_logits.resize(c.vocab); s->last_hidden.resize(c.hidden); s->final_taps.resize(5ULL*c.hidden);
+    s->state = backend_.create_stream(c.max_positions);
+    require(s->state && s->state->frontier() == 0, "input admission needs fresh physical state");
+    require(bool(s->state->fork(c.max_positions)), "input continuation requires physical rollback snapshot");
+    s->generation = ++generation_;
+    if (slot == slots_.size()) slots_.push_back(std::move(s)); else slots_[slot] = std::move(s);
+}
+void Coordinator::stage_input(std::size_t slot, std::span<const std::uint32_t> tokens) {
+    auto& s = *slots_.at(slot);
+    require(s.input_mode && s.out.status == Status::running && input_remaining(slot) == 0, "input lane is not quiescent and active");
+    if (tokens.empty()) return;
+    const auto count = tokens.size() + std::size_t(s.pending.has_value());
+    require(count <= backend_.config().max_positions - s.out.frontier, "input exceeds context capacity");
+    for (auto id : tokens) require(id < backend_.config().vocab, "input token outside vocabulary");
+    std::vector<std::uint32_t> input; input.reserve(count);
+    if (s.pending) input.push_back(*s.pending);
+    input.insert(input.end(),tokens.begin(),tokens.end());
+    s.consumed.reserve(std::size_t(s.out.frontier)+count);
+    s.input = std::move(input); s.input_offset = 0;
+}
+void Coordinator::configure_decode(std::size_t slot, Sampling sampling, std::span<const std::uint32_t> stops, std::size_t allowance) {
+    auto& s = *slots_.at(slot);
+    require(s.input_mode && s.out.status == Status::running && !input_remaining(slot), "decode needs active consumed input lane");
+    require(s.pending || s.retained, "decode needs retained model output");
+    sampling.validate();
+    s.out.ids.reserve(s.out.ids.size()+std::min<std::size_t>(allowance,backend_.config().max_positions));
+    s.request.stop_ids.assign(stops.begin(),stops.end()); s.request.sampling=sampling;
+    if (!s.sampler_initialized) { s.out.rng_draws=sampling.draws; s.sampler_initialized=true; }
+    s.request.max_tokens=s.out.ids.size()+allowance;
+}
+void Coordinator::resume(std::size_t slot) {
+    auto& s = *slots_.at(slot);
+    require(s.input_mode && s.state && s.out.status != Status::failed, "lane cannot resume");
+    s.out.status=Status::running; s.out.digest.clear();s.sealed=false;
+}
+bool Coordinator::sealed_turn(std::size_t slot) const { return slots_.at(slot)->sealed; }
+void Coordinator::commit_pending(std::size_t slot) {
+    auto& s=*slots_.at(slot);
+    require(backend_.input_continuation_supported() && !drafts_ && !s.draft,
+        "terminal commit requires supported backend without configured drafter");
+    require(s.state && (s.out.status==Status::stopped || s.out.status==Status::length) && s.out.error.empty() &&
+        (!s.input_mode || !input_remaining(slot)),"terminal commit requires successful quiescent turn");
+    require(s.out.frontier==s.state->frontier(),"terminal physical frontier mismatch");
+    if(s.sealed) return;
+    const auto anchor=pending(slot);
+    if(!anchor) {s.sealed=true;return;}
+    require(s.out.frontier<backend_.config().max_positions,"pending anchor exceeds admitted context");
+    // Reserve all publication buffers before touching the physical stream.
+    const auto& c=backend_.config();
+    if(s.input_mode) s.consumed.reserve(s.consumed.size()+1);
+    s.final_logits.resize(c.vocab);s.last_hidden.resize(c.hidden);s.final_taps.resize(5ULL*c.hidden);
+    auto tx=s.state->begin();tx->reserve_rows(1);
+    const RowPlan row{slot,s.generation,s.out.frontier,*anchor,tx.get(),0,true,true,true,true};
+    auto out=backend_.forward_rows({&row,1});
+    require(out.rows==1 && out.vocab==c.vocab && out.tap_width==5*c.hidden &&
+        out.logits.size()==c.vocab && out.hidden.size()==c.hidden && out.taps.size()==5ULL*c.hidden,
+        "invalid terminal commit result");
+    for(const auto* v:{&out.logits,&out.hidden,&out.taps})
+        for(auto x:*v) require(std::isfinite(x),"nonfinite terminal commit result");
+    tx->commit(1);tx.reset();
+    std::copy(out.logits.begin(),out.logits.end(),s.final_logits.begin());
+    std::copy(out.hidden.begin(),out.hidden.end(),s.last_hidden.begin());
+    std::copy(out.taps.begin(),out.taps.end(),s.final_taps.begin());
+    if(s.input_mode) {s.consumed.push_back(*anchor);s.pending.reset();}
+    s.out.frontier=s.state->frontier();s.retained=true;s.sealed=true;
+    ++s.out.target_calls;++s.out.target_rows;
+    s.out.digest=s.state->digest();
+}
+bool Coordinator::input_mode(std::size_t slot) const { return slots_.at(slot)->input_mode; }
+std::size_t Coordinator::input_remaining(std::size_t slot) const { const auto& s=*slots_.at(slot); return s.input.size()-s.input_offset; }
+std::span<const std::uint32_t> Coordinator::input_history(std::size_t slot) const {
+    const auto& s=*slots_.at(slot); require(s.input_mode,"input history requires continuation mode"); return s.consumed;
+}
+std::span<const std::uint32_t> Coordinator::queued_input(std::size_t slot) const {
+    const auto& s=*slots_.at(slot); return std::span<const std::uint32_t>(s.input).subspan(s.input_offset+std::size_t(s.input_offset==0 && !s.input.empty() && s.pending.has_value()));
+}
+std::optional<std::uint32_t> Coordinator::pending(std::size_t slot) const {
+    const auto& s=*slots_.at(slot);
+    if(s.sealed) return std::nullopt;
+    if (s.input_mode) return s.pending;
+    if (prompt_offset(slot) == s.request.prompt.size()) return s.out.ids.empty()?s.request.prompt.back():s.out.ids.back();
+    return std::nullopt;
+}
+std::span<const float> Coordinator::retained_logits(std::size_t slot) const {
+    const auto& s=*slots_.at(slot); return s.retained ? std::span<const float>(s.final_logits) : std::span<const float>{};
+}
+void Coordinator::release(std::size_t slot) {
+    if(slot>=slots_.size()) return;
+    auto& s=*slots_[slot]; s.draft.reset(); s.state.reset(); s.out.status=Status::cancelled;
+}
+std::vector<std::uint32_t> Coordinator::history(std::size_t slot, std::uint64_t from) const {
+    const auto& s=*slots_.at(slot); const auto F=s.out.frontier;
+    require(from<=F,"history starts beyond committed frontier");
+    if (s.input_mode) return {s.consumed.begin()+std::ptrdiff_t(from),s.consumed.end()};
+    std::vector<std::uint32_t> ids;ids.reserve(std::size_t(F-from));
+    for(auto p=from;p<F;++p) ids.push_back(p<s.request.prompt.size()?s.request.prompt[std::size_t(p)]:
+        s.out.ids.at(std::size_t(p-s.request.prompt.size())));
+    return ids;
+}
+std::size_t Coordinator::prompt_offset(std::size_t slot) const {
+    const auto& s=*slots_.at(slot);
+    if (s.input_mode) return s.input_offset;
+    return std::min(s.request.prompt.size(),s.prompt_processed+(s.prompt_processed+1>=s.request.prompt.size()?1U:0U));
+}
+const Request& Coordinator::request(std::size_t slot) const { return slots_.at(slot)->request; }
+std::shared_ptr<const void> Coordinator::capture_lane(std::size_t slot) const {
+    return std::shared_ptr<const Slot>(slots_.at(slot)->clone().release());
+}
+std::optional<std::uint64_t> Coordinator::captured_lane_bytes(const std::shared_ptr<const void>& payload) const {
+    require(bool(payload),"missing full checkpoint");
+    return std::static_pointer_cast<const Slot>(payload)->retained_bytes();
+}
+std::optional<std::uint64_t> Coordinator::turn_retained_bound(std::size_t slot) const {
+    const auto& s=*slots_.at(slot);
+    if(!backend_.input_continuation_supported() || drafts_ || s.draft || !s.state ||
+        !s.out.prefill_levers.empty() || !s.out.error.empty() ||
+        (s.out.status!=Status::stopped && s.out.status!=Status::length)) return {};
+    const auto complete=s.retained_bytes();if(!complete) return {};
+    if(!turn_work_bound()) return {};
+    // The same complete query sizes live state and rollback copies. This
+    // deliberately overbounds the smaller prompt-purpose payload as well.
+    std::uint64_t n=*complete;retained_add(n,sizeof(PrefixSnapshot));
+    const auto& c=backend_.config();
+    if(s.out.frontier>c.max_positions) return {};
+    const auto end=s.out.frontier+std::uint64_t(pending(slot).has_value());
+    if(end>c.max_positions) return {};
+    // Current eager vector implementations grow by at most 2x. Add entire
+    // future global allocations (not only one row), keeping existing capacity
+    // too. Sliding storage is already fully allocated in retained_bytes().
+    for(std::uint32_t i=0;i<c.layer.size();++i) if(c.layer[i].producer==i && c.layer[i].attention==AttentionKind::global) {
+        std::uint64_t width=0;retained_add(width,c.kv_heads,c.layer[i].head_dim);
+        std::uint64_t row_bytes=0;retained_add(row_bytes,width,4*sizeof(float));
+        retained_add(n,end,row_bytes);
+        retained_add(n,end,2*sizeof(std::uint64_t));
+    }
+    retained_add(n,end,4*sizeof(std::uint32_t)); // history, candidate, publication growth
+    retained_add(n,std::uint64_t(c.vocab)+6ULL*c.hidden,2*sizeof(float));
+    retained_add(n,backend_.identity().dump().size()+1,2);
+    return n;
+}
+std::optional<std::uint64_t> Coordinator::turn_work_bound() const {
+#if !defined(_MSC_VER) && !defined(__GLIBCXX__)
+    // No proven eager-vector growth bound for other standard libraries.
+    return {};
+#else
+    if(!backend_.input_continuation_supported() || drafts_) return {};
+    // HostTarget's worker geometry stays host-only. Native implementations
+    // supply their own resolved allocation/capacity bound below.
+    const auto identity=backend_.identity();
+    const auto* kind=identity.find("backend");
+    if(kind && kind->as_string()!="host-reference") {
+        const auto n=backend_.native_turn_work_bound();return n && *n ? n : std::nullopt;
+    }
+    const auto* workers=identity.find("workers");
+    if(!kind || kind->as_string()!="host-reference" || !workers ||
+        workers->as_int()<1 || workers->as_int()>16) return {};
+    const auto& c=backend_.config();
+    if(!c.hidden || !c.vocab || !c.inter || !c.layers || c.layers!=c.layer.size() || !c.max_positions) return {};
+    // One final-row HostTarget call: outputs, residual/norm/QKV/attention,
+    // gate/up/PLE, overlays, decoded/transformed linear inputs, and per-worker
+    // scores/numerators. 64 copies covers <=16 host workers and vector growth.
+    std::uint64_t elements=c.vocab;retained_add(elements,c.hidden,16);
+    retained_add(elements,c.inter,4);retained_add(elements,c.ple_dim,c.layers);retained_add(elements,c.max_positions);
+    for(const auto& layer:c.layer) {
+        std::uint64_t width=0;retained_add(width,c.heads,layer.head_dim);retained_add(width,c.kv_heads,layer.head_dim);
+        retained_add(elements,width,4);
+    }
+    std::uint64_t n=sizeof(Slot)+sizeof(PrefixSnapshot);
+    retained_add(n,elements,64*sizeof(float));
+    // Transaction/map/vector descriptors and their bounded one-row nodes.
+    retained_add(n,c.layers,64*(sizeof(RowPlan)+sizeof(std::vector<float>)+sizeof(void*)));
+    return n;
+#endif
+}
+void Coordinator::restore_lane(std::size_t slot,const std::shared_ptr<const void>& payload) {
+    require(bool(payload),"missing full checkpoint");
+    auto copy=std::static_pointer_cast<const Slot>(payload)->clone(); slots_.at(slot)=std::move(copy);
 }
 std::shared_ptr<PrefixSnapshot> Coordinator::snapshot(std::size_t slot) const {
     const auto& s = *slots_.at(slot);
@@ -295,12 +564,27 @@ std::shared_ptr<PrefixSnapshot> Coordinator::snapshot(std::size_t slot) const {
     auto state = s.state->fork(std::uint32_t(F));
     if (!state) return nullptr;
     auto out = std::make_shared<PrefixSnapshot>();
+    if (s.input_mode) out->tokens = s.consumed;
     const auto& prompt = s.request.prompt;
-    out->tokens.assign(prompt.begin(),prompt.begin()+std::ptrdiff_t(std::min<std::uint64_t>(F,prompt.size())));
+    if (!s.input_mode) out->tokens.assign(prompt.begin(),prompt.begin()+std::ptrdiff_t(std::min<std::uint64_t>(F,prompt.size())));
     for (std::size_t i = 0; out->tokens.size() < F; ++i) out->tokens.push_back(s.out.ids.at(i));
     out->state = std::move(state);
     out->prefill_written = s.out.prefill_frontier == F;
     if (s.draft && s.draft->wants_hidden()) out->hidden = s.last_hidden;
+    return out;
+}
+std::shared_ptr<PrefixSnapshot> Coordinator::turn_snapshot(std::size_t slot) const {
+    const auto& s=*slots_.at(slot);
+    require(backend_.input_continuation_supported() && !drafts_ && s.sealed &&
+        (s.out.status==Status::stopped || s.out.status==Status::length) && s.out.error.empty() && !pending(slot),
+        "complete-turn candidate requires supported sealed turn");
+    // Unknown device payload accounting must decline before making a copy.
+    if(!s.state || !s.state->retained_bytes() || !turn_work_bound()) return nullptr;
+    auto out=snapshot(slot);if(!out) return nullptr;
+    out->purpose=PrefixSnapshot::Purpose::complete_turn;
+    out->hidden=s.last_hidden;out->logits=s.final_logits;out->taps=s.final_taps;
+    out->identity=backend_.identity().dump();
+    if(!out->retained_bytes()) return nullptr;
     return out;
 }
 void Coordinator::cancel(std::size_t slot) {
@@ -312,9 +596,36 @@ void Coordinator::cancel(std::size_t slot) {
 }
 const Result& Coordinator::result(std::size_t slot) const { return slots_.at(slot)->out; }
 bool Coordinator::step() {
+    std::vector<LaneAdvance> lanes;
+    for(std::size_t i=0;i<slots_.size();++i) if(slots_[i]->out.status==Status::running) lanes.push_back({i,{}});
+    return advance(lanes);
+}
+bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
+    std::vector<std::function<bool()>> probes(slots_.size());
+    std::vector<bool> seen(slots_.size());
+    for(const auto& lane:lanes) {
+        require(lane.slot<slots_.size() && !seen[lane.slot],"invalid grouped lane");
+        seen[lane.slot]=true; probes[lane.slot]=lane.cancelled;
+    }
+    for(std::size_t i=0;i<slots_.size();++i)
+        require(subset || slots_[i]->out.status!=Status::running || seen[i],"group omits live lane");
+    // Complete copies are rollback protection, never shared-prefix capability.
+    // Reserve/copy every attempted continuation lane before cancellation or writes.
+    std::vector<std::unique_ptr<Slot>> rollback;
+    const bool continuation = std::any_of(lanes.begin(),lanes.end(),[&](const auto& lane){return slots_[lane.slot]->input_mode;});
+    if (continuation)
+        rollback.resize(slots_.size());
+    for (const auto& lane:lanes) if (slots_[lane.slot]->input_mode) {
+        rollback[lane.slot]=slots_[lane.slot]->clone();
+        slots_[lane.slot]->out.error.clear();
+    }
+    const auto observe=[&](std::size_t i) {
+        if(probes[i] && probes[i]() && slots_[i]->out.status==Status::running) cancel(i);
+    };
+    for(const auto& lane:lanes) observe(lane.slot);
     struct Work {
         std::size_t slot = 0, start = 0, rows = 1;
-        bool prefill = false;
+        bool prefill = false, retained = false;
         std::uint32_t k = 0;
         WindowDecision decision;
         bool confident = false, confidence_rule = false; // confidence_rule: the session's rule chose the window
@@ -327,7 +638,7 @@ bool Coordinator::step() {
     std::vector<Work> work;
     std::vector<RowPlan> plans;
     std::size_t live = 0;
-    for (const auto& s : slots_) if (s->out.status == Status::running) ++live;
+    for (std::size_t i=0;i<slots_.size();++i) if (seen[i] && slots_[i]->out.status == Status::running) ++live;
     if (!live) return false;
     const auto start = Clock::now();
     ++steps_;
@@ -335,12 +646,13 @@ bool Coordinator::step() {
     // prefill/forced steps stay plain for auto (as before) and are not batch evidence.
     bool batch = false;
     BatchPlan plan;
-    if (live > 1 && multi_.config().enabled) {
+    if (live > 1 && multi_.config().enabled &&
+        std::none_of(lanes.begin(),lanes.end(),[&](const auto& l){return slots_[l.slot]->input_mode;})) {
         batch = true;
         std::vector<StreamCandidate> candidates;
-        for (const auto& p : slots_) {
-            const auto& s = *p;
-            if (s.out.status != Status::running) continue;
+        for (std::size_t i=0;i<slots_.size();++i) {
+            const auto& s = *slots_[i];
+            if (s.out.status != Status::running || !seen[i]) continue;
             if (s.prompt_processed+1 < s.request.prompt.size() || s.request.dflash == DraftMode::on) { batch = false; break; }
             StreamCandidate c;
             c.position = s.state->frontier();
@@ -361,7 +673,10 @@ bool Coordinator::step() {
         // the same rows in groups of at most eight.
         std::vector<bool> prefilled(slots_.size(), false);
         std::size_t rowed = live; // streams left for this step's forward_rows pass
-        if (const auto chunk = backend_.prefill_chunk_rows()) {
+        // Continuation mixes all ready rows in the bounded forward below,
+        // including a legacy request's long prompt. Legacy-only calls retain
+        // their existing many-row prefill scheduling and arithmetic.
+        if (const auto chunk = continuation ? 0 : backend_.prefill_chunk_rows()) {
             // With a prefill limit, at most that many prefill calls run this step, round-robin from the cursor; the
             // other prompt streams sit this step out (scheduling only: rows and their order per stream are unchanged).
             // PREFILL_BATCH: streams whose chunks fit join one call (one weight pass for all of them); without it each
@@ -378,7 +693,7 @@ bool Coordinator::step() {
             for (std::size_t j = 0; j < slots_.size(); ++j) {
                 const auto i = (prefill_cursor_+j)%slots_.size();
                 auto& s = *slots_[i];
-                if (s.out.status != Status::running ||
+                if (!seen[i] || s.input_mode || s.out.status != Status::running ||
                     !prompt_chunk_rows(s.request.prompt.size(),s.prompt_processed,s.state->frontier(),chunk)) continue;
                 s.out.peak_streams = std::max(s.out.peak_streams,live);
                 const std::uint64_t position = s.state->frontier();
@@ -398,6 +713,14 @@ bool Coordinator::step() {
                 cursor = i+1;
             }
             for (auto& call : calls) {
+                // No transaction is in flight here. A new disconnect can be
+                // observed between long chunks without a monitoring thread.
+                std::erase_if(call,[&](const Chunk& c) {
+                    observe(c.slot);
+                    if(slots_[c.slot]->out.status==Status::running) return false;
+                    prefilled[c.slot]=true; --rowed; return true;
+                });
+                if(call.empty()) continue;
                 const auto begin = Clock::now();
                 std::vector<PrefillRows> results;
                 bool any_hidden = false, any_taps = false;
@@ -487,17 +810,32 @@ bool Coordinator::step() {
             if (prefill_limit_) prefill_cursor_ = cursor%slots_.size();
             if (!rowed) return true;
         }
+        rowed=0;
+        for(std::size_t i=0;i<slots_.size();++i) {
+            observe(i);
+            auto& s=*slots_[i];
+            if (seen[i] && s.input_mode && s.out.status==Status::running && !input_remaining(i)) {
+                if (s.out.ids.size()==s.request.max_tokens) s.out.status=Status::length;
+                else if (s.out.frontier+std::size_t(s.pending.has_value())>=backend_.config().max_positions) s.out.status=Status::length;
+                if(s.out.status!=Status::running) s.out.digest=s.state->digest();
+            }
+            if(seen[i] && s.out.status==Status::running && !prefilled[i]) ++rowed;
+        }
+        if(!rowed) return true;
         std::size_t remaining = 8, pending = rowed, index = 0;
         for (std::size_t i = 0; i < slots_.size(); ++i) {
             auto& s = *slots_[i];
-            if (s.out.status != Status::running || prefilled[i]) continue;
+            if (!seen[i] || s.out.status != Status::running || prefilled[i]) continue;
             s.out.peak_streams = std::max(s.out.peak_streams,live);
-            Work w; w.slot = i; w.start = plans.size(); w.tx = s.state->begin();
-            const auto position = w.tx->frontier();
+            Work w; w.slot = i; w.start = plans.size();
+            w.retained = s.input_mode && !input_remaining(i) && s.retained;
+            if (!w.retained) w.tx = s.state->begin();
+            const auto position = w.retained ? s.state->frontier() : w.tx->frontier();
             const auto capacity = remaining-(--pending);
-            w.prefill = s.prompt_processed+1 < s.request.prompt.size();
-            if (w.prefill) {
-                w.rows = std::min(capacity,s.request.prompt.size()-1-s.prompt_processed);
+            w.prefill = s.input_mode ? input_remaining(i)!=0 : s.prompt_processed+1 < s.request.prompt.size();
+            if (w.retained) w.rows=0;
+            else if (w.prefill) {
+                w.rows = std::min(capacity,s.input_mode ? input_remaining(i) : s.request.prompt.size()-1-s.prompt_processed);
             } else {
                 const auto budget = s.request.max_tokens-s.out.ids.size();
                 std::uint32_t k = 0;
@@ -549,14 +887,15 @@ bool Coordinator::step() {
                     for (const auto id : w.proposals) require(id < backend_.config().vocab, "draft token outside vocabulary");
                 }
             }
-            const bool hidden = s.draft && s.draft->wants_hidden();
+            const bool hidden = s.input_mode || (s.draft && s.draft->wants_hidden());
             // Logits leave the device only for sampled decode rows (greedy rows use
             // the backend's device winners), taps only for a drafter that reads them.
-            const bool logits = !w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled()),
-                taps = s.draft && s.draft->wants_taps();
+            const bool logits = s.input_mode || (!w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled())),
+                taps = s.input_mode || (s.draft && s.draft->wants_taps());
             for (std::size_t r = 0; r < w.rows; ++r) {
-                const auto token = w.prefill ? s.request.prompt[s.prompt_processed+r] :
-                    (r ? w.proposals[r-1] : (s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back()));
+                const auto token = s.input_mode ? (w.prefill ? s.input[s.input_offset+r] : s.pending.value()) :
+                    (w.prefill ? s.request.prompt[s.prompt_processed+r] :
+                    (r ? w.proposals[r-1] : (s.out.ids.empty() ? s.request.prompt.back() : s.out.ids.back())));
                 plans.push_back({i,s.generation,position+r,token,w.tx.get(),plans.size(),true,hidden,logits,taps});
             }
             remaining -= w.rows;
@@ -564,7 +903,8 @@ bool Coordinator::step() {
             work.push_back(std::move(w));
         }
         const auto target_start = Clock::now();
-        const auto out = backend_.forward_rows(plans);
+        const auto empty_result = [&] { ForwardResult r; r.vocab = backend_.config().vocab; r.tap_width = 5*backend_.config().hidden; return r; };
+        const auto out = plans.empty() ? empty_result() : backend_.forward_rows(plans);
         const auto verify_ms = elapsed(target_start);
         // A backend that checked its outputs on the device may omit logits/taps no
         // row exported, and returns its greedy winners (the host tie rule).
@@ -587,17 +927,18 @@ bool Coordinator::step() {
             dflash::Verdict verdict;
             if (!w.prefill) {
                 std::vector<std::uint32_t> selected;
-                for (std::size_t r = 0; r < w.rows; ++r) {
+                for (std::size_t r = 0; r < (w.retained ? 1 : w.rows); ++r) {
                     const auto row = w.start+r;
-                    if (s.request.sampling.temperature == 0 && out.device_checked) {
+                    if (!w.retained && s.request.sampling.temperature == 0 && out.device_checked) {
                         require(out.selected[row] < out.vocab, "device winner outside vocabulary");
                         selected.push_back(out.selected[row]);
                     }
-                    else selected.push_back(select_token({out.logits.data()+row*out.vocab,out.vocab},s.request.sampling,s.out.rng_draws));
+                    else selected.push_back(select_token(w.retained ? std::span<const float>(s.final_logits) :
+                        std::span<const float>(out.logits.data()+row*out.vocab,out.vocab),s.request.sampling,s.out.rng_draws));
                 }
                 verdict = dflash::verify_greedy({w.proposals.data(),w.k},selected,
                     s.request.max_tokens-s.out.ids.size(),s.request.stop_ids,&w.delta);
-                processed = verdict.processed;
+                processed = w.retained ? 0 : verdict.processed;
                 if (logits_digest_enabled() && !out.logits.empty())
                     for (std::size_t r = 0; r < verdict.emitted.size() && r < w.rows; ++r) {
                         const auto* bytes = reinterpret_cast<const unsigned char*>(out.logits.data()+(w.start+r)*out.vocab);
@@ -627,8 +968,23 @@ bool Coordinator::step() {
                 w.context_ms += elapsed(begin);
             }
             const auto commit_start = Clock::now();
-            w.tx->commit(processed);
+            if (w.tx) w.tx->commit(processed);
             w.tx.reset();
+            if (s.input_mode) {
+                for (std::size_t r=0;r<processed;++r) s.consumed.push_back(plans[w.start+r].token);
+                if (processed) {
+                    s.pending.reset();
+                    // Full checkpoints retain the last consumed row's outputs
+                    // after pending-anchor decode as well as input admission.
+                    const auto row=w.start+processed-1;
+                    std::copy_n(out.logits.data()+row*out.vocab,out.vocab,s.final_logits.data());
+                    std::copy_n(out.hidden.data()+row*backend_.config().hidden,backend_.config().hidden,s.last_hidden.data());
+                    std::copy_n(out.taps.data()+row*out.tap_width,out.tap_width,s.final_taps.data());
+                }
+                if (w.prefill) {
+                    s.retained=true; s.input_offset+=processed;
+                } else { s.pending=verdict.emitted.back(); s.retained=false; }
+            }
             s.out.commit_ms += elapsed(commit_start);
             if (s.draft) {
                 const auto begin = Clock::now();
@@ -638,9 +994,10 @@ bool Coordinator::step() {
             // As in the device cycle helper, statistics/output become visible
             // only after both target and draft publications have succeeded.
             if (!w.prefill) add(s.out.acceptance,w.delta);
-            ++s.out.target_calls; s.out.target_rows += w.rows;
+            if (!w.retained) ++s.out.target_calls;
+            s.out.target_rows += w.rows;
             s.out.frontier = s.state->frontier();
-            if (w.prefill) s.prompt_processed += processed;
+            if (w.prefill) { if (!s.input_mode) s.prompt_processed += processed; }
             else {
                 s.out.ids.insert(s.out.ids.end(),verdict.emitted.begin(),verdict.emitted.end());
                 ++s.out.windows[w.k];
@@ -666,7 +1023,7 @@ bool Coordinator::step() {
         }
         // Only complete C1 cycles qualify auto. Diagnostic state hashing is
         // outside decode timing and runs once at completion/cancellation.
-        if (work.size() == 1 && !work[0].prefill) {
+        if (work.size() == 1 && !work[0].prefill && !work[0].retained && !slots_[work[0].slot]->input_mode) {
             const auto& w = work[0]; auto& s = *slots_[w.slot];
             costs_->observe(1,w.k,ms,std::size_t(s.out.frontier-plans[w.start].position),plans[w.start].position,s.workload);
             if (s.draft) s.policy.observe(plans[w.start].position,w.k,ms,w.draft_ms,verify_ms,w.context_ms,w.delta,w.k && w.decision.probe);
@@ -688,13 +1045,21 @@ bool Coordinator::step() {
             auto& s = *slots_[w.slot];
             if (s.out.status != Status::running) s.out.digest = s.state->digest();
         }
-    } catch (const std::exception& e) {
+    } catch (...) {
+        std::string error="unknown target execution failure";
+        try {throw;} catch(const std::exception& e) {error=e.what();} catch(...) {}
         // Publication/append failure invalidates affected requests. Never resume
         // a target whose committed frontier and drafter context might disagree.
-        for (auto& s : slots_) {
+        for (std::size_t i=0;i<slots_.size();++i) {
+            if (!seen[i]) continue;
+            auto& s=slots_[i];
+            if (!rollback.empty() && rollback[i]) {
+                s=std::move(rollback[i]); s->out.error=error;
+                continue;
+            }
             if (s->draft) s->draft->discard();
             if (s->out.status != Status::running) continue;
-            s->out.status = Status::failed; s->out.error = e.what();
+            s->out.status = Status::failed; s->out.error = error;
             s->out.frontier = s->state->frontier();
             // A stream poisoned by the failure has no canonical state to hash; the request still fails cleanly.
             try { s->out.digest = s->state->digest(); } catch (const std::exception&) { s->out.digest.clear(); }

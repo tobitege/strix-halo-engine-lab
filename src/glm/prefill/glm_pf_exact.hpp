@@ -10,7 +10,7 @@ unsigned vector_splits(unsigned input, unsigned output, unsigned bits);
 // FP16 transformed input, rounded up to 256 bytes. Workspace must be 256-aligned.
 std::size_t workspace_bytes(unsigned max_rows, unsigned input);
 unsigned tile_rows();  // STRIX_GLM_PF_EXACT_TM=16|32|64, read per call
-unsigned x_auto_rows();  // STRIX_GLM_PF_EXACT_X=auto threshold: STRIX_GLM_PF_EXACT_X_MIN_ROWS, default 2048
+unsigned x_auto_rows();  // STRIX_GLM_PF_EXACT_X=auto threshold: STRIX_GLM_PF_EXACT_X_MIN_ROWS, default 64 (32 with FAST WMMA)
 enum class Route { tm, x, x2, x3, x3r8 };
 Route route(unsigned rows);  // STRIX_GLM_PF_EXACT_X and auto threshold, read per call
 // X/Y/workspace must be disjoint; strides are float elements, >= matrix widths.

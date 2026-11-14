@@ -27,6 +27,7 @@
 //   [L] prefetch8_wave_q8_lm_head_kernel<u16,8> (hip_lm_head_launcher.s:180867): coefficient = v_fma_mix_f32 scale,
 //       code, -0 (exact product, +103..+123), leaf chain CONTRACTED v_fmac_f32 partial, coef, x (+114..+129),
 //       __shfl_down tree adds (+146..).
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_hc.hpp"
 
 #include <cuda_fp16.h>
@@ -365,7 +366,7 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
 // Decode shapes (rows <= 8): the [P], [O] and router DAGs above, laid out for few rows.
 // STRIX_QRTX_DECODE_KERNELS=0 keeps the tiled kernels (reference seam).
 bool decode_rows_enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(v && v[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS", true);
     return on;
 }
 

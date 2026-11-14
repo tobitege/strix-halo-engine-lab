@@ -8,6 +8,7 @@ namespace strix::gemma4::engine {
 class HostBackend final : public Backend {
 public:
     HostBackend(const ModelManifest& manifest, RopeTables tables, std::uint32_t workers = 16);
+    bool input_continuation_supported() const override { return manifest_.identity == arithmetic_id; }
     std::unique_ptr<StreamState> create_stream() override;
     ForwardResult forward_rows(std::span<const RowPlan> rows) override;
     [[nodiscard]] const ModelConfig& config() const override { return manifest_.config; }

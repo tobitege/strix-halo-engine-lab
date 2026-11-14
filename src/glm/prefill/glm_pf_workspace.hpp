@@ -35,6 +35,9 @@ inline unsigned attention_scratch_rows(unsigned rows) {
 inline constexpr unsigned kIndexerPoolWindow = 4096;
 inline constexpr unsigned kIndexerRetainedPools = 512;
 inline constexpr unsigned kIndexerKeyStride = kIndexerPoolWindow + kIndexerRetainedPools;
+// STRIX_IDX_WMMA when unset: attn_core::idx::kModeExact (WMMA indexer scores, exact rescoring of the selection
+// cut-off: the pool lists of the exact kernels). 0 runs the exact kernels alone; bf16 / f16 are FAST identities.
+inline constexpr unsigned kIndexerWmmaUnsetMode = 4;
 inline constexpr unsigned kPrefillAllocationBound = 64;
 // Target, not a ceiling: the byte-admitted planner can pack more rows.
 inline constexpr unsigned kKvShardPrefillRows = 128;

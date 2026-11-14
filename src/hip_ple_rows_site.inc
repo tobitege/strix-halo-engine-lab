@@ -40,10 +40,10 @@ template <unsigned Rows> struct PleRowsGroupSite : PleRowsSite<Rows> {
 
 // Batch only the default lane recipe. Other dispatch/diagnostic settings retain their old path.
 inline bool ple_batch_admits(const PleRowsSite<64>& site, unsigned groups) {
-    static const bool recipe = q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_WAVES", 16U) == 16U &&
-        q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_STAGE", 8U) == 8U &&
-        q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PREFETCH", 1U) == 1U &&
-        q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_EXP", 0U) == 0U;
+    static const bool recipe = strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_WAVES", 16U) == 16U &&
+        strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_STAGE", 8U) == 8U &&
+        strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_PREFETCH", 1U) == 1U &&
+        strix::env_number<unsigned>("STRIX_Q8_ROWS_LANE_EXP", 0U) == 0U;
     if (!recipe || !groups || groups > 65535U || !site.width ||
         q8_rows::wide_kernel() != 2U || q8_rows::wide_stage() || !q8_rows::lane_admits(site) ||
         site.width > UINT32_MAX / 64U ||

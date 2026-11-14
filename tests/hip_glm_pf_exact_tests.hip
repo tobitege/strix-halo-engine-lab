@@ -212,15 +212,21 @@ struct Env {
     ~Env() { set(present ? saved.c_str() : nullptr); }
 };
 void test_routes() {
-    Env x("STRIX_GLM_PF_EXACT_X"), threshold("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
+    Env x("STRIX_GLM_PF_EXACT_X"), threshold("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), fast("STRIX_GLM_PF_WMMA");
     threshold.set(nullptr);
+    // Auto threshold (glm_pf_dense_policy.hpp): 64 rows on the exact route, 32 with the FAST WMMA identity.
+    x.set("auto");
+    fast.set("1");
+    check(E::x_auto_rows() == 32 && E::route(31) == E::Route::tm && E::route(32) == E::Route::x3r8, "route auto FAST floor 32");
+    fast.set(nullptr);
+    check(E::x_auto_rows() == 64, "route auto exact floor 64");
     for (const char* value : {static_cast<const char*>(nullptr), "0", "1", "2", "3", "4", "auto"}) {
         x.set(value);
-        for (unsigned rows : {2047U, 2048U, 2049U, 4096U}) {
+        for (unsigned rows : {63U, 64U, 65U, 2047U, 2048U, 4096U}) {
             const auto expected = !value || std::strcmp(value, "0") == 0 ? E::Route::tm :
                 std::strcmp(value, "1") == 0 ? E::Route::x :
                 std::strcmp(value, "3") == 0 ? E::Route::x3 : std::strcmp(value, "4") == 0 ? E::Route::x3r8 :
-                std::strcmp(value, "2") == 0 ? E::Route::x2 : rows >= 2048 ? E::Route::x3r8 : E::Route::tm;
+                std::strcmp(value, "2") == 0 ? E::Route::x2 : rows >= 64 ? E::Route::x3r8 : E::Route::tm;
             check(E::route(rows) == expected, std::string("route X=") + (value ? value : "unset") +
                   " rows=" + std::to_string(rows));
         }
@@ -367,7 +373,10 @@ void exceptional(Ctx& cx) {
     }
     sok(strix_weights_destroy(l.w), "exception destroy");
 }
+// --shard I/N: run every N-th test_shape call (each shape seeds itself), so the gate fits several short runs.
+unsigned shard_index = 0, shard_count = 1, shape_seq = 0;
 void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic, bool timing) {
+    if (shape_seq++ % shard_count != shard_index) return;
     const Lin l = prepare(cx, dir, sh, synthetic);
     const Linear prepared = engine_linear(l, false), raw = engine_linear(l, true);
     // 4096 only for representative real expert/MLA/KDA and one H128-partition shape.
@@ -557,8 +566,10 @@ int main(int argc, char** argv) {
     bool timing = true;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--no-timing") timing = false;
+        else if (std::string(argv[i]) == "--shard" && i + 1 < argc &&
+                 std::sscanf(argv[++i], "%u/%u", &shard_index, &shard_count) == 2 && shard_index < shard_count) {}
         else if (dir.empty()) dir = argv[i];
-        else { std::fprintf(stderr, "usage: %s [TRELLIS_REAL_DIR] [--no-timing]\n", argv[0]); return 2; }
+        else { std::fprintf(stderr, "usage: %s [TRELLIS_REAL_DIR] [--no-timing] [--shard I/N]\n", argv[0]); return 2; }
     }
     if (dir.empty()) if (const char* p = std::getenv("TRELLIS_REAL_DIR")) dir = p;
     try {

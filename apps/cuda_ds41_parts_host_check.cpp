@@ -17,6 +17,7 @@
 // ROUTES: recorded routes ("layer:id,id,..." items per token line). --hot-pick freq keeps the experts most often
 // routed in ROUTES (the windows come from the same file: an in-sample residency), hash a seeded random subset.
 
+#include "strix/device/cuda_enumerator.hpp"
 #include "strix/cuda_ds41_core.hpp"
 #include "strix/cuda_ds41_parts_host_driver.hpp"
 #include "strix/cuda_ds41_hot_residency.hpp"
@@ -105,6 +106,9 @@ double mean(const std::vector<double>& v) { return v.empty() ? 0.0 : std::accumu
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     Args a;
     try {
         for (int i = 1; i < argc; ++i) {

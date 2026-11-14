@@ -2,6 +2,7 @@
 // HIP references: src/hip_indexed_attention_launcher.hip (H: line numbers below), ISA
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
+#include "strix/env_flags.hpp"
 #include "strix/cuda_qwen_qsa.hpp"
 #include "strix/cuda_vram_guard.hpp"
 
@@ -690,7 +691,7 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_kernel(const flo
 // same two chains sum = fma(w[slot], v[slot], sum), slots ascending from 0, and the same epilogue.
 // STRIX_QRTX_DECODE_KERNELS=0 keeps the per-KV-head kernel (reference seam).
 bool decode_rows_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_QRTX_DECODE_KERNELS"); return !(e && e[0] == '0'); }();
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS", true);
     return on;
 }
 __device__ __forceinline__ void attention_output_head_kernel_body(const float* __restrict__ q_gate,
@@ -891,7 +892,7 @@ void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t fir
     if (!rows) return;
     std::uint32_t slots = 0;
     for (std::uint64_t p = first_position; p < first_position + rows && slots < kMaxSelected; ++p) slots = std::max(slots, selected_count(p));
-    static const bool wave = [] { const char* v = std::getenv("STRIX_QSA_SCORE_WAVE"); return v && v[0] == '1'; }();
+    static const bool wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
     if (wave) {
         const auto waves = static_cast<std::uint64_t>(rows) * (kHeads / kG) * ((slots + kSlots - 1U) / kSlots);
         attention_score_kernel<<<static_cast<std::uint32_t>((waves + 7U) / 8U), 256, 0, stream>>>(q_gate, rows, first_position,
@@ -960,7 +961,7 @@ void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_pos
 void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32_t n, const LayerWeights& w, const RopeTable* cs,
     const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
     if (n == 0 || n > kMaxSegments) throw std::invalid_argument("qwen_qsa layer_core_multi: 1..8 segments");
-    static const bool score_wave = [] { const char* v = std::getenv("STRIX_QSA_SCORE_WAVE"); return v && v[0] == '1'; }();
+    static const bool score_wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
     // Every check and the whole segment map before the first launch; the host pooled-valid counts are written only after
     // the launches (a throw here leaves the sessions as they were).
     SegmentMap map{};

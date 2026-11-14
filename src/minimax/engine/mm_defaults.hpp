@@ -60,6 +60,11 @@ void apply();
 // instead of failing.
 bool from_defaults(const char* env);
 
+// The USB4 transport names in session routes, whichever accepted spelling was requested
+// (strix::dist::negotiated_transport(requested, direct_live, kRouteHost, kRouteGpu)).
+inline constexpr const char* kRouteHost = "usb4-auto";
+inline constexpr const char* kRouteGpu = "usb4gpu";
+
 // The engine-shape options of the plain invocation (other options do not change the configuration).
 struct Cli {
     std::string app = "rank";  // rank | serve

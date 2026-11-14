@@ -61,6 +61,7 @@ struct Args {
     unsigned char* ws;
     float* dbg_gu;  // MoeView::debug_gate_up
     I4Experts i4;   // MoeView::i4 (fast_i4: routed slots on the W4A16 core; read only by the I4 kernel instantiations)
+    strix::pair::ProducerPublish pub;  // MoeView::publish (down_kernel; the core path publishes with one more launch)
     __device__ _Float16* at(unsigned pair) const {
         return reinterpret_cast<_Float16*>(ws + kOffAt) + static_cast<std::size_t>(pair) * kInter;
     }
@@ -787,6 +788,16 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
             a.out[static_cast<std::size_t>(r) * kHidden + o] = acc + load_agent(a.yslot(r) + o);
         }
     }
+    // One R16 workgroup per 256-output group stores the partial: the last of the kDnGroups publishes it.
+    if (a.pub.on()) strix::pair::producer_publish(a.pub, kDnGroups);
+}
+
+// The core down path does not publish in-kernel: one thread raises the flag after it (same message, one more launch).
+__global__ void publish_after_kernel(strix::pair::ProducerPublish t) {
+    if (threadIdx.x == 0) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        __hip_atomic_store(t.flag, t.sequence, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
 }
 
 template <int MaxR, unsigned SG, unsigned FirstSlot, bool Pipe>
@@ -835,7 +846,7 @@ Args make_args(const MoeView& v, bool router) {
         throw std::invalid_argument("glm moe: shared expert must be 4096 -> 1024 -> 4096 at K4 or K6");
     auto* ws = static_cast<unsigned char*>(v.ws.base);
     float* logits = v.logits != nullptr ? v.logits : reinterpret_cast<float*>(ws + kOffLogits);
-    return {v.rows, v.y, v.router_w, v.bias, v.ids, v.weights, logits, v.experts, v.shared, v.out, ws, v.debug_gate_up, v.i4};
+    return {v.rows, v.y, v.router_w, v.bias, v.ids, v.weights, logits, v.experts, v.shared, v.out, ws, v.debug_gate_up, v.i4, v.publish};
 }
 
 // SG (library splits per gate_up CTA; bitwise at every value). Default = the measurement (node 0, cold synthetic
@@ -879,6 +890,10 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
             if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
             core_down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
             check_launch("core_down");
+            if (a.pub.on()) {
+                publish_after_kernel<<<1, 32, 0, stream>>>(a.pub);
+                check_launch("core_down publish");
+            }
             return;
         }
     }

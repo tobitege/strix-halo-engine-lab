@@ -1,6 +1,6 @@
 # GDN FP16 chunked prefill: `qwen-gdn-fp16-chunk`, revisions 2 and 3
 
-Status: FAST (bit-changing) engine item, default OFF. `STRIX_QPF2K_GDN_FP16_CHUNK=1` replaces the conv, the recurrence
+Status: FAST (bit-changing) engine item, default OFF; `--profile fast` applies it as a provisional row. `STRIX_QPF2K_GDN_FP16_CHUNK=1` replaces the conv, the recurrence
 and the gated norm of the GDN prefill row route with a chunked route on FP16 WMMA operands with FP32 accumulation.
 Unset or `0` keeps the exact production route. The item is ignored under the baseline and for GSQ checkpoints, and
 shapes it cannot take stay exact. When it is on, stderr carries one line

@@ -19,6 +19,8 @@ void enqueue_pack_down_rows(const std::uint8_t* src, std::uint8_t* dst, std::uin
 using LoadFn = std::function<void(std::uint64_t, std::uint64_t, std::uint8_t*)>;
 [[nodiscard]] std::uint64_t part_bytes(std::uint64_t bytes, std::uint32_t experts, bool down, std::uint32_t hidden);
 void load_part(const LoadFn& load, std::uint64_t offset, std::uint64_t bytes, std::uint32_t experts, bool down, std::uint32_t hidden,
-               unsigned rank, std::uint8_t* out, void* stream);
+               unsigned rank, std::uint8_t* out, void* stream, const std::function<void()>& loaded = {});
+// `loaded` (optional) makes a queued `load` synchronous where load_part itself consumes the bytes: it returns when
+// everything passed to `load` so far is in device memory. Without it `load` must be synchronous, as before.
 
 }  // namespace strix::ds41::expert_tp
