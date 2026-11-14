@@ -13,8 +13,31 @@
 #include <string>
 #include <utility>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 namespace strix {
 namespace {
+
+// Pageable aligned host memory. Windows has no posix_memalign; its aligned pair must be used
+// together (memory from _aligned_malloc is not valid for free). Callers pass checked_total's
+// non-zero size and power-of-two alignment.
+void* allocate_pageable(std::size_t alignment, std::size_t bytes) noexcept {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, alignment);
+#else
+    void* pointer = nullptr;
+    return posix_memalign(&pointer, alignment, bytes) == 0 ? pointer : nullptr;
+#endif
+}
+void release_pageable(void* pointer) noexcept {
+#ifdef _WIN32
+    _aligned_free(pointer);
+#else
+    std::free(pointer);
+#endif
+}
 
 std::atomic<std::uint64_t> next_allocation_lease{1};
 std::uint64_t allocation_lease() {
@@ -193,20 +216,17 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
 
     if (host_mode_ ==
         HipHostAllocationMode::pageable_aligned) {
-        void* pointer = nullptr;
         const auto host_alignment =
             std::max<std::uint64_t>(
                 alignment,
                 sizeof(void*));
-        const auto result =
-            posix_memalign(
-                &pointer,
+        void* pointer =
+            allocate_pageable(
                 static_cast<std::size_t>(
                     host_alignment),
                 static_cast<std::size_t>(
                     bytes));
-        if (result != 0 ||
-            pointer == nullptr) {
+        if (pointer == nullptr) {
             throw std::bad_alloc();
         }
 
@@ -218,7 +238,7 @@ std::uintptr_t HipRuntimeAllocator::allocate_host(
             static_cast<void>(iterator);
             if(!inserted) throw std::runtime_error("duplicate pageable host allocation address");
             return address;
-        } catch(...) {std::free(pointer);throw;}
+        } catch(...) {release_pageable(pointer);throw;}
     }
 
     void* raw = nullptr;
@@ -348,7 +368,7 @@ void HipRuntimeAllocator::free_host(
             }
             pageable_host_.erase(found);
         }
-        std::free(
+        release_pageable(
             reinterpret_cast<void*>(
                 address));
         return;
@@ -409,7 +429,7 @@ void HipRuntimeAllocator::release_all() noexcept {
     for (const auto& [address, bytes] :
          pageable) {
         static_cast<void>(bytes);
-        std::free(
+        release_pageable(
             reinterpret_cast<void*>(
                 address));
     }

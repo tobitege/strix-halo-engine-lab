@@ -9490,6 +9490,14 @@ void release_hip_qsa_prefill_storage() {
     pool={};
 }
 
+void complete_hip_qsa_prefill_handoff(void* stream) {
+    auto& shared=qsa_scratch_gate();
+    const auto lock=shared.gate.enter(HipQsaScratchBackend{}.device());
+    if(!shared.handoff.pending_on(reinterpret_cast<std::uintptr_t>(stream))) return;
+    check_hip(hipEventSynchronize(shared.done),"QSA prefill handoff completion before stream release");
+    shared.handoff.drained();
+}
+
 }  // namespace strix
 
 namespace strix {

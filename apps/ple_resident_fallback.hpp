@@ -33,7 +33,8 @@ inline std::map<std::string,std::uint64_t> resident_prefill_admission(const Opti
     const PrefillRequirements& required, const PrefillMemory& memory) {
     const auto refuse=[] { throw std::runtime_error("PLE resident fallback refused before prompt mutation: zero-credit owner envelope exceeds observed memory/workspace/metadata/GTT limits"); };
     if (!required.owner_error.empty()) throw std::runtime_error("PLE resident fallback refused before prompt mutation: " + required.owner_error);
-    if (!memory.total || !memory.available || !memory.gtt_limit || !memory.gtt_used || required.owners.empty()) refuse();
+    if (!memory.total || !memory.available || !memory.gtt_limit || !memory.gtt_used || required.owners.empty() ||
+        !one_memory_pool(memory)) refuse();
     auto owners=required.owners;
     owners["rotary_table"]=options.rotary.table_bytes();
     const auto peaks=prefill_owner_phase_peaks(owners,required.owner_phases,options.known_prefill_host_headroom);

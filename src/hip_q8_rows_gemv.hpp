@@ -309,7 +309,7 @@ template <unsigned Outs> struct Q8Fetch {
         for (unsigned o = 0; o < Outs; ++o) {
             const unsigned char* block = w[o] + (base / 32U) * 34U;
             scale[o] = *reinterpret_cast<const std::uint16_t*>(block);
-            std::memcpy(&codes[o], block + 2U + base % 32U, 8U);
+            __builtin_memcpy(&codes[o], block + 2U + base % 32U, 8U);
         }
     }
 };
@@ -713,7 +713,7 @@ template <class Site, unsigned Outs, unsigned Per> struct CoefProducer {
         const unsigned char* block = pw + (f / 32U) * 34U;
         Fetch result;
         result.scale = *reinterpret_cast<const std::uint16_t*>(block);
-        std::memcpy(&result.codes, block + 2U + f % 32U, sizeof(Codes));
+        __builtin_memcpy(&result.codes, block + 2U + f % 32U, sizeof(Codes));
         return result;
     }
     // Coefficient of feature f at quad (f / 4) % 2 * 32 + f / 8 of its output: lane L
@@ -758,7 +758,7 @@ template <class Site, unsigned Waves> struct VopdProducer {
         for (unsigned j = 0; j < G; ++j) {
             const unsigned char* block = pw[j] + (f / 32U) * 34U;
             result.scale[j] = *reinterpret_cast<const std::uint16_t*>(block);
-            std::memcpy(&result.codes[j], block + 2U + f % 32U, 8U);
+            __builtin_memcpy(&result.codes[j], block + 2U + f % 32U, 8U);
         }
         return result;
     }

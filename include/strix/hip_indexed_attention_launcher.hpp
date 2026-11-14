@@ -311,4 +311,10 @@ private:
 // pools, state, rotary tables and diagnostics are retained.
 void release_hip_qsa_prefill_storage();
 
+// Call before destroying a stream that may have carried QSA prefill submissions. The shared handoff event of
+// the last submission is recorded on its stream; this completes it while the stream exists, so that neither a
+// later submission on another stream nor the end of the process waits on an event whose stream is gone.
+// No effect for any other stream.
+void complete_hip_qsa_prefill_handoff(void* stream);
+
 }  // namespace strix

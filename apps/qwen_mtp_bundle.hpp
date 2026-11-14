@@ -2,6 +2,7 @@
 #include "qwen_yarn_memory.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefill_identity.hpp"
+#include "strix/process_environment.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/ple_discard_safety.hpp"
 #include "strix/registered_backing_lifetime.hpp"
@@ -96,12 +97,8 @@ public:
     }
 private:
     static void set(const std::string& name,const std::string& value,bool erase=false) {
-#ifdef _WIN32
-        ::_putenv_s(name.c_str(),erase?"":value.c_str());
-#else
-        if(erase) ::unsetenv(name.c_str());
-        else ::setenv(name.c_str(),value.c_str(),1);
-#endif
+        if(erase) (void)process_environment::unset(name.c_str());
+        else (void)process_environment::set(name.c_str(),value.c_str(),true);
     }
     std::map<std::string,std::string> environment_;
     bool baseline_=qpf2k::baseline,marker_=qpf2k::pre_injected_moe_marker;

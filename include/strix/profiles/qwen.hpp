@@ -157,11 +157,7 @@ using ::strix::profile::Export;
 using ::strix::profile::export_environment;
 using Erase = std::function<bool(const char*)>;
 inline bool erase_environment(const char* key) {
-#ifdef _WIN32
-    return _putenv_s(key, "") == 0;
-#else
-    return ::unsetenv(key) == 0;
-#endif
+    return process_environment::unset(key);
 }
 // A re-exec can inherit a proposal that its new route declines. Remove only
 // switches whose matching marker proves profile ownership; explicit env wins.

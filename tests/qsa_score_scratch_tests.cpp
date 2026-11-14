@@ -223,6 +223,10 @@ void pending_and_serialization() {
     expect(waits==1,"different stream waits for the previous shared-scratch consumer");
     handoff.drained();handoff.before(17,wait);
     expect(waits==1 && !handoff.pending(),"exceptional drain clears the shared consumer before reuse");
+    handoff.recorded(17);
+    expect(handoff.pending_on(17) && !handoff.pending_on(31),"only the stream of the last submission owes its completion");
+    handoff.drained();
+    expect(!handoff.pending_on(17),"a drained handoff releases its stream");
 }
 }
 int main() {

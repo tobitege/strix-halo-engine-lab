@@ -890,19 +890,8 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                                         range.arena_offset + (source_begin - range.file_begin)), source,
                                     static_cast<std::size_t>(bytes)), "selective residency weight copy");
                             }); // Proves the source lease can be reused for the next chunk.
-#if defined(__linux__)
-                            if (policy.copy_tier == HipModelCopyTier::all) {
-#if defined(MADV_PAGEOUT)
-                                constexpr int pageout = MADV_PAGEOUT;
-#else
-                                constexpr int pageout = 21;
-#endif
-                                // Copied: drop these source pages (clean file pages; a later host read refaults them).
-                                const auto first = align_down(source_begin, page_size());
-                                const auto last = std::min(align_up(source_begin + bytes, page_size()), align_up(mapped.bytes(), page_size()));
-                                (void)::madvise(reinterpret_cast<void*>(mapped.base_address() + first), static_cast<std::size_t>(last - first), pageout);
-                            }
-#endif
+                            // Copied: drop these source pages (clean file pages; a later host read refaults them).
+                            if (policy.copy_tier == HipModelCopyTier::all) mapped.page_out(source_begin, bytes);
                             source_begin += bytes;
                         }
                     }

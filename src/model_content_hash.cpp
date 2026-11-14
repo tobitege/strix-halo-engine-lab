@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <limits>
 #include <optional>
 #include <string>
@@ -545,41 +547,39 @@ FileDigest hash_file_stable(const std::filesystem::path& path, FileContentHashSt
             "cannot stat model content file before hashing");
     }
 
-    std::ifstream input(
-        path,
-        std::ios::binary);
-    if (!input) {
+    // Unbuffered 8 MiB reads, each on its own thread while this one hashes the block before: the pass
+    // costs the slower of reading and hashing instead of their sum. (With MSVC's library, std::ifstream's
+    // 1 MiB reads went through the stream buffer at about 500 MB/s, against about 3 GB/s unbuffered.)
+#ifdef _WIN32
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> input(_wfopen(path.c_str(), L"rb"), &std::fclose);
+#else
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> input(std::fopen(path.c_str(), "rb"), &std::fclose);
+#endif
+    if (!input || std::setvbuf(input.get(), nullptr, _IONBF, 0) != 0) {
         throw std::runtime_error(
             "cannot open model content file");
     }
 
     FileSha256 hash;
-    std::vector<char> buffer(
-        1024U * 1024U);
+    std::array<std::vector<std::uint8_t>, 2> buffers{
+        std::vector<std::uint8_t>(8U << 20U), std::vector<std::uint8_t>(8U << 20U)};
+    const auto read_block = [file = input.get()](std::vector<std::uint8_t>& buffer) {
+        return std::fread(buffer.data(), 1, buffer.size(), file);
+    };
     std::uint64_t bytes = 0;
 
     if(progress)progress(0,before);
-    while (input) {
-        input.read(
-            buffer.data(),
-            static_cast<std::streamsize>(
-                buffer.size()));
-        const auto count =
-            input.gcount();
-        if (count > 0) {
-            hash.update(
-                reinterpret_cast<
-                    const std::uint8_t*>(
-                        buffer.data()),
-                static_cast<std::size_t>(
-                    count));
-            bytes +=
-                static_cast<std::uint64_t>(
-                    count);
-            if(progress)progress(bytes,before);
-        }
+    // Declared after the file and the buffers: an exception from the hash waits for the read in flight.
+    auto pending = std::async(std::launch::async, read_block, std::ref(buffers[0]));
+    for (std::size_t current = 0;; current ^= 1U) {
+        const auto count = pending.get();
+        if (count == 0) break;
+        pending = std::async(std::launch::async, read_block, std::ref(buffers[current ^ 1U]));
+        hash.update(buffers[current].data(), count);
+        bytes += static_cast<std::uint64_t>(count);
+        if(progress)progress(bytes,before);
     }
-    if (!input.eof()) {
+    if (std::ferror(input.get())) {
         throw std::runtime_error(
             "error while hashing model content file");
     }

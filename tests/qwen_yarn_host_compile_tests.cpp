@@ -5,6 +5,7 @@
 #include "../apps/mtp_prompt_phase.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/process_environment.hpp"
 #include "strix/qwen_yarn_table.hpp"
 
 #include <fstream>
@@ -152,6 +153,15 @@ void run(unsigned factor, unsigned capacity, unsigned count, const ModelManifest
     const auto effective = resolve_effective_config(request,model,{},manifest,
         validated_model_content_identity,{true,true,true},memory);
     require(effective.admitted,effective.error);
+    {
+        // The YaRN ledger prices host and device owners against one pool: a separate host pool refuses.
+        auto split = memory;
+        split.host_available = UINT64_C(64)<<30U;
+        const auto refused = resolve_effective_config(request,model,{},manifest,
+            validated_model_content_identity,{true,true,true},split);
+        require(!refused.admitted && refused.error.find("separate host pool")!=std::string::npos,
+            "YaRN admission refuses a separate host pool");
+    }
     validate_effective_options(effective.options,model);
     require(yarn_environment_refusal(effective.environment,factor).empty(),"effective environment classification");
     for (const auto* value : {"0","1"}) {
@@ -463,7 +473,7 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 fit.environment["STRIX_QSA_SCORE_RING_ROWS"]="64";
                 const auto* prior_ring=std::getenv("STRIX_QSA_SCORE_RING_ROWS");
                 const auto saved_ring=prior_ring?std::optional<std::string>{prior_ring}:std::nullopt;
-                ::setenv("STRIX_QSA_SCORE_RING_ROWS","64",1);
+                (void)process_environment::set("STRIX_QSA_SCORE_RING_ROWS","64",true);
                 const auto residual=resolve(fit,memory);
                 const auto needed=memory.estimate(residual.options);
                 require(needed.owner_error.empty(),"1M payload caps pass independently of physical fit");
@@ -521,7 +531,7 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 candidate.environment.erase("STRIX_PREFILL_PIPE");
                 const auto* pipe=std::getenv("STRIX_PREFILL_PIPE");
                 const auto saved_pipe=pipe?std::optional<std::string>{pipe}:std::nullopt;
-                ::unsetenv("STRIX_PREFILL_PIPE");::setenv("STRIX_QSA_SCORE_RING_ROWS","256",1);
+                (void)process_environment::unset("STRIX_PREFILL_PIPE");(void)process_environment::set("STRIX_QSA_SCORE_RING_ROWS","256",true);
                 auto candidate_memory=memory;
                 candidate_memory.total=candidate_memory.gtt_limit=1ULL<<40U;
                 candidate_memory.available=127473287168ULL;
@@ -547,7 +557,7 @@ void mtp_receipt_admission(const ModelManifest& original) {
                 require(spare_ok,"production candidate admission leaves at least 0.5 decimal GB spare in every phase:"+spare_report);
                 // The plain 1M command chooses storage, without inheriting the process ring.
                 auto automatic=candidate;automatic.environment.clear();
-                ::unsetenv("STRIX_QSA_SCORE_RING_ROWS");
+                (void)process_environment::unset("STRIX_QSA_SCORE_RING_ROWS");
                 const auto ladder=resolve(automatic,candidate_memory);
                 require(ladder.admitted,ladder.error);
                 std::cout << "YMTP_STORAGE auto-candidate\n" << effective_config_json(ladder);
@@ -620,8 +630,8 @@ void mtp_receipt_admission(const ModelManifest& original) {
                         require(!qsa_mtp_pool_route(resolved.options),"pool off keeps historical consumers");
                     else require(!resolved.ple_rolling_h,"rolling off keeps prompt-wide storage");
                 }
-                if(saved_pipe) ::setenv("STRIX_PREFILL_PIPE",saved_pipe->c_str(),1);else ::unsetenv("STRIX_PREFILL_PIPE");
-                ::setenv("STRIX_QSA_SCORE_RING_ROWS","64",1);
+                if(saved_pipe) (void)process_environment::set("STRIX_PREFILL_PIPE",saved_pipe->c_str(),true);else (void)process_environment::unset("STRIX_PREFILL_PIPE");
+                (void)process_environment::set("STRIX_QSA_SCORE_RING_ROWS","64",true);
                 auto old=fit;old.environment["STRIX_QWEN_YARN_HOST_RESERVE"]="1";
                 const auto legacy=resolve(old,memory);
                 require(!legacy.admitted && legacy.options.known_prefix_prefill_rows==2048U &&
@@ -664,8 +674,8 @@ void mtp_receipt_admission(const ModelManifest& original) {
                     const auto rejected=compile_prompt_requirements(low,model,manifest,111334654400ULL,&sidecar);
                     require(rejected.owner_error.find("exceeds cap=")!=std::string::npos,"1M one-byte-short owner cap refuses by payload, not UMA: "+name);
                 }
-                if(saved_ring) ::setenv("STRIX_QSA_SCORE_RING_ROWS",saved_ring->c_str(),1);
-                else ::unsetenv("STRIX_QSA_SCORE_RING_ROWS");
+                if(saved_ring) (void)process_environment::set("STRIX_QSA_SCORE_RING_ROWS",saved_ring->c_str(),true);
+                else (void)process_environment::unset("STRIX_QSA_SCORE_RING_ROWS");
             }
             if(c!=33024U) { require(!result.admitted,"fixed 128 MiB predictor cap or descriptor must refuse larger C");continue; }
             require(result.admitted,result.error);

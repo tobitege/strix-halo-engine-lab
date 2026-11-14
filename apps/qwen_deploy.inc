@@ -29,6 +29,9 @@ struct QwenDeployment {
         if (o.rotary.mode() != strix::RotaryMode::native || o.residency != strix::HipModelResidencyMode::registered_file_mapping ||
             o.execution.mode != strix::DecodeExecutionMode::eager)
             refusal = "Qwen deployment: rotary/copy/graph owner envelope not bound; use native registered eager route";
+        // The plan fits every owner, host and device, against the node's one measured memory figure.
+        if (!dc::one_memory_pool(memory))
+            refusal = "Qwen deployment prices one shared memory pool; this node has a separate host pool";
         if (pipeline && o.http_serve) refusal = "Qwen pipeline is a CLI prefill/handoff route; HTTP pipeline is unavailable";
         if (refusal.empty() && !o.known_prefix_prefill_rows) refusal = "Qwen deployment requires the existing tiled prefill owner calculator";
         dp::Footprint f;
@@ -109,15 +112,7 @@ struct QwenDeployment {
             throw std::invalid_argument("deployment link pin differs from pair transport");
         dp::Plan p;
         if (pipeline && !o.deploy_check && !o.print_effective_config) {
-            if (transport == "usb4auto" || transport == "usb4-auto") {
-                strix::dist::Usb4AutoOptions usb; usb.rank = rank();
-                pair_link = strix::dist::usb4_host_auto(usb);
-            } else if (transport == "tcp") {
-                const char* peer = std::getenv("STRIX_QWEN_PF_PIPE_PEER");
-                if (rank() && !peer) throw std::invalid_argument("pipeline rank 1 requires --peer");
-                const auto timeout = std::chrono::milliseconds(120000);
-                pair_link = rank() ? strix::dist::tcp_connect(peer, 29872, timeout) : strix::dist::tcp_listen(29872, timeout);
-            } else throw std::invalid_argument("deployment: unsupported pipeline transport");
+            pair_link = strix::qwen_pp::open_deployment_link(transport, rank());
             p = dp::resolve_pair(spec, provider, rank(), local, [&](auto out, auto in) { pair_link->exchange(out, in); });
         } else p = dp::resolve(spec, dp::inspection_devices(spec, rank(), local), provider);
         if (!p.refused) {

@@ -1,4 +1,5 @@
 #include "strix/hip_model_residency.hpp"
+#include "strix/host_memory.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <string_view>
@@ -89,7 +90,9 @@ std::uint64_t selective_copy_payload_bytes(const ModelManifest& manifest, HipMod
 unsigned hip_model_copy_all_mode() noexcept {
     static const unsigned mode = [] {
         const char* v = std::getenv("STRIX_MODEL_COPY_ALL");
-        if (!v || !v[0] || v[0] == '0') return 0U;
+        // A registered mapping stays host memory. Where host memory is a separate pool, the model belongs in the
+        // GPU pool, so the copied arena is the only form there and unset or 0 select the hipMalloc arena.
+        if (!v || !v[0] || v[0] == '0') return host_memory_is_separate_pool() ? 1U : 0U;
         if (std::string_view(v) == "fine") return 2U;
         if (std::string_view(v) == "uc") return 3U;
         return 1U;

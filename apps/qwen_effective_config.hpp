@@ -17,6 +17,7 @@
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/q51_known_rows.hpp"
+#include "strix/host_memory.hpp"
 #include "strix/linux_uma_observation.hpp"
 #include "strix/uma_owner_inventory.hpp"
 #include <map>
@@ -98,7 +99,47 @@ struct PrefillMemory {
     std::optional<std::uint64_t> yarn_registered_storage_step{};
     // Runtime supplies a fresh physical/GTT sample before each registered trial.
     std::function<void(PrefillMemory&)> refresh_registered{};
+    // Set only where host and GPU memory are separate pools (strix/host_memory.hpp; observe_separate_pools).
+    // available, total and the GTT facts then describe the GPU pool, which holds the model (as the copied
+    // arena), state and workspaces, and host-only items (metadata copies, native host pools, HTTP slot and
+    // session memory, session and prefix cache defaults) are priced against this. On a UMA node it stays
+    // empty: one pool holds both.
+    // Last member: positional initializers of the members above stay valid.
+    std::optional<std::uint64_t> host_available{};
 };
+// The pool host-only items are priced against: the separate host RAM where the GPU has memory of its own,
+// otherwise the one pool both share.
+inline std::optional<std::uint64_t> host_pool_available(const PrefillMemory& memory) {
+    return memory.host_available ? memory.host_available : memory.available;
+}
+// An admission that prices host and device items against one observation (YaRN, the resident PLE fallback,
+// automatic serving T) is valid only where both share a pool; with a separate host pool it declines.
+inline bool one_memory_pool(const PrefillMemory& memory) { return !memory.host_available; }
+// A separate host pool as observed: the GPU pool is the device's dedicated memory, the host pool the RAM the
+// system sees. Without both observations the memory stays unknown and nothing is admitted.
+inline void observe_separate_pools(PrefillMemory& memory, const strix::deploy::DeviceFacts& device,
+    std::optional<std::uint64_t> host_available) {
+    if (!host_available || !device.gtt_total_bytes || !device.gtt_used_bytes ||
+        *device.gtt_used_bytes > *device.gtt_total_bytes) return;
+    memory.host_available = host_available;
+    memory.total = device.gtt_total_bytes;
+    memory.available = *device.gtt_total_bytes - *device.gtt_used_bytes;
+}
+// Where host memory is a separate pool the model must live in the GPU pool. The default residency gets there as
+// the copied arena (hip_model_copy_all_mode) and --residency copy is device memory. A selective copy tier and
+// graph execution leave the rest of a registered model in host RAM, which the admissions do not price: refused.
+inline std::string separate_pool_residency_refusal(const Options& o, bool separate_pool) {
+    if (!separate_pool || o.residency != HipModelResidencyMode::registered_file_mapping) return {};
+    if (o.model_copy_tier != HipModelCopyTier::none)
+        return "--model-copy-tier leaves the rest of the model registered in host RAM; with a separate host "
+               "memory pool use the default residency or --residency copy";
+    if (o.execution.mode == DecodeExecutionMode::graph)
+        return "graph execution keeps the model registered in host RAM; with a separate host memory pool use "
+               "eager execution or --residency copy";
+    return {};
+}
+// Kept free of host-only items in a separate host pool, for the rest of the system.
+inline constexpr std::uint64_t separate_host_reserve = UINT64_C(1) << 30;
 // Both inspection and execution validate explicit-T assets before the inspection exit.
 inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
     if(o.http_serve && o.mtp.enabled && o.known_prefix_prefill_rows) {
@@ -918,6 +959,11 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     throw std::runtime_error("insufficient-memory");
                 if (add(add(live.reservation_upper_bound_bytes, growth), required.runtime_payload) > uma)
                     throw std::runtime_error("insufficient-memory");
+                // Separate host pool: the host-only items (metadata copies, native host pools, PLE rolling) fit
+                // the host RAM too; the checks above price them against the GPU pool as well.
+                if (memory.host_available && add(add(required.metadata, add(prefill_native_pools(candidate, model).host,
+                        rolling_owner)), separate_host_reserve) > *memory.host_available)
+                    throw std::runtime_error("insufficient-memory");
                 (void)plan_uma_reservation_growth(live, growth, required.runtime_payload, {uma, uma});
                 result.ple_reclaim_credit = credit;
                 result.ple_rolling_h = rolling_h;
@@ -1196,6 +1242,9 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         o.model_copy_tier != HipModelCopyTier::none ||
         (copy_all != result.environment.end() && !copy_all->second.empty() && copy_all->second.front() != '0'))
         return notice("automatic T declined for target residency copy, selective copy or copy-all; explicit tiled configuration required");
+    // The committed backing below is the registered target in the one pool it shares with the device.
+    if (!one_memory_pool(memory))
+        return notice("automatic T declined for a separate host memory pool; explicit tiled configuration required");
     if (!memory.available || !memory.gtt_limit || !memory.gtt_used || !memory.estimate)
         return notice("memory observation unavailable; explicit tiled configuration required");
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
@@ -1779,8 +1828,8 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     };
     auto result=resolve_prefill_effective_config(proposed,model,info,manifest,content,capabilities,charged_memory);
     resolve_serve_prefill(result,model,content,capabilities,memory,proposed.environment,info,manifest);
-    resolve_session_defaults(result.options,model,request.environment,memory.available);
-    resolve_prefix_defaults(result.options,model,request.environment,memory.available);
+    resolve_session_defaults(result.options,model,request.environment,host_pool_available(memory));
+    resolve_prefix_defaults(result.options,model,request.environment,host_pool_available(memory));
     resolve_http_session_ram(result,memory);
     auto& o = result.options;
     // A profile proposal may fall back to builtin storage. Explicit requests
@@ -1896,8 +1945,10 @@ inline void intersect_cache_cgroup_limits(PrefillMemory& result, const std::stri
     }
     result.cache_limits_known=true;
 }
-// Read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
+// Linux: read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
 // visibility is unknown capacity and declines; HIP is never initialized here.
+// Windows has no sysfs: the deployment probe asks the HIP runtime (strix/deploy/device.hpp),
+// which applies the visibility variables itself.
 inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, bool cache_limits=false) {
     PrefillMemory result;
     (void)cache_limits;
@@ -1926,12 +1977,15 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities, b
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
     for (const char* name : {"HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"})
         if (const char* value = std::getenv(name); value && *value) return result;
+#endif
+#if defined(__linux__) || defined(_WIN32)
     const auto device = strix::deploy::probe_device();
     result.gtt_limit = device.gtt_total_bytes;
     result.gtt_used = device.gtt_used_bytes;
     result.gfx_target = device.gfx_target_version;
     capabilities.target_qualified = device.gfx_target_version == 110501U;
     capabilities.fp16_operands = capabilities.target_qualified;
+    observe_separate_pools(result, device, separate_host_memory_available());
 #endif
     return result;
 }

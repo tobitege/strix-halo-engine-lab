@@ -236,7 +236,9 @@ int main() {
     expect(strix::model_content_identity_hex(strix::sha256_file_content(million_path)) ==
                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
            "SHA-256 million-a known vector matches");
-    for (const auto size : {55U, 56U, 63U, 64U, 65U, 1048575U, 1048576U, 1048577U, 2097189U}) {
+    // The reader alternates two 8 MiB blocks: sizes around one, two and three blocks.
+    for (const auto size : {55U, 56U, 63U, 64U, 65U, 1048575U, 1048576U, 1048577U, 2097189U,
+             8388607U, 8388608U, 8388609U, 16777216U, 16777217U, 25165825U}) {
         std::string payload(size, '\0');
         for (std::size_t index = 0; index < payload.size(); ++index)
             payload[index] = static_cast<char>((index * 37U + index / 97U) % 256U);

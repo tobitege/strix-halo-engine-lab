@@ -255,8 +255,10 @@ unsigned carried_pre_injected(Get get, unsigned allowed) {
     const char* text = get(pre_injected_env);
     if (!text || !*text) return 0U;
     char* end = nullptr;
-    const auto value = std::strtoul(text, &end, 10);
-    if (!end || *end || value > 0xffffffffUL) return 0U;
+    // unsigned long long: 64 bits on every platform, so "-1" and overflow exceed the 32-bit range
+    // here as they do with Linux's 64-bit unsigned long (Windows' is 32 bits and would wrap to it).
+    const auto value = std::strtoull(text, &end, 10);
+    if (!end || *end || value > 0xffffffffULL) return 0U;
     unsigned carried = 0U;
     for (const auto& entry : defaults) {
         if (!(value & bit(entry.item)) || !(allowed & bit(entry.item))) continue;

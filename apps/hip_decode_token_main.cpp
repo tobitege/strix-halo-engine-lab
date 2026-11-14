@@ -69,6 +69,8 @@
 #include "strix/model_tensor_index.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_serve_policy.hpp"
+#include "strix/process_environment.hpp"
+#include "strix/process_restart.hpp"
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -642,12 +644,25 @@ private:
     strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
+// The end of the streams that can carry a QSA prefill submission: those of the known-prompt memories (their own
+// or the cohort's shared one) and of the serving sessions, which are the streams a launch scope of the
+// known-prefix windows and the serving cohorts runs on. A submission records the shared handoff event on its
+// stream: that handoff completes before the stream goes, on every way out of the program
+// (strix::complete_hip_qsa_prefill_handoff). Fail-stop, like the other teardown steps.
+// The two other stream owners of this program stay as they are: the deferred MoE stream carries serial decode
+// steps only (its launch scope cannot nest a known-prefix window's), and the prefix cache streams carry copies.
+static void destroy_stream(hipStream_t stream) noexcept {
+    if (!stream) return;
+    try { strix::complete_hip_qsa_prefill_handoff(stream); } catch (...) { std::_Exit(3); }
+    if (hipStreamDestroy(stream) != hipSuccess) std::_Exit(3);
+}
+
 // One stream shared by the window owners of every request of an MTP cohort (a cohort window
 // interleaves their steps); destroyed after the last owner that borrows it.
 class SharedWindowStream final {
 public:
     SharedWindowStream() { check_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create cohort window stream"); }
-    ~SharedWindowStream() { if (stream && hipStreamDestroy(stream) != hipSuccess) std::_Exit(3); }
+    ~SharedWindowStream() { destroy_stream(stream); }
     SharedWindowStream(const SharedWindowStream&) = delete;
     SharedWindowStream& operator=(const SharedWindowStream&) = delete;
     hipStream_t stream = nullptr;
@@ -747,7 +762,7 @@ private:
         serial_status_ = nullptr;
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
         status_ = nullptr;
-        if (scope.stream && !shared_stream_ && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        if (!shared_stream_) destroy_stream(scope.stream);
         scope.stream = nullptr;
     }
     std::shared_ptr<const void> retained_;
@@ -786,7 +801,7 @@ public:
         if (!touched_) return;
         guard_->recover_or_fail_stop();
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
-        if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        destroy_stream(scope.stream);
         // memory_ then releases its own state/scratch before allocator_ dies.
     }
     void initialize(const std::function<void(const strix::ExecutionMemoryBinding&)>& admit) {
@@ -1298,11 +1313,8 @@ static int run_decode_entry(
         pair_arguments.push_back(argv[0]);
         bool pair_rank_seen = false;
         const auto pair_setenv = [](const char* key, const char* value) {
-#ifdef _WIN32
-            if (_putenv_s(key, value) != 0) throw std::runtime_error("pair prefill environment update failed");
-#else
-            if (setenv(key, value, 1) != 0) throw std::runtime_error("pair prefill environment update failed");
-#endif
+            if (!strix::process_environment::set(key, value, true))
+                throw std::runtime_error("pair prefill environment update failed");
         };
         for (int pair_index = 1; pair_index < argc; ++pair_index) {
             const std::string_view pair_argument(argv[pair_index]);
@@ -1335,8 +1347,8 @@ static int run_decode_entry(
         const char* r = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
         if (!r || (std::string_view(r) != "0" && std::string_view(r) != "1"))
             throw std::invalid_argument("deployment pipeline requires --rank 0|1");
-        (void)::setenv("STRIX_QWEN_PF_PIPE", "1", 1);
-        (void)::setenv("STRIX_QWEN_PF_PIPE_DECODE", "1", 1);
+        (void)strix::process_environment::set("STRIX_QWEN_PF_PIPE", "1", true);
+        (void)strix::process_environment::set("STRIX_QWEN_PF_PIPE_DECODE", "1", true);
     }
     if (options.print_model_graph || options.print_plan) {
         auto described_model = strix::ModelContract::qwen38_flash_next();
@@ -1371,7 +1383,7 @@ static int run_decode_entry(
         strix::qwen_allon::gate_long_prompt(options.tokens.size(),
             [](const char* name) { return std::getenv(name); },
             [&](const char* name, const char* value) {
-                if (::setenv(name, value, 1) != 0)
+                if (!strix::process_environment::set(name, value, true))
                     throw std::runtime_error("qwen allon long-prompt gate: setenv failed");
             });
         // Include inherited OFF values after eager exec; report the actual state.
@@ -1400,17 +1412,20 @@ static int run_decode_entry(
         strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
             !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
             [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
+            [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); })) {
         std::fflush(nullptr);
+        // Linux repeats the process's own arguments from /proc (see split_process_arguments); where that file
+        // does not exist the restart takes the command line from the process itself.
         std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
         const auto original = strix::decode_cli::split_process_arguments(
             std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
         std::vector<char*> restart;
         for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
         restart.push_back(nullptr);
-        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+        const auto failure = strix::process_restart::run_again(original.empty() ? argv : restart.data());
         std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
-            std::strerror(errno));
+            failure.c_str());
+        strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
@@ -1716,6 +1731,9 @@ static int run_decode_entry(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    if (const auto refusal = strix::decode_cli::separate_pool_residency_refusal(options, strix::host_memory_is_separate_pool());
+        !refusal.empty())
+        throw std::invalid_argument(refusal);
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
@@ -1837,10 +1855,11 @@ static int run_decode_entry(
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
     { strix::startup::Phase marker("preflight_reset");
       yarn_preflight_reclaimer.reset(); } // runtime owns a fresh verified drop after registration
-    strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
+    strix::qpf2k::undo_pre_injected([](const char* name) { (void)strix::process_environment::unset(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
-        if (!std::getenv(name.c_str()) || options.baseline) ::setenv(name.c_str(), value.c_str(), 1);
+        if (!std::getenv(name.c_str()) || options.baseline)
+            (void)strix::process_environment::set(name.c_str(), value.c_str(), true);
     }
     strix::qpf2k::defaulted_items = 0U;
     for (const auto& entry : strix::qpf2k::defaults) {
@@ -4472,7 +4491,11 @@ static int run_decode_entry(
             if (reserve_ple && warmed_file_backed_bytes) {
                 strix::HipModelResidencyPolicy policy;
                 policy.coalesce_gap_bytes = options.coalesce_gap_bytes;
+#if defined(__linux__)
                 const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#else
+                const std::uint64_t page = 4096;
+#endif
                 reserved_table_bytes = strix::decode_cli::file_backed_unregistered_bytes(manifest,
                     strix::build_registered_residency_ranges(manifest, policy, mapped.bytes(), page), mapped.bytes(), page);
             }
@@ -4519,7 +4542,8 @@ static int run_decode_entry(
             }
             auto retained = estimate;
             // Observations of the last fit, reused if the route falls back to the single runner.
-            auto fit_host = before.available;
+            // The host fit runs against the pool host memory comes from (the same pool on a UMA node).
+            auto fit_host = host_pool_available(before);
             auto fit_device = gtt_free(before);
             auto capacity = resolve_http_bridge_capacity(estimate, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
             if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit: " + capacity.limiting);
@@ -4535,7 +4559,7 @@ static int run_decode_entry(
                 };
                 const auto measured = std::max({estimate, delta(before.available, after.available), delta(gtt_free(before), gtt_free(after))});
                 retained = measured;
-                fit_host = after.available ? before.available : std::nullopt;
+                fit_host = after.available ? host_pool_available(before) : std::nullopt;
                 fit_device = gtt_free(after) ? gtt_free(before) : std::nullopt;
                 capacity = resolve_http_bridge_capacity(measured, serving, fit_host, fit_device, headroom, headroom, options.http_batch_cap);
                 if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
@@ -4557,7 +4581,7 @@ static int run_decode_entry(
                     // Allocated payload includes in-flight capture, not unallocated credits.
                     const auto stats=prefix_store ? prefix_store->stats() : strix::PrefixStateCacheStats{};
                     const auto pressure=observe();
-                    return HttpBridgeGrowthObservation{pressure.available,gtt_free(pressure),
+                    return HttpBridgeGrowthObservation{host_pool_available(pressure),gtt_free(pressure),
                         stats.host_bytes,stats.staging_bytes};
                 });
             if(options.cache_activation->automatic_path) {
@@ -5791,11 +5815,7 @@ static int run_decode_entry(
                 throw std::invalid_argument("pair prefill cost-driven chunk selection requires a fresh prompt");
             const auto pair_cut_text = pair_prediction.stage().text();
             const auto pair_range = pair_rank == 0U ? "0:" + pair_cut_text : pair_cut_text + ":48";
-#if defined(_WIN32)
-            if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str()) != 0)
-#else
-            if (::setenv("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), 1) != 0)
-#endif
+            if (!strix::process_environment::set("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), true))
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
                 pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
@@ -5912,11 +5932,7 @@ static int run_decode_entry(
                 }
                 if (pair_rank == 0U) pair_decode_logits = std::move(pair_final_logits);
                 pair_context = {};
-#if defined(_WIN32)
-                if (_putenv_s("STRIX_QWEN_PF_LAYER_RANGE", "") != 0)
-#else
-                if (::unsetenv("STRIX_QWEN_PF_LAYER_RANGE") != 0)
-#endif
+                if (!strix::process_environment::unset("STRIX_QWEN_PF_LAYER_RANGE"))
                     throw std::runtime_error("pair handoff full-layer restore failed");
             }
             // pair handoff exports the complete request below, after rank-0 decode.

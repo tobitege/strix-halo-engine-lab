@@ -1,3 +1,4 @@
+#include "strix/dist/communicator.hpp"
 #include "../src/dist_crc32c_parallel.hpp"
 #include "../src/dist_crc32c_vector.hpp"
 
@@ -25,7 +26,7 @@ int main() {
     const auto test = [&](std::size_t offset, std::size_t n) {
         const auto bytes = std::span<const std::byte>(data).subspan(offset, n);
         const auto expected = reference(bytes);
-        if (strix::dist::detail::crc32c_parallel(bytes) != expected ||
+        if (strix::dist::crc32c(bytes) != expected || strix::dist::detail::crc32c_parallel(bytes) != expected ||
             (strix::dist::detail::crc32c_vector_available() && strix::dist::detail::crc32c_vector(bytes) != expected)) {
             std::cerr << "CRC differs at offset " << offset << " size " << n << '\n';
             return false;

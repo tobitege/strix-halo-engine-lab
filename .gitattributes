@@ -16,3 +16,6 @@
 *.png binary
 *.jpg binary
 *.pdf binary
+
+# cmd reads batch files reliably only with CRLF (a goto can miss its label in an LF file).
+*.bat text eol=crlf

@@ -10,6 +10,11 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 namespace {
 
 int failures = 0;
@@ -24,9 +29,9 @@ void expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(_WIN32)
     std::cout
-        << "mapped model file tests skipped on non-Linux\n";
+        << "mapped model file tests skipped on this platform\n";
     return 0;
 #else
     const auto path =
@@ -171,6 +176,38 @@ int main() {
     expect(range_rejected,
            "mapped model rejects tensor range outside file");
 
+    {
+        // page_out keeps the bytes (a later read faults them in again); on Windows it also leaves the working set.
+        const auto big_path = std::filesystem::temp_directory_path() / "strix-mapped-model-pageout.bin";
+        std::vector<std::uint8_t> big(64U << 20U);
+        for (std::size_t index = 0; index < big.size(); ++index) big[index] = static_cast<std::uint8_t>(index * 7U + index / 4096U);
+        {
+            std::ofstream output(big_path, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(big.data()), static_cast<std::streamsize>(big.size()));
+        }
+        {
+            auto paged = strix::MappedModelFile::open_read_only(big_path, "pageout.bin", generations);
+            const auto* bytes_at = reinterpret_cast<const volatile std::uint8_t*>(paged.base_address());
+            std::uint64_t sum = 0;
+            for (std::size_t index = 0; index < big.size(); index += 4096U) sum += bytes_at[index];
+#if defined(_WIN32)
+            PROCESS_MEMORY_COUNTERS before{}, after{};
+            GetProcessMemoryInfo(GetCurrentProcess(), &before, sizeof(before));
+#endif
+            paged.page_out(0, paged.bytes());
+#if defined(_WIN32)
+            GetProcessMemoryInfo(GetCurrentProcess(), &after, sizeof(after));
+            expect(before.WorkingSetSize > after.WorkingSetSize + (48U << 20U),
+                "page_out removes the copied pages from the working set");
+#endif
+            bool same = true;
+            for (std::size_t index = 0; index < big.size(); index += 4093U) same = same && bytes_at[index] == big[index];
+            expect(same && sum != 0, "page_out keeps the mapped bytes readable");
+        }
+        std::error_code ignored;
+        std::filesystem::remove(big_path, ignored);
+    }
+
     auto moved = std::move(mapped);
     expect(!mapped.valid() &&
                moved.valid(),
@@ -187,6 +224,8 @@ int main() {
     bool mutation_rejected=false;
     try{moved.validate_unchanged();}catch(const std::runtime_error&){mutation_rejected=true;}
     expect(mutation_rejected,"FD/stat setup witness rejects file mutation after the full-file hash");
+    moved = strix::MappedModelFile{}; // Windows does not remove a file that is still mapped
+    expect(!moved.valid(),"assigning an empty owner releases the mapping");
     std::error_code error;
     std::filesystem::remove(
         path,

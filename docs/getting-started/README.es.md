@@ -25,6 +25,9 @@ con el driver USB4 y la biblioteca trellis. La RTX independiente necesita Window
 Q2/Q8 admitido y los assets de recibo/estado/referencia. Los manifiestos de modelos, la procedencia de las conversiones y los avisos
 obligatorios se enumeran en [modelos y procedencia](../reproduce.md#models-and-provenance).
 
+Windows: [windows.md](windows.md) (en inglés) describe una compilación nativa experimental del motor Qwen de un solo nodo
+y sus diferencias. Linux sigue siendo el runtime principal.
+
 La configuración del kernel/IOMMU corresponde al propietario de la máquina. Mantenga traducidos los controladores USB4; nunca desactive
 el IOMMU para ganar velocidad. Registre el kernel en ejecución y `amdgpu.iommu_perfopt` en los recibos de tiempos y compare
 PerfOpt activado/desactivado solo con el mismo kernel.
