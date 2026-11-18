@@ -74,6 +74,9 @@ inline void require_rotary_producer_identity(const RotaryIdentity& producer, con
 // exactly a no-op, including when the existing hash has value zero.
 std::uint64_t append_rotary_identity(std::uint64_t existing, const RotaryIdentity& rotary);
 std::uint32_t parse_qwen_rope_yarn(std::string_view value);
+// Diagnostic recommendation only: smallest experimental factor covering a non-native
+// context (2 up to 524,288, 4 up to 1,048,576), or 0. Never selects numerical policy.
+std::uint32_t recommended_qwen_rope_yarn(std::uint64_t context) noexcept;
 RotaryDescriptor validate_qwen_rotary_request(std::uint32_t factor,
     bool context_explicit, std::uint64_t context, bool baseline);
 

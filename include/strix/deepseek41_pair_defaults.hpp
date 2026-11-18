@@ -1,4 +1,5 @@
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -49,6 +50,14 @@ namespace strix::deepseek41::pair_defaults {
 
 enum class App { rank, batch, prefill, serve };
 
+struct DsparkSettings {
+    bool copy_rows8 = false;
+    bool arbiter = false;
+};
+// Device-independent switch registration, also used before inspection exits.
+// Lookup admission still controls whether BatchSpeculator applies these settings.
+DsparkSettings resolve_dspark_settings();
+
 struct Build {
     bool trellis_dense_r1 = false;  // linked against a trellis library with the dense-r1 API (STRIX_DS41_TRELLIS_API)
 };
@@ -84,6 +93,10 @@ struct Resolved {
     std::vector<std::string> notices;                          // one line each
     bool print_only = false;                                   // --print-effective-config (removed from args)
     std::optional<strix::profile::Resolution> profile;         // --profile (removed from args); always resolved
+    // STRIX_DS41_DECODE_XPORT as BatchForward resolves it (strix/ds41_decode_xport.hpp): "communicator" / "channel",
+    // then the origin ("default" / "explicit"). One rule for CLI, serve and engine; both ranks also agree at load.
+    std::string decode_xport;
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 
 using Getenv = std::function<const char*(const char*)>;

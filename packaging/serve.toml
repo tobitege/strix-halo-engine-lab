@@ -1,0 +1,8 @@
+# Reserved configuration example. The packaged binaries do not currently read this file.
+# Configure Linux through STRIX_MODEL / STRIX_SERVE_ARGS in strix.env and Windows through serve.args.
+# strix-start.ps1 will use this file only if a future binary advertises --serve-config in --help.
+
+[http]
+serve = true
+bind = "127.0.0.1"
+port = 8080

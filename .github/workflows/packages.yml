@@ -1,0 +1,123 @@
+name: Packages
+
+# Release packages (docs/install.md). Tags v* build, inspect, install and smoke-test the Linux packages and attach
+# them to the run; pull requests that touch packaging run the same jobs. The Windows CUDA ZIP needs MSVC + the CUDA
+# toolkit and a hosted runner has no CUDA: build it with packaging/windows/package.cmd (docs/install.md, "Windows").
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - 'cmake/StrixSession.cmake'
+      - '.github/workflows/packages.yml'
+  workflow_dispatch:
+
+jobs:
+  linux-host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ninja-build rpm file python3-numpy
+
+      - name: Build strix-core, strix-tools, strix-docs
+        run: |
+          tag_flag=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag_flag="--require-tag"; fi
+          bash packaging/package.sh build/pkg-host host $tag_flag
+
+      - name: Packaging host regressions (no engine build)
+        run: |
+          cmake -S tests/packaging -B build/pkg-tests
+          ctest --test-dir build/pkg-tests --output-on-failure
+
+      - name: Inspect package contents
+        run: |
+          set -euo pipefail
+          for p in build/pkg-host/strix-*.deb; do echo "== $p"; dpkg-deb -I "$p" | sed -n '1,25p'; dpkg-deb -c "$p" | wc -l; done
+          for p in build/pkg-host/strix-*.rpm; do echo "== $p"; rpm -qip "$p" | head -12; rpm -qlp "$p" | wc -l; done
+          bash packaging/smoke.sh --check-packages build/pkg-host
+
+      - name: Smoke test the extracted tar.gz
+        run: |
+          mkdir -p build/tgz-root
+          for t in build/pkg-host/strix-*.tar.gz; do tar -xzf "$t" -C build/tgz-root; done
+          bash packaging/smoke.sh --root build/tgz-root --require-health
+
+      - name: Install the DEB packages and smoke test
+        run: |
+          sudo apt-get install -y ./build/pkg-host/strix-core_*.deb ./build/pkg-host/strix-tools_*.deb ./build/pkg-host/strix-docs_*.deb
+          bash /usr/share/strix/support/smoke-core.sh --require-health
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: strix-linux-host-packages
+          path: |
+            build/pkg-host/strix-*.deb
+            build/pkg-host/strix-*.rpm
+            build/pkg-host/strix-*.tar.gz
+            build/pkg-host/*.sha256
+            build/pkg-host/packaging/build-host.txt
+          if-no-files-found: error
+
+  linux-hip:
+    runs-on: ubuntu-24.04
+    # Not blocking yet: the pinned ROCm image does not compile the DeepSeek HIP sources for gfx1151
+    # (src/hip_ds41_layer.hip, integer_core::launch_dense instantiations), which build with the HIP 7.16 toolchain
+    # the release package was measured on (docs/install.md). Make it blocking once the image digest moves to that
+    # ROCm generation; the job log then lists the first compile errors (packaging/package.sh).
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        archs: ['gfx1151']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build strix-hip in the ROCm container
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054'
+          docker pull "$image" >/dev/null
+          tag_flag=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag_flag="--require-tag"; fi
+          docker run --rm -v "$PWD:/work" -w /work -e ARCHS='${{ matrix.archs }}' -e TAG_FLAG="$tag_flag" "$image" bash -lc '
+            set -euo pipefail
+            apt-get update >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev dpkg-dev rpm file git >/dev/null
+            git config --global --add safe.directory /work
+            # Match ci.yml hip-offline-build: pinned ROCm/hip-dev, Release,
+            # testing configuration and the default warnings-as-errors policy.
+            bash packaging/package.sh build/pkg-hip hip --hip-archs "$ARCHS" --rpath /opt/rocm/lib $TAG_FLAG -- -DBUILD_TESTING=ON -DSTRIX_WARNINGS_AS_ERRORS=ON
+            bash packaging/smoke.sh --check-packages build/pkg-hip
+            for p in build/pkg-hip/strix-*.deb; do dpkg-deb -I "$p" | sed -n "1,25p"; dpkg-deb -c "$p"; done
+            for p in build/pkg-hip/strix-*.rpm; do rpm -qip "$p" | head -12; rpm -qlp "$p"; done
+            cat build/pkg-hip/packaging/build-hip.txt
+            mkdir -p build/hip-root && tar -xzf build/pkg-hip/strix-hip-*.tar.gz -C build/hip-root
+            bash packaging/smoke.sh --root build/hip-root
+          ' 2>&1 | tee hip-packages.log | tail -n 80
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strix-linux-hip-packages
+          path: |
+            build/pkg-hip/strix-*.deb
+            build/pkg-hip/strix-*.rpm
+            build/pkg-hip/strix-*.tar.gz
+            build/pkg-hip/*.sha256
+            build/pkg-hip/packaging/build-hip.txt
+            hip-packages.log
+          if-no-files-found: ignore

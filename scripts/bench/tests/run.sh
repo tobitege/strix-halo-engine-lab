@@ -12,7 +12,8 @@ cleanup_test() {
     rm -rf -- "$tmp"
 }
 trap cleanup_test EXIT
-for f in scripts/bench/bench.sh scripts/bench/fetch-models.sh scripts/bench/lib/*.sh scripts/bench/engines/*.sh scripts/bench/tests/*.sh; do
+for f in scripts/bench/bench.sh scripts/bench/fetch-models.sh scripts/bench/lib/*.sh scripts/bench/engines/*.sh scripts/bench/tests/*.sh \
+    scripts/bench/common/*.sh scripts/bench/qwen/*.sh scripts/bench/ds41/*.sh scripts/bench/glm/*.sh scripts/bench/minimax/*.sh scripts/bench/vision/*.sh scripts/bench/rtx/*.sh; do
     bash -n "$f"
 done
 printf 'PASS bash syntax\n'
@@ -104,6 +105,9 @@ grep -q 'NO-REFERENCE' "$tmp/results.md"
 printf 'PASS fixture schema and markdown render\n'
 "$BENCH_PYTHON" scripts/bench/tests/test_kit.py
 "$BENCH_PYTHON" -B scripts/bench/tests/test_tasks.py
+"$BENCH_PYTHON" -B scripts/bench/tests/test_runner.py
+"$BENCH_PYTHON" -B scripts/bench/tests/test_lifecycle.py
+"$BENCH_PYTHON" -B scripts/bench/tests/test_evidence.py
 # Public machine endpoints must contain exactly one JSON document on stdout.
 bash scripts/bench/bench.sh list --json >"$tmp/list.json"
 "$BENCH_PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); assert len(d["engines"])==6' "$tmp/list.json"
@@ -151,7 +155,8 @@ printf 'PASS parameter sweeps, pure JSON endpoints, all-engine skips and offline
 )
 printf 'PASS TERM-resistant rank teardown\n'
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -x scripts/bench/bench.sh scripts/bench/fetch-models.sh scripts/bench/lib/*.sh scripts/bench/engines/*.sh scripts/bench/tests/*.sh
+    shellcheck -x scripts/bench/bench.sh scripts/bench/fetch-models.sh scripts/bench/lib/*.sh scripts/bench/engines/*.sh scripts/bench/tests/*.sh \
+        scripts/bench/common/*.sh scripts/bench/qwen/*.sh scripts/bench/ds41/*.sh scripts/bench/glm/*.sh scripts/bench/minimax/*.sh scripts/bench/vision/*.sh scripts/bench/rtx/*.sh
     printf 'PASS shellcheck\n'
 else
     printf 'SKIP shellcheck (not installed)\n'

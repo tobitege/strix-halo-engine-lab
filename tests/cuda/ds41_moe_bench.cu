@@ -4,8 +4,8 @@
 // per window routes + gate/up + down + combine, and gate/up and down alone. GB/s = union experts' weight bytes / time.
 // Prefill: R rows of tokens cycled from the recorded routes through the grouped entry points.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_moe.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_moe.hpp"
 #include "strix/gguf_reader.hpp"
 
 #include <cuda_runtime.h>

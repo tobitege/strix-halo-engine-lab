@@ -15,3 +15,7 @@ GGUF prompts use `strix-tokenize ... encode`. EXL3 prompts use the local model's
 These are raw completion prompts, not an inferred chat template. Long-context
 inputs repeat token IDs and truncate to the requested count; this is recorded in
 results. Use the eventual README prompt manifest to compare identical workloads.
+
+`classes/` holds the three decode-class prompts used by `scripts/bench/common/serve-decode.sh`
+(prose essay, code edit that returns most of a file, CSV to JSON). Drafting acceptance differs by
+an order of magnitude between them, so served decode is always reported per class.

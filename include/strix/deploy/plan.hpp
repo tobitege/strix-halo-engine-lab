@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "strix/deploy/footprint.hpp"
 
 namespace strix::deploy {
@@ -25,6 +27,11 @@ struct Plan {
     [[nodiscard]] std::string hash() const; // canonical JSON, FNV-1a-64, 16 lowercase hex digits
 };
 
+// Per-rank admission shared by resolve() and the route planner (deploy/route.hpp): KV first, then workspace, weights,
+// staging and extras; the margin is preserved and elastic extras are fitted last. `footprint` may throw; its message
+// becomes the refusal reason.
+[[nodiscard]] RankBudget fit_rank(std::uint32_t rank, std::uint32_t node, const DeviceFacts& device, std::uint64_t margin,
+                                  std::uint32_t context, std::uint32_t slots, const std::function<Footprint()>& footprint);
 [[nodiscard]] Plan resolve(const Spec&, const std::vector<DeviceFacts>&, const FootprintProvider&);
 
 } // namespace strix::deploy

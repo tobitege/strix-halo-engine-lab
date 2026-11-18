@@ -1,9 +1,9 @@
 #pragma once
 
-#include "strix/cuda_qwen_prefix_identity.hpp"
-#include "strix/cuda_qwen_prefix_store.hpp"
-#include "strix/cuda_qwen_prefix_pool.hpp"
-#include "strix/cuda_vram_guard.hpp"
+#include "strix/cuda/qwen_prefix_identity.hpp"
+#include "strix/cuda/qwen_prefix_store.hpp"
+#include "strix/cuda/qwen_prefix_pool.hpp"
+#include "strix/cuda/vram_guard.hpp"
 
 #include <cuda_runtime.h>
 #include <atomic>

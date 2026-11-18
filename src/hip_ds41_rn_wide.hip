@@ -7,6 +7,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"
+#include "strix/lever_cache.hpp"
 #include "strix/dist/staged_ready.hpp"
 
 #include "strix/ds41_formats.hpp"
@@ -626,17 +627,18 @@ bool parse_shape(const char* e, RnWideShape& s) {
 } // namespace
 
 bool rn_wide_enabled() {
-    static const bool on = strix::envcfg::flag("STRIX_DS41_RN_WIDE", false);
-    return on;
+    static strix::lever_cache<bool> on{[] { return strix::envcfg::flag("STRIX_DS41_RN_WIDE", false); }};
+    return on.get();
 }
 
 RnWideShape rn_wide_default_shape(const Q8A8View& view) {
-    static const RnWideShape forced = [] {
+    static strix::lever_cache<RnWideShape> forced_cache{[] {
         RnWideShape s;
         s.waves = 0;
         parse_shape(std::getenv("STRIX_DS41_RN_SHAPE"), s);
         return s;
-    }();
+    }};
+    const RnWideShape forced = forced_cache.get();
     if (forced.waves != 0U) return forced;
     // From the cold bench (strix-hip-ds41-rn-wide-bench, sr-r6-bench2): widths whose group count is not a multiple of
     // 32 (attn_q_b, 40 groups) take 2 outputs per wave, 8 waves, activations read in place (U6 R6 125 -> 175 GB/s; the

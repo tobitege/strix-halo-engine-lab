@@ -177,6 +177,10 @@ std::uint64_t build_identity(
         hash_u64(hash, 0x47444e53544f5231ULL);
         hash_u64(hash, static_cast<std::uint32_t>(layout.recurrent_storage));
     }
+    if (model.recurrent_state != RecurrentStateType::f32) {  // f32 keeps its identity bytes; 16-bit types are tagged
+        hash_u64(hash, 0x5253543136524e45ULL); // "RST16RNE" (recurrent_state_contract tag)
+        hash_u64(hash, static_cast<std::uint32_t>(model.recurrent_state));
+    }
     return hash;
 }
 

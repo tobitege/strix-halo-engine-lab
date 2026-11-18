@@ -12,9 +12,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_exact.hpp"
     "${STRIX_SOURCE_ROOT}/src/glm/prefill/glm_pf_dense_policy.hpp"
     "${STRIX_SOURCE_ROOT}/src/glm/engine/engine.hip"
+    "${STRIX_SOURCE_ROOT}/apps/glm_route_levers.hpp"
     "${STRIX_SOURCE_ROOT}/tests/hip_glm_pf_wmma_tests.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/engine/engine.hip"
     "${STRIX_SOURCE_ROOT}/src/minimax/moe/mmx_prefill_iu4.inc"
+    "${STRIX_SOURCE_ROOT}/src/minimax/moe/mmx_prefill.hip"
+    "${STRIX_SOURCE_ROOT}/src/minimax/engine/mm_defaults.cpp"
     "${STRIX_SOURCE_ROOT}/apps/hip_decode_token_main.cpp"
     "${STRIX_SOURCE_ROOT}/apps/hip_decode_options.hpp")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/../route_policy_host_extract.py"

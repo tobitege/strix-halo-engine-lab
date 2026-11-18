@@ -39,11 +39,21 @@
 //   const uint16_t* value_t(const Args&, kv_head, d) kOp V^T row: element pos = V[pos][d]; 16-B aligned at pos%16==0
 //   unsigned* failure(const Args&)                  bit 1 nonfinite output, bit 4 operand query overflow
 // The denominator sums the operand-rounded p (what PV accumulates) in key order across both half-waves.
+// Optional two-term operands (static constexpr unsigned kTerms = 2; absent or 1 = one term, the bytes above):
+//   const uint16_t* key_lo(const Args&, pos, kv_head)   lo terms of key(), same layout (tile::to_operand2)
+//   const uint16_t* value_t_lo(const Args&, kv_head, d) lo terms of value_t(), same layout
+// Q, K, V and P are carried as hi + lo and every product runs as hi.hi + hi.lo + lo.hi into the same FP32 chain
+// (lo.lo dropped): 3x the QK and PV WMMA. Per product, about 2u |ab| -> 3u^2 |ab| (f16 u = 2^-11: 2^-10 -> 2^-20.4)
+// while the remainders are normal f16; below that a 2^-25 absolute floor, and no gain for |x| < 2^-14. The FP32
+// chain adds about 2^-24 x sum |a_i b_i| per WMMA step, so cancellation is not covered. Bounds and a host model of
+// these products in this order: two_term_model.hpp.
+// The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "flash_core.hpp"
 
@@ -67,15 +77,24 @@ struct Shape {
     static_assert(lds_bytes <= 65536, "LDS budget");
 };
 
+// FP16 terms per operand of a policy: P::kTerms when declared, else 1.
+template <class P, class = void> struct terms_of { static constexpr unsigned value = 1; };
+template <class P> struct terms_of<P, std::void_t<decltype(P::kTerms)>> { static constexpr unsigned value = P::kTerms; };
+
 __device__ inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
 
 template <class P>
-__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits) {
+__device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
     using S = typename P::Shape;
     constexpr unsigned D = S::dim, KP = S::kpitch, SP = S::spitch, F = S::frags, T = S::threads;
     constexpr auto O = P::kOp;
+    constexpr bool Two = terms_of<P>::value == 2U;
+    static_assert(terms_of<P>::value == 1U || Two, "kTerms is 1 or 2");
+    static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536, "LDS budget (two-term)");
     __shared__ __attribute__((aligned(16))) std::uint16_t ks[16 * KP];
     __shared__ __attribute__((aligned(16))) std::uint16_t vs[D * 16];
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t ks_lo[Two ? 16 * KP : 8];
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t vs_lo[Two ? D * 16 : 8];
     __shared__ __attribute__((aligned(16))) float part[S::waves * 16 * SP];
     const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5, rr = lane & 15U, hw = lane >> 4;
     const unsigned tile = wave / S::split, piece = wave % S::split;
@@ -90,8 +109,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const unsigned pos_first = p0 + row_base, pos_last = pos_first + block_rows - 1U;
     const unsigned key_begin = window_lo(pos_first, window) & ~15U;
     const unsigned tiles_total = (pos_last >> 4) - (key_begin >> 4) + 1U, share = (tiles_total + splits - 1U) / splits;
-    const unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
-    const unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
+    unsigned kt_begin = key_begin + 16U * min(tiles_total, blockIdx.z * share);
+    unsigned kt_end = key_begin + 16U * min(tiles_total, (blockIdx.z + 1U) * share); // exclusive
+    if (seg_tiles) { // chunkinv-attn-state-v1: segment z = absolute key tiles [z * seg_tiles, (z + 1) * seg_tiles)
+        const unsigned lo = 16U * blockIdx.z * seg_tiles, hi = lo + 16U * seg_tiles, end = 16U * ((pos_last >> 4) + 1U);
+        kt_begin = max(key_begin, lo);
+        kt_end = max(kt_begin, min(end, hi));
+    }
     // This wave's 16 rows: one query head, 16 consecutive positions.
     const unsigned head = kvh * S::group + tile % S::group, sub = tile / S::group * 16U;
     const bool wave_live = sub < block_rows;
@@ -101,17 +125,20 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     const unsigned d0 = piece * S::slice;
     bool bad_half = false;
     Frag qf[F];
+    [[maybe_unused]] Frag qf_lo[Two ? F : 1];
     {
         const float* q = live ? P::query(a, my_row, head) + d0 : nullptr;
         constexpr unsigned short exponent = O == tile::Operand::f16 ? 0x7c00U : 0x7f80U;
 #pragma unroll
         for (unsigned f = 0; f < F; ++f) {
             qf[f] = live ? tile::frag_from_f32<O>(q + 16U * f) : Frag{};
+            if constexpr (Two) qf_lo[f] = live ? tile::frag_lo_from_f32<O>(q + 16U * f) : Frag{};
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) bad_half |= (qf[f][i] & exponent) == exponent;
         }
     }
     U4 kreg[S::per_thread], vreg[S::per_thread];
+    [[maybe_unused]] U4 klreg[Two ? S::per_thread : 1], vlreg[Two ? S::per_thread : 1];
     const auto fetch = [&](unsigned kt) {
 #pragma unroll
         for (unsigned i = 0; i < S::per_thread; ++i) {
@@ -121,6 +148,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 kreg[i] = *reinterpret_cast<const U4*>(P::key(a, kt + key, kvh) + 8U * c);
                 const unsigned d = idx >> 1, h = idx & 1U;
                 vreg[i] = *reinterpret_cast<const U4*>(P::value_t(a, kvh, d) + kt + 8U * h);
+                if constexpr (Two) {
+                    klreg[i] = *reinterpret_cast<const U4*>(P::key_lo(a, kt + key, kvh) + 8U * c);
+                    vlreg[i] = *reinterpret_cast<const U4*>(P::value_t_lo(a, kvh, d) + kt + 8U * h);
+                }
             }
         }
     };
@@ -133,6 +164,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 *reinterpret_cast<U4*>(&ks[key * KP + 8U * c]) = kreg[i];
                 const unsigned d = idx >> 1, h = idx & 1U;
                 *reinterpret_cast<U4*>(&vs[d * 16U + 8U * h]) = vreg[i];
+                if constexpr (Two) {
+                    *reinterpret_cast<U4*>(&ks_lo[key * KP + 8U * c]) = klreg[i];
+                    *reinterpret_cast<U4*>(&vs_lo[d * 16U + 8U * h]) = vlreg[i];
+                }
             }
         }
     };
@@ -152,8 +187,22 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             Acc s = tile::acc_zero(), s1 = tile::acc_zero();
 #pragma unroll
             for (unsigned f = 0; f < F; f += 2) {
-                s = tile::mma<O>(qf[f], tile::frag32(&ks[rr * KP + d0 + 16U * f]), s);
-                if (f + 1 < F) s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks[rr * KP + d0 + 16U * f + 16U]), s1);
+                if constexpr (Two) {  // the small products first, then hi.hi, in each chain
+                    const unsigned at = rr * KP + d0 + 16U * f;
+                    const Frag kh = tile::frag32(&ks[at]);
+                    s = tile::mma<O>(qf[f], tile::frag32(&ks_lo[at]), s);
+                    s = tile::mma<O>(qf_lo[f], kh, s);
+                    s = tile::mma<O>(qf[f], kh, s);
+                    if (f + 1 < F) {
+                        const Frag kh1 = tile::frag32(&ks[at + 16U]);
+                        s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks_lo[at + 16U]), s1);
+                        s1 = tile::mma<O>(qf_lo[f + 1], kh1, s1);
+                        s1 = tile::mma<O>(qf[f + 1], kh1, s1);
+                    }
+                } else {
+                    s = tile::mma<O>(qf[f], tile::frag32(&ks[rr * KP + d0 + 16U * f]), s);
+                    if (f + 1 < F) s1 = tile::mma<O>(qf[f + 1], tile::frag32(&ks[rr * KP + d0 + 16U * f + 16U]), s1);
+                }
             }
             s += s1;
             float* pw = part + wave * 16U * SP;
@@ -193,6 +242,7 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             // The online update is spelled out, not routed through online_step (flash_core.hpp): identical
             // math through the shared step adds 4-24 B of scratch per kernel on gfx1151 (remarks, R1-7).
             Frag pa;
+            [[maybe_unused]] Frag pl;
             const float alpha = present ? __builtin_amdgcn_exp2f(maximum - m) : 1.0F;
             {
                 float own[8];
@@ -202,9 +252,17 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
                 for (unsigned j = 0; j < 16; ++j) {
                     const float other = __shfl_xor(own[j % 8U], 16, 32);
-                    const std::uint16_t p = tile::to_operand<O>(j / 8U == hw ? own[j % 8U] : other);
-                    sum += tile::operand_value<O>(p);
-                    pa[j] = p;
+                    const float x = j / 8U == hw ? own[j % 8U] : other;
+                    if constexpr (Two) {
+                        const tile::Terms2 t = tile::to_operand2<O>(x);
+                        sum += tile::operand_value<O>(t.hi) + tile::operand_value<O>(t.lo);
+                        pa[j] = t.hi;
+                        pl[j] = t.lo;
+                    } else {
+                        const std::uint16_t p = tile::to_operand<O>(x);
+                        sum += tile::operand_value<O>(p);
+                        pa[j] = p;
+                    }
                 }
                 denominator = denominator * alpha + sum;
                 maximum = m;
@@ -217,7 +275,15 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 Acc c = acc[f];
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
-                acc[f] = tile::mma<O>(pa, tile::frag32(&vs[(d0 + 16U * f + rr) * 16U]), c);
+                if constexpr (Two) {
+                    const unsigned at = (d0 + 16U * f + rr) * 16U;
+                    const Frag vh = tile::frag32(&vs[at]);
+                    c = tile::mma<O>(pa, tile::frag32(&vs_lo[at]), c);
+                    c = tile::mma<O>(pl, vh, c);
+                    acc[f] = tile::mma<O>(pa, vh, c);
+                } else {
+                    acc[f] = tile::mma<O>(pa, tile::frag32(&vs[(d0 + 16U * f + rr) * 16U]), c);
+                }
             }
         }
         __syncthreads();
@@ -265,8 +331,8 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 // 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
 template <class P>
 __global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
-    typename P::Args a, float* ws, unsigned splits) {
-    flash_body<P>(a, ws, splits);
+    typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
+    flash_body<P>(a, ws, splits, seg_tiles);
 }
 
 // Split-K merge: one work-group per (row, head), D / 4 threads x 4 components.
@@ -301,13 +367,23 @@ __host__ __device__ constexpr std::size_t workspace_floats(unsigned rows, unsign
     return splits > 1U ? std::size_t(splits) * rows * heads * (dim + 2U) : 0U;
 }
 template <class P>
-inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1) {
+// Call cuts: the P.V WMMA rounds keys (2i, 2i+1) as a pair even when P of key 2i+1 is zero, so a call ending at an
+// even absolute position gives its last row other bits than a run that also holds the next key's V (packed pad = 0
+// here). The kernel cannot see that V; callers commit at chunk_contract::kWmmaKPairRows and recompute the open row
+// (src/core/chunk_contract.hpp section 4). Every other row and every aligned call keep their bits.
+// seg_tiles != 0 (identity dense-flash-absseg-v1/s<seg_tiles>, opt-in): split z covers the ABSOLUTE key tiles
+// [z * seg_tiles, (z + 1) * seg_tiles), so a row's partials and their ascending combine do not depend on the call's
+// rows or neighbouring queries (src/core/chunk_contract.hpp). The caller passes splits >= absolute_segment_count of the
+// call's last key; segments a row cannot see stay empty and combine skips them. seg_tiles == 0: block share (default).
+inline void launch(const typename P::Args& a, unsigned heads, hipStream_t stream, float* ws = nullptr, unsigned splits = 1,
+                   unsigned seg_tiles = 0) {
     using S = typename P::Shape;
     const unsigned rows = P::rows(a);
     if (!rows) return;
     if (!ws) splits = 1;
+    if (splits == 1U) seg_tiles = 0; // one segment: the direct path is bitwise the one-segment combine
     const dim3 grid((rows + S::positions - 1U) / S::positions, heads / S::group, splits);
-    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits);
+    hipLaunchKernelGGL(flash_prefill<P>, grid, dim3(S::threads), 0, stream, a, ws, splits, seg_tiles);
     if (splits > 1U) hipLaunchKernelGGL(combine<P>, dim3(rows, heads), dim3(S::dim / 4U), 0, stream, a, ws, splits);
 }
 

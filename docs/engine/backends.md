@@ -182,7 +182,7 @@ state policy remain unchanged when adding a backend executor for those schemas.
 The existing CUDA paths are separate from this adapter. `cmake/QwenCuda.cmake`
 selects the CUDA language and existing Qwen libraries; the root build also has
 the DeepSeek CUDA path and its limited build configuration. In
-`src/cuda/qwen_prefill_driver.cu`, device arenas use `cudaMalloc`, copy staging
+`src/cuda/models/qwen/qwen_prefill_driver.cu`, device arenas use `cudaMalloc`, copy staging
 uses `cudaMallocHost`, queues use `cudaStreamCreateWithFlags`, events use
 `cudaEventCreate`, and uploads use `cudaMemcpyAsync`. A future CUDA adapter maps
 those allocations, streams, events, copies and memory observations into private

@@ -28,6 +28,10 @@
 #include <string>
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
+#include "hip/weight/gsq_partial_trace.hpp"
+#include "hip/weight/arch/gfx1151_gsq.hpp"
+#include "hip/weight/gsq_sources.hpp"
+#include "hip/weight/gsq_plan.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
 #if !STRIX_HAS_RDNA35_WMMA || !STRIX_HAS_SUDOT4
 #error "A8 CSR gate/up requires RDNA 3.5 packed WMMA and signed-A unsigned-B dot4"
@@ -918,7 +922,9 @@ __global__ __launch_bounds__(256) void down_prefill_q20(const unsigned char* wei
     }
 }
 // GSQ IQ window / prefill forms: project_iq / down_rawdots_iq lane arithmetic per (row, slot).
-template<std::uint32_t T,unsigned G,bool Prefill,class View>
+// Bodies are templated on the signed-A8 operand source (src/hip/weight/gsq_sources.hpp); the outer kernels keep the
+// numeric type parameter and bind it to its source.
+template<class Source,unsigned G,bool Prefill,class View>
 __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const unsigned char* up,const View& view,
     const DeviceCsr& csr,unsigned batch,unsigned tile_index,unsigned hidden,unsigned outputs) {
     const auto begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
@@ -927,7 +933,7 @@ __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const 
     __shared__ float tile[2][G][32];
     const unsigned lane=threadIdx.x&31U,c=lane&7U,wave=threadIdx.x/32U;
     const unsigned out=tile_index*32U+wave*4U+lane/8U,groups=hidden/32U;
-    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*gsq_a8::row_bytes(T,hidden);
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*Source::row_bytes(hidden);
     for(unsigned group=0;group<count;group+=G) {
         if(group)__syncthreads();
 #pragma unroll
@@ -946,10 +952,13 @@ __device__ __forceinline__ void project_iq_body(const unsigned char* gate,const 
             const unsigned char* w=(m==0U?gate:up)+offset;
 #pragma unroll 1
             for(unsigned g=c;g<groups;g+=8U) {
-                const auto x=gsq_a8::iq_group<T>(w,g);
+                const auto x=Source::group(w,g);
 #pragma unroll
                 for(unsigned a=0;a<G;++a)if(group+a<count) {
-                    const float value=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_deltas[a][g]);
+                    const float value=Source::apply(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_deltas[a][g]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                    strix::wfmt_trace::gsq_partial(value);
+#endif
                     acc[m][a]=acc[m][a]+value;
                 }
             }
@@ -994,7 +1003,7 @@ __global__ __launch_bounds__(256) void project_window_iq(const unsigned char* ga
     unsigned failure=csr.summary[0];
     for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
     if((failure&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
-    project_iq_body<T,G,false>(gate,up,view,csr,blockIdx.y,blockIdx.x,hidden,outputs);
+    project_iq_body<::strix::weight::hip::GsqSignedSource<T>,G,false>(gate,up,view,csr,blockIdx.y,blockIdx.x,hidden,outputs);
 }
 template<std::uint32_t T,unsigned G>
 __global__ __launch_bounds__(256) void project_prefill_iq(const unsigned char* gate,const unsigned char* up,PrefillRows view,
@@ -1002,9 +1011,9 @@ __global__ __launch_bounds__(256) void project_prefill_iq(const unsigned char* g
     const auto& csr=view.csr;
     if((csr.summary[0]&~projection_nonfinite)||blockIdx.x>=csr.summary[2])return;
     const DeviceCsr d{csr.summary,csr.offsets,csr.touched,csr.rows,csr.slots,csr.experts,csr.begins};
-    project_iq_body<T,G,true>(gate,up,view,d,blockIdx.x,blockIdx.y,hidden,outputs);
+    project_iq_body<::strix::weight::hip::GsqSignedSource<T>,G,true>(gate,up,view,d,blockIdx.x,blockIdx.y,hidden,outputs);
 }
-template<std::uint32_t T,unsigned Rows,bool Prefill,class View>
+template<class Source,unsigned Rows,bool Prefill,class View>
 __device__ __forceinline__ void down_iq_body(const unsigned char* weights,const View& view,const DeviceCsr& csr,
     unsigned batch,unsigned tile_index,unsigned hidden,unsigned width) {
     const auto begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
@@ -1013,7 +1022,7 @@ __device__ __forceinline__ void down_iq_body(const unsigned char* weights,const 
     const unsigned groups=width/32U;
     const unsigned lane=threadIdx.x&31U,owner=lane&3U;
     const unsigned row=tile_index*64U+(threadIdx.x/32U)*8U+lane/4U;
-    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*gsq_a8::row_bytes(T,width);
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*Source::row_bytes(width);
     for(unsigned first=0;first<count;first+=Rows) {
         if(first)__syncthreads();
 #pragma unroll
@@ -1030,10 +1039,13 @@ __device__ __forceinline__ void down_iq_body(const unsigned char* weights,const 
         float acc[Rows]={};
 #pragma unroll 1
         for(unsigned group=owner;group<groups;group+=4U) {
-            const auto x=gsq_a8::iq_group<T>(row_weights,group);
+            const auto x=Source::group(row_weights,group);
 #pragma unroll
             for(unsigned a=0;a<Rows;++a)if(first+a<count) {
-                const float contribution=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(codes[a]+group*32U),deltas[a][group]);
+                const float contribution=Source::apply(x,reinterpret_cast<const int*>(codes[a]+group*32U),deltas[a][group]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+                strix::wfmt_trace::gsq_partial(contribution);
+#endif
                 acc[a]=acc[a]+contribution;
             }
         }
@@ -1057,14 +1069,14 @@ __global__ __launch_bounds__(256) void down_window_iq(const unsigned char* weigh
     for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
     if(failure){if(blockIdx.x==0U&&blockIdx.y==0U&&threadIdx.x==0U)csr.summary[0]=failure;return;}
     if(blockIdx.y>=csr.summary[2])return;
-    down_iq_body<T,Rows,false>(weights,view,csr,blockIdx.y,blockIdx.x,hidden,width);
+    down_iq_body<::strix::weight::hip::GsqSignedSource<T>,Rows,false>(weights,view,csr,blockIdx.y,blockIdx.x,hidden,width);
 }
 template<std::uint32_t T,unsigned Rows>
 __global__ __launch_bounds__(256) void down_prefill_iq(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
     const auto& csr=view.csr;
     if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
     const DeviceCsr d{csr.summary,csr.offsets,csr.touched,csr.rows,csr.slots,csr.experts,csr.begins};
-    down_iq_body<T,Rows,true>(weights,view,d,blockIdx.x,blockIdx.y,hidden,width);
+    down_iq_body<::strix::weight::hip::GsqSignedSource<T>,Rows,true>(weights,view,d,blockIdx.x,blockIdx.y,hidden,width);
 }
 // down_window over strided prefill rows, Rows staged rows at a time: same lane
 // chains, block decode and reduction per (row, slot). Grid x = batch, y = 64-row tile.
@@ -1955,12 +1967,8 @@ PrefillKernelForm prefill_kernel_form(const Request& request,unsigned down_type,
     static const bool gsq_f16_env=gsq_prefill_f16_enabled();
     // The GSQ decoders read rows as whole dwords and 18-byte blocks in even/odd pairs (hip_moe_gsq_weights.inc): rows of
     // another geometry keep the A8 forms.
-    const auto rows_ok=[](std::uint32_t type,std::uint32_t width) {
-        return width%gsq_a8::block_elements(type)==0U&&gsq_a8::row_bytes(type,width)%4U==0U&&
-            (gsq_a8::block_bytes(type)!=18U||(width/gsq_a8::block_elements(type))%2U==0U);
-    };
-    const bool gsq_f16=q20&&gsq_a8::down_type(down_type)&&rows_ok(request.gate_type,request.shape.hidden)&&
-        rows_ok(down_type,request.shape.rows);
+    const bool gsq_f16=::strix::weight::hip::gsq_f16_prefill_capable(request.gate_type,down_type,request.shape.hidden,
+        request.shape.rows);
     // GSQ Q2_0 gate/up with Q2_0 down also has the iu8 WMMA form (hip_moe_gsq_wmma_prefill.inc, bit-identical to dot4).
     const bool gsq_q20=q20&&request.gate_type==gsq_a8::type_q2_0&&down_type==gsq_a8::type_q2_0;
     const bool fast_form=form>=3&&form<=66;

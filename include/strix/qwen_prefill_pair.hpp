@@ -2,6 +2,7 @@
 #include "strix/qwen_prefill_pipeline.hpp"
 #include "strix/pair/pipe.hpp"
 #include "strix/dist/pipeline_timeline.hpp"
+#include "strix/env_flags.hpp"
 #include <array>
 #include <algorithm>
 #include <memory>
@@ -57,6 +58,7 @@ private:
         value.timing = {pt_d2h_wait, pt_crc, pt_wire, pt_ack_wait, pt_header_wait, pt_h2d_wait};
         value.profile_label = "qwen-pair-profile";
         value.profile = pipe_profile_enabled();
+        value.recheck_sent = envcfg::flag("STRIX_PAIR_SEAM_RECHECK", false);
         value.validate = [cut, count](const pair::PipeHeader& header, std::uint64_t sequence) {
             if (header[0] != Seam::magic || header[1] != sequence || header[42] != 3U ||
                 header[41] != count || header[3] == 0U || header[3] > 16384U ||

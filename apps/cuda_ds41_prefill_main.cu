@@ -39,8 +39,8 @@
 // --batch-no-solo), then the batch, and prints per prompt: solo / batch seconds, logits FNV, state digest and
 // "state_equal" / "logits_equal" (the batch's serialized state and logits byte-compared with the solo run's).
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 
 #include <algorithm>

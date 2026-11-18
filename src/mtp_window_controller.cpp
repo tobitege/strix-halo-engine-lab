@@ -193,6 +193,46 @@ std::uint32_t mtp_serve_row_budget_max_lanes() noexcept {
         try {return envcfg::number<std::uint32_t>("STRIX_SERVE_ROW_BUDGET_MAX_LANES",6U,0U,8U);} catch(...) {return 6U;}}();
     return lanes;
 }
+std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle) noexcept {
+    // 0 = "ab" (alternate by cycle), else the lane count.
+    static const std::uint32_t lanes=[]()->std::uint32_t{
+        try {
+            const char* raw=envcfg::text("STRIX_SERVE_JOINT_GROUP_LANES");
+            if(raw && std::string_view(raw)=="ab") return 0U;
+            // Default 16: above the lane bound one group (one weight read) takes up to 16 requests. Same token ids
+            // as 8 per request; 9 lanes 171.8 against 211.8 ms per cycle (joint16 receipt, 16-nov). The earlier
+            // 9-lane stall was the wide launchers' eight-session tables (kCohortWideMaxSessions). 8 = old form.
+            return envcfg::number<std::uint32_t>("STRIX_SERVE_JOINT_GROUP_LANES",kMtpJointGroupLanesMax,8U,kMtpJointGroupLanesMax);
+        } catch(...) {return kMtpJointGroupLanesMax;}}();
+    return lanes?lanes:(cycle&1U)?8U:kMtpJointGroupLanesMax;
+}
+const char* mtp_serve_row_measured_choice() noexcept {
+    static const char* choice=[]()->const char* {
+        const char* v=envcfg::text("STRIX_SERVE_ROW_MEASURED");
+        if(!v || !*v || std::string_view(v)=="auto") return "auto";
+        if(std::string_view(v)=="0" || std::string_view(v)=="1") return std::string_view(v)=="0"?"0":"1";
+        return "list";}();
+    return choice;
+}
+std::uint32_t mtp_serve_row_measured_lane_list(std::string_view text) noexcept {
+    // "7,8": the listed lane counts (1..8); anything else in the list = none (the affine fit).
+    std::uint32_t mask=0;
+    for(std::size_t at=0;at<text.size();) {
+        const auto end=std::min(text.find(',',at),text.size());
+        const auto item=text.substr(at,end-at);
+        if(item.size()!=1U || item[0]<'1' || item[0]>'8') return 0U;
+        mask|=1U<<static_cast<std::uint32_t>(item[0]-'0');
+        at=end+1U;
+    }
+    return mask;
+}
+std::uint32_t mtp_serve_row_measured_lanes() noexcept {
+    static const std::uint32_t lanes=[]{
+        const std::string_view c=mtp_serve_row_measured_choice();
+        if(c=="list") {const char* v=envcfg::text("STRIX_SERVE_ROW_MEASURED");return mtp_serve_row_measured_lane_list(v?v:"");}
+        return c=="auto"?kMtpRowMeasuredAutoLanes:c=="1"?0x1FEU:0U;}();
+    return lanes;
+}
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
     return on;
@@ -205,6 +245,8 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
     if(text.find("budget")!=std::string_view::npos) rule.budget=true;
+    if(rule.budget) rule.measured_lanes=text.find("measured")!=std::string_view::npos?0x1FEU:
+        text.find("budget-fit")!=std::string_view::npos?0U:mtp_serve_row_measured_lanes();
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -321,10 +363,16 @@ MtpBatchWindowController::BudgetCost MtpBatchWindowController::budget_cost() con
 }
 std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
     PlanInfo* info) const {
-    if(q.empty() || q.size()>8U || budget<2U*q.size())
-        throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
+    // Above the lane bound the plan is fixed (no search), so a group may hold up to kMtpJointGroupLanesMax requests.
+    const std::size_t most=q.size()>mtp_serve_row_budget_max_lanes()?kMtpJointGroupLanesMax:8U;
+    if(q.empty() || q.size()>most || budget<2U*q.size())
+        throw std::invalid_argument("joint MTP windows require 1..8 requests (16 above the lane bound) and two physical rows each");
     for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
         throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    if(measured_plans(q.size())) {
+        auto measured=measured_rows(q,budget,prior,info);
+        if(!measured.empty()) return measured;
+    }
     // Regime selection: above the lane bound the measured cycle is faster with the fixed table's two rows per
     // request (the cost of a deeper row exceeds its yield there), so the budget plans only up to the bound.
     if(q.size()>mtp_serve_row_budget_max_lanes()) {
@@ -339,13 +387,13 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     std::vector<serve::LaneDemand> lanes(q.size());
     for(std::size_t k=0;k<q.size();++k) {
         const auto& h=history_.at(q[k].slot);
-        std::uint32_t most=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
+        const std::uint32_t row_limit=prior?std::min(q[k].limit,std::max(rule_.cap,2U)):q[k].limit;
         accept[k][0]=1.0F;
         for(std::size_t d=0;d<7U;++d) {
             const double p=prior?0.8:d<q[k].probabilities.size()?std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0):0.0;
             accept[k][d+1U]=static_cast<float>((h.hits[d]+4.0*p)/(h.seen[d]+4.0));
         }
-        lanes[k]={q[k].slot,most,2U,most,std::span<const float>(accept[k]),0.0};
+        lanes[k]={q[k].slot,row_limit,2U,row_limit,std::span<const float>(accept[k]),0.0};
     }
     const auto model=budget_cost();
     const double draft_ms=prior?(draft_.samples()?draft_.value():1.2):0.0;
@@ -399,6 +447,68 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     if(info) *info=estimate(q,out,prior);
     return out;
 }
+std::vector<std::uint32_t> MtpBatchWindowController::measured_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
+    PlanInfo* info) const {
+    // Exact maximum of expected tokens / (measured topology ms + predictor ms) over every owner assignment. A lane
+    // takes 0 (no draft, two physical rows), 2, 4 or 8 rows; the cycle cost depends only on the counts (#R4, #R8,
+    // drafting R2s), so a DP over lanes keeps each count triple's best tokens (9^3 states, ~23K steps at eight
+    // lanes, against 4^8 leaves for a plain enumeration) and the triples are then ranked by tokens per ms. Only a
+    // topology with >= 3 cycle samples prices: no slope is extrapolated across a dispatch or padding boundary.
+    const std::size_t n=q.size();
+    if(n==0U || n>8U) return {};
+    constexpr std::size_t D=9U,S=D*D*D;
+    constexpr std::uint32_t kRows[4]{0U,2U,4U,8U};
+    constexpr std::size_t kStep[4]{0U,1U,D*D,D}; // state index (a4*D+a8)*D+a2: what each choice adds
+    std::vector<double> best((n+1U)*S,-1.0);
+    std::vector<std::uint8_t> pick((n+1U)*S,0U);
+    best[0]=0.0;
+    for(std::size_t k=0;k<n;++k) {
+        double gain[4];
+        for(std::size_t c=0;c<4U;++c) {
+            const auto r=kRows[c];
+            const bool ok=(prior || r!=0U) && std::max(r,2U)<=q[k].limit && !(prior && r>rule_.cap);
+            gain[c]=ok?(r?expected(q[k],r,prior):1.0):-1.0;
+        }
+        for(std::size_t s=0;s<S;++s) {
+            const double v=best[k*S+s];
+            if(v<0.0) continue;
+            for(std::size_t c=0;c<4U;++c) {
+                if(gain[c]<0.0) continue;
+                const auto t=(k+1U)*S+s+kStep[c];
+                if(v+gain[c]>best[t]) {best[t]=v+gain[c];pick[t]=static_cast<std::uint8_t>(c);}
+            }
+        }
+    }
+    const double draft=prior?(draft_.samples()?draft_.value():1.2):0.0;
+    double best_rate=-1.0,best_e=0.0,best_ms=0.0;
+    std::size_t chosen=S;
+    for(std::size_t s=0;s<S;++s) {
+        const double e=best[n*S+s];
+        if(e<0.0) continue;
+        const std::uint32_t a4=static_cast<std::uint32_t>(s/(D*D)),a8=static_cast<std::uint32_t>((s/D)%D),a2=static_cast<std::uint32_t>(s%D);
+        const std::uint32_t r2=static_cast<std::uint32_t>(n)-a4-a8,used=2U*r2+4U*a4+8U*a8;
+        // Small primaries have exactly four or eight rows (see search).
+        if(used>budget || (used<9U && used!=4U && used!=8U)) continue;
+        const auto found=costs_.find({r2,a4,a8});
+        if(found==costs_.end() || found->second.provisional()) continue;
+        const double ms=found->second.value()+draft*static_cast<double>(a2+3U*a4+7U*a8);
+        if(!(ms>0.0)) continue;
+        // After drafting, the topology's tokens are scaled by what it delivered against the model (shrunk to 1 with
+        // eight tokens each way): a model that over-promises deep owners stops buying them on its word alone.
+        double yield=e;
+        if(!prior) if(const auto y=yields_.find({r2,a4,a8});y!=yields_.end()) yield*=(y->second[1]+8.0)/(y->second[0]+8.0);
+        if(yield/ms>best_rate) {best_rate=yield/ms;best_e=yield;best_ms=ms;chosen=s;}
+    }
+    if(chosen==S) return {};
+    std::vector<std::uint32_t> out(n,2U);
+    for(std::size_t k=n,s=chosen;k>0U;--k) {
+        const auto c=pick[k*S+s];
+        out[k-1U]=kRows[c];
+        s-=kStep[c];
+    }
+    if(info) *info={best_e,best_ms,false};
+    return out;
+}
 MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<const Request> q,
     std::span<const std::uint32_t> rows,bool prior) const {
     double e=0.0;std::uint32_t drafts=0;
@@ -409,7 +519,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
     plan_members_=q.size();
     auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
-    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) return out;
+    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes() && !measured_plans(q.size())) return out;
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
     // region. It does not borrow another request's acceptance history.
@@ -417,7 +527,10 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
         const auto depth=plans<=9U?(2U<<((plans-1U)%3U)):plans%96U<33U?8U:plans%96U<65U?4U:2U;
         std::uint32_t used=2U*static_cast<std::uint32_t>(q.size());
         std::fill(out.begin(),out.end(),2U);
-        for(std::size_t k=0;k<q.size();++k) {
+        for(std::size_t n=0;n<q.size();++n) {
+            // The measured rule rotates the first deep lane between probe rounds, so a mixed topology is not
+            // always the same lanes' (the budget fills lane 0 first, as before).
+            const auto k=measured_plans(q.size())?(n+(plans-1U)/3U)%q.size():n;
             auto r=std::min(depth,rule_.cap);while(r>q[k].limit || used+r-2U>budget) r/=2U;
             if(r>=2U) {out[k]=r;used+=r-2U;}
         }
@@ -444,10 +557,25 @@ void MtpBatchWindowController::observe(std::span<const Request> q,std::span<cons
     if(q.size()!=rows.size() || rows.size()!=accepted.size() || !(target_ms>0.0) || draft_ms<0.0)
         throw std::invalid_argument("joint MTP observation geometry or timing differs");
     costs_[batch_key(rows)].add(target_ms);
+    {
+        // Measured rule's yield calibration: the model's tokens for the executed rows (before this cycle updates the
+        // histories) against the tokens they delivered (accepted drafts inside the rows + the committed row). q holds
+        // the complete candidates choose() priced (context rows from external_first on included), so the expectation
+        // and the delivered count describe the same rows. Aged like the topology timing (about the last eight cycles)
+        // so a workload change is not outvoted by the whole history.
+        auto& y=yields_[batch_key(rows)];
+        y[0]*=kMtpYieldKeep;y[1]*=kMtpYieldKeep;
+        for(std::size_t k=0;k<q.size();++k) {
+            const auto r=std::max(rows[k],2U);
+            y[0]+=expected(q[k],r,false);
+            y[1]+=1.0+static_cast<double>(std::min(accepted[k],r-1U));
+        }
+    }
     if(steps && draft_ms>0.0) draft_.add(draft_ms/steps);
     for(std::size_t k=0;k<q.size();++k) {
         auto& h=history_.at(q[k].slot);
-        for(std::size_t d=0;d<q[k].probabilities.size() && d+1U<rows[k] && d<=accepted[k];++d) {
+        // Predictor histories and bins: only predictor drafts (context candidates from external_first on are not).
+        for(std::size_t d=0;d<q[k].probabilities.size() && d<q[k].external_first && d+1U<rows[k] && d<=accepted[k];++d) {
             h.seen[d]+=1.0;if(d<accepted[k]) h.hits[d]+=1.0;
             // Calibration bins (read only by the calibrated rule): every verified predictor draft that was reached.
             const auto b=calibration_bin(std::clamp(static_cast<double>(q[k].probabilities[d]),0.0,1.0));

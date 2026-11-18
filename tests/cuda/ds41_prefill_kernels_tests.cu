@@ -4,10 +4,10 @@
 // subnormals, signed zeros, the largest half). With --bench: device times of the prefill uses at 2K / 8K / 32K rows
 // (chunks of 1024 rows, as the prefill driver calls them), the decode kernels against these.
 
-#include "strix/cuda_ds41_attention.hpp"
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_prefill_kernels.hpp"
+#include "strix/cuda/ds41_attention.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_prefill_kernels.hpp"
 
 #include "strix/ds41_layer.hpp"
 #include "strix/ds41_moe.hpp"

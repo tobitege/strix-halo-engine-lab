@@ -1,7 +1,10 @@
+#include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
+#include "../src/core/chunk_contract.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_stages.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
 #include "strix/qwen_prefill_pipe_dump.hpp"
 #include "strix/qwen_prefill_balance.hpp"
@@ -30,6 +33,8 @@
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
+#include "strix/hip_qwen_onfly_i4.hpp"
+#include <map>
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
@@ -70,7 +75,6 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/ple_serve_policy.hpp"
 #include "strix/process_environment.hpp"
-#include "strix/process_restart.hpp"
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
@@ -885,7 +889,7 @@ public:
         std::uint64_t vocabulary, std::uint64_t capacity, strix::SerialSessionContext& session,
         std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
         std::span<const std::uint32_t> teacher_inputs = {}, std::string teacher_logits_path = {},
-        std::uint64_t effective_max_positions = 262144U)
+        std::uint64_t effective_max_positions = 262144U, std::span<const std::uint64_t> teacher_logits_rows = {})
         : target_(target), ids_(ids.begin(), ids.end()), teacher_inputs_(teacher_inputs.begin(), teacher_inputs.end()),
           vocabulary_(vocabulary), maximum_rows_(teacher_inputs.empty() ? capacity : teacher_inputs.size() - 1U),
           session_(session), guard_(std::move(guard)) {
@@ -898,7 +902,10 @@ public:
         rows_.reserve(static_cast<std::size_t>(maximum_rows_));
         if (!teacher_logits_path.empty()) {
             if (teacher_inputs_.empty()) throw std::invalid_argument("teacher logits file requires retained teacher inputs");
-            spool_ = std::make_unique<strix::TeacherLogitSpool>(teacher_logits_path,vocabulary_,teacher_inputs_);
+            spool_ = std::make_unique<strix::TeacherLogitSpool>(teacher_logits_path,vocabulary_,teacher_inputs_,
+                teacher_logits_rows);
+        } else if (!teacher_logits_rows.empty()) {
+            throw std::invalid_argument("teacher logits rows require a teacher logits file");
         }
     }
     std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
@@ -1200,6 +1207,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
     c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    if(options.batch_cache_solo && runner==strix::decode_cli::CacheRunner::batch_mtp) {c.groups=false;c.cohort=false;c.nest_rows=0;}
     c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
     c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
     const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;
@@ -1217,7 +1225,8 @@ static int run_decode_entry(
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
-    strix::device::bind_hip_main(argc, argv);
+    // Eager code loading is resolved below by this engine's own policy (--no-eager-code-load, baseline, defaults off).
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine);
     // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
     // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
     try {
@@ -1408,24 +1417,9 @@ static int run_decode_entry(
     // Inspection predicts this policy without changing the process environment.
     // A value set here is already too late for this image, so restart it once with the value in its
     // environment; the restarted image finds the value set and continues without restarting again.
-    if (!options.print_effective_config && !options.print_cache_family &&
-        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
-            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
-            [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return strix::process_environment::set(name, value, false); })) {
-        std::fflush(nullptr);
-        // Linux repeats the process's own arguments from /proc (see split_process_arguments); where that file
-        // does not exist the restart takes the command line from the process itself.
-        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
-        const auto original = strix::decode_cli::split_process_arguments(
-            std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
-        std::vector<char*> restart;
-        for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
-        restart.push_back(nullptr);
-        const auto failure = strix::process_restart::run_again(original.empty() ? argv : restart.data());
-        std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
-            failure.c_str());
-        strix::decode_cli::withdraw_eager_code_loading(strix::process_environment::unset);
+    if (!options.print_effective_config && !options.print_cache_family) {
+        strix::device::restart_with_eager_code_loading(options.eager_code_load && !options.baseline &&
+            strix::envcfg::flag("STRIX_QPF2K_DEFAULTS", true, strix::EnvFlagMatch::first_character), argv);
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
@@ -1437,7 +1431,7 @@ static int run_decode_entry(
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
-        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
+        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file", "--teacher-logits-rows",
         "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable", "--deploy", "--deploy-check"};
     // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
     const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
@@ -1572,6 +1566,13 @@ static int run_decode_entry(
         strix::gguf::read_file(
             options.model_path);
     strix::qwen_description::refuse_unless_described(model, info);
+    std::shared_ptr<const strix::weight::Source> weight_source;
+    auto weight_status = strix::weight::open_source(options.model_path, weight_source);
+    strix::weight::TensorIndex weight_index;
+    if (weight_status) weight_status = strix::weight::index_gguf(info, weight_source, weight_index);
+    strix::weight::WeightMap admitted_weights;
+    if (weight_status) weight_status = strix::weight::bind_qwen(weight_index, admitted_weights);
+    if (!weight_status) throw std::runtime_error("Qwen weight admission: " + weight_status.detail);
     const auto manifest =
         strix::build_model_manifest(
             info);
@@ -1734,6 +1735,17 @@ static int run_decode_entry(
     if (const auto refusal = strix::decode_cli::separate_pool_residency_refusal(options, strix::host_memory_is_separate_pool());
         !refusal.empty())
         throw std::invalid_argument(refusal);
+    if (options.mtp.enabled) {
+        const auto& mtp = options.mtp;
+        std::cerr << "MTP runtime budget: requested=" << mtp.runtime_bytes
+            << " effective=" << strix::mtp_payload::runtime_budget(model,options.context_tokens,mtp.runtime_bytes,mtp.runtime_automatic)
+            << " source=" << (mtp.runtime_automatic ? "automatic-bundle" : "explicit") << '\n';
+    }
+    std::optional<strix::qwen_pp::PairPolicy> pair_policy;
+    if (strix::qwen_pp::pipe_enabled())
+        pair_policy = strix::qwen_pp::resolve_pair_policy(options.tokens.size(),
+            strix::qwen_pp::decode_enabled() ? strix::qwen_pp::PairExecution::handoff :
+                                             strix::qwen_pp::PairExecution::prefill_only, options.baseline);
     {
         // Shared route receipt: the prefill route this entry point resolved (the CLI and the HTTP server resolve
         // differently from the same switches), requested vs effective, with the selector's own reason text.
@@ -1772,8 +1784,11 @@ static int run_decode_entry(
             rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
     }
     // Export only after the resolved route has admitted the profile proposals.
-    strix::qwen::profile::withdraw_declined(options.product_profile);
-    strix::qwen::profile::apply(options.product_profile);
+    // --print-effective-config always prints and exits: it must not write the process environment.
+    if (!options.print_effective_config) {
+        strix::qwen::profile::withdraw_declined(options.product_profile);
+        strix::qwen::profile::apply(options.product_profile);
+    }
     for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);
@@ -1827,14 +1842,16 @@ static int run_decode_entry(
     std::cerr << effective.serve_prefill_notice << strix::decode_cli::effective_config_notice(effective);
     if (options.print_effective_config && options.deployment_spec) {
         deployment.resolve(effective, model, manifest, mapped.bytes(), prompt_memory);
-        std::cout << deployment.json() << '\n';
+        const auto config = deployment.json();
+        std::cout << (pair_policy ? strix::qwen_pp::inspect_pair_policy(config, *pair_policy) : config) << '\n';
         return deployment.plan->refused ? 2 : 0;
     }
     if (options.http_serve || !options.print_effective_config)
         strix::decode_cli::validate_effective_startup(effective);
     strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
-        std::cout << strix::decode_cli::effective_config_json(effective);
+        const auto config = strix::decode_cli::effective_config_json(effective);
+        std::cout << (pair_policy ? strix::qwen_pp::inspect_pair_policy(config, *pair_policy) : config);
         return 0;
     }
     if (options.deployment_spec) {
@@ -1850,6 +1867,8 @@ static int run_decode_entry(
         }
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
+    strix::core::iu4_rows::configure_execution_policy({effective.options.turbo.row_decode.effective,
+                                                     effective.options.turbo.row_reduction.effective});
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
     if (yarn) yarn_watchdog = std::make_unique<strix::decode_cli::YarnMemoryWatchdog>();
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
@@ -2694,6 +2713,49 @@ static int run_decode_entry(
         views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
         shared_model_inventory = strix::build_uma_owner_inventory(views);
     }
+    // TURBO+ onfly INT4 g64 copies of the dense decode projections (--turbo-weights onfly): after the router copy, before any kernel plan.
+    const auto onfly_i4_owner = strix::load_hip_qwen_onfly_i4(manifest, model_residency.binding(), options.turbo);
+    if (options.turbo.active()) {
+        const auto inventory = onfly_i4_owner->owner_inventory(onfly_i4_owner);
+        auto views = shared_model_inventory.pinned_views;
+        views.insert(views.end(), inventory.pinned_views.begin(), inventory.pinned_views.end());
+        shared_model_inventory = strix::build_uma_owner_inventory(views);
+        optimization_profile_receipt += onfly_i4_owner->receipt_json();
+        std::cerr << "turbo-weights onfly " << onfly_i4_owner->resolved.identity() << ": " << onfly_i4_owner->copies.size() << " tensors, "
+                  << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
+                  << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
+    }
+    if (strix::envcfg::flag("STRIX_MTP_WEIGHT_LOG", false)) {
+        // The family adapter supplies tensor names; registry ownership and the
+        // shared projection's admitted K groups determine the effective form.
+        std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> groups;
+        for (std::size_t index = 0; index < manifest.tensors.size(); ++index) {
+            const auto& tensor = manifest.tensors[index];
+            const auto* runtime = strix::find_runtime_tensor_binding(model_residency.binding(), static_cast<std::uint32_t>(index));
+            if (!runtime || !runtime->address) continue;
+            std::string name = tensor.name;
+            if (name.starts_with("blk.")) {
+                const auto end = name.find('.', 4U);
+                if (end != std::string::npos) name.erase(0U, end + 1U);
+            }
+            const auto* address = reinterpret_cast<const void*>(runtime->address);
+            std::string form = "native";
+            if (const auto* packed = strix::q6p::find(address))
+                form = packed->kind == strix::q6p::Kind::bf16 ? "bf16-copy" : "q6p32-copy";
+            const bool copy = std::any_of(onfly_i4_owner->copies.begin(), onfly_i4_owner->copies.end(),
+                [&](const auto& c) { return c.original == address; });
+            if (copy && tensor.dimensions.size() == 2U) {
+                const auto g = tensor.dimensions[0] / 64U;
+                form = g == 32U || g == 40U || g == 64U || g == 96U ? options.turbo.identity() : "native-unused-i4-copy";
+            }
+            const std::string key = name + " ggml=" + std::to_string(tensor.ggml_type) + " effective=" + form;
+            auto& total = groups[key]; ++total.first; total.second += tensor.byte_size;
+        }
+        for (const auto& [group, total] : groups)
+            std::cerr << "mtp-weight path=verify_and_commit source_sha256=" << admitted_content << " group=" << group
+                      << " tensors=" << total.first << " source_bytes=" << total.second
+                      << " scope=decode-r1-r8 commit=reuse-verified-state wide_iu4=off\n";
+    }
     optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
         "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +
         "  \"qwen_router_bf16_tensors\":" + std::to_string(router_bf16_owner->copies.size()) + ",\n" +
@@ -3481,6 +3543,10 @@ static int run_decode_entry(
     strix::qwen_pp::PromptRoute pair_prompt_route;
     const char* pair_cut_env = std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* pair_cost_env = std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
+    // PR-3 stage emulation: the pair chunk (STRIX_QWEN_PF_PIPE_CHUNK) is the tile, as the pair route sets it.
+    if (!strix::qwen_pp::pipe_enabled() && strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE") && options.known_prefix_prefill_rows)
+        if (const char* emulate_chunk = std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"); emulate_chunk && *emulate_chunk)
+            options.known_prefix_prefill_rows = static_cast<std::uint32_t>(std::strtoul(emulate_chunk, nullptr, 10));
     if (strix::qwen_pp::pipe_enabled()) {
         strix::qwen_pp::LegalCuts pair_legal{};
         for (std::uint32_t pair_layer = 1; pair_layer < 48U; ++pair_layer) {
@@ -3501,16 +3567,22 @@ static int run_decode_entry(
                 strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
                 strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
         } else {
-            const auto pair_cut = strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half);
+            const auto pair_cut = strix::qwen_pp::resolve_stage_cut(pair_cut_env, pair_legal, pair_legal_half,
+                pair_policy->half_cut.on);
             pair_prediction.cut = pair_cut.layer;
             pair_prediction.half = pair_cut.half;
         }
         const auto pair_legacy_rows = options.known_prefix_prefill_rows;
-        const auto choice = strix::qwen_pp::choose_chunk(std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"),
-            pair_legacy_rows, options.tokens.size(), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
-        options.known_prefix_prefill_rows = choice.rows;
-        pair_prompt_route = strix::qwen_pp::choose_prompt_route(options.tokens.size(), choice.rows,
-            pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction);
+        const auto pair_route = strix::qwen_pp::resolve_pair_route(options.tokens.size(), pair_legacy_rows,
+            std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"), pair_cost_bucket ? &*pair_cost_bucket : nullptr, pair_prediction,
+            pair_policy->chunk_policy.on, pair_policy->single_tiles.on, pair_policy->execution);
+        const auto& choice = pair_route.chunk;
+        options.known_prefix_prefill_rows = pair_route.tile_rows;
+        pair_prompt_route = pair_route.route;
+        std::fprintf(stderr, "qwen-pair regime policy=%s mode=%s chunk=%u chunks=%llu model-pipeline-ms=%.0f "
+            "model-single-ms=%.0f tile-rows=%u\n", pair_route.policy, pair_prompt_route.prefix ? "pipeline" : "single",
+            choice.rows, static_cast<unsigned long long>(pair_route.chunks), pair_route.model.pipeline_ms,
+            pair_route.model.single_ms, pair_route.tile_rows);
         std::fprintf(stderr, "qwen-handoff route=%s prefix=%llu suffix=%llu\n", pair_prompt_route.reason,
             static_cast<unsigned long long>(pair_prompt_route.prefix),
             static_cast<unsigned long long>(options.tokens.size() - pair_prompt_route.prefix));
@@ -3790,7 +3862,8 @@ static int run_decode_entry(
             strix::decode_cli::PrefillReservationGrowth mtp_growth;
             if (ple_turn) {
                 const auto& m = options.mtp;
-                mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes, m.runtime_bytes,
+                mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes,
+                    strix::mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes, m.runtime_automatic),
                     m.target_capture_bytes, m.replay_host_bytes, m.golden_max_bytes, m.window_arena_bytes,
                     m.window_capture_bytes, m.window_checkpoint_bytes, m.window_total_bytes,
                     m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
@@ -4145,18 +4218,20 @@ static int run_decode_entry(
                 throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
-            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
-                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4318,6 +4393,7 @@ static int run_decode_entry(
             std::shared_ptr<strix::HipKnownPrefixWindow> block_owner;
             std::unique_ptr<strix::HipKnownPromptBackend> blocks;
             std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
+            std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> wide_owners;  // split profile: decode-profile wide owners
             std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
             std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
             // Split prefill profile: the sibling prefill execution's view of this slot's serial scratch and
@@ -4410,6 +4486,13 @@ static int run_decode_entry(
                     known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
                 hand_off(*stack.tails.back());
             }
+            // --mtp-copy-wide-rows under a split prefill profile: the slot's decode-profile wide owners (as the CLI's
+            // known_wide_owners; their scratch is shared like the tails': the server runs a wide cycle only while one
+            // request is active)
+            for (std::size_t w = 0; w < known_wide_plans.size() && w < known_wide_memories.size(); ++w)
+                stack.wide_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_wide_plans[w], compiled, model,
+                    catalog_config, stack.parents->resources, known_wide_memories[w]->scratch, known_wide_memories[w]->scope,
+                    std::static_pointer_cast<const void>(known_wide_memories[w]), workspace(known_wide_memories[w])));
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
                     prefix_cache_unit(options), prefix_cache_every, model, state_layout, stack.memory->state());
@@ -4419,16 +4502,20 @@ static int run_decode_entry(
             if(stack.cache) stack.cache->set_staging_cap(options.prefix_cache_staging_bytes);
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
-            for (std::size_t t = 0; t < stack.tails.size(); ++t)
-                tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < stack.tails.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
+            for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
+                tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4511,7 +4598,12 @@ static int run_decode_entry(
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
                 return *observation.gtt_limit - *observation.gtt_used;
             };
-            const auto serving = prompt_memory.serving(options);
+            auto serving = prompt_memory.serving(options);
+            // The bridge builds a wide workspace for every slot, including slot zero.
+            // The stack probe below does not build these; charge them as future slot commitments.
+            const auto wide_bytes = mtp_wide_copy_retained_bytes(model, state_layout, mtp_wide_copy_rows_effective(options));
+            serving.slot_host = add(serving.slot_host, wide_bytes);
+            serving.slot_device = add(serving.slot_device, wide_bytes);
             // Future commitments exclude the already resident primary stack and tiled arenas.
             auto slot_metadata = known_prefill_plan->host_metadata_payload_bytes;
             for (const auto& tail : known_tail_plans) slot_metadata = add(slot_metadata, tail->host_metadata_payload_bytes);
@@ -4588,7 +4680,8 @@ static int run_decode_entry(
                 cache_slot_retained=retained;
                 const auto mul=strix::decode_cli::prefill_checked_mul;
                 // Native owner budgets bound the geometry charged in serving.slot_*.
-                cache_slot_native=add(add(options.mtp.runtime_bytes,options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
+                cache_slot_native=add(add(strix::mtp_payload::runtime_budget(model,options.context_tokens,options.mtp.runtime_bytes,options.mtp.runtime_automatic),
+                    options.mtp.window_total_bytes),options.mtp.target_capture_bytes);
                 // Request admission builds taps, draft/greedy heads and scratch.
                 // Keep all of them unpaid even when the lane's native owners exist.
                 const auto width=mul(mul(model.hidden_size,model.hc_count),2U);
@@ -4618,10 +4711,13 @@ static int run_decode_entry(
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
-            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
-                const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
+                auto single_serving = prompt_memory.serving(options);
+                single_serving.slot_host = add(single_serving.slot_host, wide_bytes);
+                single_serving.slot_device = add(single_serving.slot_device, wide_bytes);
+                const auto single = resolve_http_bridge_capacity(retained, single_serving,
                     fit_host, fit_device, headroom, headroom, 1U);
                 options.qsa_mtp_pool_fallback_unfit = !single.slots;
                 std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="
@@ -4711,7 +4807,8 @@ static int run_decode_entry(
                 cache_ready_commitment=strix::decode_cli::cache_unpaid_slot_bytes(
                     *cache_slot_retained,*cache_slot_native,cache_prompt_transient,batch_slots,eager_slots,eager_slots);
             } else {
-                auto future=prefill_checked_add(options.mtp.runtime_bytes,options.mtp.window_total_bytes);
+                auto future=prefill_checked_add(strix::mtp_payload::runtime_budget(model,options.context_tokens,
+                    options.mtp.runtime_bytes,options.mtp.runtime_automatic),options.mtp.window_total_bytes);
                 future=prefill_checked_add(future,options.mtp.target_capture_bytes);
                 const auto resident_native=future;
                 const auto width=prefill_checked_mul(prefill_checked_mul(model.hidden_size,model.hc_count),2);
@@ -5556,7 +5653,7 @@ static int run_decode_entry(
             requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
                 model.vocab_size, options.context_tokens, session, original_work_device,
                 options.teacher_forced_score ? std::span<const std::uint32_t>{options.tokens} : std::span<const std::uint32_t>{},
-                options.teacher_logits_path, model.effective_max_positions());
+                options.teacher_logits_path, model.effective_max_positions(), options.teacher_logits_rows);
         strix::SerialGreedyStepBackend* generation_backend = requested_logprobs
             ? static_cast<strix::SerialGreedyStepBackend*>(requested_logprobs.get())
             : static_cast<strix::SerialGreedyStepBackend*>(&backend);
@@ -5804,6 +5901,94 @@ static int run_decode_entry(
                     " bytes=" + std::to_string(bytes) + " fnv1a64=" + std::to_string(hash) + metadata + "\n");
             }
         };
+        // PR-3 identity gate (MMPIPE-PLAN, option C): STRIX_QWEN_PF_STAGE_EMULATE=v runs the interleaved (stage, chunk)
+        // order of 2v stages (v per rank) on ONE node: one cursor and one session, a frontier per stage swapped in
+        // around each step, the step's layer range in qwen_pp::pipe_step, seams kept per (chunk, boundary). v = 0 runs
+        // the same step loop without a split. Prints logits SHA-256, a state digest and the folded lineage.
+        if (const char* emulate_text = strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE");
+            emulate_text && *emulate_text && !strix::qwen_pp::pipe_enabled()) {
+            const auto emulate_v = static_cast<std::uint32_t>(std::strtoul(emulate_text, nullptr, 10));
+            if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty())
+                throw std::invalid_argument("stage emulation requires the 48-layer tiled model and a prompt");
+            strix::pair::StageMap emulate_map;
+            if (const char* map_text = strix::envcfg::text("STRIX_PAIR_STAGE_MAP"); map_text && *map_text && emulate_v)
+                emulate_map = strix::pair::StageMap::parse(map_text, 48U);
+            else if (emulate_v) emulate_map = strix::qwen_pp::even_map(emulate_v, 48U);
+            else emulate_map.cuts = {strix::pair::StageCut(0U), strix::pair::StageCut(48U)};
+            const auto emulate_stages = emulate_map.stages();
+            strix::KnownPromptChunkRequest emulate_req;
+            emulate_req.prompt_tokens = options.tokens;
+            emulate_req.start_position = session.next_position;
+            emulate_req.vocab_size = request.vocab_size; emulate_req.context_capacity = request.context_capacity;
+            emulate_req.max_new_tokens = 0U; emulate_req.eos_token_id = request.eos_token_id;
+            emulate_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+            emulate_req.tiled_prefill = true;
+            emulate_req.output_policy = options.known_prefix_output_policy;
+            emulate_req.all_row_heads = false;
+            emulate_req.schedule_extensions = true;
+            emulate_req.schedule_defer = false;  // a deferred block would complete across a stage switch
+            emulate_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+            strix::KnownPromptChunkCursor emulate_chunks(emulate_req, *known_prefix_backend, backend);
+            for (auto& tail : known_tail_backends)  // only owners smaller than the emulated tile
+                if (tail->logical_rows() < emulate_req.logical_rows) emulate_chunks.set_tail_backend(*tail);
+            const auto emulate_units = emulate_chunks.cold_plan().size();
+            strix::qwen_pp::require_stage_seams(emulate_stages,
+                strix::known_prompt_pipeline_plan(emulate_chunks.cold_plan()).serial_rows);
+            std::vector<strix::KnownPromptChunkStageView> emulate_views(emulate_stages, emulate_chunks.stage_view());
+            std::vector<strix::qwen_pp::StageFrontier> emulate_frontiers(emulate_stages,
+                strix::qwen_pp::StageFrontier{session.next_position, session.committed_tokens, session.arithmetic_lineage});
+            struct StepReset {
+                ~StepReset() { strix::qwen_pp::pipe_step = {}; }
+            } emulate_step_reset;
+            const auto emulate_swap = [&](std::uint32_t stage) {
+                emulate_chunks.swap_stage(emulate_views[stage]);
+                auto& front = emulate_frontiers[stage];
+                std::swap(session.next_position, front.next_position);
+                std::swap(session.committed_tokens, front.committed_tokens);
+                std::swap(session.arithmetic_lineage, front.lineage);
+            };
+            const auto emulate_start = std::chrono::steady_clock::now();
+            for (const auto& step : strix::qwen_pp::local_order(emulate_stages, emulate_units)) {
+                emulate_swap(step.stage);
+                strix::qwen_pp::pipe_step = {true, step.stage, emulate_stages, step.chunk, emulate_stages == 1U ?
+                    strix::qwen_pp::LayerRange{0U, 48U, false} : strix::qwen_pp::stage_range(emulate_map, step.stage)};
+                const bool ran = emulate_chunks.advance();
+                strix::qwen_pp::pipe_step = {};
+                emulate_swap(step.stage);
+                if (!ran) throw std::runtime_error("stage emulation: cursor ended before its planned units");
+            }
+            const auto emulate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - emulate_start).count();
+            // The last stage holds the terminal logits; the session frontier is the last stage's, its lineage the fold.
+            emulate_chunks.swap_stage(emulate_views.back());
+            session.next_position = emulate_frontiers.back().next_position;
+            session.committed_tokens = emulate_frontiers.back().committed_tokens;
+            session.arithmetic_lineage = strix::qwen_pp::fold_stage_lineages(emulate_frontiers);
+            const auto emulate_frontier = emulate_chunks.frontier();
+            if (!emulate_frontier.valid || emulate_frontier.logits.size() != model.vocab_size)
+                throw std::runtime_error("stage emulation: no terminal logits");
+            check_hip(hipDeviceSynchronize(), "stage emulation state digest fence");
+            std::uint64_t emulate_state = 14695981039346656037ULL, emulate_state_bytes = 0;
+            std::vector<std::uint64_t> emulate_staging(strix::qwen_pp::seam_piece_bytes / sizeof(std::uint64_t));
+            for (const auto& view : pair_state_views(0U, 48U))
+                for (std::uint64_t offset = 0; offset < view.second.bytes;) {
+                    const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        emulate_staging.size() * sizeof(std::uint64_t), view.second.bytes - offset));
+                    std::fill(emulate_staging.begin(), emulate_staging.end(), 0ULL);
+                    check_hip(hipMemcpy(emulate_staging.data(), reinterpret_cast<const void*>(view.second.address + offset),
+                        size, hipMemcpyDeviceToHost), "stage emulation state digest D2H");
+                    for (std::size_t word = 0; word < (size + 7U) / 8U; ++word)
+                        emulate_state = (emulate_state ^ emulate_staging[word]) * 1099511628211ULL;
+                    offset += size; emulate_state_bytes += size;
+                }
+            std::cout << "{\"stage_emulation\":" << emulate_v << ",\"map\":\"" << emulate_map.text() << "\",\"units\":" << emulate_units
+                << ",\"position\":" << session.next_position << ",\"lineage_history\":" << session.arithmetic_lineage.history_identity
+                << ",\"lineage_intervals\":" << session.arithmetic_lineage.intervals.size()
+                << ",\"lineage_tainted\":" << (session.arithmetic_lineage.tainted ? "true" : "false")
+                << ",\"state_fnv64w\":" << emulate_state << ",\"state_bytes\":" << emulate_state_bytes
+                << ",\"logits_sha256\":\"" << strix::model_content_identity_hex(strix::sha256_bytes(
+                    std::as_bytes(std::span<const float>(emulate_frontier.logits)))) << "\",\"wall_ms\":" << emulate_ms << "}\n";
+            return 0;
+        }
         if (strix::qwen_pp::pipe_enabled() && (!strix::qwen_pp::decode_enabled() || pair_prompt_route.prefix)) {
             const auto pair_prompt_size = strix::qwen_pp::decode_enabled() ? pair_prompt_route.prefix : options.tokens.size();
             if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty() ||
@@ -5818,16 +6003,45 @@ static int run_decode_entry(
             if (!strix::process_environment::set("STRIX_QWEN_PF_LAYER_RANGE", pair_range.c_str(), true))
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
+                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" :
+                    (pair_policy && pair_policy->half_cut.on ? "measured-default-half" : "measured-default")),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.
             auto pair_link = deployment.pair_link
                 ? std::make_unique<strix::qwen_pp::PairTransport>(std::move(deployment.pair_link))
                 : std::make_unique<strix::qwen_pp::PairTransport>(pair_rank);
+            // The cursor's own cold plan fixes the frames: a remainder below T runs as a merged partial block plus
+            // tail blocks, so ceil(P / T) frames would leave the producer filling slots the consumer never reads.
+            const auto pair_req = [&] {
+                strix::KnownPromptChunkRequest r;
+                r.prompt_tokens = std::span<const std::uint32_t>(options.tokens).first(static_cast<std::size_t>(pair_prompt_size));
+                r.start_position = session.next_position;
+                r.vocab_size = request.vocab_size; r.context_capacity = request.context_capacity;
+                r.max_new_tokens = request.max_new_tokens; r.eos_token_id = request.eos_token_id;
+                r.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+                r.tiled_prefill = true;
+                r.output_policy = options.known_prefix_output_policy;
+                r.all_row_heads = false;
+                r.schedule_extensions = true;
+                r.schedule_defer = strix::qpf2k::cli_sched_defers(false);
+                r.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+                return r;
+            }();
+            const auto pair_plan = [&] {
+                strix::KnownPromptChunkCursor planner(pair_req, *known_prefix_backend, backend);
+                for (auto& tail : known_tail_backends) planner.set_tail_backend(*tail);
+                return strix::known_prompt_pipeline_plan(planner.cold_plan());
+            }();
+            if (!pair_plan.units || pair_plan.serial_rows || pair_plan.rows != pair_prompt_size)
+                throw std::invalid_argument("pair prefill plan has " + std::to_string(pair_plan.serial_rows) +
+                    " serial rows in the pipelined " + std::to_string(pair_prompt_size) + "-row prefix (no seam for a serial row; "
+                    "the tail owners must cover the remainder on the 16-row grain)");
+            std::fprintf(stderr, "qwen-pair plan frames=%llu rows=%llu last-frame-rows=%llu\n",
+                static_cast<unsigned long long>(pair_plan.units), static_cast<unsigned long long>(pair_plan.rows),
+                static_cast<unsigned long long>(pair_plan.unit_rows.back()));
             strix::dist::PipelineTimeline pair_timeline("qwen-prefill", pair_rank, strix::qwen_pp::pair_timing_columns());
-            strix::qwen_pp::Pipe pair_pipe(pair_rank,
-                (pair_prompt_size + known_prefill_plan->logical_rows - 1U) / known_prefill_plan->logical_rows,
+            strix::qwen_pp::Pipe pair_pipe(pair_rank, pair_plan.units,
                 [&](std::span<const std::byte> data) { pair_link->send(data); },
                 [&](std::span<std::byte> data) { pair_link->receive(data); },
                 [&] { pair_link->abort("pair prefill stopped"); }, pair_prediction.stage(),
@@ -5846,31 +6060,23 @@ static int run_decode_entry(
             pair_context.identity ^= compiled.execution_identity ^ known_prefill_plan->prefill_kernel_plan_identity;
             for (const char pair_byte : strix::model_content_identity_hex(mapped.file_sha256()))
                 pair_context.identity = (pair_context.identity ^ static_cast<unsigned char>(pair_byte)) * 1099511628211ULL;
+            // Both ranks must run the same units: a differing plan fails at the first seam header, not as a hang.
+            pair_context.identity = (pair_context.identity ^ pair_plan.identity) * 1099511628211ULL;
             struct PairContextReset {
                 ~PairContextReset() { strix::qwen_pp::pipe_context = {}; }
             } pair_reset;
             const auto pair_start = std::chrono::steady_clock::now();
             std::vector<float> pair_final_logits;
             {   // drive the chunks through the normal cursor/backend (session handoff), not the raw owner
-                strix::KnownPromptChunkRequest pair_req;
-                pair_req.prompt_tokens = std::span<const std::uint32_t>(options.tokens).first(static_cast<std::size_t>(pair_prompt_size));
-                pair_req.start_position = session.next_position;
-                pair_req.vocab_size = request.vocab_size; pair_req.context_capacity = request.context_capacity;
-                pair_req.max_new_tokens = request.max_new_tokens; pair_req.eos_token_id = request.eos_token_id;
-                pair_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
-                pair_req.tiled_prefill = true;
-                pair_req.output_policy = options.known_prefix_output_policy;
-                pair_req.all_row_heads = false;
-                pair_req.schedule_extensions = true;
-                pair_req.schedule_defer = strix::qpf2k::cli_sched_defers(false);
-                pair_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
                 strix::KnownPromptChunkCursor pair_chunks(pair_req, *known_prefix_backend, backend);
                 for (auto& tail : known_tail_backends) pair_chunks.set_tail_backend(*tail);
                 std::size_t pair_position = 0;
                 for (;;) {
                     const auto pair_chunk_start = std::chrono::steady_clock::now();
                     if (!pair_chunks.advance()) break;
-                    const auto pair_rows = std::min<std::size_t>(known_prefill_plan->logical_rows, static_cast<std::size_t>(pair_prompt_size) - pair_position);
+                    const auto pair_rows = static_cast<std::size_t>(pair_chunks.last_unit().end - pair_chunks.last_unit().begin);
+                    if (pair_context.sequence >= pair_plan.units || pair_rows != pair_plan.unit_rows[pair_context.sequence])
+                        throw std::logic_error("pair prefill cursor left its cold plan");
                     if (pair_rank == 1U) pair_pipe.release(pair_context.sequence);
                     if (pair_timeline.enabled()) {
                         const auto pair_chunk_end = std::chrono::steady_clock::now();
@@ -5987,6 +6193,16 @@ static int run_decode_entry(
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
+            // chunkinv-attn-state-v1 witness (src/core/chunk_contract.hpp): with GDN FAST (C32, closes its partial block per
+            // call) the call plan is chunk-invariant when every call before the last absolute 32-row boundary ends on one.
+            if (strix::prefill_option_enabled(strix::PrefillOption::gdn_fp16_chunk) && paired.tiled_prefill) {
+                std::vector<std::uint64_t> ends;
+                for (const auto& unit : chunks.cold_plan()) ends.push_back(unit.end);
+                const bool canonical = strix::chunk_contract::block_plan_canonical(ends, paired.start_position, 32U);
+                std::fprintf(stderr, "chunkinv %s: GDN FAST plan T%u start %llu rows %zu units %zu -> %s\n",
+                    strix::chunk_contract::kContractName, paired.logical_rows, static_cast<unsigned long long>(paired.start_position),
+                    prompt.size(), ends.size(), canonical ? "canonical" : "NOT canonical (unaligned start/interior end or non-increasing ends)");
+            }
             if(prefix_state) {
                 strix::decode_cli::QwenTiledPlanConfig plan;
                 plan.rows=paired.logical_rows;
@@ -6509,7 +6725,10 @@ static int run_decode_entry(
         if (requested_logprobs) {
             if (!options.teacher_logits_path.empty())
                 std::cout << "  \"teacher_logits_file\":\"" << strix::decode_receipt::escape_json_string(options.teacher_logits_path)
-                    << "\",\n  \"teacher_logits_scope\":\"complete-finite-full-vocabulary-F32-scored-N-minus-1-rows-with-teacher-IDs-and-completion-footer\",\n";
+                    << "\",\n  \"teacher_logits_scope\":\"" << (options.teacher_logits_rows.empty()
+                        ? "complete-finite-full-vocabulary-F32-scored-N-minus-1-rows-with-teacher-IDs-and-completion-footer"
+                        : "complete-finite-full-vocabulary-F32-selected-rows-of-N-minus-1-scored-with-teacher-IDs-and-completion-footer")
+                    << "\",\n  \"teacher_logits_rows\":" << options.teacher_logits_rows.size() << ",\n";
             const auto previous_precision = std::cout.precision(17);
             std::cout << "  \"requested_logprobs_scope\":\""
                       << (options.teacher_forced_score ? "teacher-forced-next-input-diagnostic-N-minus-1-rows-not-a-speed-run" :

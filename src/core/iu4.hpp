@@ -41,7 +41,18 @@ inline int iu4_requant(float w, float inv) {
 // 0.0116, fast full range 0.0096.
 inline constexpr int iu4_scale_rule_legacy = 0;
 inline constexpr int iu4_scale_rule_fast_full = 2001;
-inline constexpr bool iu4_scale_rule_valid(int rule) { return rule == iu4_scale_rule_legacy || rule == iu4_scale_rule_fast_full; }
+// MSE clip search (load-time only): the fast full range grid [-8, 7], scale = c * max(max(w, 0) / 7, max(-w, 0) / 8)
+// for c = iu4_mse_clip(0..iu4_mse_steps-1) (1.00 down to 0.60, step 0.02), each candidate rounded to FP16 first; the
+// candidate with the least sum of (w - s q)^2 over the group wins (the larger clip on ties).
+inline constexpr int iu4_scale_rule_mse = 2002;
+inline constexpr int iu4_mse_steps = 21;
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline constexpr float iu4_mse_clip(int i) { return 1.0f - 0.02f * static_cast<float>(i); }
+inline constexpr bool iu4_scale_rule_valid(int rule) {
+    return rule == iu4_scale_rule_legacy || rule == iu4_scale_rule_fast_full || rule == iu4_scale_rule_mse;
+}
 #if defined(__HIPCC__)
 __host__ __device__
 #endif

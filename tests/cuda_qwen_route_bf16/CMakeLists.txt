@@ -35,7 +35,7 @@ endif()
 # Existing real prefix identity/store regressions, without a CUDA runtime.
 add_executable(qwen-route-bf16-prefix-host
     ../cuda/qwen_prefix_cache_host_test.cpp
-    ../../src/cuda/qwen_prefix_identity.cpp ../../src/prefix_state_cache.cpp
+    ../../src/cuda/models/qwen/qwen_prefix_identity.cpp ../../src/prefix_state_cache.cpp
     ../../src/model_content_hash.cpp ../../src/model_runtime_binding.cpp)
 target_compile_features(qwen-route-bf16-prefix-host PRIVATE cxx_std_20)
 target_include_directories(qwen-route-bf16-prefix-host PRIVATE ../../include)

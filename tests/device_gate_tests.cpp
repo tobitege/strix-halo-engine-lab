@@ -290,6 +290,12 @@ void entry_points() {
     char* bad_argv[] = {b0, b1, nullptr};
     int bad_argc = 2;
     rejects([&] { (void)take_command_line(bad_argc, bad_argv); }, "needs a value", "flag without a value");
+    char c0[] = "app", c1[] = "--deploy", c2[] = "auto", c3[] = "--deploy-check", c4[] = "--device-id", c5[] = "main";
+    char* check_argv[] = {c0, c1, c2, c3, c4, c5, nullptr};
+    int check_argc = 6;
+    const auto check = take_command_line(check_argc, check_argv);
+    require(check.select == "main" && check_argc == 4 && std::string(check_argv[3]) == "--deploy-check",
+            "--deploy-check is kept for the engine parser to interpret");
 }
 
 // NPU and CPU units: declared explicitly, never matched against the GPU listing, shown in the start line.
@@ -337,8 +343,8 @@ void units() {
                       "\"byte_cap_gbytes_ps\":10}") != std::string::npos &&
                 json.find("\"corun_qualification\":\"E1-test\"}]}") != std::string::npos,
             "units in the receipt");
-    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "npu", -1, {}}); }, "npu unit, not a GPU", "selecting the npu as the GPU");
-    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "host", -1, {}}); }, "cpu unit, not a GPU", "selecting the cpu as the GPU");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "npu", -1, {}, {}}); }, "npu unit, not a GPU", "selecting the npu as the GPU");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "host", -1, {}, {}}); }, "cpu unit, not a GPU", "selecting the cpu as the GPU");
 
     // An NPU without its qualification parses, is listed, and is refused the role.
     const auto unqualified = parse_declaration(gpu + npu + "driver = \"amdxdna\"\n");
@@ -397,6 +403,37 @@ void host_wait() {
     }
     require(refused, "host wait: unknown text is refused");
 }
+void code_load() {
+    // Policy: explicit HIP value (even empty) and STRIX_EAGER_CODE_LOAD=0 both decline; otherwise the value is set once.
+    std::vector<std::string> puts;
+    auto put = [&](const char* name, const char* value) { puts.push_back(std::string(name) + "=" + value); return true; };
+    auto env = [](const char* strix, const char* hip) {
+        return [=](const char* name) -> const char* {
+            return std::string(name) == "STRIX_EAGER_CODE_LOAD" ? strix : std::string(name) == "HIP_ENABLE_DEFERRED_LOADING" ? hip : nullptr;
+        };
+    };
+    require(apply_eager_code_loading(true, env(nullptr, nullptr), put) && puts == std::vector<std::string>{"HIP_ENABLE_DEFERRED_LOADING=0"},
+        "code load: default sets HIP_ENABLE_DEFERRED_LOADING=0");
+    require(!apply_eager_code_loading(true, env("0", nullptr), put), "code load: STRIX_EAGER_CODE_LOAD=0 declines");
+    require(!apply_eager_code_loading(true, env("1", ""), put), "code load: an explicit (empty) HIP value wins");
+    require(!apply_eager_code_loading(true, env(nullptr, "1"), put), "code load: explicit deferred HIP value wins");
+    require(!apply_eager_code_loading(false, env(nullptr, nullptr), put) && puts.size() == 1U, "code load: disabled engine policy");
+    rejects([&] { (void)apply_eager_code_loading(true, env(nullptr, nullptr), [](const char*, const char*) { return false; }); },
+        "cannot configure", "code load: a refused setenv is an error");
+    char arg0[] = "x";
+    char* argv[] = {arg0, nullptr};
+    eager_code_load_or_restart(argv, CodeLoad::engine);  // engine-owned: never restarts
+    set_env("STRIX_EAGER_CODE_LOAD", "");
+    set_env("HIP_ENABLE_DEFERRED_LOADING", "0");
+    require(code_load_receipt() == "code load: eager (HIP_ENABLE_DEFERRED_LOADING=0)", "code load: eager receipt");
+    require(code_load_receipt(CodeLoad::engine) == "code load: eager (engine policy)", "code load: engine receipt");
+    set_env("STRIX_EAGER_CODE_LOAD", "0");
+    set_env("HIP_ENABLE_DEFERRED_LOADING", "");
+    require(code_load_receipt() == "code load: deferred (STRIX_EAGER_CODE_LOAD=0)", "code load: declined receipt");
+    set_env("STRIX_EAGER_CODE_LOAD", "");
+    require(split_process_arguments(std::string_view("a\0\0b\0", 5)) == std::vector<std::string>{"a", "", "b"} &&
+                split_process_arguments("cut").empty(), "code load: restart arguments");
+}
 } // namespace
 
 int main() {
@@ -413,6 +450,7 @@ int main() {
         entry_points();
         units();
         host_wait();
+        code_load();
     } catch (const std::exception& e) {
         std::cerr << "device gate tests: " << e.what() << '\n';
         return 1;

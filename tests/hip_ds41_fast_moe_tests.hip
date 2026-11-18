@@ -94,6 +94,8 @@ struct DeviceExperts {
     const Experts& e;
     Device<std::uint8_t> gate, up, down;
     explicit DeviceExperts(const Experts& x) : e(x), gate(x.host[0].size()), up(x.host[1].size()), down(x.host[2].size()) {
+        for (unsigned i=0;i<3;++i) expect(strix::ds41::ds41_f16_moe_weights_fit(i==2?x.down:x.gate_up,
+            x.host[i].data(),x.host[i].size()), "FP16 weight metadata fits");
         gate.upload(x.host[0]); up.upload(x.host[1]); down.upload(x.host[2]);
     }
 };
@@ -273,6 +275,31 @@ __global__ void flush_kernel(int* p, std::size_t n, int* sink) {
 }
 bool timing_on = true;
 unsigned reps = 7;
+unsigned only_rows = 0;
+bool real_only = false;
+bool checks_only = false;
+void f16_mode(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("STRIX_DS41_FAST_MOE_F16",enabled?"1":"0");
+#else
+    setenv("STRIX_DS41_FAST_MOE_F16",enabled?"1":"0",1);
+#endif
+}
+double rel_l2(const std::vector<float>&,const std::vector<float>&,std::size_t&);
+struct Error { double l2=0, max=0, mean=0, p50=0, p99=0; std::size_t nonfinite=0; };
+// Per-row relative L2 avoids dividing individual near-zero outputs by zero; report
+// maximum and mean as well as quantiles to reveal clustering across routed rows.
+Error row_error(const std::vector<float>& ref,const std::vector<float>& got,unsigned width) {
+    Error e; e.l2=rel_l2(ref,got,e.nonfinite); std::vector<double> errors;
+    for(std::size_t r=0;r<ref.size()/width;++r) {
+        double a=0,b=0;
+        for(unsigned j=0;j<width;++j) { double x=ref[r*width+j],y=got[r*width+j]; a+=(y-x)*(y-x);b+=x*x; }
+        errors.push_back(std::sqrt(a/std::max(b,1e-30)));
+    }
+    std::sort(errors.begin(),errors.end());
+    for(double x:errors) { e.max=std::max(e.max,x);e.mean+=x; }
+    e.mean/=static_cast<double>(std::max<std::size_t>(errors.size(),1));e.p50=errors[errors.size()/2];e.p99=errors[errors.size()*99/100];return e;
+}
 double rel_l2(const std::vector<float>& ref, const std::vector<float>& got, std::size_t& nonfinite) {
     double num = 0, den = 0;
     nonfinite = 0;
@@ -300,7 +327,8 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
     for (auto& v : ev) check(hipEventCreate(&v), "event");
     struct Result { std::vector<float> raw, deltas; std::vector<std::int8_t> codes; float gu = 0, dn = 0; };
     const auto run_mode = [&](int mode) {
-        set_fast_moe(i4_diagnostic ? 0 : mode);
+        f16_mode(mode==2);
+        set_fast_moe(i4_diagnostic ? 0 : (mode!=0));
         set_fast_i4(i4_diagnostic ? mode : 0);
         PrefillRun run(slots, rows, e.hidden, e.inter, false);
         check(hipMemset(run.raw.data, 0, run.raw.count * sizeof(float)), "clear");
@@ -326,6 +354,33 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
     };
     const Result exact = run_mode(0), fast = run_mode(1);
     const Result again = run_mode(1);
+    if (!i4_diagnostic) {
+        const Result f16=run_mode(2), f16_again=run_mode(2);
+        expect(bit_mismatches(f16.raw,f16_again.raw)==0 && bit_mismatches(f16.codes,f16_again.codes)==0,label+": FP16 repeat bits");
+        const auto activation = [](const Result& r) {
+            std::vector<float> a(r.codes.size());
+            for(std::size_t i=0;i<a.size();++i) a[i]=float(r.codes[i])*r.deltas[i/32];
+            return a;
+        };
+        const auto act=activation(exact);
+        const auto relaxed_raw=row_error(exact.raw,fast.raw,e.hidden);
+        const auto relaxed_act=row_error(act,activation(fast),e.inter);
+        for(unsigned mode=1;mode<=2;++mode) {
+            const auto& v=mode==1?fast:f16;
+            const auto raw=row_error(exact.raw,v.raw,e.hidden),a=row_error(act,activation(v),e.inter);
+            expect(raw.nonfinite==0 && a.nonfinite==0,label+": FP16 finite outputs");
+            if(mode==2) {
+                const bool qualified=raw.max<=2*relaxed_raw.max && raw.mean<=2*relaxed_raw.mean &&
+                    a.max<=2*relaxed_act.max && a.mean<=2*relaxed_act.mean;
+                std::cout<<"F16_QUALIFICATION "<<label<<" T="<<rows<<" within_2x="<<qualified<<std::endl;
+                expect(qualified,label+": FP16 max/mean errors within 2x relaxed");
+            }
+            std::cout<<"F16 "<<label<<" T="<<rows<<" mode="<<(mode==1?"relaxed":"f16")<<" gu_ms="<<v.gu<<" dn_ms="<<v.dn
+                <<" raw_l2="<<raw.l2<<" raw_max="<<raw.max<<" raw_mean="<<raw.mean<<" raw_p50="<<raw.p50<<" raw_p99="<<raw.p99
+                <<" act_l2="<<a.l2<<" act_max="<<a.max<<" act_mean="<<a.mean<<" act_p50="<<a.p50<<" act_p99="<<a.p99<<std::endl;
+        }
+    }
+    f16_mode(false);
     set_fast_moe(-1);
     set_fast_i4(-1);
     std::size_t nonfinite = 0;
@@ -344,6 +399,34 @@ void run_case(const DeviceExperts& x, std::uint32_t rows, std::uint32_t top_k, d
               << (fast.gu + fast.dn > 0 ? (exact.gu + exact.dn) / (fast.gu + fast.dn) : 0.0) << " raw_rel_l2=" << err
               << " codes_diff=" << static_cast<double>(code_diff) / static_cast<double>(std::max<std::size_t>(exact.codes.size(), 1U)) << std::endl;
     for (auto& v : ev) (void)hipEventDestroy(v);
+}
+// Alter one activation row by a large exact power of two. Every other row must
+// retain its bits; the changed row's raw gate/up sums must scale back without Inf.
+void row_scaling_case(const DeviceExperts& x) {
+    using namespace strix::ds41;
+    const auto& e=x.e; constexpr unsigned rows=77,top_k=6;
+    RouteBuffers rb(rows,top_k,e.experts,16U);rb.ids.upload(routing(rows,top_k,e.experts,0.0,172U));
+    enqueue_build_prefill_routes(rb.ids.data,rows,top_k,e.experts,e.experts,16U,rb.b,nullptr);
+    const auto view=prefill_routes_view(rb.b,rows,top_k,e.experts,16U);
+    Inputs in(rows,top_k,e.hidden,781U);
+    PrefillRun base(rows*top_k,rows,e.hidden,e.inter,true),scaled(rows*top_k,rows,e.hidden,e.inter,true);
+    f16_mode(true);set_fast_moe(1);set_fast_i4(0);
+    enqueue_prefill(x,in,view,base,true);check(hipDeviceSynchronize(),"scale baseline");
+    auto deltas=in.deltas.download();
+    for(unsigned g=0;g<e.hidden/32U;++g) deltas[g]*=0x1p80F;
+    in.deltas.upload(deltas);
+    enqueue_prefill(x,in,view,scaled,true);check(hipDeviceSynchronize(),"scale changed row");
+    const auto a=base.gate.download(),b=scaled.gate.download();
+    const auto u=base.up.download(),v=scaled.up.download();
+    bool finite=true,own=true,other=true;
+    for(std::size_t i=0;i<a.size();++i) {
+        finite &= std::isfinite(b[i]) && std::isfinite(v[i]);
+        if(i<top_k*e.inter) own &= a[i]==b[i]*0x1p-80F && u[i]==v[i]*0x1p-80F;
+        else other &= a[i]==b[i] && u[i]==v[i];
+    }
+    expect(finite && own && other,"FP16 row power scaling and independent row bits");
+    std::cout<<"F16_SCALE finite="<<finite<<" scaled_bits="<<own<<" other_row_bits="<<other<<std::endl;
+    f16_mode(false);set_fast_moe(-1);set_fast_i4(-1);
 }
 // Non-canonical batches (the views accept them; the builders never make them): every expert's 4th batch split into two
 // batches of 8. The relaxed kernels must cover every entry exactly once (vs the exact kernels on the same view).
@@ -377,7 +460,8 @@ void custom_batches_case(const DeviceExperts& x, std::uint32_t rows, std::uint32
     Inputs in(rows, top_k, e.hidden, 444U + rows);
     const std::size_t slots = static_cast<std::size_t>(rows) * top_k;
     const auto run_mode = [&](int mode) {
-        set_fast_moe(i4_diagnostic ? 0 : mode);
+        f16_mode(mode==2);
+        set_fast_moe(i4_diagnostic ? 0 : (mode!=0));
         set_fast_i4(i4_diagnostic ? mode : 0);
         PrefillRun run(slots, rows, e.hidden, e.inter, false);
         check(hipMemset(run.raw.data, 0xff, run.raw.count * sizeof(float)), "poison");   // NaN: an unwritten entry shows
@@ -386,6 +470,12 @@ void custom_batches_case(const DeviceExperts& x, std::uint32_t rows, std::uint32
         return run.raw.download();
     };
     const auto exact = run_mode(0), fast = run_mode(1);
+    if(!i4_diagnostic) {
+        const auto f16=run_mode(2); std::size_t nf=0;
+        const double err16=rel_l2(exact,f16,nf);
+        expect(nf==0 && err16<0.02,"FP16 custom batches finite and covered");
+    }
+    f16_mode(false);
     set_fast_moe(-1);
     set_fast_i4(-1);
     std::size_t nonfinite = 0;
@@ -397,29 +487,47 @@ void custom_batches_case(const DeviceExperts& x, std::uint32_t rows, std::uint32
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // Admission checks never dereference GPU storage and reject non-finite metadata.
+    for(auto format:{WeightFormat::iq2_xxs,WeightFormat::q2_k}) {
+        std::vector<std::uint8_t> bytes(strix::ds41::block_bytes(format),0);
+        expect(strix::ds41::ds41_f16_moe_weights_fit(format,bytes.data(),bytes.size()),"zero weights fit");
+        const unsigned off=format==WeightFormat::q2_k?80U:0U;
+        for(std::uint16_t bits:{std::uint16_t(0x7bff),std::uint16_t(0x7c00),std::uint16_t(0x7e00)}) {
+            std::memcpy(bytes.data()+off,&bits,2);
+            expect(!strix::ds41::ds41_f16_moe_weights_fit(format,bytes.data(),bytes.size()),"large/nonfinite scales rejected");
+            if(format==WeightFormat::q2_k) {
+                std::fill(bytes.begin(),bytes.end(),0);std::memcpy(bytes.data()+82U,&bits,2);
+                expect(!strix::ds41::ds41_f16_moe_weights_fit(format,bytes.data(),bytes.size()),"large/nonfinite minima rejected");
+            }
+        }
+    }
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--fast-i4") i4_diagnostic = true;
+        else if (std::string(argv[i]) == "--rows" && i+1<argc) only_rows=static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (std::string(argv[i]) == "--checks-only") checks_only=true;
+        else if (std::string(argv[i]) == "--real-only") real_only=true;
         else if (std::string(argv[i]) == "--no-timing") timing_on = false;
         else if (std::string(argv[i]) == "--reps" && i + 1 < argc) reps = static_cast<unsigned>(std::stoul(argv[++i]));
     }
     if (i4_diagnostic) std::cout << "FAST_I4 diagnostic: finite/coverage/repeat gates only; model fidelity NOT QUALIFIED\n";
-    {
+    if (!real_only) {
         // 48 synthetic experts: T 1024 x top-6 = ~128 rows per expert (an 8K pair prefill), T 4096 = ~512 (32K)
         const auto s = synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 48U, 5120U, 2304U, 11U);
         const DeviceExperts x(s);
-        run_case(x, 77U, 6U, 0.0, "synthetic-small");
-        custom_batches_case(x, 1024U, 6U);
-        run_case(x, 1024U, 6U, 0.0, "synthetic");
-        run_case(x, 1024U, 6U, 0.6, "synthetic-skew");
-        run_case(x, 4096U, 6U, 0.0, "synthetic");
+        if(!only_rows) {
+            if(!i4_diagnostic) row_scaling_case(x);
+            run_case(x,77U,6U,0.0,"synthetic-small");
+            custom_batches_case(x,1024U,6U);
+            if(!checks_only) run_case(x,1024U,6U,0.6,"synthetic-skew");
+        }
+        for(unsigned rows:{2048U,4096U,8192U}) if(!checks_only && (!only_rows || only_rows==rows)) run_case(x,rows,6U,0.0,"synthetic");
     }
     if (const char* path = std::getenv("STRIX_DS41_Q2_GGUF"); path && *path) {
         const char* l = std::getenv("STRIX_DS41_FAST_MOE_LAYER");
         const std::string p = "blk." + std::string(l && *l ? l : "20") + ".";
         const auto f = file_experts(path, p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight", p + "ffn_down_exps.weight");
         const DeviceExperts x(f);
-        run_case(x, 4096U, 6U, 0.0, "real-" + p);      // 384 experts: ~64 rows each
-        run_case(x, 16384U, 6U, 0.0, "real-" + p);     // ~256 rows each
+        run_case(x, only_rows ? only_rows : 4096U, 6U, 0.0, "real-" + p);
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " (" << failures << " failures)" << std::endl;
     return failures == 0 ? 0 : 1;

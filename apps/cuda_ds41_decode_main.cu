@@ -31,7 +31,7 @@
 // --stops K1,K2,..: after the greedy steps, --stop-steps steps (default 16) that stop after layer K (FRONT prefixes:
 //   the stream comes out, no head); the sequence's later layers fall behind (timing only).
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_file_reader.hpp"
 

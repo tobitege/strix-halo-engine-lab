@@ -1,0 +1,3533 @@
+{
+  "schema": "wfmt.matrix@1",
+  "cases": [
+    {
+      "file": "cuda-dense-0.wfmt",
+      "case": "cuda-dense-0",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 544,
+        "output": 84
+      }
+    },
+    {
+      "file": "cuda-dense-1.wfmt",
+      "case": "cuda-dense-1",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-2.wfmt",
+      "case": "cuda-dense-2",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 1088,
+        "output": 168
+      }
+    },
+    {
+      "file": "cuda-dense-3.wfmt",
+      "case": "cuda-dense-3",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 1064
+      }
+    },
+    {
+      "file": "cuda-dense-4.wfmt",
+      "case": "cuda-dense-4",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 3808,
+        "output": 588
+      }
+    },
+    {
+      "file": "cuda-dense-5.wfmt",
+      "case": "cuda-dense-5",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 3724
+      }
+    },
+    {
+      "file": "cuda-dense-6.wfmt",
+      "case": "cuda-dense-6",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 4352,
+        "output": 672
+      }
+    },
+    {
+      "file": "cuda-dense-7.wfmt",
+      "case": "cuda-dense-7",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 4256
+      }
+    },
+    {
+      "file": "cuda-dense-8.wfmt",
+      "case": "cuda-dense-8",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 4896,
+        "output": 756
+      }
+    },
+    {
+      "file": "cuda-dense-9.wfmt",
+      "case": "cuda-dense-9",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 4788
+      }
+    },
+    {
+      "file": "cuda-dense-10.wfmt",
+      "case": "cuda-dense-10",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 16864,
+        "output": 2604
+      }
+    },
+    {
+      "file": "cuda-dense-11.wfmt",
+      "case": "cuda-dense-11",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 16492
+      }
+    },
+    {
+      "file": "cuda-dense-12.wfmt",
+      "case": "cuda-dense-12",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 17408,
+        "output": 2688
+      }
+    },
+    {
+      "file": "cuda-dense-13.wfmt",
+      "case": "cuda-dense-13",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-14.wfmt",
+      "case": "cuda-dense-14",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 17952,
+        "output": 2772
+      }
+    },
+    {
+      "file": "cuda-dense-15.wfmt",
+      "case": "cuda-dense-15",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 17556
+      }
+    },
+    {
+      "file": "cuda-dense-16.wfmt",
+      "case": "cuda-dense-16",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 34272,
+        "output": 5292
+      }
+    },
+    {
+      "file": "cuda-dense-17.wfmt",
+      "case": "cuda-dense-17",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 33516
+      }
+    },
+    {
+      "file": "cuda-dense-18.wfmt",
+      "case": "cuda-dense-18",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 34816,
+        "output": 5376
+      }
+    },
+    {
+      "file": "cuda-dense-19.wfmt",
+      "case": "cuda-dense-19",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-20.wfmt",
+      "case": "cuda-dense-20",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 35360,
+        "output": 5460
+      }
+    },
+    {
+      "file": "cuda-dense-21.wfmt",
+      "case": "cuda-dense-21",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 34580
+      }
+    },
+    {
+      "file": "cuda-dense-22.wfmt",
+      "case": "cuda-dense-22",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 69088,
+        "output": 10668
+      }
+    },
+    {
+      "file": "cuda-dense-23.wfmt",
+      "case": "cuda-dense-23",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 67564
+      }
+    },
+    {
+      "file": "cuda-dense-24.wfmt",
+      "case": "cuda-dense-24",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 69632,
+        "output": 10752
+      }
+    },
+    {
+      "file": "cuda-dense-25.wfmt",
+      "case": "cuda-dense-25",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 68096
+      }
+    },
+    {
+      "file": "cuda-dense-26.wfmt",
+      "case": "cuda-dense-26",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        17,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 70176,
+        "output": 10836
+      }
+    },
+    {
+      "file": "cuda-dense-27.wfmt",
+      "case": "cuda-dense-27",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        0,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 68628
+      }
+    },
+    {
+      "file": "cuda-dense-28.wfmt",
+      "case": "cuda-dense-28",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 544,
+        "output": 84
+      }
+    },
+    {
+      "file": "cuda-dense-29.wfmt",
+      "case": "cuda-dense-29",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-30.wfmt",
+      "case": "cuda-dense-30",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 1088,
+        "output": 168
+      }
+    },
+    {
+      "file": "cuda-dense-31.wfmt",
+      "case": "cuda-dense-31",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 1064
+      }
+    },
+    {
+      "file": "cuda-dense-32.wfmt",
+      "case": "cuda-dense-32",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 3808,
+        "output": 588
+      }
+    },
+    {
+      "file": "cuda-dense-33.wfmt",
+      "case": "cuda-dense-33",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 3724
+      }
+    },
+    {
+      "file": "cuda-dense-34.wfmt",
+      "case": "cuda-dense-34",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 4352,
+        "output": 672
+      }
+    },
+    {
+      "file": "cuda-dense-35.wfmt",
+      "case": "cuda-dense-35",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 4256
+      }
+    },
+    {
+      "file": "cuda-dense-36.wfmt",
+      "case": "cuda-dense-36",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 4896,
+        "output": 756
+      }
+    },
+    {
+      "file": "cuda-dense-37.wfmt",
+      "case": "cuda-dense-37",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 4788
+      }
+    },
+    {
+      "file": "cuda-dense-38.wfmt",
+      "case": "cuda-dense-38",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 16864,
+        "output": 2604
+      }
+    },
+    {
+      "file": "cuda-dense-39.wfmt",
+      "case": "cuda-dense-39",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 16492
+      }
+    },
+    {
+      "file": "cuda-dense-40.wfmt",
+      "case": "cuda-dense-40",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 17408,
+        "output": 2688
+      }
+    },
+    {
+      "file": "cuda-dense-41.wfmt",
+      "case": "cuda-dense-41",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-42.wfmt",
+      "case": "cuda-dense-42",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 17952,
+        "output": 2772
+      }
+    },
+    {
+      "file": "cuda-dense-43.wfmt",
+      "case": "cuda-dense-43",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 17556
+      }
+    },
+    {
+      "file": "cuda-dense-44.wfmt",
+      "case": "cuda-dense-44",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 34272,
+        "output": 5292
+      }
+    },
+    {
+      "file": "cuda-dense-45.wfmt",
+      "case": "cuda-dense-45",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 33516
+      }
+    },
+    {
+      "file": "cuda-dense-46.wfmt",
+      "case": "cuda-dense-46",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 34816,
+        "output": 5376
+      }
+    },
+    {
+      "file": "cuda-dense-47.wfmt",
+      "case": "cuda-dense-47",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-48.wfmt",
+      "case": "cuda-dense-48",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 35360,
+        "output": 5460
+      }
+    },
+    {
+      "file": "cuda-dense-49.wfmt",
+      "case": "cuda-dense-49",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 34580
+      }
+    },
+    {
+      "file": "cuda-dense-50.wfmt",
+      "case": "cuda-dense-50",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 69088,
+        "output": 10668
+      }
+    },
+    {
+      "file": "cuda-dense-51.wfmt",
+      "case": "cuda-dense-51",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 67564
+      }
+    },
+    {
+      "file": "cuda-dense-52.wfmt",
+      "case": "cuda-dense-52",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 69632,
+        "output": 10752
+      }
+    },
+    {
+      "file": "cuda-dense-53.wfmt",
+      "case": "cuda-dense-53",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 68096
+      }
+    },
+    {
+      "file": "cuda-dense-54.wfmt",
+      "case": "cuda-dense-54",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        17,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 70176,
+        "output": 10836
+      }
+    },
+    {
+      "file": "cuda-dense-55.wfmt",
+      "case": "cuda-dense-55",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        1,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 68628
+      }
+    },
+    {
+      "file": "cuda-dense-56.wfmt",
+      "case": "cuda-dense-56",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 544,
+        "output": 42
+      }
+    },
+    {
+      "file": "cuda-dense-57.wfmt",
+      "case": "cuda-dense-57",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 266
+      }
+    },
+    {
+      "file": "cuda-dense-58.wfmt",
+      "case": "cuda-dense-58",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 1088,
+        "output": 84
+      }
+    },
+    {
+      "file": "cuda-dense-59.wfmt",
+      "case": "cuda-dense-59",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-60.wfmt",
+      "case": "cuda-dense-60",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 3808,
+        "output": 294
+      }
+    },
+    {
+      "file": "cuda-dense-61.wfmt",
+      "case": "cuda-dense-61",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 1862
+      }
+    },
+    {
+      "file": "cuda-dense-62.wfmt",
+      "case": "cuda-dense-62",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 4352,
+        "output": 336
+      }
+    },
+    {
+      "file": "cuda-dense-63.wfmt",
+      "case": "cuda-dense-63",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 2128
+      }
+    },
+    {
+      "file": "cuda-dense-64.wfmt",
+      "case": "cuda-dense-64",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 4896,
+        "output": 378
+      }
+    },
+    {
+      "file": "cuda-dense-65.wfmt",
+      "case": "cuda-dense-65",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 2394
+      }
+    },
+    {
+      "file": "cuda-dense-66.wfmt",
+      "case": "cuda-dense-66",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 16864,
+        "output": 1302
+      }
+    },
+    {
+      "file": "cuda-dense-67.wfmt",
+      "case": "cuda-dense-67",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 8246
+      }
+    },
+    {
+      "file": "cuda-dense-68.wfmt",
+      "case": "cuda-dense-68",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 17408,
+        "output": 1344
+      }
+    },
+    {
+      "file": "cuda-dense-69.wfmt",
+      "case": "cuda-dense-69",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 8512
+      }
+    },
+    {
+      "file": "cuda-dense-70.wfmt",
+      "case": "cuda-dense-70",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 17952,
+        "output": 1386
+      }
+    },
+    {
+      "file": "cuda-dense-71.wfmt",
+      "case": "cuda-dense-71",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 8778
+      }
+    },
+    {
+      "file": "cuda-dense-72.wfmt",
+      "case": "cuda-dense-72",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 34272,
+        "output": 2646
+      }
+    },
+    {
+      "file": "cuda-dense-73.wfmt",
+      "case": "cuda-dense-73",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 16758
+      }
+    },
+    {
+      "file": "cuda-dense-74.wfmt",
+      "case": "cuda-dense-74",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 34816,
+        "output": 2688
+      }
+    },
+    {
+      "file": "cuda-dense-75.wfmt",
+      "case": "cuda-dense-75",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-76.wfmt",
+      "case": "cuda-dense-76",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 35360,
+        "output": 2730
+      }
+    },
+    {
+      "file": "cuda-dense-77.wfmt",
+      "case": "cuda-dense-77",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 17290
+      }
+    },
+    {
+      "file": "cuda-dense-78.wfmt",
+      "case": "cuda-dense-78",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 69088,
+        "output": 5334
+      }
+    },
+    {
+      "file": "cuda-dense-79.wfmt",
+      "case": "cuda-dense-79",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 33782
+      }
+    },
+    {
+      "file": "cuda-dense-80.wfmt",
+      "case": "cuda-dense-80",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 69632,
+        "output": 5376
+      }
+    },
+    {
+      "file": "cuda-dense-81.wfmt",
+      "case": "cuda-dense-81",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-82.wfmt",
+      "case": "cuda-dense-82",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        17,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 70176,
+        "output": 5418
+      }
+    },
+    {
+      "file": "cuda-dense-83.wfmt",
+      "case": "cuda-dense-83",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        2,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 34314
+      }
+    },
+    {
+      "file": "cuda-dense-84.wfmt",
+      "case": "cuda-dense-84",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 544,
+        "output": 42
+      }
+    },
+    {
+      "file": "cuda-dense-85.wfmt",
+      "case": "cuda-dense-85",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 266
+      }
+    },
+    {
+      "file": "cuda-dense-86.wfmt",
+      "case": "cuda-dense-86",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 1088,
+        "output": 84
+      }
+    },
+    {
+      "file": "cuda-dense-87.wfmt",
+      "case": "cuda-dense-87",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-88.wfmt",
+      "case": "cuda-dense-88",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 3808,
+        "output": 294
+      }
+    },
+    {
+      "file": "cuda-dense-89.wfmt",
+      "case": "cuda-dense-89",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 1862
+      }
+    },
+    {
+      "file": "cuda-dense-90.wfmt",
+      "case": "cuda-dense-90",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 4352,
+        "output": 336
+      }
+    },
+    {
+      "file": "cuda-dense-91.wfmt",
+      "case": "cuda-dense-91",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 2128
+      }
+    },
+    {
+      "file": "cuda-dense-92.wfmt",
+      "case": "cuda-dense-92",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 4896,
+        "output": 378
+      }
+    },
+    {
+      "file": "cuda-dense-93.wfmt",
+      "case": "cuda-dense-93",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 2394
+      }
+    },
+    {
+      "file": "cuda-dense-94.wfmt",
+      "case": "cuda-dense-94",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 16864,
+        "output": 1302
+      }
+    },
+    {
+      "file": "cuda-dense-95.wfmt",
+      "case": "cuda-dense-95",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 8246
+      }
+    },
+    {
+      "file": "cuda-dense-96.wfmt",
+      "case": "cuda-dense-96",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 17408,
+        "output": 1344
+      }
+    },
+    {
+      "file": "cuda-dense-97.wfmt",
+      "case": "cuda-dense-97",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 8512
+      }
+    },
+    {
+      "file": "cuda-dense-98.wfmt",
+      "case": "cuda-dense-98",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 17952,
+        "output": 1386
+      }
+    },
+    {
+      "file": "cuda-dense-99.wfmt",
+      "case": "cuda-dense-99",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 8778
+      }
+    },
+    {
+      "file": "cuda-dense-100.wfmt",
+      "case": "cuda-dense-100",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 34272,
+        "output": 2646
+      }
+    },
+    {
+      "file": "cuda-dense-101.wfmt",
+      "case": "cuda-dense-101",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 16758
+      }
+    },
+    {
+      "file": "cuda-dense-102.wfmt",
+      "case": "cuda-dense-102",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 34816,
+        "output": 2688
+      }
+    },
+    {
+      "file": "cuda-dense-103.wfmt",
+      "case": "cuda-dense-103",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-104.wfmt",
+      "case": "cuda-dense-104",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 35360,
+        "output": 2730
+      }
+    },
+    {
+      "file": "cuda-dense-105.wfmt",
+      "case": "cuda-dense-105",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 17290
+      }
+    },
+    {
+      "file": "cuda-dense-106.wfmt",
+      "case": "cuda-dense-106",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 69088,
+        "output": 5334
+      }
+    },
+    {
+      "file": "cuda-dense-107.wfmt",
+      "case": "cuda-dense-107",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 33782
+      }
+    },
+    {
+      "file": "cuda-dense-108.wfmt",
+      "case": "cuda-dense-108",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 69632,
+        "output": 5376
+      }
+    },
+    {
+      "file": "cuda-dense-109.wfmt",
+      "case": "cuda-dense-109",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-110.wfmt",
+      "case": "cuda-dense-110",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        17,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 4624,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 70176,
+        "output": 5418
+      }
+    },
+    {
+      "file": "cuda-dense-111.wfmt",
+      "case": "cuda-dense-111",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        3,
+        1
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 34314
+      }
+    },
+    {
+      "file": "cuda-dense-112.wfmt",
+      "case": "cuda-dense-112",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-113.wfmt",
+      "case": "cuda-dense-113",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 1064
+      }
+    },
+    {
+      "file": "cuda-dense-114.wfmt",
+      "case": "cuda-dense-114",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 3724
+      }
+    },
+    {
+      "file": "cuda-dense-115.wfmt",
+      "case": "cuda-dense-115",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 4256
+      }
+    },
+    {
+      "file": "cuda-dense-116.wfmt",
+      "case": "cuda-dense-116",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 4788
+      }
+    },
+    {
+      "file": "cuda-dense-117.wfmt",
+      "case": "cuda-dense-117",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 16492
+      }
+    },
+    {
+      "file": "cuda-dense-118.wfmt",
+      "case": "cuda-dense-118",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-119.wfmt",
+      "case": "cuda-dense-119",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 17556
+      }
+    },
+    {
+      "file": "cuda-dense-120.wfmt",
+      "case": "cuda-dense-120",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 33516
+      }
+    },
+    {
+      "file": "cuda-dense-121.wfmt",
+      "case": "cuda-dense-121",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-122.wfmt",
+      "case": "cuda-dense-122",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 34580
+      }
+    },
+    {
+      "file": "cuda-dense-123.wfmt",
+      "case": "cuda-dense-123",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 67564
+      }
+    },
+    {
+      "file": "cuda-dense-124.wfmt",
+      "case": "cuda-dense-124",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 68096
+      }
+    },
+    {
+      "file": "cuda-dense-125.wfmt",
+      "case": "cuda-dense-125",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        0,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 68628
+      }
+    },
+    {
+      "file": "cuda-dense-126.wfmt",
+      "case": "cuda-dense-126",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-127.wfmt",
+      "case": "cuda-dense-127",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 1064
+      }
+    },
+    {
+      "file": "cuda-dense-128.wfmt",
+      "case": "cuda-dense-128",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 3724
+      }
+    },
+    {
+      "file": "cuda-dense-129.wfmt",
+      "case": "cuda-dense-129",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 4256
+      }
+    },
+    {
+      "file": "cuda-dense-130.wfmt",
+      "case": "cuda-dense-130",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 4788
+      }
+    },
+    {
+      "file": "cuda-dense-131.wfmt",
+      "case": "cuda-dense-131",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 16492
+      }
+    },
+    {
+      "file": "cuda-dense-132.wfmt",
+      "case": "cuda-dense-132",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-133.wfmt",
+      "case": "cuda-dense-133",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 17556
+      }
+    },
+    {
+      "file": "cuda-dense-134.wfmt",
+      "case": "cuda-dense-134",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 33516
+      }
+    },
+    {
+      "file": "cuda-dense-135.wfmt",
+      "case": "cuda-dense-135",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-136.wfmt",
+      "case": "cuda-dense-136",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 34580
+      }
+    },
+    {
+      "file": "cuda-dense-137.wfmt",
+      "case": "cuda-dense-137",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 67564
+      }
+    },
+    {
+      "file": "cuda-dense-138.wfmt",
+      "case": "cuda-dense-138",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 68096
+      }
+    },
+    {
+      "file": "cuda-dense-139.wfmt",
+      "case": "cuda-dense-139",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        1,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 68628
+      }
+    },
+    {
+      "file": "cuda-dense-140.wfmt",
+      "case": "cuda-dense-140",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 266
+      }
+    },
+    {
+      "file": "cuda-dense-141.wfmt",
+      "case": "cuda-dense-141",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-142.wfmt",
+      "case": "cuda-dense-142",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 1862
+      }
+    },
+    {
+      "file": "cuda-dense-143.wfmt",
+      "case": "cuda-dense-143",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 2128
+      }
+    },
+    {
+      "file": "cuda-dense-144.wfmt",
+      "case": "cuda-dense-144",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 2394
+      }
+    },
+    {
+      "file": "cuda-dense-145.wfmt",
+      "case": "cuda-dense-145",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 8246
+      }
+    },
+    {
+      "file": "cuda-dense-146.wfmt",
+      "case": "cuda-dense-146",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 8512
+      }
+    },
+    {
+      "file": "cuda-dense-147.wfmt",
+      "case": "cuda-dense-147",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 8778
+      }
+    },
+    {
+      "file": "cuda-dense-148.wfmt",
+      "case": "cuda-dense-148",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 16758
+      }
+    },
+    {
+      "file": "cuda-dense-149.wfmt",
+      "case": "cuda-dense-149",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-150.wfmt",
+      "case": "cuda-dense-150",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 17290
+      }
+    },
+    {
+      "file": "cuda-dense-151.wfmt",
+      "case": "cuda-dense-151",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 33782
+      }
+    },
+    {
+      "file": "cuda-dense-152.wfmt",
+      "case": "cuda-dense-152",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-153.wfmt",
+      "case": "cuda-dense-153",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        2,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 34314
+      }
+    },
+    {
+      "file": "cuda-dense-154.wfmt",
+      "case": "cuda-dense-154",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        1,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 256,
+        "activation_scales": 32,
+        "sidecars": 12,
+        "partials": 4128,
+        "output": 266
+      }
+    },
+    {
+      "file": "cuda-dense-155.wfmt",
+      "case": "cuda-dense-155",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        2,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 512,
+        "activation_scales": 64,
+        "sidecars": 24,
+        "partials": 8256,
+        "output": 532
+      }
+    },
+    {
+      "file": "cuda-dense-156.wfmt",
+      "case": "cuda-dense-156",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        7,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 1792,
+        "activation_scales": 224,
+        "sidecars": 84,
+        "partials": 28896,
+        "output": 1862
+      }
+    },
+    {
+      "file": "cuda-dense-157.wfmt",
+      "case": "cuda-dense-157",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        8,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2048,
+        "activation_scales": 256,
+        "sidecars": 96,
+        "partials": 33024,
+        "output": 2128
+      }
+    },
+    {
+      "file": "cuda-dense-158.wfmt",
+      "case": "cuda-dense-158",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        9,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 2304,
+        "activation_scales": 288,
+        "sidecars": 108,
+        "partials": 37152,
+        "output": 2394
+      }
+    },
+    {
+      "file": "cuda-dense-159.wfmt",
+      "case": "cuda-dense-159",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        31,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 7936,
+        "activation_scales": 992,
+        "sidecars": 372,
+        "partials": 127968,
+        "output": 8246
+      }
+    },
+    {
+      "file": "cuda-dense-160.wfmt",
+      "case": "cuda-dense-160",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        32,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8192,
+        "activation_scales": 1024,
+        "sidecars": 384,
+        "partials": 132096,
+        "output": 8512
+      }
+    },
+    {
+      "file": "cuda-dense-161.wfmt",
+      "case": "cuda-dense-161",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        33,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 8448,
+        "activation_scales": 1056,
+        "sidecars": 396,
+        "partials": 136224,
+        "output": 8778
+      }
+    },
+    {
+      "file": "cuda-dense-162.wfmt",
+      "case": "cuda-dense-162",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        63,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16128,
+        "activation_scales": 2016,
+        "sidecars": 756,
+        "partials": 260064,
+        "output": 16758
+      }
+    },
+    {
+      "file": "cuda-dense-163.wfmt",
+      "case": "cuda-dense-163",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        64,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16384,
+        "activation_scales": 2048,
+        "sidecars": 768,
+        "partials": 264192,
+        "output": 17024
+      }
+    },
+    {
+      "file": "cuda-dense-164.wfmt",
+      "case": "cuda-dense-164",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        65,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 16640,
+        "activation_scales": 2080,
+        "sidecars": 780,
+        "partials": 268320,
+        "output": 17290
+      }
+    },
+    {
+      "file": "cuda-dense-165.wfmt",
+      "case": "cuda-dense-165",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        127,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32512,
+        "activation_scales": 4064,
+        "sidecars": 1524,
+        "partials": 524256,
+        "output": 33782
+      }
+    },
+    {
+      "file": "cuda-dense-166.wfmt",
+      "case": "cuda-dense-166",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        128,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 32768,
+        "activation_scales": 4096,
+        "sidecars": 1536,
+        "partials": 528384,
+        "output": 34048
+      }
+    },
+    {
+      "file": "cuda-dense-167.wfmt",
+      "case": "cuda-dense-167",
+      "format": "gguf.q8_0@1",
+      "arithmetic": "cuda-qwen-imma-four-chain@1",
+      "shape": [
+        129,
+        256,
+        129,
+        3,
+        0
+      ],
+      "required_sections": {
+        "source": 35088,
+        "activation_codes": 33024,
+        "activation_scales": 4128,
+        "sidecars": 1548,
+        "partials": 532512,
+        "output": 34314
+      }
+    }
+  ]
+}

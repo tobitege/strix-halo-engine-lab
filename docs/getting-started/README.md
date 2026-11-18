@@ -72,6 +72,14 @@ DeepSeek production trellis API/library settings and the complete per-engine bui
 [Build each engine](../reproduce.md#build-each-engine). Configure and build both ranks identically.
 MiniMax and GLM family targets require these build options even though their execution defaults are fast.
 
+The HIP device gate isolates the SDK's empty GCC-host `__noinline__` macro before
+including further standard-library headers. This avoids a collision with the
+`[[__gnu__::__noinline__]]` attribute used by libstdc++ 16 through `<chrono>` and
+`<format>`; no ROCm header edits or warning suppression are needed. With HIP and
+`BUILD_TESTING=ON`, build `strix-hip-host-header-tests` and run
+`ctest --test-dir build -R '^strix-hip-host-header-tests$' --output-on-failure` for
+the host-only regression (no GPU or model required).
+
 The CUDA parts for the RTX PRO build separately with `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build` runs
 the host and device tests (many device tests need the GPU and the model files). All CMake options are listed in
 [docs/getting-started/engine-reference.md](engine-reference.md#build-options).
@@ -91,6 +99,6 @@ Each engine's launch contract, profiles and long-context options are on its page
   [standalone RTX](../models/deepseek-v4.1/README.md#deepseek-standalone-rtx); RTX + pair:
   [pipeline stages](../models/deepseek-v4.1/pipeline-stages.md).
 - [MiniMax M3.1 Flash pair](../models/minimax-m3.1/README.md#minimax-pair).
-- [GLM-5.3 Flash pair](../models/glm-5.3/README.md#glm-pair) and [GLM on one RTX PRO 6000](../../src/glm/rtxpf/README.md).
+- [GLM-5.3 Flash pair](../models/glm-5.3/README.md#glm-pair) and [GLM on one RTX PRO 6000](../../src/cuda/models/glm/README.md).
 - [Nemotron 3.5 Bolt E4B](../models/nemotron-3.5-bolt-e4b/README.md#build-and-run) (opt-in build).
 - Exposing the servers, authentication and limits: [serving](../serving.md#exposing-the-servers).

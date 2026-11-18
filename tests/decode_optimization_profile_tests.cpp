@@ -1,6 +1,9 @@
 #include "../apps/hip_decode_options.hpp"
 #include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <array>
+#include "teacher_rows_test_directory.hpp"
 #include <string>
 #include <vector>
 using namespace strix;
@@ -1355,6 +1358,37 @@ int main() {
         "teacher logits file requires a nonempty path");
     rejects([] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score", "--teacher-logits-file=a", "--teacher-logits-file=b"}); },
         "duplicate teacher logits file option");
+    {
+        const TeacherRowsDirectory rows_dir, other_dir;
+        expect(rows_dir.path != other_dir.path, "teacher row fixtures own distinct directories");
+        const auto rows_path = (rows_dir.path / "rows.txt").string();
+        { std::ofstream rows_file(rows_path); rows_file << "0 1 "; }
+        auto rows_teacher = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-file", "fresh-logits.bin", "--teacher-logits-rows", rows_path.c_str()});
+        expect(rows_teacher.teacher_logits_rows == std::vector<std::uint64_t>{0U, 1U} && !rows_teacher.any_low_level_flag,
+            "teacher logits rows keep the listed positions without selecting a numerical recipe");
+        rejects([&] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-rows", rows_path.c_str()}); }, "teacher logits rows require a teacher logits file");
+        { std::ofstream rows_file(rows_path); rows_file << "1 1 "; }
+        rejects([&] { (void)parse({"decoder", "m", "1", "2", "--generate", "1", "--teacher-forced-score",
+            "--teacher-logits-file", "a.bin", "--teacher-logits-rows", rows_path.c_str()}); },
+            "teacher logits rows must be ascending decimal positions");
+        std::istringstream long_word(std::string(100000U, '0'));
+        rejects([&] { (void)read_teacher_logits_rows(long_word); },
+            "teacher logits rows must be ascending decimal positions");
+        expect(long_word.tellg() <= std::streampos(20), "oversized row token rejected without reading its tail");
+        std::ostringstream many_rows;
+        for (unsigned row = 0; row < 65536U; ++row) many_rows << row << ' ';
+        const auto limit_bytes = many_rows.str().size();
+        std::istringstream too_many(many_rows.str() + "65536 invalid-tail");
+        rejects([&] { (void)read_teacher_logits_rows(too_many); },
+            "teacher logits rows file must list 1..65536 positions");
+        expect(too_many.tellg() == static_cast<std::streamoff>(limit_bytes), "row limit checked before reading position 65537");
+        std::istringstream at_limit(many_rows.str());
+        expect(read_teacher_logits_rows(at_limit).size() == 65536U, "row limit remains inclusive");
+        std::istringstream maximum("18446744073709551615");
+        expect(read_teacher_logits_rows(maximum).back() == UINT64_MAX, "maximum uint64 row is accepted");
+    }
     validate_resolved_teacher_forced_score(teacher, 4);
     rejects([&] { validate_resolved_teacher_forced_score(teacher, 3); }, "teacher input exceeds model vocabulary");
     auto short_context = teacher; short_context.context_tokens = 2;

@@ -104,6 +104,9 @@ public:
     }
 
     bool publishes() const override { return true; }
+    // Split-producer chunk frames: only the Tier B o projection (raw weights) writes its halves in two launches.
+    bool splits_o(const KdaLayerWeights& w) const override { return raw(w.o); }
+    bool splits_o(const DsaLayerWeights& w) const override { return raw(w.o); }
     void kda(const KdaLayerWeights& w, KdaState& st, const CallCtx& c, const float* x, float* y) override {
         pub_begin(c, y);
         kda_run(w, st, c, x, y);
@@ -122,7 +125,9 @@ private:
     const float* pub_y_ = nullptr;
     unsigned pub_rows_ = 0;
     bool pub_done_ = false;
+    const CallCtx* split_c_ = nullptr;  // CallCtx::split_cols != 0: the o projection must run as split_o (checked by pub_end)
     void pub_begin(const CallCtx& c, const float* y) {
+        split_c_ = c.split_cols != 0 ? &c : nullptr;
         pub_ = c.publish;
         pub_y_ = y;
         pub_rows_ = static_cast<unsigned>(c.rows.size());
@@ -133,7 +138,15 @@ private:
         pub_done_ = true;
         return &pub_;
     }
+    // The split o projection: true (once) when the partial at y is the whole TX slot of a split message.
+    bool split_for(const float* y, unsigned n) {
+        if (split_c_ == nullptr || !pub_.on() || pub_done_ || y != pub_y_ || n != pub_rows_) return false;
+        pub_done_ = true;
+        return true;
+    }
     void pub_end(const CallCtx& c) {
+        if (split_c_ != nullptr && !pub_done_) throw std::logic_error("fast attention: split producer slot but the o projection did not split it");
+        split_c_ = nullptr;
         if (pub_.on() && !pub_done_) publish_partial(pub_, c.stream);
         pub_ = {};
     }
@@ -233,7 +246,10 @@ private:
             if (st.shard) st.shard->attention(st, c, d, tok_, ntok_, q_, w.kv_b, mw_, o_);
             else F::mla_attention(d, tok_, ntok_, q_, w.kv_b, Hm_, mw_, o_, c.stream, static_cast<unsigned>(std::min<std::uint64_t>(t_vis, 1U << 30)));
             if (dumping) dump_decode(st, c);
-            if (raw(w.o)) TB::dsa_o(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y + r0 * kHidden, n));
+            if (raw(w.o) && split_for(y + r0 * kHidden, n))
+                TB::dsa_o_split(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, y + r0 * kHidden + static_cast<std::size_t>(n) * c.split_cols,
+                                tb_ws_, c.stream, TB::env_knobs(), c.publish, c.publish_tail, c.split_mid, c.split_mid_ctx);
+            else if (raw(w.o)) TB::dsa_o(mat(w.o), o_, Hm_ * kMlaDim, n, y + r0 * kHidden, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y + r0 * kHidden, n));
             else c.lin->run(w.o, o_, y + r0 * kHidden, n, c.stream);
         }
     }
@@ -340,7 +356,10 @@ private:
         }
     }
     void kda_o(const KdaLayerWeights& w, float* y, unsigned n, const CallCtx& c) {
-        if (raw(w.o)) TB::kda_o(mat(w.o), ky_, C_, n, y, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y, n));
+        if (raw(w.o) && split_for(y, n))
+            TB::kda_o_split(mat(w.o), ky_, C_, n, y, y + static_cast<std::size_t>(n) * c.split_cols, tb_ws_, c.stream, TB::env_knobs(),
+                            c.publish, c.publish_tail, c.split_mid, c.split_mid_ctx);
+        else if (raw(w.o)) TB::kda_o(mat(w.o), ky_, C_, n, y, kHidden, tb_ws_, c.stream, TB::env_knobs(), pub_for(y, n));
         else c.lin->run(w.o, ky_, y, n, c.stream);
     }
 

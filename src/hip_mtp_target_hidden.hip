@@ -20,6 +20,7 @@
 #include "strix/serial_request.hpp"
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
+#include "strix/mtp_logits_dump.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/mtp_step_logits_digest.hpp"
 #include <algorithm>
@@ -416,9 +417,12 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
                 logits_digest,mtp_logits_digest_enabled(),mtp_step_logits_digest_enabled()};
             // One read of the logits row serves the digests and the session callback (R2-18).
             const bool digest=digest_policy.enabled() || prompt_terminal_digest_enabled();
-            if(digest || i.session_logits) {
+            if(digest || i.session_logits || mtp_logits_dump_enabled()) {
                 std::vector<float> row;
                 read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
+                const std::array<std::uint32_t,1> dump_input{token};
+                dump_mtp_logits(lease->position,lease->position,0U,1U,dump_input,
+                    session.arithmetic_lineage.history_identity,row);
                 if(digest) {
                     lease->logits_digest=digest_policy.capture(row);
                     if(prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(row));

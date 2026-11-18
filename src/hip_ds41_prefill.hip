@@ -2,12 +2,17 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_check.hpp"
 #pragma clang fp contract(off)
+#include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "strix/lever_cache.hpp"
+
 #include "moe_core/grouped_integer_decode.hpp"
+#include "moe_core/grouped_a8_f16.hpp"
 #include "ds41_integer_operand.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1, FAST_I4)
 
 #include "strix/ds41_moe.hpp"
@@ -438,11 +443,11 @@ StageLayout stage_layout(unsigned width, unsigned batch_rows) {
 }
 // STRIX_DS41_PREFILL_STAGE=1 keeps 16-row batches on the stage kernels (comparison only).
 bool stage_forced() {
-    static const bool forced = [] {
+    static strix::lever_cache<bool> forced{[] {
         const char* v = std::getenv("STRIX_DS41_PREFILL_STAGE");
         return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
-    return forced;
+    }};
+    return forced.get();
 }
 // Prefill kernel forms (moe_kernel_tuning().prefill, STRIX_DS41_MOE_PREFILL): 0 = the original decoders; 1 = the lean
 // decoders (same integers, see decode_lean); 2 = lean with the IQ2_XXS sign table (decode_signs); 3 = the lean decoders
@@ -668,7 +673,8 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
         view.top_k > view.experts || (view.image_rows && !view.bias_image))
         throw std::invalid_argument("ds41 prefill router view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    static const bool wide = strix::envcfg::flag("STRIX_DS41_PREFILL_ROUTER_WIDE", true);
+    static strix::lever_cache<bool> wide_cache{[] { return strix::envcfg::flag("STRIX_DS41_PREFILL_ROUTER_WIDE", true); }};
+    const bool wide = wide_cache.get();
     RouterView v = view;
     v.wide_stage = wide && view.wide_stage && view.hidden % 4U == 0U && reinterpret_cast<std::uintptr_t>(view.x) % 16U == 0U &&
                    reinterpret_cast<std::uintptr_t>(view.weight) % 16U == 0U;
@@ -696,9 +702,38 @@ static bool fast_moe_order() {
     const char* e = std::getenv("STRIX_DS41_FAST_MOE_ORDER");
     return !(e && e[0] == '0');
 }
+bool ds41_f16_moe_weights_fit(WeightFormat format, const void* data, std::uint64_t bytes) {
+    if (format != WeightFormat::iq2_xxs && format != WeightFormat::q2_k) return false;
+    const auto size = block_bytes(format);
+    if ((!data && bytes) || bytes % size) return false;
+    const auto* p = static_cast<const unsigned char*>(data);
+    const auto read_half = [](const unsigned char* src) {
+        unsigned short bits; std::memcpy(&bits, src, 2);
+        return __half2float(__ushort_as_half(bits));
+    };
+    // Conservative metadata bounds (no scan of individual weight codes required).
+    for (std::uint64_t at = 0; at < bytes; at += size) {
+        if (format == WeightFormat::iq2_xxs) {
+            // grid magnitudes <= 43; (0.5+s)/4 <= 3.875.
+            const float bound = fabsf(read_half(p + at)) * (43.0F * 3.875F);
+            if (!(bound <= 65504.0F)) return false;
+        } else {
+            const float d = fabsf(read_half(p + at + 80U)), m = fabsf(read_half(p + at + 82U));
+            if (!(d * 45.0F + m * 15.0F <= 65504.0F)) return false;
+        }
+    }
+    return true;
+}
 bool fast_moe() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_FAST_MOE"); return e != nullptr && std::strcmp(e, "1") == 0; }();
-    return fast_moe_mode < 0 ? env : fast_moe_mode != 0;
+    static strix::lever_cache<bool> env{[] { return fast_profile::moe_on(); }};  // the lever or STRIX_DS41_FAST_PREFILL
+    // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
+    return effective_fast(&PrefillPrecision::fast_moe, fast_moe_mode, env.get());
+}
+// FAST lever ds41-moe-f16wmma-v1 (with fast_moe): the relaxed kernels' FP16-operand form. Per execution (PrefillPrecision), else
+// STRIX_DS41_FAST_MOE_F16; no process-wide setter.
+bool fast_moe_f16() {
+    static const bool env = fast_profile::moe_f16_on();
+    return effective_fast(&PrefillPrecision::fast_moe_f16, -1, env);
 }
 int fast_i4_mode = -1;
 void set_fast_i4(int mode) { fast_i4_mode = mode; }
@@ -721,11 +756,11 @@ int pf_core_policy_of(const char* raw) {
     throw std::invalid_argument(std::string("STRIX_DS41_PF_CORE: expected 0, 1, moe or dense, got '") + raw + "'");
 }
 int pf_core_env() {
-    static const int policy = [] {
+    static strix::lever_cache<int> policy{[] {
         const char* raw = strix::envcfg::text("STRIX_DS41_PF_CORE");
         return raw ? pf_core_policy_of(raw) : int(pf_core_auto);
-    }();
-    return policy;
+    }};
+    return policy.get();
 }
 constexpr int pf_core_unset = -2;
 int pf_core_override = pf_core_unset;
@@ -778,12 +813,16 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
     }
     if (fast_moe() && format == WeightFormat::iq2_xxs && view.hidden % 256U == 0U && view.inter % 128U == 0U &&
         view.routes.batch_rows <= relaxed_rows) {
+        // FP16-operand gate/up (relaxed_f16_gate_up_kernel): measured 0.76-0.85x of relaxed at 2048-8192 rows and on blk.5
+        // (IQ2_XXS decode to FP16 costs 1,744 VALU per 128 WMMA): not dispatched; the kernel stays for the bench.
+        {
         if (fast_moe_order() && view.routes.max_batches <= 65535U)  // grid y limit
             hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, true>), dim3(view.inter / 128U, view.routes.max_batches),
                                dim3(relaxed_threads), 0, queue, view);
         else
             hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_gate_up_kernel<WeightFormat::iq2_xxs, false>), dim3(view.routes.max_batches, view.inter / 128U),
                                dim3(relaxed_threads), 0, queue, view);
+        }
         check(hipGetLastError(), "prefill gate/up launch (relaxed)");
         return;
     }
@@ -850,10 +889,16 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         const bool rows32 = !(rows_env && std::strcmp(rows_env, "64") == 0) && view.routes.batch_rows <= 32U;
         const bool swap = fast_moe_order() && view.routes.max_batches <= 65535U;  // grid y limit
         const dim3 grid = swap ? dim3(view.outputs / 256U, view.routes.max_batches) : dim3(view.routes.max_batches, view.outputs / 256U);
+        if (fast_moe_f16()) {
+        // FP16-operand down: R64 (1.37x of relaxed R64, 1.13x of relaxed R32 on blk.5 at 4096 rows; R32 FP16 is 0.80x)
+        if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_f16_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        } else {
         if (swap && rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
         else if (swap) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, true>), grid, dim3(relaxed_threads), 0, queue, view);
         else if (rows32) hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false, 32U>), grid, dim3(relaxed_threads), 0, queue, view);
         else hipLaunchKernelGGL(HIP_KERNEL_NAME(relaxed_down_kernel<WeightFormat::q2_k, false>), grid, dim3(relaxed_threads), 0, queue, view);
+        }
         check(hipGetLastError(), "prefill down launch (relaxed)");
         return;
     }
@@ -908,38 +953,27 @@ PrefillMoe::PrefillMoe(const PrefillMoeWeights& weights, std::uint32_t top_k, st
         !w_.down || w_.hidden == 0U || w_.inter == 0U || (w_.down_width != 0U && (w_.down_width < w_.inter || w_.down_width % 32U != 0U)))
         throw std::invalid_argument("ds41 prefill MoE configuration is inconsistent");
     if (w_.down_width == 0U) w_.down_width = w_.inter;
-    const std::uint64_t slots = static_cast<std::uint64_t>(chunk_rows) * top_k, owned = end_ - first_;
-    // Batches of 8 (window path) bound the batch count of either path.
-    const std::uint64_t batches = prefill_max_batches(chunk_rows, top_k, static_cast<std::uint32_t>(owned), 8U);
+    const std::uint64_t owned = end_ - first_;
     if (const char* v = std::getenv("STRIX_DS41_PREFILL_WINDOW_MEAN"); v && *v) window_mean_ = std::strtod(v, nullptr);
     if (const char* v = std::getenv("STRIX_DS41_PREFILL_SELECT"); v && *v) select_hist_ = std::strcmp(v, "mean") != 0;
-    // One allocation, 256-byte aligned parts.
-    std::uint64_t offset = 0;
-    const auto take = [&](std::uint64_t bytes) { const auto at = offset; offset += (bytes + 255U) / 256U * 256U; return at; };
-    const auto o_counts = take(owned * 4U), o_begins = take((owned + 1U) * 4U), o_rows = take(slots * 4U), o_slots = take(slots * 4U);
-    const auto o_bexp = take(batches * 4U), o_bbeg = take((batches + 1U) * 4U), o_bcnt = take(batches * 4U), o_btot = take(4U);
-    const auto o_order = take(slots * 4U), o_low = take(static_cast<std::uint64_t>(chunk_rows) * 4U);
-    const auto o_sexp = take(batches * 4U), o_sbeg = take((batches + 1U) * 4U), o_stot = take(4U);
-    const auto o_codes = take(slots * w_.inter), o_deltas = take(slots * w_.inter / 32U * 4U), o_sums = take(slots * w_.inter / 32U * 4U);
-    const auto o_raw = take(slots * w_.hidden * 4U);
+    const auto layout = prefill_moe_layout(chunk_rows, top_k, static_cast<std::uint32_t>(owned), w_.hidden, w_.inter, w_.down_width);
     const bool pad = w_.down_width != w_.inter;
-    const auto o_pcodes = pad ? take(slots * w_.down_width) : 0U, o_pdeltas = pad ? take(slots * w_.down_width / 32U * 4U) : 0U;
-    scratch_bytes_ = offset;
-    check(hipMalloc(&memory_, offset), "prefill MoE scratch");
+    scratch_bytes_ = layout.bytes;
+    check(hipMalloc(&memory_, layout.bytes), "prefill MoE scratch");
     auto* base = static_cast<unsigned char*>(memory_);
     const auto u32 = [&](std::uint64_t at) { return reinterpret_cast<std::uint32_t*>(base + at); };
-    routes_ = {u32(o_counts), u32(o_begins), u32(o_rows), u32(o_slots), u32(o_bexp), u32(o_bbeg), u32(o_bcnt), u32(o_btot),
-               u32(o_order), u32(o_low)};
-    routes_.sparse_expert = u32(o_sexp);
-    routes_.sparse_begin = u32(o_sbeg);
-    routes_.sparse_total = u32(o_stot);
-    act_codes_ = reinterpret_cast<std::int8_t*>(base + o_codes);
-    act_deltas_ = reinterpret_cast<float*>(base + o_deltas);
-    act_sums_ = reinterpret_cast<std::int32_t*>(base + o_sums);
-    raw_ = reinterpret_cast<float*>(base + o_raw);
+    routes_ = {u32(layout.o_counts), u32(layout.o_begins), u32(layout.o_rows), u32(layout.o_slots), u32(layout.o_bexp), u32(layout.o_bbeg), u32(layout.o_bcnt), u32(layout.o_btot),
+               u32(layout.o_order), u32(layout.o_low)};
+    routes_.sparse_expert = u32(layout.o_sexp);
+    routes_.sparse_begin = u32(layout.o_sbeg);
+    routes_.sparse_total = u32(layout.o_stot);
+    act_codes_ = reinterpret_cast<std::int8_t*>(base + layout.o_codes);
+    act_deltas_ = reinterpret_cast<float*>(base + layout.o_deltas);
+    act_sums_ = reinterpret_cast<std::int32_t*>(base + layout.o_sums);
+    raw_ = reinterpret_cast<float*>(base + layout.o_raw);
     if (pad) {
-        pad_codes_ = reinterpret_cast<std::int8_t*>(base + o_pcodes);
-        pad_deltas_ = reinterpret_cast<float*>(base + o_pdeltas);
+        pad_codes_ = reinterpret_cast<std::int8_t*>(base + layout.o_pcodes);
+        pad_deltas_ = reinterpret_cast<float*>(base + layout.o_pdeltas);
     }
 }
 PrefillMoe::~PrefillMoe() {

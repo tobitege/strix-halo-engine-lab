@@ -13,6 +13,7 @@
 // exact in int32 (s8 x s8 dot4). Lanes and trees are the Q2_0 ones (q20_numerical_identity).
 
 #include <cstdint>
+#include "strix/weight/formats/ggml.hpp"
 
 namespace strix::gsq_a8 {
 
@@ -28,10 +29,9 @@ inline constexpr bool iq_type(std::uint32_t t) {
     return t == type_iq2_s || t == type_iq3_xxs || t == type_iq3_s || t == type_iq4_xs || t == type_iq4_nl;
 }
 // Block geometry: (elements, bytes).
-inline constexpr std::uint32_t block_elements(std::uint32_t t) { return t == type_iq4_nl ? 32U : t == type_q2_0 ? 64U : 256U; }
+inline constexpr std::uint32_t block_elements(std::uint32_t t) { return weight::formats::gsq_block_elements(t); }
 inline constexpr std::uint32_t block_bytes(std::uint32_t t) {
-    return t == type_iq4_nl ? 18U : t == type_q2_0 ? 18U : t == type_iq2_s ? 82U : t == type_iq3_xxs ? 98U :
-           t == type_iq3_s ? 110U : t == type_iq4_xs ? 136U : 0U;
+    return weight::formats::gsq_block_bytes(t);
 }
 inline constexpr std::uint64_t row_bytes(std::uint32_t t, std::uint32_t width) {
     return static_cast<std::uint64_t>(width / block_elements(t)) * block_bytes(t);

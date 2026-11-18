@@ -78,7 +78,8 @@ int main(int argc, char** argv) try {
     const auto plan = strix::build_memory_plan(model, request);
     const auto decision = strix::decide_admission(host, plan);
 
-    std::cout << "{\n  \"breakdown\": {\n";
+    std::cout << "{\n  \"recurrent_state\": \"" << strix::recurrent_state_contract(model.recurrent_state)
+              << "\",\n  \"breakdown\": {\n";
     print_field("base_kv", plan.base_kv);
     print_field("mtp_kv", plan.mtp_kv);
     print_field("mtp_draft_state", plan.mtp_draft_state);

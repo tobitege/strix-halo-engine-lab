@@ -5,7 +5,7 @@ Status: **experimental prototype; NOT READY for the model or the exact FRONT**.
 ## Delivered
 
 `STRIX_ENABLE_CUDA_TRELLIS` is OFF by default and does not change the serving or
-model dispatch. The API in `include/strix/cuda_trellis.hpp` takes views of
+model dispatch. The API in `include/strix/cuda/trellis.hpp` takes views of
 compressed weights on the device. It implements:
 
 - Circular bitstream K1–K8/mul1, exact decoding to FP16 and complete scales.

@@ -49,6 +49,15 @@ inline Runtime runtime(const ModelContract& m,std::uint64_t capacity) {
     p.reader=selector(m.vocab_size);p.retained=add(add(p.pool,255U),p.reader);
     return p;
 }
+// Only automatically selected budgets grow with context. Explicit budgets remain ceilings;
+// admission and the native owner reject a retained payload exceeding the returned ceiling.
+// Invalid capacities keep the declared value for the owner's own refusal.
+inline std::uint64_t runtime_budget(const ModelContract& m,std::uint64_t capacity,std::uint64_t declared,
+    bool automatic=false) {
+    if(!automatic || !capacity || capacity>m.effective_max_positions()) return declared;
+    const auto need=runtime(m,capacity).retained;
+    return need>declared?need:declared;
+}
 inline std::uint64_t target_capture(const ModelContract& m,std::uint64_t rows,
     const SerialSessionStateLayout* deferred) {
     if(!rows) throw std::invalid_argument("MTP target capture rows are zero");

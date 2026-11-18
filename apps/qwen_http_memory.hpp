@@ -4,6 +4,7 @@
 #include "qwen_prompt_organization.hpp"
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/indexed_attention_state.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/q51_known_rows.hpp"
 #include "strix/ple_lookup.hpp"
 
@@ -30,20 +31,9 @@ inline HttpServingMemory http_mtp_memory(const Options& o, const ModelContract& 
     const auto mul = prefill_checked_mul;
     const auto width = mul(mul(model.hidden_size,model.hc_count),2U);
     const auto selector = add(mul((model.vocab_size+255U)/256U,16U),64U);
-    const auto buffers = build_serial_execution_buffer_plan(model,{});
-    const auto attention = build_indexed_attention_workspace_layout(model);
-    auto mtp_model = model; mtp_model.attention_kv_storage = AttentionKvStorage::bf16;
-    const auto predictor = build_indexed_attention_state_layout(mtp_model);
-    const auto input = mul(mul(model.hidden_size,model.hc_count+1U),4U);
-    std::uint64_t pool = 0;
-    for (const auto bytes : {width,width,mul(model.hidden_size,2U),input,input,width,width,
-            buffers.hidden_bytes,buffers.hidden_bytes,buffers.hidden_bytes,buffers.injection_weight_bytes,
-            buffers.route_index_bytes,buffers.route_weight_bytes,buffers.hyper_workspace_bytes,
-            attention.total_bytes,buffers.mlp_intermediate_bytes,mul(model.num_experts,4U),buffers.logits_bytes,
-            mul(o.context_tokens,predictor.kv_row_bytes),mul(o.context_tokens,predictor.raw_index_row_bytes),UINT64_C(8)})
-        if (bytes) pool = add(add(pool,255U)/256U*256U,bytes);
-    pool = add(add(pool,255U),selector);
-    if (pool > o.mtp.runtime_bytes) throw std::runtime_error("one-slot:native pool exceeds runtime budget");
+    const auto pool = mtp_payload::runtime(model,o.context_tokens).retained;
+    if (pool > mtp_payload::runtime_budget(model,o.context_tokens,o.mtp.runtime_bytes,o.mtp.runtime_automatic))
+        throw std::runtime_error("one-slot:native pool exceeds runtime budget");
     SerialSessionStateLayoutRequest request; request.context_tokens=o.context_tokens;
     request.recurrent_storage=o.gdn_recurrent_storage;
     const auto state=build_serial_session_state_layout(model,request);

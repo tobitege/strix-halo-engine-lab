@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "core/ordered_reduce.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -16,7 +17,10 @@
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
+#include "strix/qpf2k_defaults.hpp"
+#include "strix/prefill_identity.hpp"
 #include "hip_q8_rows_gemv.hpp"
+#include "hip_dense_f16_tiled.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -1149,19 +1153,15 @@ __global__ void ple_rows_gate_norm_kernel(
         key_square += k * k;
         query_square += q * q;
     }
-    key_reduce[lane] = key_square;
-    query_reduce[lane] = query_square;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) {
-            key_reduce[lane] += key_reduce[lane + stride];
-            query_reduce[lane] += query_reduce[lane + stride];
-        }
-        __syncthreads();
-    }
+    // Halving trees of key_reduce/query_reduce, levels 16..1 in wave 0 registers (core/ordered_reduce.hpp: same pairing
+    // and bits, 3 barriers per tree instead of 9). The barrier after each lane-0 block is the reuse barrier.
+    namespace tree = ::strix::core::ordered_reduce;
+    float* const square_reduce[2] = {key_reduce, query_reduce};
+    float squares[2] = {key_square, query_square};
+    tree::tree_to_lane0<kThreads, 2U>(square_reduce, squares, lane);
     if (lane == 0) {
-        inverse_key = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
-        inverse_query = rsqrtf(query_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+        inverse_key = rsqrtf(squares[0] / static_cast<float>(hidden_size) + epsilon);
+        inverse_query = rsqrtf(squares[1] / static_cast<float>(hidden_size) + epsilon);
     }
     __syncthreads();
 
@@ -1173,14 +1173,9 @@ __global__ void ple_rows_gate_norm_kernel(
             bf16_to_float(query[index]) * inverse_query * load_small(query_norm, query_norm_kind, index);
         dot += normalized_key * normalized_query;
     }
-    key_reduce[lane] = dot;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
-        __syncthreads();
-    }
+    dot = tree::tree_to_lane0<kThreads>(key_reduce, dot, lane);
     if (lane == 0) {
-        const float score = key_reduce[0] / sqrtf(static_cast<float>(hidden_size));
+        const float score = dot / sqrtf(static_cast<float>(hidden_size));
         const float magnitude = sqrtf(fmaxf(fabsf(score), 1e-6F));
         const float signed_root = score > 0.0F ? magnitude : score < 0.0F ? -magnitude : 0.0F;
         gate = 1.0F / (1.0F + expf(-signed_root));
@@ -1194,13 +1189,8 @@ __global__ void ple_rows_gate_norm_kernel(
         const float gated = ple_rows_exact_mul(value[feature], g);
         square += gated * gated;
     }
-    key_reduce[lane] = square;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
-        __syncthreads();
-    }
-    if (lane == 0) inverse_rms = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+    square = tree::tree_to_lane0<kThreads>(key_reduce, square, lane);
+    if (lane == 0) inverse_rms = rsqrtf(square / static_cast<float>(hidden_size) + epsilon);
     __syncthreads();
     for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
         const auto index = base + feature;
@@ -2492,6 +2482,17 @@ register_for_compiled_execution(
 }
 
 #include "hip_ple_rows_site.inc"
+// FAST ple_rows_f16: the same rows and FP32 stores for q8_rows::tiled (row r at input0 + r * input_stride).
+struct PleTiledSite {
+    using Input = std::uint16_t;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* out;
+    std::uint32_t out_stride;
+    __device__ void store(std::uint32_t o, std::uint32_t r, float value) const { out[static_cast<std::uint64_t>(r) * out_stride + o] = value; }
+};
 
 void testing::invalidate_ple_projection_weights() { q8_rows::invalidate_lane_weights(); }
 
@@ -2725,6 +2726,31 @@ struct HipPleKnownWindow::Impl {
         const auto key = site(reinterpret_cast<const void*>(p.tensors.key.runtime->address), expanded, projections);
         const auto value = site(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
             projections + static_cast<std::uint64_t>(max_rows) * expanded);
+        // FAST ple_rows_f16 (STRIX_PREFILL_PLE_ROWS_F16=1, default OFF): every row of the call through the shared FP16 dense core
+        // (q8_rows::tiled, one launch per projection): BF16 rows rounded to FP16 while staging, fp16(d * q) weights, FP32
+        // accumulation over ascending K16 tiles, the same FP32 store as PleRowsSite. Changes logits (identity tag plef16).
+        if (prefill_option_enabled(PrefillOption::ple_rows_f16)) {
+            const std::uint32_t tiled_rows = groups * kPleWideRows;
+            const auto tiled = [&](const PleRowsSite<kPleWideRows>& s) {
+                PleTiledSite t{};
+                t.input0 = reinterpret_cast<const unsigned char*>(s.base);
+                t.input_stride = static_cast<std::uint64_t>(s.in_stride) * sizeof(std::uint16_t);
+                t.segments = s.segments; t.width = s.width; t.outputs = s.outputs;
+                t.out = s.out; t.out_stride = s.out_stride;
+                return t;
+            };
+            const auto tk = tiled(key), tv = tiled(value);
+            if (q8_rows::tiled::supported(tk, tiled_rows) && q8_rows::tiled::supported(tv, tiled_rows)) {
+                static const bool witness = [] { std::fprintf(stderr, "qpf2k ple rows f16 tiled active (FAST ple_rows_f16)\n"); return true; }();
+                (void)witness;
+                q8_rows::tiled::launch(tk, tiled_rows, hip_execution_stream());
+                q8_rows::tiled::launch(tv, tiled_rows, hip_execution_stream());
+                check_hip(hipGetLastError(), "prefill PLE tiled f16 projection launch");
+                return true;
+            }
+            static const bool declined = [] { std::fprintf(stderr, "qpf2k ple rows f16 declined: shape unsupported by q8_rows::tiled\n"); return true; }();
+            (void)declined;
+        }
         if (!ple_batch_admits(key, groups) || !ple_batch_admits(value, groups)) return false;
         if (!ple_batch_reserve(batch_rows, static_cast<std::uint64_t>(groups) * kPleWideRows * width * sizeof(float))) return false;
         auto* packed = static_cast<float*>(batch_rows.base);
@@ -3263,6 +3289,15 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         const auto total = static_cast<std::uint32_t>(rows.size());
         std::uint32_t first = 0;
         static const bool batch = strix::envcfg::flag("STRIX_PREFILL_PLE_BATCH", false, strix::EnvFlagMatch::exact);
+        // The draft FP16 arithmetic exists only on the batch route. Refuse controls
+        // that would silently execute or restore FP32 projections under plef16.
+        if (prefill_option_enabled(PrefillOption::ple_rows_f16)) {
+            if (!wide || !batch || qpf2k::suppressed(qpf2k::Item::ple_batch))
+                throw std::invalid_argument("ple_rows_f16 requires STRIX_PREFILL_PLE_WIDE=1 and "
+                    "STRIX_PREFILL_PLE_BATCH=1 with PLE batching unsuppressed");
+            if (check)
+                throw std::invalid_argument("ple_rows_f16 is incompatible with STRIX_PREFILL_PLE_WIDE_CHECK=1");
+        }
         if (wide && batch && !qpf2k::suppressed(qpf2k::Item::ple_batch) &&
             total >= kPleWideRows && w.project_rows_batch(prepared[0], at(0), total / kPleWideRows)) {
             static const bool witness = [] { std::fprintf(stderr, "qpf2k ple row batch active\n"); return true; }();

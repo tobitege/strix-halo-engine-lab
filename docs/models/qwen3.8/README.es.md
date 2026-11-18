@@ -13,6 +13,11 @@ comandos de lanzamiento, los perfiles y los interruptores de ajuste. Cómo se le
 
 ## Ejecución
 
+**Pesos:** [hyukudan/Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (réplica de `unsloth/Qwen3.8-Flash-Next-GGUF`): el motor lee el GGUF
+`UD-Q4_K_XL` tal cual se publica, unido en un fichero; las palancas opcionales solo añaden copias en el dispositivo al
+cargar. La cabeza de draft MTP Q8_0 destilada se publica en [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) (el `MTP/*.gguf` base de la réplica
+es otra cabeza). Ficheros y revisiones: [reproducir](../../reproduce.md#models-and-provenance).
+
 Ejecución recomendada: el comando simple selecciona los valores predeterminados de producción, 256 tokens.
 
 ```sh
@@ -217,8 +222,22 @@ nodo hace el decode; 64 tokens generados idénticos a la ejecución solo en el n
 | Modo | Hardware | 1K | 4K | 8K | 16K | 32K | Build |
 |---|---|---:|---:|---:|---:|---:|---|
 | Prefill, TTFT | 1 nodo | **0.77 s** | **2.42 s** | | **9.47 s** | **19.13 s** | main `85353311b`, comando simple |
+| Prefill, TTFT | 1 nodo | | | **4.35 s** | | **17.7 s** | main `ae06f9466` / `e5886cb79`, comando del motor, en caliente |
+| Prefill, `fast` (opcional; calificación de calidad en curso), TTFT | 1 nodo | | | **4.08 s** | | 16.59 s (una ejecución) | igual |
+| Prefill en pipeline, TTFT | 2 nodos | | | 3.67 s (pipeline forzado) | | **11.04 s** (una ejecución) | main `e5886cb79` |
 | Descarga de prefill, TTFT | RTX PRO + 1 nodo | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | `70b93af3` |
 | Mismo servidor sin la RTX, TTFT | 1 nodo | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | misma compilación del servidor |
+
+**Medido en main actual** (un nodo, comando del motor, prompts reales con plantilla de chat, caché de páginas caliente): exacto 8K
+1,853-1,885 tok/s con 1.19-1.25 M ciclos de GPU por token, 32K 1,845-1,856, 128K 1,755-1,762 (74.4-74.7 s); `--profile fast`
+(opcional; calificación de calidad en curso; cambia los logits) 8K 1,971-2,008 con 1.10-1.17 M ciclos por token, 32K 1,975. Dos nodos, prompt en pipeline
+sobre USB4 en chunks de 4,096 filas con el estado recurrente y de atención entregado al rank 1: 32K 2,968 tok/s exacto,
+3,191 `fast` (1.60x un nodo), logits y primer token tras la entrega iguales a un nodo; dos nodos gastan un 13-23 % más de
+ciclos de GPU por token. Por debajo de 28,672 filas de prompt el par lee el prompt en un nodo por defecto; la cifra de
+8K en pipeline (2,224-2,233 exacto, 2,381-2,389 `fast`) se midió forzando el pipeline. El servidor lee un prompt a 0.92
+(1K / 8K) y 0.87 (32K) de la velocidad del comando del motor con tokens de salida idénticos; la diferencia es el cebado
+MTP de las filas del prompt, que el comando simple no ejecuta, más una elección de tile a 32K. El cebado en grupos de
+64 filas (por defecto desde #585) bajó la vuelta de cebado a 8K de 450-461 a 418-434 ms.
 
 La descarga se compara con el mismo servidor de producción al que reenvía (tiles de prompt de 2,048 filas), que lee
 los prompts más despacio que la fila de prefill de un nodo anterior (tiles de filas automáticos). A 32K la ruta RTX es 4.9× más rápida que

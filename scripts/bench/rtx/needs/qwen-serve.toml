@@ -1,0 +1,15 @@
+# strix-route-needs-v1 for the Qwen CUDA serve route (weights resident, no host / file tier), from the measured
+# load on one RTX PRO 6000 at 34,816 positions: 6.0 GB free after the load (weights, context, workspaces and
+# session 0), session = 31,616 B/position + 233 MB, slot margin 2 GiB. weights_resident = card total - 6.0 GB -
+# session 0, so the plan gives the measured 3 slots on that card.
+# Plan any declared device: strix-device-plan --devices FILE --needs scripts/bench/rtx/needs/qwen-serve.toml
+schema = "strix-route-needs-v1"
+route = "qwen-serve"
+weights_resident = 95309258912
+session_fixed = 233000000
+session_per_position = 31616
+positions = 34816
+min_positions = 8704
+slots = 4
+min_slots = 1
+margin_bytes = 2147483648

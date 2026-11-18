@@ -10,10 +10,10 @@
 // STRIX_FMOE_EXPERT_COUNT=N with uniform routes checks a prefix of the real experts (small portability runs).
 // STRIX_FMOE_DUMP_PREFIX=PATH writes raw outputs outside the source tree for comparisons across frozen builds.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_moe.hpp"
-#include "strix/cuda_ds41_moe_fast.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_moe.hpp"
+#include "strix/cuda/ds41_moe_fast.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/gguf_reader.hpp"

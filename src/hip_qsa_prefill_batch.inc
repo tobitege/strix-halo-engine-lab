@@ -134,7 +134,10 @@ void qpf2k_stage_score_slice(const Qpf2kStageBatch& batch, QsaPrefillPool* pool,
             static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();
             (void)witness;
         }
-        if (qpf2k_index_score_wmma_active) {
+        if (qsa_flash::index_band())
+            qpf2k_band_reduce(pool->capacity, pool->packed ? static_cast<const void*>(pool->packed) : pool->keys,
+                pool->packed != nullptr, max_blocks, stream);
+        if (!qsa_flash::index_band() && qpf2k_index_score_wmma_active) {
             qsa_flash::launch_index_score_wmma<64U, true>(QsaRowsScoreViews<64U>{},
                 pool->packed ? static_cast<const void*>(pool->packed) : pool->keys, pool->packed != nullptr,
                 max_blocks, nullptr, 0U, slot.scores + first, count, stream);
@@ -259,6 +262,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         return decline();
     // The range and score launch arguments below must only reuse this reservation.
     if ((max_new || max_blocks) && !qpf2k_key_ranges(pool->capacity, true)) return decline();
+    if (qsa_flash::index_band() && (max_new || max_blocks) && !qpf2k_key_norms(pool->capacity, true)) return decline();
     std::uint64_t offset = 0;
     for (std::uint32_t g = 0; g < groups; ++g) {
         norms[g].table = slot.tables + static_cast<std::uint64_t>(g) * 64U * 64U;
@@ -303,7 +307,8 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         check_hip(hipGetLastError(), "QSA stage batch pool launch");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((total_new + 255U) / 256U),
             dim3(256), 0, stream, static_cast<const float*>(pool->keys), pool->valid, total_new,
-            qpf2k_key_ranges(pool->capacity), slot.bounds, groups);
+            qpf2k_key_ranges(pool->capacity), slot.bounds, groups,
+            qsa_flash::index_band() ? qpf2k_key_norms(pool->capacity) : nullptr);
         check_hip(hipGetLastError(), "QSA stage batch range launch");
     }
     if (!compact) qpf2k_stage_score_slice(batch, pool, a.index_dim, 0U, groups);

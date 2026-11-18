@@ -39,8 +39,9 @@ void enqueue_hc_mixes(const HcMixView& view, void* stream);
 void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden, float* out,
                          void* stream);
 // out[r][k][i] = post[k] * sub[r][i] + sum_j comb[j][k] * residual[r][j][i] (out may not alias residual).
+// sub_low and sub_high (both or neither): sub[r][i] is (sub + sub_low) + sub_high, as HcSiteView::sub_low.
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                       float* out, void* stream);
+                       float* out, void* stream, const float* sub_low = nullptr, const float* sub_high = nullptr);
 
 // One launch per hyper-connection site boundary (the decode chain between two sublayers), bitwise the
 // composition of the separate calls:
@@ -57,6 +58,12 @@ void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mix
 struct HcSiteView {
     std::uint32_t rows = 0, hidden = 0;
     const float* sub = nullptr;
+    // Not null (both, with sub): the sublayer input is the canonical rank sum (sub[i] + sub_low[i]) + sub_high[i], the
+    // expression and order of enqueue_canonical_sum, read where sub is read (no materialised sum); same bits. Row stride hidden.
+    // Only with collapse_out (the collapse site) or a view that runs the separate kernels (the other site kernels keep the
+    // stored-sub code: no runtime branch, no register cost).
+    const float* sub_low = nullptr;
+    const float* sub_high = nullptr;
     const float* residual = nullptr;
     const HcMix* expand_mixes = nullptr;
     float* stream = nullptr;
@@ -89,7 +96,25 @@ struct HcSiteView {
     // expand_mixes[r].pre to collapse_out[r * hidden + i] (as the collapse a NormView with hc_stream reads), same bits;
     // tiles of at most 4 rows.
     float* collapse_out = nullptr;
+    // With collapse_out: 0 by STRIX_DS41_HC_COLLAPSE_ONCE (default on from hc_collapse_once_min_rows rows); 1 each copy's
+    // chunk read on its own (the previous form: every copy re-reads the hc residual copies and sub); 2 one read of the
+    // residual copies and sub expands every copy, tiles of at most 2 rows (hip_ds41_layer.hip site_fast_partial, same
+    // expressions and order, same bits).
+    std::uint32_t collapse_once = 0;
 };
+inline constexpr std::uint32_t hc_collapse_once_min_rows = 256;  // smallest measured row count where one read wins
+struct HcCollapseRoute {
+    bool once;
+    std::uint32_t tile;
+};
+// Scheduling selector for the admitted fast collapse site; environment policy is supplied by the caller.
+[[nodiscard]] constexpr HcCollapseRoute hc_collapse_route(const HcSiteView& v, bool once_enabled) {
+    const bool once = v.collapse_once == 2 ||
+                      (v.collapse_once == 0 && once_enabled && v.rows >= hc_collapse_once_min_rows);
+    const auto tile = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+    const auto cap = once ? 2U : 4U;
+    return {once, tile < cap ? tile : cap};
+}
 inline constexpr std::uint32_t hc_site_one_launch_rows = 4;  // previous kernel, measured: one launch wins at 1-4 rows, loses at 8
 inline constexpr std::uint32_t hc_site_fast_one_launch_rows = 8;  // fast kernel
 [[nodiscard]] std::size_t hc_site_counter_count(std::uint32_t rows);
@@ -241,6 +266,9 @@ struct Q8A8DensePrefillView {
     std::uint32_t out_stride = 0;
     std::uint32_t row_width = 0, k_offset = 0;  // K-split parts, as Q8A8View
     bool accumulate = false;
+    // keep the exact kernels (no FAST dense form ds41-dense-f16-v1): a policy pins the call's form (in the padding
+    // after accumulate: the view's size and offsets, and so every kernel's arguments, are unchanged)
+    bool exact = false;
     std::uint32_t tall = 0;  // tall form RT * 10 + OT, 1 auto (the same bits); 0: STRIX_DS41_DENSE_TALL (default off)
     // Optional A8 of the outputs (enqueue_quantize_a8's bits; accumulate off, count a multiple of 32): codes at
     // r * a8_stride + o, deltas / sums at r * a8_stride / 32 + o / 32. Written by the tall forms whose blocks own whole
@@ -254,8 +282,33 @@ struct Q8A8DensePrefillView {
     // Lean 4 form, auto, row_width 8192 / width 4096, from 896 rows; else the two launches). No A8 output.
     std::uint32_t k_parts = 1;
 };
+// FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE): 1 on, 0 off, -1 = the environment (default). Process-wide.
+// Callers must serialize changes against execution in every engine instance, not only the current prefill task.
+void set_fast_dense(int mode);
+// FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM): the Engram KV projection on the shared FP16 WMMA core.
+// 1 on, 0 off, -1 = the environment (default). Process-wide, serialized like set_fast_dense.
+// Only controls the two-argument dispatch; DevicePrefill passes its per-instance policy explicitly.
+void set_fast_engram(int mode);
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
+// FAST dense (ds41-dense-f16-v1) of `groups` same-shape products in ONE launch (the batched form of the shared core
+// dense-q8a8-f16-v1): group g reads weight + g * weight_group_bytes and codes / deltas from column g * view.width, and
+// writes out columns from g * view.count. Bits: those of the per-group calls. Returns false, with nothing enqueued, when
+// the FAST dense form does not take the call or STRIX_DS41_FAST_DENSE_BATCH=0: the caller then makes the per-group calls.
+// Invalid dense views, including k_parts != 1, are declined before enqueueing. The outputs' A8 (a8_codes) is never written here.
+bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& view, unsigned groups, std::size_t weight_group_bytes, void* stream);
+// FAST lever ds41-shared-f16-v1 (the prefill shared expert on the FAST dense core): one Q8_0 x A8 product on the shared
+// FP16 WMMA core of policy dense-q8a8-f16-v1, whatever the FAST dense switch (one K part, no accumulate, no A8 output).
+// enqueue returns false and enqueues nothing when the core does not take the view: check every product of the expert
+// with q8_0_a8_fast_core_supported first, so an expert is either wholly FAST or wholly exact.
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& view);
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& view, void* stream);
+// FAST flash layers (ds41-attn-bf16flash-v1), q_b only: when the FAST dense form takes `view` (the same rule as above),
+// writes the BF16 image of q after RoPE (rope[r] for output row r; view.out_stride elements per row) into `image`
+// instead of view.out and returns true; the flash core reads it through query_op with the bits of the FP32 path.
+// Returns false (nothing launched) when the FAST dense form declines: the caller runs the FP32 form.
+// rope: const attn::RopeRow* (strix/ds41_attention.hpp), one per output row.
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& view, std::uint16_t* image, const void* rope, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
 // any number of rows (above 8 a tiled kernel with the same lane classes and butterfly, so the same bits).
 struct F16RowsView {
@@ -275,6 +328,8 @@ void enqueue_f16_rows(const F16RowsView& view, void* stream);
 // gives NaN in both, possibly with another payload). Default on; STRIX_DS41_ENGRAM_F16_PF=0
 // (read on every call) restores enqueue_f16_rows, which also serves every other view.
 void enqueue_engram_f16_rows(const F16RowsView& view, void* stream);
+// Per-execution numerical policy, independent of set_fast_engram and its environment default.
+void enqueue_engram_f16_rows(const F16RowsView& view, void* stream, bool fast_engram);
 // Explicit entry for tests / microbench: rejects unsupported views, ignores the switch.
 [[nodiscard]] bool engram_f16_pf_supported(const F16RowsView& view) noexcept;
 // Default admission (enqueue_engram_f16_rows): supported and the 48-row padding at most 9/8 of the 64-row tile's.
@@ -300,8 +355,9 @@ void enqueue_combine_argmax(const ArgmaxCandidate* a, const ArgmaxCandidate* b, 
 // Engram: raw rows (row_count x 264 B) to bfloat16-rounded FP32 values (row_count x 256).
 void enqueue_engram_rows_bf16(const std::uint8_t* rows, std::uint32_t row_count, float* out, void* stream);
 // Gated injection: stream rows x (hc * hidden) updated in place from kv rows x (hidden * (hc + 1)).
+// gate_off (device, rows bytes, may be null): nonzero = an image position: gate 0 on every copy (upstream's token_mask).
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,
-                           std::uint32_t hidden, float eps, void* stream);
+                           std::uint32_t hidden, float eps, void* stream, const std::uint8_t* gate_off = nullptr);
 
 // ---- launch accesses ---------------------------------------------------------------------------
 // The device bytes a call may read or write, for launchers that track cache lines across dependent
@@ -330,7 +386,8 @@ private:
 [[nodiscard]] LaunchAccess launch_access(const Q8A8View& view);
 [[nodiscard]] LaunchAccess launch_access(const F16RowsView& view);
 [[nodiscard]] LaunchAccess launch_access_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows,
-                                                std::uint32_t hidden, const float* out);
+                                                std::uint32_t hidden, const float* out, const float* sub_low = nullptr,
+                                                const float* sub_high = nullptr);
 [[nodiscard]] LaunchAccess launch_access_engram_inject(const float* hc_stream, const float* kv, const float* q_norm,
                                                        const float* k_norm, std::uint32_t rows, std::uint32_t hidden);
 [[nodiscard]] LaunchAccess launch_access_argmax(const float* logits, std::uint32_t rows, std::uint32_t count, std::uint32_t stride,

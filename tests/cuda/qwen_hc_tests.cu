@@ -1,4 +1,4 @@
-// Tests of src/cuda/qwen_hc.cu (family "hc"): literal host references of the HIP kernels vs the CUDA kernels, bit for bit.
+// Tests of src/cuda/models/qwen/qwen_hc.cu (family "hc"): literal host references of the HIP kernels vs the CUDA kernels, bit for bit.
 //   qwen_hc_tests [--tables DIR] [--fixture FILE] [--skip-real] [--skip-perf]
 // Tables default qrtx-build\tables; the GGUF comes from tests/cuda/qwen_gguf_host.hpp. With --fixture (or when
 // qrtx-build\fx\d64.dump exists) the HIP step dump is replayed: hyper mixes, router, inject, combine, expand,
@@ -6,7 +6,7 @@
 //
 // The host references follow the HIP source and the gfx1151 ISA literally (see the header comment of qwen_hc.cu):
 // each FMA is std::fma, every other operation one IEEE single operation (no contraction: fp_contract off below).
-// expf/rsqrtf on the host are a transliteration of src/cuda/qwen_amd_math.cuh over the same table files.
+// expf/rsqrtf on the host are a transliteration of include/strix/cuda/amd_math.cuh over the same table files.
 #if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
 #pragma fp_contract(off)
 #pragma float_control(precise, on)
@@ -29,10 +29,11 @@
 #include <string>
 #include <vector>
 
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
-#include "strix/cuda_qwen_hc.hpp"
+#include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 
 namespace hc = strix::cuda::qwen_hc;
 namespace am = strix::cuda::amdmath;
@@ -71,7 +72,7 @@ static std::uint16_t float_to_half(float f) {  // RNE, used only to build synthe
     return static_cast<std::uint16_t>(s | r);
 }
 
-// Host port of qwen_amd_math.cuh (same tables, same algorithm).
+// Host port of amd_math.cuh (same tables, same algorithm).
 struct HostMath {
     std::vector<std::uint32_t> exp_bits, rsq_bits;
     std::map<std::uint32_t, float> exp_hard, rsq_hard;
@@ -772,8 +773,209 @@ static void replay(const std::string& path, const strix::qwen_gguf::Model& m, co
     for (const auto& [op, n] : done) std::printf("fixture: op %s replayed in %u steps\n", op.c_str(), n);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// FAST form (HcMixArgs::mma): tensor-core projection + output vs the exact kernels on the same packed weights and inputs.
+struct Err {
+    double d2 = 0, r2 = 0, mx = 0;
+    void add(double ref, double got) { const double d = got - ref; d2 += d * d; r2 += ref * ref; mx = std::max(mx, std::fabs(d)); }
+    double rel() const { return r2 > 0 ? std::sqrt(d2 / r2) : 0.0; }
+};
+static void report_err(const std::string& name, const Err& all, const Err* cls, const char* const* names, unsigned n, double tol) {
+    double lo = 1e30, hi = 0; std::string detail;
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "max abs %.3e rel L2 %.3e;", all.mx, all.rel()); detail = buf;
+    for (unsigned i = 0; i < n; ++i) {
+        if (cls[i].r2 <= 0) continue;
+        lo = std::min(lo, cls[i].rel()); hi = std::max(hi, cls[i].rel());
+        std::snprintf(buf, sizeof buf, " %s %.2e", names[i], cls[i].rel()); detail += buf;
+    }
+    report(name, all.rel() < tol && hi <= 3.0 * std::max(all.rel(), 1e-9), detail);
+}
+// Exercise the actual FAST output kernels with identical low-rank input, bypassing norm/projection.
+static void test_hc_mma_split(const am::Tables& t) {
+    constexpr unsigned rows = 65;  // Includes a partial output tile.
+    auto wu = synth_q8(W, RK, 2e-4F, 2e-3F);
+    const std::size_t stream_bytes = wu.size() / S;
+    for (unsigned s = 1; s < S; ++s)
+        std::copy_n(wu.data(), stream_bytes, wu.data() + s * stream_bytes);
+    Dev<std::uint8_t> down(synth_q8(RK, W, 2e-4F, 2e-3F)), up(wu);
+    Dev<std::uint8_t> packed(hc::hc_packed_bytes());
+    std::vector<float> n(static_cast<std::size_t>(rows) * P, 0.0F);
+    for (unsigned r = 0; r < rows; ++r) {
+        for (unsigned k = 0; k < RK; ++k)
+            n[static_cast<std::size_t>(r) * P + W + k] = r == 0 ? 0.0F : nrand(2.0F);
+        for (unsigned f = 0; f < H; ++f) {
+            // Row 0: zero gates make sigmoid exactly 1/2. Probe a BF16 tie and
+            // its adjacent FP32 values. Other rows cancel equal, nonzero gates.
+            const float midpoint = 1.00390625F;
+            const float boundary = f % 3U == 0 ? std::nextafter(midpoint, 0.0F) :
+                (f % 3U == 1 ? midpoint : std::nextafter(midpoint, 2.0F));
+            const std::size_t i = static_cast<std::size_t>(r) * P + f;
+            n[i] = r == 0 ? 0.0F : 4096.0F;
+            n[i + H] = 8.0F * boundary;
+            n[i + 2U * H] = -n[i];
+        }
+    }
+    Dev<float> normalized(n), gates(static_cast<std::size_t>(rows) * W);
+    Dev<std::uint16_t> output(static_cast<std::size_t>(rows) * H);
+    hc::HcMixArgs a;
+    a.rows = rows; a.mma = true; a.normalized = normalized.p; a.output = output.p;
+    a.packed = hc::hc_packed_view(packed.p);
+    hc::hc_pack(down.p, up.p, a.packed, nullptr);
+    hc::hc_mix(a, t, nullptr, 4U);
+    CK(cudaDeviceSynchronize());
+    const auto fused = output.get();
+    CK(cudaMemset(output.p, 0xff, output.n * sizeof(std::uint16_t)));
+    a.gates = gates.p;
+    hc::hc_mix(a, t, nullptr, 12U);
+    CK(cudaDeviceSynchronize());
+    same("hc FAST fused == split: finite cancellation and BF16 boundaries", fused, output.get(), false, H);
+    bool boundary_ok = true, finite = true;
+    for (unsigned f = 0; f < H; ++f)
+        boundary_ok = boundary_ok && fused[f] == (f % 3U == 2 ? 0x3f81U : 0x3f80U);
+    for (auto v : fused) finite = finite && (v & 0x7f80U) != 0x7f80U;
+    report("hc FAST split fixture covers BF16 tie and neighbors", boundary_ok);
+    report("hc FAST cancellation outputs remain finite", finite);
+}
+static void test_hc_mma(const am::Tables& t, const char* tag, float down_lo, float down_hi, bool with_inject, bool outliers) {
+    HcWeights w;
+    w.down = synth_q8(RK, W, down_lo, down_hi); w.up = synth_q8(W, RK, 2e-4F, 2e-3F);
+    w.norm.resize(W); for (auto& v : w.norm) v = 1.0F + nrand(0.2F);
+    if (with_inject) { w.inject.resize(static_cast<std::size_t>(S) * W); for (auto& v : w.inject) v = nrand(0.02F); }
+    Dev<std::uint8_t> down(w.down), up(w.up);
+    Dev<float> norm(w.norm), inj(w.inject.empty() ? std::vector<float>{} : w.inject);
+    Dev<std::uint8_t> packed(hc::hc_packed_bytes());
+    hc::HcMixArgs a;
+    a.packed = hc::hc_packed_view(packed.p); a.norm = norm.p; a.inject = w.inject.empty() ? nullptr : inj.p; a.epsilon = 1e-6F;
+    hc::hc_pack(down.p, up.p, a.packed, nullptr);
+    const unsigned list[] = {1, 15, 16, 17, 65, 1000, 8192};
+    for (unsigned rows : list) {
+        auto input = synth_bf16(static_cast<std::size_t>(rows) * W, 1.0F);
+        if (outliers) for (std::size_t i = 0; i < input.size(); i += 997) input[i] = to_bf(nrand(40.0F));
+        Dev<std::uint16_t> in(input);
+        Dev<float> normalized(static_cast<std::size_t>(rows) * P), injection(static_cast<std::size_t>(rows) * S);
+        Dev<std::uint16_t> out(static_cast<std::size_t>(rows) * H);
+        a.input = in.p; a.rows = rows; a.normalized = normalized.p; a.injection = injection.p; a.output = out.p;
+        a.mma = false; hc::hc_mix(a, t, nullptr); CK(cudaDeviceSynchronize());
+        const auto ne = normalized.get(); const auto ie = injection.get(); const auto oe = out.get();
+        CK(cudaMemset(normalized.p, 0xff, normalized.n * 4)); CK(cudaMemset(injection.p, 0xff, injection.n * 4)); CK(cudaMemset(out.p, 0xff, out.n * 2));
+        a.mma = true; hc::hc_mix(a, t, nullptr); CK(cudaDeviceSynchronize());
+        const auto nm = normalized.get(); const auto im = injection.get(); const auto om = out.get();
+        // Keep the independent full-workspace references above. Compact owns only
+        // inverses and low values; compare its low/injection/output for both forms,
+        // including separate producer/consumer calls.
+        if (rows <= 65U) for (bool mma : {false, true}) {
+            a.mma = mma;
+            a.workspace_layout = hc::HcWorkspaceLayout::compact;
+            for (bool staged : {false, true}) {
+                CK(cudaMemset(normalized.p, 0xff, normalized.n * sizeof(float)));
+                if (staged) for (unsigned stage : {1U, 2U, 4U}) hc::hc_mix(a, t, nullptr, stage);
+                else hc::hc_mix(a, t, nullptr);
+                CK(cudaDeviceSynchronize());
+                const auto compact = normalized.get();
+                std::vector<float> expected_low, compact_low;
+                const auto& full = mma ? nm : ne;
+                for (unsigned row = 0; row < rows; ++row) for (unsigned k = 0; k < RK; ++k) {
+                    const auto at = static_cast<std::size_t>(row) * P + W + k;
+                    expected_low.push_back(full[at]); compact_low.push_back(compact[at]);
+                }
+                const std::string label = std::string("compact ") + (mma ? "mma" : "exact") +
+                    (staged ? " staged" : " complete") + " rows=" + std::to_string(rows);
+                same(label + " low", expected_low, compact_low, false, RK);
+                if (with_inject) same(label + " injection", mma ? im : ie, injection.get(), false, S);
+                same(label + " output", mma ? om : oe, out.get(), false, H);
+            }
+        }
+        // A valid scalar input view need not satisfy compact vector alignment.
+        if (rows == 16U) {
+            auto shifted_input = input; shifted_input.insert(shifted_input.begin(), 0);
+            auto shifted_norm = w.norm; shifted_norm.insert(shifted_norm.begin(), 0.0F);
+            Dev<std::uint16_t> unaligned_input(shifted_input);
+            Dev<float> unaligned_norm(shifted_norm);
+            a.input = unaligned_input.p + 1; a.norm = unaligned_norm.p + 1;
+            a.workspace_layout = hc::HcWorkspaceLayout::automatic;
+            for (bool mma : {false, true}) {
+                a.mma = mma; hc::hc_mix(a, t, nullptr); CK(cudaDeviceSynchronize());
+                same("unaligned full workspace", mma ? nm : ne, normalized.get(), false, P);
+                same("unaligned output", mma ? om : oe, out.get(), false, H);
+            }
+            a.input = in.p; a.norm = norm.p;
+        }
+        a.workspace_layout = hc::HcWorkspaceLayout::full;
+        const unsigned tail = rows % 64U ? rows - rows % 64U : (rows > 64U ? rows - 64U : 0U);
+        Err low, lowc[3], lowk[2], io, ioc[3], ou, ouc[3], ouf[3];
+        const auto rc = [&](unsigned r) { return r < 16U ? 0U : (r >= tail ? 2U : 1U); };
+        for (unsigned r = 0; r < rows; ++r) {
+            for (unsigned k = 0; k < RK; ++k) {
+                const double e = ne[static_cast<std::size_t>(r) * P + W + k], g = nm[static_cast<std::size_t>(r) * P + W + k];
+                low.add(e, g); lowc[rc(r)].add(e, g); lowk[k >= RK - 32U ? 1U : 0U].add(e, g);
+            }
+            if (with_inject) for (unsigned s = 0; s < S; ++s) { const double e = ie[r * S + s], g = im[r * S + s]; io.add(e, g); ioc[rc(r)].add(e, g); }
+            for (unsigned f = 0; f < H; ++f) {
+                const double e = bf(oe[static_cast<std::size_t>(r) * H + f]), g = bf(om[static_cast<std::size_t>(r) * H + f]);
+                ou.add(e, g); ouc[rc(r)].add(e, g); ouf[f < 32U ? 0U : (f >= H - 32U ? 2U : 1U)].add(e, g);
+            }
+        }
+        bool nan_hit = false;  // the poison fill must be gone (every output written)
+        for (std::size_t i = 0; i < om.size(); ++i) if (om[i] == 0xffffU) { nan_hit = true; break; }
+        const std::string base = std::string("hc_mma ") + tag + " rows=" + std::to_string(rows) + " ";
+        const char* rn[3] = {"rows<16", "mid", "lasttile"}; const char* kn[2] = {"k<288", "klast32"}; const char* fn[3] = {"f<32", "mid", "flast32"};
+        report_err(base + "low", low, lowc, rn, 3, 2e-2);
+        report_err(base + "low (by output block)", low, lowk, kn, 2, 2e-2);
+        if (with_inject) report_err(base + "injection", io, ioc, rn, 3, 2e-2);
+        report_err(base + "output bf16", ou, ouc, rn, 3, 2e-2);
+        report_err(base + "output bf16 (by feature)", ou, ouf, fn, 3, 2e-2);
+        report(base + "all outputs written", !nan_hit);
+    }
+}
+static void time_hc_mma(const am::Tables& t) {
+    HcWeights w = synth_hc(true);
+    Dev<std::uint8_t> down(w.down), up(w.up);
+    Dev<float> norm(w.norm), inj(w.inject);
+    Dev<std::uint8_t> packed(hc::hc_packed_bytes());
+    hc::HcMixArgs a;
+    a.packed = hc::hc_packed_view(packed.p); a.norm = norm.p; a.inject = inj.p; a.epsilon = 1e-6F;
+    hc::hc_pack(down.p, up.p, a.packed, nullptr);
+    cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    for (unsigned rows : {8192U, 1024U}) {
+        Dev<std::uint16_t> in(synth_bf16(static_cast<std::size_t>(rows) * W, 1.0F));
+        Dev<float> normalized(static_cast<std::size_t>(rows) * P), injection(static_cast<std::size_t>(rows) * S);
+        Dev<std::uint16_t> out(static_cast<std::size_t>(rows) * H);
+        a.input = in.p; a.rows = rows; a.normalized = normalized.p; a.injection = injection.p; a.output = out.p;
+        Dev<float> gates_buf(static_cast<std::size_t>(rows) * S * H);
+        for (int mode = 0; mode < 2; ++mode) {
+            a.mma = mode == 1;
+            for (unsigned stages : {1U, 2U, 4U, 4U | 0x100U}) {
+                a.gates = stages & 0x100U ? gates_buf.p : nullptr; stages &= 15U;
+                for (int i = 0; i < 3; ++i) hc::hc_mix(a, t, nullptr, stages);
+                CK(cudaDeviceSynchronize());
+                CK(cudaEventRecord(e0));
+                for (int i = 0; i < 20; ++i) hc::hc_mix(a, t, nullptr, stages);
+                CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+                float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+                std::printf("perf: rows=%u %s %s %.3f ms\n", rows, a.mma ? "mma  " : "exact", stages == 1U ? "norm      " : stages == 2U ? "projection" : a.gates ? "out(gates)" : "output    ", ms / 20);
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     std::string tables = "qrtx-build\\tables", fixture;
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--mma") {
+        for (int j = 1; j + 1 < argc; ++j) if (std::string(argv[j]) == "--tables") tables = argv[j + 1];
+        try {
+            load_host_math(tables);
+            am::Tables t = am::load_tables(tables);
+            test_hc_mma_split(t);
+            test_hc_mma(t, "mild", 2e-4F, 2e-3F, true, false);
+            test_hc_mma(t, "mild+outliers", 2e-4F, 2e-3F, true, true);
+            test_hc_mma(t, "saturating", 2e-3F, 2e-2F, false, false);
+            time_hc_mma(t);
+            am::free_tables(t);
+        } catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); ++g_fail; }
+        std::printf("qwen_hc_tests --mma: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     bool real = true, perf = true, only_fixture = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

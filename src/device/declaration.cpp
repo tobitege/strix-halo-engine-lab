@@ -1,7 +1,9 @@
 #include "strix/device/declaration.hpp"
 
+#include "strix/device/profiles.hpp"
 #include "strix/model_description.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -62,7 +64,7 @@ const Value* find(const Table& t, std::string_view key) {
 
 Attach parse_attach(const Value& v, const std::string& key) {
     const auto& t = table(v, key);
-    only(t, {"kind", "pcie_gen", "pcie_width", "h2d_gbytes_ps", "gbps_measured", "rtt_us_measured"}, key + ".");
+    only(t, {"kind", "pcie_gen", "pcie_width", "h2d_gbytes_ps", "gbps_measured", "rtt_us_measured", "link", "port"}, key + ".");
     Attach a;
     const auto* kind = find(t, "kind");
     if (!kind) bad(key + ".kind", "required");
@@ -75,14 +77,44 @@ Attach parse_attach(const Value& v, const std::string& key) {
     if (const auto* x = find(t, "h2d_gbytes_ps")) a.h2d_gbytes_ps = rate(*x, key + ".h2d_gbytes_ps");
     if (const auto* x = find(t, "gbps_measured")) a.gbps_measured = rate(*x, key + ".gbps_measured");
     if (const auto* x = find(t, "rtt_us_measured")) a.rtt_us_measured = integer(*x, key + ".rtt_us_measured");
+    if (const auto* x = find(t, "link")) {
+        a.link = lower(string(*x, key + ".link"));
+        if (!known_link_class(a.link)) bad(key + ".link", "unknown link class " + a.link);
+        if (a.kind == "integrated") bad(key + ".link", "an integrated device has no link");
+    }
+    if (const auto* x = find(t, "port")) a.port = string(*x, key + ".port");
     return a;
+}
+
+Link parse_link(const std::string& name, const Value& v) {
+    const std::string key = "links." + name;
+    const auto& t = table(v, key);
+    only(t, {"between", "class", "gbps_measured", "rtt_us_measured", "port"}, key + ".");
+    Link l;
+    l.name = name;
+    const auto* between = find(t, "between");
+    const auto* list = between ? std::get_if<Value::Array>(&between->data) : nullptr;
+    if (!list || list->size() != 2) bad(key + ".between", "expected two device ids");
+    l.a = string((*list)[0], key + ".between");
+    l.b = string((*list)[1], key + ".between");
+    if (l.a == l.b) bad(key + ".between", "a link joins two different devices");
+    const auto* cls = find(t, "class");
+    if (!cls) bad(key + ".class", "required");
+    l.link = lower(string(*cls, key + ".class"));
+    if (!known_link_class(l.link)) bad(key + ".class", "unknown link class " + l.link);
+    if (const auto* x = find(t, "gbps_measured")) l.gbps_measured = rate(*x, key + ".gbps_measured");
+    if (const auto* x = find(t, "rtt_us_measured")) l.rtt_us_measured = integer(*x, key + ".rtt_us_measured");
+    if (const auto* x = find(t, "port")) l.port = string(*x, key + ".port");
+    if (l.port.empty()) l.port = "link-" + name;
+    return l;
 }
 
 Descriptor parse_device(const std::string& id, const Value& v) {
     const std::string key = "devices." + id;
     const auto& t = table(v, key);
     only(t, {"kind", "vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason", "cores",
-             "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification"}, key + ".");
+             "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification", "profile", "memory_gib",
+             "bandwidth_gbytes_ps", "units", "count", "interconnect"}, key + ".");
     Descriptor d;
     d.id = id;
     try {
@@ -99,9 +131,49 @@ Descriptor parse_device(const std::string& id, const Value& v) {
         if (d.kind != Kind::npu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"npu\" unit takes this key");
     for (const std::string_view name : {"uuid", "pci", "attach", "memory_bytes"})
         if (cpu && find(t, name)) bad(key + "." + std::string(name), "a cpu unit takes no " + std::string(name));
+    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect"})
+        if (d.kind != Kind::gpu && find(t, name)) bad(key + "." + std::string(name), "only a GPU entry takes this key");
+    if (d.kind == Kind::npu && find(t, "memory_gib")) bad(key + ".memory_gib", "only a GPU or the cpu unit takes this key");
+    const Profile* profile = nullptr;
+    if (const auto* x = find(t, "profile")) {
+        d.profile = string(*x, key + ".profile");
+        profile = find_profile(d.profile);
+        if (!profile) bad(key + ".profile", "unknown profile " + d.profile + "; known: " + profile_names());
+    }
     const auto* vendor = find(t, "vendor");
-    if (!vendor && !cpu) bad(key + ".vendor", "required");
     if (vendor) d.vendor = parse_vendor(string(*vendor, key + ".vendor"));
+    if (profile && !profile->vendor.empty()) {
+        const Vendor implied = parse_vendor(profile->vendor);
+        if (vendor && d.vendor != implied)
+            bad(key + ".vendor", std::string(vendor_name(d.vendor)) + " contradicts profile " + d.profile);
+        d.vendor = implied;
+    } else if (!vendor && !cpu) {
+        bad(key + ".vendor", "required");
+    }
+    if (const auto* x = find(t, "memory_gib")) {
+        const double gib = rate(*x, key + ".memory_gib");
+        if (gib <= 0.0) bad(key + ".memory_gib", "must be positive (omit the key for no declared budget)");
+        d.budget_bytes = static_cast<std::uint64_t>(std::llround(gib * 1073741824.0));
+    }
+    if (profile && profile->name == "custom" && d.budget_bytes == 0) bad(key + ".memory_gib", "required with profile custom");
+    if (const auto* x = find(t, "bandwidth_gbytes_ps")) d.bandwidth_gbytes_ps = rate(*x, key + ".bandwidth_gbytes_ps");
+    if (const auto* x = find(t, "units")) d.units = static_cast<std::uint32_t>(integer(*x, key + ".units"));
+    if (const auto* x = find(t, "count")) {
+        const auto n = integer(*x, key + ".count");
+        if (n < 1 || n > 64) bad(key + ".count", "expected 1 to 64");
+        d.count = static_cast<std::uint32_t>(n);
+    }
+    if (const auto* x = find(t, "interconnect")) {
+        d.interconnect = lower(string(*x, key + ".interconnect"));
+        if (!find_interconnect(d.interconnect)) {
+            std::string known;
+            for (const auto& i : interconnects()) known += (known.empty() ? "" : ", ") + std::string(i.name);
+            bad(key + ".interconnect", "unknown class " + d.interconnect + " (no catalogue device has NVLink); known: " + known);
+        }
+    }
+    if (d.count > 1 && d.interconnect.empty()) bad(key + ".interconnect", "required with count > 1");
+    if (d.count > 1 && (find(t, "uuid") || find(t, "pci")))
+        bad(key + ".count", "a shape of several devices takes no identity: declare each bound card as its own entry");
     if (const auto* x = find(t, "arch")) d.arch = lower(string(*x, key + ".arch"));
     try {
         if (const auto* x = find(t, "uuid")) d.uuid = normalise_uuid(string(*x, key + ".uuid"));
@@ -109,10 +181,18 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     } catch (const std::invalid_argument& e) {
         bad(key, e.what());
     }
-    if (!cpu && d.uuid.empty() && d.pci.empty()) bad(key, "needs an identity: uuid or pci (an index is not an identity)");
+    if (!cpu && d.uuid.empty() && d.pci.empty()) {
+        if (!profile) bad(key, "needs an identity: uuid or pci (an index is not an identity), or a profile for a planned shape");
+        d.planned = true;
+    }
+    if (d.count > 1) d.planned = true;
     if (const auto* x = find(t, "name")) d.name = string(*x, key + ".name");
     if (const auto* x = find(t, "memory_bytes")) d.memory_bytes = integer(*x, key + ".memory_bytes");
-    if (const auto* x = find(t, "attach")) d.attach = parse_attach(*x, key + ".attach");
+    if (const auto* x = find(t, "attach")) {
+        d.attach = parse_attach(*x, key + ".attach");
+        // Remote devices of one machine share its network port unless stated; a PCIe slot is its own resource.
+        if (d.attach.port.empty()) d.attach.port = d.attach.kind == "remote" ? "attach-remote" : "attach-" + id;
+    }
     if (const auto* x = find(t, "roles")) {
         const auto* list = std::get_if<Value::Array>(&x->data);
         if (!list) bad(key + ".roles", "expected an array of strings");
@@ -311,7 +391,7 @@ std::string role_refusal(const Descriptor& device, std::string_view role) {
 Declaration parse_declaration(std::string_view toml, std::string source) {
     const auto parsed = model_description::parse(toml);
     const auto& root = parsed.fields;
-    only(root, {"schema", "machine", "devices", "device_policies"}, "");
+    only(root, {"schema", "machine", "devices", "device_policies", "links"}, "");
     const auto* schema = find(root, "schema");
     if (!schema) bad("schema", "required (strix-devices-v1)");
     if (string(*schema, "schema") != "strix-devices-v1") bad("schema", "expected strix-devices-v1");
@@ -330,6 +410,16 @@ Declaration parse_declaration(std::string_view toml, std::string source) {
             if (!a.uuid.empty() && a.uuid == b.uuid) bad("devices." + b.id + ".uuid", "same identity as device " + a.id);
             if (!a.pci.empty() && a.pci == b.pci) bad("devices." + b.id + ".pci", "same identity as device " + a.id);
             if (a.kind == Kind::cpu && b.kind == Kind::cpu) bad("devices." + b.id + ".kind", "second cpu unit (the first is " + a.id + ")");
+        }
+    if (const auto* x = find(root, "links"))
+        for (const auto& [name, value] : table(*x, "links")) {
+            auto link = parse_link(name, value);
+            for (const auto* end : {&link.a, &link.b}) {
+                const auto it = std::find_if(out.devices.begin(), out.devices.end(), [&](const Descriptor& d) { return d.id == *end; });
+                if (it == out.devices.end()) bad("links." + name + ".between", "unknown device " + *end);
+                if (it->kind == Kind::cpu) bad("links." + name + ".between", "a cpu unit takes no link");
+            }
+            out.links.push_back(std::move(link));
         }
     return out;
 }

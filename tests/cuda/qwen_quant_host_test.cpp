@@ -1,8 +1,8 @@
-// Host check of include/strix/cuda_qwen_quant.cuh (the decoders the RTX kernels use) against the CPU oracle
+// Host check of include/strix/cuda/qwen_quant.cuh (the decoders the RTX kernels use) against the CPU oracle
 // src/ggml_dequant.cpp (the GGUF reference decoders) on real rows of GGUF files: every (tensor kind, type) present,
 // a few rows each (first, last and spread), every 32-value group of the row compared bit for bit.
 //   qwen_quant_host_test <file.gguf>...       (exit 0 = all equal)
-#include "strix/cuda_qwen_quant.cuh"
+#include "strix/cuda/qwen_quant.cuh"
 #include "strix/ggml_dequant.hpp"
 #include "strix/gguf_reader.hpp"
 

@@ -33,6 +33,12 @@ struct WideHyperRowsTestViews {
     std::uint64_t recompute_stride = 0;
     const float* recompute_inverse = nullptr;
     const float* recompute_norm = nullptr;
+    // Optional producer receipt, published only after a successful projection launch.
+    // Required for output-only calls: retain the view/stream and its live allocations,
+    // and do not overwrite the consumed image. Split calls require exclusive scratch
+    // use until stream completion. Any intervening projection invalidates
+    // the receipt (including another view or recompute specialization).
+    std::uint64_t* low_generation = nullptr;
 };
 // Output form 15: experimental OUT16 inverse reuse, wide-rows only; without inverses restores form14.
 // Output form 14: qpf2k OUT16 (HCW2 arithmetic), paired with projection 4 or output-only 255.

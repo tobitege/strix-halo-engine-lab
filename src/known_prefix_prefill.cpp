@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace strix {
 namespace {
@@ -20,6 +21,27 @@ std::uint64_t add(std::uint64_t a,std::uint64_t b) {
 std::uint64_t multiply(std::uint64_t a,std::uint64_t b) {
     if(b&&a>UINT64_MAX/b) throw std::overflow_error("known prefill storage overflow");
     return a*b;
+}
+// A rejected workspace names its terms: T, the bytes needed and per row, the budget, the layout in force
+// and the largest per-row buffers, so the failing term is visible without a debugger (issue 758).
+[[noreturn]] void workspace_budget_exceeded(const KnownPrefillRequest& request,const KnownWindowArena& arena,
+    std::uint64_t needed,std::uint64_t external_qsa_score_bytes,bool terminal_logits,const char* check) {
+    std::vector<std::pair<std::uint64_t,std::string>> rows;
+    for(std::size_t i=0;i<arena.row_stride.size()&&i<arena.physical.allocations.size();++i) {
+        const auto& use=arena.physical.allocations[i].use;
+        rows.emplace_back(arena.row_stride[i],execution_use_is_logits(use)?std::string("logits"):
+            "class "+std::to_string(static_cast<unsigned>(use.buffer.buffer_class))+" slot "+std::to_string(use.buffer.slot));
+    }
+    std::stable_sort(rows.begin(),rows.end(),[](const auto& a,const auto& b){return a.first>b.first;});
+    std::string message="known prefill workspace exceeds its explicit arena budget: T = "+std::to_string(request.logical_rows)+
+        " needs "+std::to_string(needed)+" bytes ("+check+", "+std::to_string(needed/request.logical_rows)+
+        " per row) > --known-prefix-workspace-budget-bytes "+std::to_string(request.workspace_budget_bytes)+
+        "; layout "+(external_qsa_score_bytes||terminal_logits?"compact":"uniform")+
+        " (QSA score ring "+(external_qsa_score_bytes?"on":"off")+", terminal logits stripe "+(terminal_logits?"on":"off")+
+        (request.exact_memory?"":"; this owner keeps per-row logits and QSA scores (HTTP serving, segmented owners)")+
+        "); largest row buffers:";
+    for(std::size_t i=0;i<rows.size()&&i<3U;++i) message+=(i?", ":" ")+rows[i].second+" "+std::to_string(rows[i].first);
+    throw KnownPrefillBudgetExceeded(message);
 }
 void hash(std::uint64_t& h,std::uint64_t value) {
     for(unsigned shift=0;shift<64;shift+=8) {h^=(value>>shift)&255U;h*=1099511628211ULL;}
@@ -104,11 +126,15 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     // Every stripe/interval scales uniformly from the closed eight-row arena.
     // Its offsets are multiples of eight alignments, including odd T shapes.
     require(plan.tile8.arena.physical.total_bytes%8U==0U,"known prefill tile arena cannot be uniformly scaled");
-    if(!plan.external_qsa_score_bytes && !plan.terminal_logits_arena && multiply(plan.tile8.arena.physical.total_bytes/8U,request.logical_rows)>request.workspace_budget_bytes)
-        throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
+    if(!plan.external_qsa_score_bytes && !plan.terminal_logits_arena) {
+        const auto uniform=multiply(plan.tile8.arena.physical.total_bytes/8U,request.logical_rows);
+        if(uniform>request.workspace_budget_bytes)
+            workspace_budget_exceeded(request,plan.tile8.arena,uniform,0U,false,"eight-row tile scaled to T");
+    }
     plan.arena=build_known_prefill_arena(serial.arena,serial.arena.alignment,request.logical_rows,plan.external_qsa_score_bytes,plan.terminal_logits_arena,true,plan.compact_qsa_output_savings);
     if(plan.arena.physical.total_bytes>request.workspace_budget_bytes)
-        throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
+        workspace_budget_exceeded(request,plan.arena,plan.arena.physical.total_bytes,plan.external_qsa_score_bytes,
+            plan.terminal_logits_arena,"packed T-row arena");
     for(std::uint32_t row=0;row<request.logical_rows;++row)
         if(known_window_produces_logits(request.output_policy,row,request.logical_rows)) plan.logit_row_indices.push_back(row);
     const auto [execution,numerical]=identities(plan);plan.prefill_execution_identity=execution;plan.prefill_kernel_plan_identity=numerical;

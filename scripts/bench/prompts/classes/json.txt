@@ -1,0 +1,16 @@
+Convert this CSV to a JSON array of objects, one object per row, keeping the column names as keys, numbers as numbers and true/false as booleans. Output only the JSON.
+
+id,name,city,joined,plan,monthly_eur,active
+1001,Ana Ruiz,Sevilla,2021-03-14,basic,9.90,true
+1002,Liam Becker,Hamburg,2020-11-02,pro,24.00,true
+1003,Chloe Martin,Lyon,2022-01-19,basic,9.90,false
+1004,Marco Bianchi,Torino,2019-07-30,team,79.00,true
+1005,Sofia Almeida,Porto,2023-05-08,pro,24.00,true
+1006,Jan Kowalski,Gdansk,2021-09-21,basic,9.90,true
+1007,Elin Berg,Uppsala,2020-02-11,team,79.00,false
+1008,Pablo Ortega,Valencia,2022-12-01,pro,24.00,true
+1009,Ines Costa,Braga,2021-06-17,basic,9.90,true
+1010,Tom Jansen,Utrecht,2023-08-25,pro,24.00,false
+1011,Marta Nowak,Krakow,2019-10-05,team,79.00,true
+1012,Luca Ferri,Bologna,2022-04-12,basic,9.90,true
+

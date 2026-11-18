@@ -467,7 +467,15 @@ void full_hash(const std::filesystem::path &dir) {
     shard(pack / "visible.safetensors", "y", 81);
     const auto pack_key = [&] { return session_compat({}, {{"env:STRIX_DS41_TRELLIS", pack}}, file).key(); };
     const auto mutate = [&](const std::filesystem::path& path) {
-        std::ofstream(path, std::ios::app) << "mutation";
+        // Change the declared one-byte tensor without adding unclaimed payload.
+        std::fstream out(path, std::ios::in | std::ios::out | std::ios::binary);
+        out.seekg(-1, std::ios::end);
+        char byte = 0;
+        require(static_cast<bool>(out.get(byte)), "read fixture payload for mutation");
+        out.seekp(-1, std::ios::end);
+        out.put(static_cast<char>(byte ^ 1));
+        out.flush();
+        require(static_cast<bool>(out), "write fixture payload mutation");
         std::filesystem::last_write_time(path, std::filesystem::last_write_time(path) + std::chrono::seconds(2));
     };
     auto prior_key = pack_key();
@@ -475,7 +483,7 @@ void full_hash(const std::filesystem::path &dir) {
     require(pack_key() != prior_key, "unindexed hidden shard bound");
     prior_key = pack_key(); mutate(pack / "visible.safetensors");
     require(pack_key() != prior_key, "visible checkpoint shard bound");
-    prior_key = pack_key(); mutate(pack / ".notes");
+    prior_key = pack_key(); std::ofstream(pack / ".notes") << "mutation";
     require(pack_key() == prior_key, "unconsumed dotfile excluded");
     std::ofstream(pack / "model.safetensors.index.json") << R"({"weight_map":{"x":".hidden.safetensors","y":"../outside.bin"}})";
     shard(dir / "outside.bin", "y", 82);

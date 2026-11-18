@@ -46,6 +46,12 @@ encoder 10 s) and ~8 min on the pair (52-55 s per step, video VAE 40.6 s), the p
 
 ## Install and run
 
+**Weights:** not published by us. The DiT and both VAE files of step 2 are byte-identical to
+[`Comfy-Org/MiniMax-H3@54472221`](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707) (`diffusion_models/`, `vae/`); the 6-step LoRA and the fast video VAE
+come from no pinned public source; the text-encoder pack is built locally with `tools/h3/te/te_pack.py`. The
+[MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/0919fb684102ef115126612f3fbb84d1027e7317/LICENSE) grants use and redistribution only outside the European Union, the United
+Kingdom, the Republic of Korea and the United States; read it before downloading.
+
 1. **Build** on each node (ROCm, gfx1151):
 
    ```sh

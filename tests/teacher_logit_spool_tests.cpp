@@ -51,6 +51,35 @@ int main(){
         const std::array<std::uint32_t,2> invalid{0U,3U};
         rejects([&]{strix::TeacherLogitSpool file(path.string(),3U,invalid);});
         require(!std::filesystem::exists(path),"invalid spool created an output");
+        // Row selection: every row is appended and checked, only the selected positions are written.
+        const std::array<std::uint32_t,4> four{1U,2U,0U,1U};
+        const std::array<std::uint64_t,2> repeated{1U,1U};
+        const std::array<std::uint64_t,1> outside{3U},middle{1U};
+        rejects([&]{strix::TeacherLogitSpool file(path.string(),3U,four,repeated);});
+        rejects([&]{strix::TeacherLogitSpool file(path.string(),3U,four,outside);});
+        require(!std::filesystem::exists(path),"invalid selection created an output");
+        {
+            strix::TeacherLogitSpool file(path.string(),3U,four,middle);
+            rejects([&]{file.append(2U,1U,second);});
+            file.append(1U,0U,first);
+            file.append(2U,1U,second);
+            rejects([&]{file.finish();});
+            file.append(0U,2U,first);
+            file.finish();
+        }
+        std::ifstream selected_stream(path,std::ios::binary);
+        const std::string kept{std::istreambuf_iterator<char>{selected_stream},{}};
+        selected_stream.close();
+        const auto at=[&](std::size_t offset){std::uint32_t result=0U;
+            for(unsigned i=0;i<4U;++i)result|=static_cast<std::uint32_t>(
+                static_cast<unsigned char>(kept.at(offset+i)))<<(8U*i);return result;};
+        require(kept.size()==96U && kept.substr(0U,8U)=="TMLLOG02" && kept.substr(80U,8U)=="TMLEOF01",
+            "selected spool framing differs");
+        require(at(16U)==1U && at(24U)==4U && at(48U)==1U && at(56U)==2U && at(60U)==1U && at(88U)==1U,
+            "selected spool header/row/footer differ");
+        require(at(68U)==std::bit_cast<std::uint32_t>(second[0]) && at(76U)==std::bit_cast<std::uint32_t>(second[2]),
+            "selected spool row bits differ");
+        std::filesystem::remove(path);
         std::cout<<"teacher logit spool tests passed\n";
     }catch(const std::exception& error){std::filesystem::remove(path);std::cerr<<error.what()<<'\n';return 1;}
     return 0;

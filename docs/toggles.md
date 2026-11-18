@@ -43,9 +43,19 @@ FAST changes the numerics. Use it when throughput matters more than bit-identica
 |---|---|---|---|
 | `STRIX_QPF2K_MOE_ROUTE_BF16=1`, `--prefill-moe-route-bf16` | qwen | off (on in `fast`) | BF16 MoE routing in prefill. |
 | `STRIX_QPF2K_GDN_FP16_CHUNK=1`, `--gdn-fp16-chunk` | qwen | off (on in `fast`) | FP16 GDN chunk in prefill. |
+| `STRIX_RECURRENT_STATE=f32\|f16\|bf16` | qwen | `f32` | FAST, opt-in: storage type of the Gated DeltaNet state matrix (see below). |
 | `--prefill-exact-fp16` | qwen | off | Forces the exact FP16 prefill path. |
 | `STRIX_DS41_FAST_MOE=1` | deepseek | off (`fast`) | Relaxed MoE epilogue. |
+| `STRIX_DS41_FAST_PREFILL=1` | deepseek | off | Opt-in. Profile `ds41-fast-pf-v1` (one resolver, `include/strix/ds41_fast_profile.hpp`): `STRIX_DS41_FAST_ATTN=2` + `STRIX_DS41_FAST_MOE=1` + `STRIX_DS41_FAST_DENSE=1`; a lever variable that is set wins. Changes logits. Pair gate against exact (1,280 teacher-forced rows, 20 prompts, true next-token labels, both ranks equal): pooled KL 0.0108, top-1 97.7 %, dNLL +0.0049: passes KL <= 0.02, top-1 >= 93 % and the floor-relative dNLL limit +0.0155 (mean + 2 sd of three one-ulp layer-0 null arms on the same binary, `strix-gate --dnll-rule floor`; see [tools/strix-gate](../tools/strix-gate/README.md)). Warm pair prefill, engine, fresh process: 2,952 / 8,192 / 11,594 / 32,768 tokens 893 -> 1,037, 1,165 -> 1,377, 1,203 -> 1,425, 1,285 -> 1,546 tok/s; GPU clocks per token at 8K 2.17 M -> 1.89 M. Serve keeps its prefix and session caches off while `STRIX_DS41_FAST_ATTN=2` or `STRIX_DS41_FAST_DENSE=1` is in effect (`prefix_continuation_decline()`: flash runs only from position 0 and the FAST dense route follows the rows of each piece, so a restored state would continue on other arithmetic); the reason is printed at start and in `prefix_cache_declined`. |
+| `STRIX_DS41_FAST_ATTN=2` | deepseek | off | Opt-in. BF16 one-pass sparse attention on the shared flash core (`ds41-attn-bf16flash-v1`; `1` = the older f16 WMMA form, slower than exact). Gate alone (1,280 rows): KL 0.0108, top-1 97.2 %, dNLL +0.0120: passes the floor-relative limit +0.0155, fails the fixed 0.01 dNLL limit. |
+| `STRIX_DS41_FAST_DENSE=1` | deepseek | off | Opt-in. Dense Q8_0 x A8 products (q_b, o_a, o_b; calls of at least `STRIX_DS41_FAST_DENSE_MIN_ROWS`, default 128) in one FP16 WMMA chain on the shared dense core, policy `dense-q8a8-f16-v1` (`src/core/f16_dense_q8a8.hpp`; `STRIX_F16_Q8A8_WAVES=8\|16` forces the CTA height, same bits). Gate alone (1,280 rows): KL 0.0100, top-1 98.1 %, dNLL +0.0146: passes the floor-relative limit +0.0155, fails the fixed 0.01 dNLL limit. |
+| `STRIX_DS41_FAST_ENGRAM=1` | deepseek | off | Opt-in, explicit (not a member of `STRIX_DS41_FAST_PREFILL`). Policy `ds41-engram-f16wmma-v1`: the Engram KV projection (layers 1 and 14, x [rows][6144] x W FP16 [25600][6144]) on the shared dense FP16 WMMA core (`src/core/f16_dense_tall.hpp`) instead of the exact FP32 FMA chain; x rounded to FP16, a device scan sends views with \|x\| >= 2^16, Inf or NaN to the exact kernel. Pair, FAST + bounded replay R=256, warm: 2,952 tokens 2,238 -> 2,085 ms, 8,192 tokens 5,223 -> 4,784 ms. Gate (20 prompts x 65 rows, with FAST + R=256): KL 0.0109, top-1 96.6 %, dNLL -0.0019 (floor limit +0.0099): PASS. |
+| `STRIX_DS41_FAST_SHARED=1` | deepseek | off | Opt-in, explicit (not a member of `STRIX_DS41_FAST_PREFILL`). Policy `ds41-shared-f16-v1`: the prefill shared expert's gate, up and down (Q8_0 x A8) on the FAST dense core (`dense-q8a8-f16-v1`, FP16 WMMA) with the exact `swiglu_a8` epilogue between them, as the CUDA FAST shared expert. Calls under `STRIX_DS41_FAST_DENSE_MIN_ROWS` keep the exact kernels. Changes logits (FAST gate). |
+| `STRIX_DS41_FAST_MOE_F16=1` | deepseek | off | Opt-in, explicit, acts with `STRIX_DS41_FAST_MOE` (relaxed routed experts). Policy `ds41-moe-f16wmma-v1`: the relaxed kernels in their FP16-operand form (A8 rows times an exact per-row power of two and decoded weights each rounded once to FP16, `v_wmma_f32_16x16x16_f16`, FP32 accumulation over the whole K, no per-group epilogue). Changes logits (FAST gate). |
+| `STRIX_F16_Q8A8_WPACK=0` | shared (DeepSeek binds it) | on | Weight decode of policy `dense-q8a8-f16-v1`: on = two Q8_0 weights per packed FP16 operation (perm, packed subtract, packed multiply); `0` = one FP32 product per weight, the previous form. Same bits (all 65,536 scales x 256 codes through the stager, plus every DS41 shape); DS41 rank-0 dense at 11.6K about -1.2 % (1,024-row chunks) to -3.3 % (680-row tail). Kit: `ds41/dense-forms` (docs/benchmarking.md). |
 | `STRIX_GLM_PF_WMMA=1` | glm | off (on in rank `--profile fast`) | WMMA prefill. Opt-in FAST identity; `=0` disables even in `fast`. |
+
+`STRIX_RECURRENT_STATE` (FAST, opt-in, never part of a profile) stores the GDN recurrent state matrix as `f16` or `bf16` instead of `f32`: kernels widen each element, update in f32 and narrow on store (round to nearest even), so outputs differ from the f32 run. Equal storage types alone do not establish equality across routes with different rounding boundaries. One resolver (`strix::recurrent_state_policy()`) sets `ModelContract::recurrent_state`, the single source for HIP dispatch, matrix sizing (half the bytes) and session layout identity. Shared session restore rejects cross-type layouts. CUDA application startup currently refuses typed state until prefill rounding is independent of scheduling and prefix history; low-level typed CUDA kernels remain experimental. RTX handoff/import also refuses typed state on both ends until the wire protocol negotiates a producer state contract; equal f16/bf16 byte counts and an echoed consumer identity are insufficient. F32 behavior and identities are unchanged. Routes that still read the state as f32 refuse a 16-bit type through `recurrent_state_route_refusal`. Kernel-level ABAB of the storage types: `scripts/bench/gdn-state/run.sh BIN OUT` (fixture `bench-state16`); these measurements do not qualify application performance or model fidelity.
 
 ## The regime rule
 
@@ -96,6 +106,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
+| `--vision FILE` | deepseek serve (rank 0) | off | Image input: loads the vision GGUF and accepts `image_url` parts. Needs `--prefill-path device`. [Image input](engine/vision.md). | - |
+| `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: the image tower is uploaded at start; `0`: on the first image. | `0` to keep the memory free until an image arrives. |
+| `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Size of the image embed cache in MiB; `0` disables storing. | Larger when the same images repeat. |
 
 ### Decode, MTP and DSpark
 
@@ -198,6 +211,8 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` | deepseek | auto | [ds-prefill](optimizations.md#ds-prefill) |
 | `STRIX_DS41_PREFIX_DIAGNOSTICS` | deepseek | ON: 512 MiB/rank, block 256, reserve ... | [deepseek-pair-agent-prefix-cache](engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache) |
 | `STRIX_PREFIX_CACHE` | qwen | ON on the qualified single tiled-MTP ... | [certified-mtp-subset](engine/serving/prefix-state-cache.md#certified-mtp-subset) |
+| `STRIX_PREFIX_QUEUE_PROTECT` | qwen | off | A waiting request holds a reference on the longest compatible host-tier prefix state; eviction skips it until the request is admitted, cancelled or refused (byte cap). |
+| `STRIX_SERVE_STARTUP_OVERLAP` | shared serve (bound: minimax) | on | Server start: host-only start work that does not depend on the model weights (the MiniMax drafter file) is read on its own thread beside the weight load and collected where it was read before. Same bytes; `0` keeps the serial start. |
 | `STRIX_PREFIX_CACHE_DISK` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_DURABLE` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_INFLIGHT` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
@@ -238,6 +253,11 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_IN_TOKEN` | glm | 1 | [glm-pf-in-token](optimizations.md#glm-pf-in-token) |
 | `STRIX_GLM_PF_KDA_PACK` | glm | 0 | [glm-pf-kda-pack](optimizations.md#glm-pf-kda-pack) |
 | `STRIX_GLM_PF_KDA_WMMA` | glm | on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode | [glm-pf-kda-wmma](optimizations.md#glm-pf-kda-wmma) |
+| `STRIX_GLM_PF_ROUTER_WMMA=1` | glm | off | Opt-in FAST `glm-pf-router-wmma-v1`: prefill router logits (288 x 4096) on the shared dense FP16 WMMA core, D::route unchanged. Gate vs exact passes (8K chat/code/json KL 0.0041 / 0.0003 / 0.0002) but there is no wall gain in the TP2 pair: the router runs during the hidden-state exchange (trace: fully overlapped by `copy_publish_kernel` / stream waits), so it stays off. Both ranks must agree. |
+| `STRIX_GLM_PF_MLA_WMMA` | glm | on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
+| `STRIX_GLM_PF_MLA_OB16` | glm | on when the MLA WMMA out GEMM runs (same bits); 0 = FP32 o-bar | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
+| `STRIX_GLM_PF_TOPK_OVERLAP` | glm | off; 1 = diagnostic: per FAST flash call, top-k list sizes vs union sizes of aligned row pairs / quads / octets (dense prefix and sparse rows), syncs the stream (not for timing), bits unchanged | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
+| `STRIX_GLM_PF_MLA_GEMM_HEADS` | glm | on (exact and FAST; same bits); 0 = rows-then-head CTA order | [glm-pf-mla-gemm-heads](optimizations.md#glm-pf-mla-gemm-heads) |
 | `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
@@ -251,11 +271,13 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_SUMEXP` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
 | `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
+| `STRIX_GLM_PF_WMMA_SHARED128` | glm | 1 | [glm-pf-wmma-shared128](optimizations.md#glm-pf-wmma-shared128) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | qwen | 512 | [qwen-intprefill-dense-rows](optimizations.md#qwen-intprefill-dense-rows) |
 | `STRIX_MMX_PREFILL_GATHER_TOK` | minimax | 1 | [mm-pf-gather-tok](optimizations.md#mm-pf-gather-tok) |
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
 | `STRIX_MMX_PREFILL_PIPE` | minimax | 1 | [mm-pf-moe-pipe](optimizations.md#mm-pf-moe-pipe) |
 | `STRIX_MMX_PREFILL_TAIL_STREAM` | minimax | 1 | [mm-pf-tail-stream](optimizations.md#mm-pf-tail-stream) |
+| `STRIX_MMX_PREFILL_PIPE_TAIL` | minimax | 1 | [mm-pf-pipe-tail](optimizations.md#mm-pf-pipe-tail) |
 | `STRIX_MM_PFX` | minimax | on | [mm-rank-pfx](optimizations.md#mm-rank-pfx) |
 | `STRIX_MM_PFX_CHUNK` | minimax | 4194304 | [mm-pfx-chunk](optimizations.md#mm-pfx-chunk) |
 | `STRIX_MM_PFX_JOINED` | minimax | 1 | [mm-pfx-joined](optimizations.md#mm-pfx-joined) |
@@ -269,6 +291,11 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_PF_KV_TILE` | minimax | auto | [mm-pf-kv-tile](optimizations.md#mm-pf-kv-tile) |
 | `STRIX_MM_PF_LATE_SRC_FENCE` | minimax | ON | [minimax-grouped-prefill.md](minimax-grouped-prefill.md) |
 | `STRIX_MM_PF_MSA_BATCH` | minimax | 1 | [mm-pf-msa-batch](optimizations.md#mm-pf-msa-batch) |
+| `STRIX_MM_FAST_PREFILL=1` | minimax | off | Opt-in. Profile `mm-fast-pf-v2` (governed rows `src/minimax/engine/mm_profile_table.hpp`, shared bundle rules `include/strix/fast_profile.hpp`): `STRIX_MM_PF_MSA_FLASH=1` on layers 40-59 = `msa-flash-bf16-l40-v1` plus `STRIX_MM_PF_ROUTER_WMMA=1` on layers 40-59 = `mm-pf-router-wmma-v1` (v2), EXL3 MoE base only (not selected with `STRIX_MMX_MODEL_FORMAT=fast_i4`); a set member wins, `0` beats the bundle. Both ranks must agree; active policies enter the session-cache identity. Changes logits. The following measurements are for `mm-fast-pf-v1` (MSA flash layers 40-59, router WMMA OFF), not v2; v2 complete-bundle qualification is not established here. Device (EXL3 pair, unchanged gate KL <= 0.02, top-1 >= 93 %, dNLL <= 0.01, 256 rows per prompt): 8K PASS (KL 0.0012), 32K PASS (two prompts, KL 0.0029); TTFT with the defaults 8K 12.47 -> 11.92 s, 32K 50.91 -> 48.06 s. `STRIX_MM_PF_MSA_FLASH_LAYERS=30-59` (`msa-flash-bf16-l30-v1`) passes at 8K (KL 0.0076, 11.41 s) but fails at 32K (dNLL +0.012 / +0.016): prompts of at most 8K tokens only, never selected by the bundle. |
+| `STRIX_MM_PF_ROUTER_WMMA` | minimax | on in `STRIX_MM_FAST_PREFILL=1` (`mm-fast-pf-v2`); off otherwise | FAST `mm-pf-router-wmma-v1`: the prefill router product (128 x 6144) of the MoE layers in `STRIX_MM_PF_ROUTER_WMMA_LAYERS` (default 40-59) on the shared dense FP16 WMMA core (`src/core/f16_dense_tall.hpp`, guarded store; rows with a non-finite sum get the exact chain); sigmoid, bias and selection unchanged. Gate vs exact (EXL3 pair, 256 rows per prompt): 8K KL 0.0020, top-1 99.0 %; 32K KL 0.0029 / 0.0035. Layers 20-59 (KL 0.084) and 0-59 (KL 0.58) fail. Kernel trace 8K: router -27 ms per rank (exposed). `0` opts out; both ranks must agree. |
+| `STRIX_MM_PF_ROUTER_WMMA_LAYERS` | minimax | 40-59 | Layer set of the FAST router product (read only while it runs; part of the cache identity). |
+| `STRIX_F16_MATRIX_FORM` | glm, minimax | auto | Launch form of the guarded matrix product of the shared dense FP16 core (`plan`, `narrow4`, `wide16`); `auto` = the adapter's choice (MiniMax router: `narrow4` up to 1,536 rows, `wide16` above; GLM router: `narrow4`). Diagnostics only. |
+| `STRIX_MM_PF_MSA_FLASH` | minimax | 0 | FAST MSA flash attention (1 one-term, 2 two-term BF16), governed row of the FAST prefill profile; [mm-pf-msa-flash](optimizations.md) |
 | `STRIX_MM_PF_MSA_REWORK` | minimax | 5 | [mm-pf-msa-rework](optimizations.md#mm-pf-msa-rework) |
 | `STRIX_MM_PF_MSA_SCRATCH_MB` | minimax | 1152 | [mm-pf-msa-scratch](optimizations.md#mm-pf-msa-scratch) |
 | `STRIX_MM_PF_ROUTER_BATCH` | minimax | 1 | [mm-pf-router-batch](optimizations.md#mm-pf-router-batch) |
@@ -298,6 +325,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_HC_OUTPUT3` | qwen | 1 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3_BAND` | qwen | 16 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_HC_RECOMPUTE_NORM` | qwen | ON with the WMMA HC output (auto); =1 ... | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
+| `STRIX_QPF2K_HC_LOW32` | qwen | 0 (out16 projection skips the unread FP32 low tail); =1 keeps the store | [hc-normalized-recompute](optimizations.md#hc-normalized-recompute) |
 | `STRIX_QPF2K_HC_UPCOPY` | qwen | auto with HC output v3 | [qwen-hc](optimizations.md#qwen-hc) |
 | `STRIX_QPF2K_INDEX_BATCH` | qwen | ON | [exact-indexer-projection-batching](optimizations.md#exact-indexer-projection-batching) |
 | `STRIX_QPF2K_MOE_DA16` | qwen | 1 | [qwen-moe](optimizations.md#qwen-moe) |
@@ -312,11 +340,13 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QPF2K_SCHED` | qwen | 14 | [qwen-schedule](optimizations.md#qwen-schedule) |
 | `STRIX_QPF2K_SCORE_ROWS` | qwen | auto (32 rows above 4096 blocks, 16 o... | [qwen-qsa-score-rows](optimizations.md#qwen-qsa-score-rows) |
 | `STRIX_QPF2K_SHARED_PRE` | qwen | 1 | [qwen-shared-pre](optimizations.md#qwen-shared-pre) |
+| `STRIX_QPF2K_GLU_PAIR` | qwen | 1 | [qwen-glu-pair](optimizations.md#qwen-glu-pair) |
 | `STRIX_QPF2K_T16K` | qwen | ON from 32768 prompt tokens | [automatic-t16384-prefill](optimizations.md#automatic-t16384-prefill) |
 | `STRIX_QPF2K_WMMA_PIN` | qwen | 1 | [qwen-dense](optimizations.md#qwen-dense) |
 | `STRIX_SERVE_PREFILL` | qwen | ON: admitted T8192; configured prefix... | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_ROUTE` | qwen | ON: server tile and prefill arithmetic from the single-request route rule; `0` restores T8192 with the resolved arithmetic | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_PREFILL_ORG` | qwen | ON: an admitted server owner takes the prefill organization of the single-request route (row-loop, attention stage, table and expert header/merge batching); `0` keeps the startup items only | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_SERVE_PREFILL_GROUP` | deepseek (pair) | auto | several short prompts admitted together share one device prefill pass; `0` = one pass per prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) caps a group; [DeepSeek page](models/deepseek-v4.1/README.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
@@ -343,7 +373,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QSA_DECODE_POOL` | qwen | 1 (plain append-only serial decode) | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QSA_DECODE_SELECT` | qwen | 1 | [qwen-qsa-decode-select](optimizations.md#qwen-qsa-decode-select) |
 | `STRIX_QSA_DECODE_VALUE_V2` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
-| `STRIX_QWEN_DECODE_FUSE` | qwen | OFF (opt-in: STRIX_QWEN_DECODE_FUSE=1) | [qwen-decode-fuse](optimizations.md#qwen-decode-fuse) |
+| `STRIX_QWEN_DECODE_FUSE` | qwen | ON (code default; STRIX_QWEN_DECODE_FUSE=0 restores the three-launch sequence) | [qwen-decode-fuse](optimizations.md#qwen-decode-fuse) |
 | `STRIX_QWEN_YARN_MTP` | qwen | table-backed QSA MTP pool and rolling... | [qwen-yarn-mtp](optimizations.md#qwen-yarn-mtp) |
 | `STRIX_TOOL_DRAFT_PREFIX_GATE` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
 
@@ -361,6 +391,8 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DIST_USB4_EAGER` | deepseek | auto | [ds-transport](optimizations.md#ds-transport) |
 | `STRIX_DS41_CE_PACING` | deepseek-rtx | ON | [rtx-ce-pacing](optimizations.md#rtx-ce-pacing) |
 | `STRIX_DS41_ENGRAM_TP` | deepseek | on for steps of up to 8 rows | [ds-engram-tp](optimizations.md#ds-engram-tp) |
+| `STRIX_DS41_ENGRAM_FROM_LEAD` | deepseek | on | [ds-engram-tp](optimizations.md#ds-engram-tp) |
+| `STRIX_DS41_ENGRAM_READY` | deepseek | on | [ds-engram-tp](optimizations.md#ds-engram-tp) |
 | `STRIX_DS41_EXPERT_TP` | deepseek | ON | [ds-core](optimizations.md#ds-core) |
 | `STRIX_DS41_F16_PAIR` | deepseek | ON | [ds-core](optimizations.md#ds-core) |
 | `STRIX_DS41_TP_DOWN` | deepseek | ON | [ds-core](optimizations.md#ds-core) |
@@ -374,6 +406,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_XFER` | minimax | XFER on, PFX loaded, interleave on | [mm-routes](optimizations.md#mm-routes) |
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
+| `STRIX_MTP_PRIME_BATCH` | qwen | 64 rows (clamped to 8..128; 8 restores original batches) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
@@ -459,6 +492,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_MOE` | glm | fast | [glm-moe-fast](optimizations.md#glm-moe-fast) |
 | `STRIX_GLM_POST` | glm | fast | [glm-post-exchange-fast](optimizations.md#glm-post-exchange-fast) |
 | `STRIX_GLM_SERVE_G2` | glm | on (with MTP) | [glm-serve-g2](optimizations.md#glm-serve-g2) |
+| `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | a long prompt admitted under load is cut into layer units, not token chunks; `0` = token chunks; [GLM page](models/glm-5.3/README.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |
 | `STRIX_LM_HEAD_COHORT_LEAN` | qwen | 1 | [qwen-lm-head-cohort-lean](optimizations.md#qwen-lm-head-cohort-lean) |

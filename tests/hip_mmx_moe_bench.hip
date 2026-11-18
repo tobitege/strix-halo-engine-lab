@@ -21,6 +21,8 @@
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"
+#include "attn_core/wmma_types.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "minimax_gate_common.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -34,6 +36,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <numeric>
 #include <random>
 #include <string>
@@ -43,6 +46,23 @@
 namespace {
 
 namespace opt = strix::minimax::moe::opt;
+
+// The MSA flash prologue on an FP32 q (msa_flash_policy.hpp query + sparse_flash_keysplit.hpp staging): one wave per
+// (row, 128-dim head), load4 layout, norm_rope_lane, pack2<bf16>; lo = the Split terms. Reference for the q image.
+__global__ void msa_q_image_ref(const float* q, const float* w, const strix::minimax::msa::RopeRow* rope, unsigned rows, unsigned n,
+                                std::uint16_t* hi, std::uint16_t* lo) {
+    namespace tile = strix::attn_core::tile;
+    constexpr tile::Operand O = tile::Operand::bf16;
+    const unsigned wave = (blockIdx.x * blockDim.x + threadIdx.x) >> 5U, lane = threadIdx.x & 31U, heads = n / 128U;
+    if (wave >= rows * heads) return;
+    const unsigned row = wave / heads, h = wave % heads;
+    const std::size_t at = static_cast<std::size_t>(row) * n + h * 128U + lane * 4U;
+    float x[4] = {q[at], q[at + 1], q[at + 2], q[at + 3]};
+    strix::minimax::msa::norm_rope_lane(x, w, rope[row], lane);
+    *reinterpret_cast<uint2*>(hi + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+    for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+    *reinterpret_cast<uint2*>(lo + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+}
 namespace mref = strix::minimax::moe;
 
 constexpr unsigned H = opt::kHidden, IR = opt::kInter;
@@ -518,6 +538,7 @@ struct Options {
     std::string routes, tests;
     bool no_load = false;
     unsigned syn_bits = 3;
+    unsigned dense_bits = 5;  // --dense-bits: synthetic dense MLP weights (real packs retain their widths)
     bool diverse = false;
     bool diverse_fallback = false;  // explicit negative-reader gate, never singleton qualification
     std::string singletons = "min";  // --singletons min|max|COUNT; infeasible cells are skipped
@@ -788,8 +809,9 @@ struct Bench {
             {"v", a + "v_proj", true, r * 256, 256, H, 256, 6, 64},
             {"o", a + "o_proj", false, r * 4096, 4096, 4096, H, 6, 16},
             {"head", "language_model.lm_head", true, r * 100096, r == 0 ? 100096U : 99968U, H, r == 0 ? 100096U : 99968U, 8, 1},
-            {"dense_gate", kP + "layers.0.mlp.gate_proj", true, r * 6144, 6144, H, 6144, 5, 8},
-            {"dense_down", kP + "layers.0.mlp.down_proj", false, r * 6144, 6144, 6144, H, 5, 8},
+            {"dense_gate", kP + "layers.0.mlp.gate_proj", true, r * 6144, 6144, H, 6144, o.dense_bits, 8},
+            {"dense_up", kP + "layers.0.mlp.up_proj", true, r * 6144, 6144, H, 6144, o.dense_bits, 8},
+            {"dense_down", kP + "layers.0.mlp.down_proj", false, r * 6144, 6144, 6144, H, o.dense_bits, 8},
             {"xgate", b + "experts.0.w1", true, r * IR, IR, H, IR, 3, 32},
             {"xdown", b + "experts.0.w2", false, r * IR, IR, IR, H, 3, 32},
         };
@@ -800,7 +822,7 @@ struct Bench {
             ds.input = sp.in;
             ds.output = sp.out;
             for (unsigned c = 0; c < sp.copies; ++c)
-                ds.copies.push_back(mk(sp.prefix, sp.out_slice, sp.first, sp.n, sp.in, sp.out, sp.bits, 5000 + dense.size() * 100 + c));
+                ds.copies.push_back(mk(sp.prefix, sp.out_slice, sp.first, sp.n, sp.in, sp.out, sp.bits, 5000 + dense.size() * 100 + c + r * 100000));
             dense.push_back(std::move(ds));
         }
         // Scratch and workspaces.
@@ -1486,9 +1508,10 @@ struct Bench {
     // MT8 kernel switches; routes in the router layout with each row's slots rotated (the planner sorts them); an
     // invalid row (repeated id) is reported by prefill_moe_device_check.
     void test_prefill_device() {
-        struct Arm { const char* name; int pipe, pair, core8, tails; };
+        struct Arm { const char* name; int pipe, pair, core8, tails, n16 = -1; };
         const Arm arms[] = {{"default", -1, -1, -1, -1}, {"pipe0", 0, -1, 0, -1}, {"core8.1", 0, -1, 1, -1}, {"core8.2", 0, -1, 2, -1},
-                            {"pipe.pair", 1, 1, 0, -1}, {"pipe2.pair", 2, 1, 0, -1}, {"pipe2", 2, 0, 0, -1}, {"tails0", -1, -1, -1, 0}};
+                            {"pipe.pair", 1, 1, 0, -1}, {"pipe2.pair", 2, 1, 0, -1}, {"pipe2", 2, 0, 0, -1}, {"tails0", -1, -1, -1, 0},
+                            {"pipe.n16", 1, -1, 0, -1, 1}, {"pipe2.n16", 2, -1, 0, -1, 1}};
         opt::ExpertSlices* ex_d = nullptr;
         for (unsigned T : {5U, 16U, 100U, 333U, 2048U, 4096U}) {
             Prefill q = make_prefill(T);
@@ -1517,6 +1540,7 @@ struct Bench {
             for (const Arm& arm : arms) {
                 if (arm.pipe >= 0) opt::set_prefill_pipe(arm.pipe);
                 if (arm.pair >= 0) opt::set_prefill_pipe_pair(arm.pair);
+                if (arm.n16 >= 0) opt::set_prefill_pipe_n16(arm.n16);
                 if (arm.core8 >= 0) opt::set_prefill_core8(arm.core8);
                 if (arm.tails >= 0) opt::set_prefill_tail_stream(arm.tails);
                 check(opt::prefill_moe_device_plan(T), "device plan selected");
@@ -1527,6 +1551,7 @@ struct Bench {
                 opt::prefill_moe_device_check();
                 opt::set_prefill_pipe(-1);
                 opt::set_prefill_pipe_pair(-1);
+                opt::set_prefill_pipe_n16(-1);
                 opt::set_prefill_core8(-1);
                 opt::set_prefill_tail_stream(-1);
                 std::size_t at = 0;
@@ -1661,6 +1686,80 @@ struct Bench {
                         static_cast<double>(f.chunk_bytes) / 1e6);
             std::fflush(stdout);
             free_group(f);
+        }
+    }
+    // Chunk invariance (STRIX_MMX_PF_ORDER=invariant): the same rows through one device call per chunk of 256, 1024,
+    // 4096 and the whole call, plus 4096 + 1..17 row tails, are bitwise equal. Adaptive is the negative control.
+    void run_chunked(const Prefill& q, const opt::ExpertSlices* ex_d, unsigned T, unsigned seg, float* out) {
+        const std::size_t bytes = opt::prefill_moe_workspace_bound(std::min(seg, T));
+        void* ws = nullptr;
+        hip_ok(hipMalloc(&ws, bytes), "chunk ws");
+        for (unsigned c0 = 0; c0 < T; c0 += seg) {
+            const unsigned n = std::min(seg, T - c0);
+            std::vector<std::uint32_t> routes(std::size_t{n} * 8);
+            for (unsigned t = 0; t < n; ++t)
+                for (unsigned k = 0; k < 4; ++k) {
+                    const std::size_t g = std::size_t{c0} + t;
+                    routes[std::size_t{t} * 4 + k] = q.ids[g * 4 + k];
+                    std::memcpy(&routes[std::size_t{n} * 4 + std::size_t{t} * 4 + k], &q.w4[g * 4 + k], 4);
+                }
+            auto* routes_d = dalloc<std::uint32_t>(routes.size());
+            hip_ok(hipMemcpy(routes_d, routes.data(), routes.size() * 4, hipMemcpyHostToDevice), "routes");
+            opt::PrefillMoeDeviceView dv;
+            dv.rows = n;
+            dv.y = q.yy + std::size_t{c0} * H;
+            dv.routes = routes_d;
+            dv.experts = ex_d;
+            dv.shared = L.shared;
+            dv.out = out + std::size_t{c0} * H;
+            opt::enqueue_prefill_moe_device(dv, ws, bytes, nullptr);
+            hip_ok(hipDeviceSynchronize(), "chunked call");
+            opt::prefill_moe_device_check();
+            hip_ok(hipFree(routes_d), "free");
+        }
+        hip_ok(hipFree(ws), "free");
+    }
+    void test_prefill_chunk_invariance() {
+        struct Case { unsigned T; std::vector<unsigned> segs; };
+        std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({t, {1}});
+        for (const Case& k : cases) {
+            Prefill q = make_prefill(k.T);
+            auto* ex_d = dalloc<opt::ExpertSlices>(opt::kExperts);
+            hip_ok(hipMemcpy(ex_d, q.ex.data(), opt::kExperts * sizeof(opt::ExpertSlices), hipMemcpyHostToDevice), "experts");
+            float* whole = dalloc<float>(std::size_t{k.T} * H);
+            float* part = dalloc<float>(std::size_t{k.T} * H);
+            bool control_differs = false;
+            for (int order : {1, 0}) {
+                opt::set_prefill_moe_order(order);
+                hip_ok(hipMemset(whole, 0xff, std::size_t{k.T} * H * 4), "poison");
+                run_chunked(q, ex_d, k.T, k.T, whole);
+                const auto ref = d2h(whole, std::size_t{k.T} * H);
+                for (unsigned seg : k.segs) {
+                    hip_ok(hipMemset(part, 0xff, std::size_t{k.T} * H * 4), "poison");
+                    run_chunked(q, ex_d, k.T, seg, part);
+                    std::size_t at = 0;
+                    const bool same = same_bits(ref, d2h(part, std::size_t{k.T} * H), &at);
+                    if (order == 1) {
+                        check(same, "chunk invariance T=" + std::to_string(k.T) + " seg=" + std::to_string(seg) +
+                                    " differs at " + std::to_string(at));
+                        std::printf("prefill chunk invariance T=%u seg=%u invariant: bitwise\n", k.T, seg);
+                    } else {
+                        control_differs |= !same;
+                    }
+                }
+            }
+            opt::set_prefill_moe_order(-1);
+            if (k.T == 8192) {
+                check(control_differs, "negative control: adaptive split should change bits with chunking");
+                std::printf("prefill chunk invariance T=8192 adaptive control: differs (expected)\n");
+            }
+            std::fflush(stdout);
+            hip_ok(hipFree(whole), "free");
+            hip_ok(hipFree(part), "free");
+            hip_ok(hipFree(ex_d), "free");
+            free_prefill(q);
         }
     }
     // Whole calls, interleaved: A = one device-planned call per chunk, B = the group-wide call (same bits).
@@ -1934,6 +2033,21 @@ struct Bench {
                     const bool exact = plain.part == paired.part && plain.xt == paired.xt && plain.at == paired.at &&
                                        same_bits(plain.out, paired.out) && off.part == paired.part && same_bits(off.out, paired.out);
                     const std::string cell = "pipe pair PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
+                    check(exact, cell + " raw partials/transformed inputs/down inputs/output");
+                    if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
+                    std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
+                }
+            }
+            {  // N16 PIPE (8 waves of one output tile) on every MT8 call vs production (pairs auto)
+                struct RestoreN16 { ~RestoreN16() { opt::set_prefill_pipe_n16(-1); } } restore_n16;
+                for (int pipe : {1, 2}) {
+                    opt::set_prefill_pipe_n16(0);
+                    const PfDump plain = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    opt::set_prefill_pipe_n16(1);
+                    const PfDump n16 = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const bool exact = plain.part == n16.part && plain.xt == n16.xt && plain.at == n16.at &&
+                                       same_bits(plain.out, n16.out) && off.part == n16.part && same_bits(off.out, n16.out);
+                    const std::string cell = "pipe n16 PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
                     check(exact, cell + " raw partials/transformed inputs/down inputs/output");
                     if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
                     std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
@@ -2294,19 +2408,23 @@ struct Bench {
     }
     // M4 auto-select receipt: whole MoE call, production PIPE (A) vs paired bands (B), 10 A B B A blocks per T, real
     // routes. Per block delta = mean(B) / mean(A) - 1; mean and a normal 95 % interval over the blocks.
+    // Cells "n16abba T": production (A, pairs auto) vs the N16 PIPE on every MT8 call (B), same receipt.
     void bench_pair_abba() {
-        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1);  opt::set_prefill_mtfit(-1); } } restore;
-        for (unsigned T : {1024U, 2048U, 4096U}) {
-            const std::string cell = "pairabba T" + std::to_string(T);
+        bench_moe_abba("pairabba", "pair", {1024U, 2048U, 4096U}, [](int on) { opt::set_prefill_pipe_pair(on); });
+        bench_moe_abba("n16abba", "n16", {512U, 1024U, 1536U, 2048U, 4096U, 8192U}, [](int on) { opt::set_prefill_pipe_n16(on); });
+    }
+    template <class Set> void bench_moe_abba(const char* prefix, const char* label, std::initializer_list<unsigned> ts, Set set) {
+        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1); opt::set_prefill_pipe_n16(-1); opt::set_prefill_mtfit(-1); } } restore;
+        for (unsigned T : ts) {
+            const std::string cell = std::string(prefix) + " T" + std::to_string(T);
             if (!wanted(cell)) continue;
             Prefill q = make_prefill_routes(T);
             hipEvent_t e0, e1;
             hip_ok(hipEventCreate(&e0), "abba event");
             hip_ok(hipEventCreate(&e1), "abba event");
-            auto call = [&](int pair) {
-                
+            auto call = [&](int on) {
                 opt::set_prefill_mtfit(1);
-                opt::set_prefill_pipe_pair(pair);
+                set(on);
                 hip_ok(hipDeviceSynchronize(), "abba idle");
                 hip_ok(hipEventRecord(e0, nullptr), "abba e0");
                 for (int i = 0; i < 4; ++i) prefill_B(q);
@@ -2330,8 +2448,8 @@ struct Bench {
             for (double d : delta) mean += d / static_cast<double>(delta.size());
             for (double d : delta) var += (d - mean) * (d - mean) / static_cast<double>(delta.size() - 1);
             const double half = 1.96 * std::sqrt(var / static_cast<double>(delta.size()));
-            std::printf("%s: MoE call A %.3f ms B(pair) %.3f ms | per-block B/A-1 mean %+.2f %% (95 %% CI %+.2f..%+.2f %%), %d of %zu blocks faster\n",
-                        cell.c_str(), sa / 20.0, sb / 20.0, 100.0 * mean, 100.0 * (mean - half), 100.0 * (mean + half),
+            std::printf("%s: MoE call A %.3f ms B(%s) %.3f ms | per-block B/A-1 mean %+.2f %% (95 %% CI %+.2f..%+.2f %%), %d of %zu blocks faster\n",
+                        cell.c_str(), sa / 20.0, label, sb / 20.0, 100.0 * mean, 100.0 * (mean - half), 100.0 * (mean + half),
                         static_cast<int>(std::count_if(delta.begin(), delta.end(), [](double d) { return d < 0; })), delta.size());
             std::fflush(stdout);
             (void)hipEventDestroy(e0);
@@ -2542,20 +2660,28 @@ struct Bench {
 
     // Dense prefill sites through strix_gemm (the engine's prefill identity) at T rows: us and TFLOPS.
     // Dense prefill linears on the v4 core (opt::enqueue_prefill_dense) == the library strix_gemm, bitwise, for the
-    // attention sites alone and k+v in one call; outputs start poisoned.
+    // attention and dense MLP sites, including grouped gate+up; outputs start poisoned.
     std::vector<std::vector<DenseSite*>> dense_v4_groups() {
         std::vector<std::vector<DenseSite*>> g;
         DenseSite *q = nullptr, *k = nullptr, *v = nullptr, *ov = nullptr;
+        DenseSite *gate = nullptr, *up = nullptr, *down = nullptr;
         for (auto& ds : dense) {
             if (ds.name == "q") q = &ds;
             if (ds.name == "k") k = &ds;
             if (ds.name == "v") v = &ds;
             if (ds.name == "o") ov = &ds;
+            if (ds.name == "dense_gate") gate = &ds;
+            if (ds.name == "dense_up") up = &ds;
+            if (ds.name == "dense_down") down = &ds;
         }
         if (k != nullptr && v != nullptr) g.push_back({k, v});
         if (q != nullptr) g.push_back({q});
         if (ov != nullptr) g.push_back({ov});
         if (q != nullptr && k != nullptr && v != nullptr) g.push_back({q, k, v});
+        if (gate != nullptr) g.push_back({gate});
+        if (up != nullptr) g.push_back({up});
+        if (down != nullptr) g.push_back({down});
+        if (gate != nullptr && up != nullptr) g.push_back({gate, up});
         return g;
     }
     void run_dense_v4(const std::vector<DenseSite*>& g, const float* in, std::vector<float*>& outs, unsigned T, void* ws, std::size_t ws_bytes, std::size_t copy) {
@@ -2567,6 +2693,36 @@ struct Bench {
         std::vector<opt::PrefillDenseJob> jobs;
         for (auto* ds : g) jobs.push_back({ds->copies[0].dev, reinterpret_cast<float*>(1)});
         return opt::prefill_dense_workspace_bytes(jobs.data(), static_cast<unsigned>(jobs.size()), T);
+    }
+    void test_dense_mlp_chain(const std::vector<DenseSite*>& gu, std::vector<float*>& libOut,
+                              std::vector<float*>& v4Out, unsigned T, void* ws, std::size_t bytes) {
+        DenseSite* down = nullptr;
+        for (auto& ds : dense) if (ds.name == "dense_down") down = &ds;
+        if (down == nullptr) throw std::logic_error("dense MLP gate requires down weights");
+        const std::size_t hidden = std::size_t{T} * gu[0]->output;
+        const std::size_t output = std::size_t{T} * down->output;
+        float* ref = dalloc<float>(output);
+        std::vector<float*> got{dalloc<float>(output)};
+        hip_ok(hipMemset(ref, 0xff, output * sizeof(float)), "poison MLP reference");
+        hip_ok(hipMemset(got[0], 0xff, output * sizeof(float)), "poison MLP candidate");
+        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, libOut[0], libOut[1], libOut[0], hidden);
+        hipLaunchKernelGGL(swiglu_kernel, dim3(grid(hidden)), dim3(256), 0, nullptr, v4Out[0], v4Out[1], v4Out[0], hidden);
+        lib.gemm_wmma(down->copies[0].lib, down->input, down->output, libOut[0], ref, T);
+        // Reuse the gate/up workspace on the same stream, exactly as the engine does.
+        run_dense_v4({down}, v4Out[0], got, T, ws, bytes, 0);
+        hip_ok(hipDeviceSynchronize(), "dense MLP sync");
+        const auto actA = d2h(libOut[0], hidden), actB = d2h(v4Out[0], hidden);
+        const auto mlpA = d2h(ref, output), mlpB = d2h(got[0], output);
+        const auto finite = [](const std::vector<float>& x) {
+            return std::all_of(x.begin(), x.end(), [](float v) { return std::isfinite(v); });
+        };
+        const bool same = finite(actA) && finite(actB) && finite(mlpA) && finite(mlpB) &&
+                          same_bits(actA, actB) && same_bits(mlpA, mlpB);
+        check(same, "dense_v4 composed SwiGLU/down differs or contains poison");
+        std::printf("dense_v4 chain rank %u bits %u/%u/%u T%u: %s\n", o.rank, gu[0]->copies[0].dev.bits,
+                    gu[1]->copies[0].dev.bits, down->copies[0].dev.bits, T, same ? "bitwise" : "DIFF");
+        hip_ok(hipFree(ref), "free");
+        hip_ok(hipFree(got[0]), "free");
     }
     void test_prefill_dense() {
         {  // unsupported bit widths are refused (the engine then keeps the library call)
@@ -2585,7 +2741,8 @@ struct Bench {
         // band 0 = MT8 PIPE CTAs; 4 / 8 = tall bands (full bands + PIPE tiles + tail at 1700 rows).
         struct RestoreBand { ~RestoreBand() { opt::set_prefill_dense_band(-1); } } restore_band;
         for (int band : {0, 4, 8})
-        for (unsigned T : {9U, 17U, 100U, 129U, 1024U, 1700U, 4096U}) {
+        // 1023: 7 full tiles in the PIPE epilogue + a 127-row MT8-class remainder on partials and dense_finish_kernel
+        for (unsigned T : {9U, 17U, 100U, 129U, 1023U, 1024U, 1700U, 4096U}) {
             if (band != 0 && T < 1024U) continue;
             opt::set_prefill_dense_band(band);
             for (const auto& g : dense_v4_groups()) {
@@ -2601,7 +2758,11 @@ struct Bench {
                     hip_ok(hipMemset(libOut.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
                     hip_ok(hipMemset(v4Out.back(), 0xff, std::size_t{T} * ds->output * 4), "poison");
                 }
-                const std::size_t bytes = dense_v4_bytes(g, T);
+                const bool mlp_chain = T == 4096 && g.size() == 2 && g[0]->name == "dense_gate" && g[1]->name == "dense_up";
+                std::size_t bytes = dense_v4_bytes(g, T);
+                if (mlp_chain) {
+                    for (auto& ds : dense) if (ds.name == "dense_down") bytes = std::max(bytes, dense_v4_bytes({&ds}, T));
+                }
                 void* ws = nullptr;
                 hip_ok(hipMalloc(&ws, bytes), "dense ws");
                 hip_ok(hipMemset(ws, 0xff, bytes), "poison ws");
@@ -2612,7 +2773,9 @@ struct Bench {
                 std::string detail;
                 for (std::size_t i = 0; i < g.size(); ++i) {
                     const auto a = d2h(libOut[i], std::size_t{T} * g[i]->output), b = d2h(v4Out[i], std::size_t{T} * g[i]->output);
-                    const bool same = same_bits(a, b);
+                    const bool same = same_bits(a, b) &&
+                        std::all_of(a.begin(), a.end(), [](float x) { return std::isfinite(x); }) &&
+                        std::all_of(b.begin(), b.end(), [](float x) { return std::isfinite(x); });
                     std::size_t diff = 0;
                     for (std::size_t j = 0; j < a.size(); ++j)
                         if (std::memcmp(&a[j], &b[j], 4) != 0) ++diff;
@@ -2622,15 +2785,142 @@ struct Bench {
                 const std::string cell = "dense_v4 " + group_name(g) + " T" + std::to_string(T) +
                                          (band != 0 ? " band" + std::to_string(band) : std::string());
                 check(all, cell + " differs:" + detail);
+                if (g[0]->name == "q" && g[0]->output % 128U == 0U) {
+                    // the q image (MSA FAST flash query_op): dense finish image + lo == the flash prologue on the FP32 q
+                    const std::size_t qn = std::size_t{T} * g[0]->output;
+                    std::vector<float> hw(128), hr(std::size_t{T} * sizeof(strix::minimax::msa::RopeRow) / 4U);
+                    std::uniform_real_distribution<float> ud(-1.0F, 1.0F);
+                    for (auto& x : hw) x = 0.25F * ud(rng);
+                    for (auto& x : hr) x = ud(rng);
+                    float* dw = dupload(hw);
+                    float* drope = dupload(hr);
+                    auto* img = dalloc<std::uint16_t>(2 * qn);
+                    auto* ref = dalloc<std::uint16_t>(2 * qn);
+                    hip_ok(hipMemset(img, 0xff, 4 * qn), "poison");
+                    std::vector<opt::PrefillDenseJob> jobs;
+                    for (std::size_t i = 0; i < g.size(); ++i) jobs.push_back({g[i]->copies[0].dev, v4Out[i]});
+                    jobs[0].image = img, jobs[0].image_lo = img + qn, jobs[0].image_w = dw, jobs[0].image_rope = drope;
+                    opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in, T, ws, bytes, nullptr);
+                    const unsigned waves = T * (g[0]->output / 128U);
+                    hipLaunchKernelGGL(msa_q_image_ref, dim3((waves + 7U) / 8U), dim3(256), 0, nullptr, v4Out[0], dw,
+                                       reinterpret_cast<const strix::minimax::msa::RopeRow*>(drope), T, g[0]->output, ref, ref + qn);
+                    hip_ok(hipDeviceSynchronize(), "image sync");
+                    std::vector<std::uint16_t> a(2 * qn), b(2 * qn);
+                    hip_ok(hipMemcpy(a.data(), img, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    hip_ok(hipMemcpy(b.data(), ref, 4 * qn, hipMemcpyDeviceToHost), "d2h");
+                    std::size_t diff = 0;
+                    for (std::size_t j = 0; j < a.size(); ++j) diff += a[j] != b[j];
+                    check(diff == 0U, cell + " q image differs");
+                    detail += diff == 0U ? " q-image bitwise" : " q-image DIFF " + std::to_string(diff);
+                    hip_ok(hipFree(dw), "free"), hip_ok(hipFree(drope), "free"), hip_ok(hipFree(img), "free"), hip_ok(hipFree(ref), "free");
+                }
                 std::printf("%s:%s (splits", cell.c_str(), detail.c_str());
                 for (auto* ds : g) std::printf(" %u", opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, T));
                 std::printf(")\n");
                 std::fflush(stdout);
+                if (mlp_chain) test_dense_mlp_chain(g, libOut, v4Out, T, ws, bytes);
                 hip_ok(hipFree(ws), "free");
                 hip_ok(hipFree(in), "free");
                 for (auto* x : libOut) hip_ok(hipFree(x), "free");
                 for (auto* x : v4Out) hip_ok(hipFree(x), "free");
             }
+        }
+    }
+    // Dense v4 chunk invariance (STRIX_MMX_PF_ORDER=invariant binds core::fixed_linear_contract): every group's output over
+    // T rows computed whole == computed in segments of 256 / 1024 / 4096 rows, 4096 + 1..17 tails and 1..17-row calls,
+    // bitwise; the adaptive control (gemm_splits by rows) must differ in some chunking. Where the library's split equals the fixed
+    // one (> 8 rows, S = 1) the invariant v4 output also equals strix_gemm (the engine keeps the library there).
+    void run_dense_segments(const std::vector<DenseSite*>& g, const float* in, const std::vector<float*>& outs, unsigned T,
+                            unsigned seg, void* ws) {
+        for (unsigned r0 = 0; r0 < T; r0 += seg) {
+            const unsigned n = std::min(seg, T - r0);
+            std::vector<opt::PrefillDenseJob> jobs;
+            for (std::size_t i = 0; i < g.size(); ++i)
+                jobs.push_back({g[i]->copies[0].dev, outs[i] + std::size_t{r0} * g[i]->output});
+            const std::size_t bytes = dense_v4_bytes(g, n);
+            opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in + std::size_t{r0} * g[0]->input, n,
+                                       ws, bytes, nullptr);
+        }
+        hip_ok(hipDeviceSynchronize(), "dense segments");
+    }
+    void test_prefill_dense_chunk_invariance() {
+        struct Restore { ~Restore() { opt::set_prefill_moe_order(-1); } } restore;
+        struct Case { unsigned T; std::vector<unsigned> segs; };
+        std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({t, {1}});
+        for (const auto& g : dense_v4_groups()) {
+            const unsigned K = g[0]->input;
+            std::size_t ws_bytes = 0;
+            for (int order : {0, 1}) {
+                opt::set_prefill_moe_order(order);
+                ws_bytes = std::max(ws_bytes, dense_v4_bytes(g, 8192));
+                for (unsigned n : {256U, 1024U, 4096U}) ws_bytes = std::max(ws_bytes, dense_v4_bytes(g, n));
+            }
+            void* ws = nullptr;
+            hip_ok(hipMalloc(&ws, ws_bytes), "dense ws");
+            unsigned pass = 0, cells = 0, lib_same = 0, lib_cells = 0, control_cases = 0;
+            for (const Case& k : cases) {
+                std::vector<float> hin(std::size_t{k.T} * K);
+                std::normal_distribution<float> nd(0.0F, 1.0F);
+                for (auto& x : hin) x = nd(rng);
+                float* in = dupload(hin);
+                std::vector<float*> whole, part;
+                for (auto* ds : g) {
+                    whole.push_back(dalloc<float>(std::size_t{k.T} * ds->output));
+                    part.push_back(dalloc<float>(std::size_t{k.T} * ds->output));
+                }
+                bool control_differs = false;
+                for (int order : {1, 0}) {
+                    opt::set_prefill_moe_order(order);
+                    for (std::size_t i = 0; i < g.size(); ++i) hip_ok(hipMemset(whole[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                    run_dense_segments(g, in, whole, k.T, k.T, ws);
+                    for (unsigned seg : k.segs) {
+                        for (std::size_t i = 0; i < g.size(); ++i) hip_ok(hipMemset(part[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                        run_dense_segments(g, in, part, k.T, seg, ws);
+                        bool same = true;
+                        std::size_t at = 0;
+                        for (std::size_t i = 0; i < g.size() && same; ++i)
+                            same = same_bits(d2h(whole[i], std::size_t{k.T} * g[i]->output), d2h(part[i], std::size_t{k.T} * g[i]->output), &at);
+                        if (order == 1) {
+                            check(same, "dense chunk invariance " + group_name(g) + " T=" + std::to_string(k.T) + " seg=" +
+                                            std::to_string(seg) + " differs at " + std::to_string(at));
+                            pass += same ? 1U : 0U;
+                            ++cells;
+                        } else {
+                            control_differs |= !same;
+                        }
+                    }
+                    if (order == 1 && (k.T == 8192 || k.T == 4097 || k.T == 9 || k.T == 17)) {
+                        // Library cross-check where the engine keeps strix_gemm under the invariant order.
+                        bool off = false;
+                        for (auto* ds : g) off |= k.T <= 8 || opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, k.T) != 1U;
+                        if (!off) {
+                            ++lib_cells;
+                            bool same = true;
+                            for (std::size_t i = 0; i < g.size(); ++i) {
+                                hip_ok(hipMemset(part[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                                lib.gemm_wmma(g[i]->copies[0].lib, g[i]->input, g[i]->output, in, part[i], k.T);
+                            }
+                            hip_ok(hipDeviceSynchronize(), "lib sync");
+                            for (std::size_t i = 0; i < g.size(); ++i)
+                                same = same && same_bits(d2h(whole[i], std::size_t{k.T} * g[i]->output), d2h(part[i], std::size_t{k.T} * g[i]->output));
+                            check(same, "invariant v4 != strix_gemm where the library split is 1: " + group_name(g) + " T=" + std::to_string(k.T));
+                            lib_same += same ? 1U : 0U;
+                        }
+                    }
+                }
+                if (control_differs) ++control_cases;
+                hip_ok(hipFree(in), "free");
+                for (auto* x : whole) hip_ok(hipFree(x), "free");
+                for (auto* x : part) hip_ok(hipFree(x), "free");
+            }
+            // Adaptive control: some chunking must differ (q / o: only the short calls, where the library split is > 1).
+            check(control_cases > 0, "dense negative control: adaptive split should change bits in some chunking " + group_name(g));
+            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u; adaptive control "
+                        "differs in %u/%zu cases\n", group_name(g).c_str(), pass, cells, lib_same, lib_cells, control_cases, cases.size());
+            std::fflush(stdout);
+            hip_ok(hipFree(ws), "free");
         }
     }
     void bench_prefill_dense() {
@@ -3170,6 +3460,167 @@ struct Bench {
     }
 };
 
+// test_prefill_pipe_tail (STRIX_MMX_PREFILL_PIPE_TAIL): tail classes MT 1..7 on pfk::pipe_tail and the MT8 partial
+// block on pipe_or_tail with the kPipeTail policy against item_core_v3 (dq_v4), bits {3,4,5,6,8} x rows
+// {1,15,17,47,100,112,120} (MT8: {113,120,127}) x splits {1,2,4,8} x row0 {0,128} x decode {scalar,packed}: memcmp of
+// the partials (sentinel-filled) with NaN in every padded input row. K={512,80,16} covers equal, uneven and empty
+// split ranges. Direct-core coverage only: no dispatch or Simplify=true qualification. Synthetic weights; no model needed.
+template <int MT> __global__ __launch_bounds__(128) void pipe_tail_ref_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: opt::pfk::item_core_v3<3, MT, 0, true>(it, bx, by, bz); break;
+        case 4: opt::pfk::item_core_v3<4, MT, 0, true>(it, bx, by, bz); break;
+        case 5: opt::pfk::item_core_v3<5, MT, 0, true>(it, bx, by, bz); break;
+        case 6: opt::pfk::item_core_v3<6, MT, 0, true>(it, bx, by, bz); break;
+        default: opt::pfk::item_core_v3<8, MT, 0, true>(it, bx, by, bz); break;
+    }
+}
+template <int MT, bool Packed> __device__ __forceinline__ void pipe_tail_arm(const opt::pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_PT_CALL(B)                                                                                        \
+    if constexpr (MT == 8) opt::pfk::pipe_or_tail<B, 8, 4, false, Packed, true>(it, bx, by, bz);           \
+    else opt::pfk::pipe_tail<B, MT, false, Packed>(it, bx, by, bz)
+    switch (it.bits) {
+        case 3: STRIX_PT_CALL(3); break;
+        case 4: STRIX_PT_CALL(4); break;
+        case 5: STRIX_PT_CALL(5); break;
+        case 6: STRIX_PT_CALL(6); break;
+        default: STRIX_PT_CALL(8); break;
+    }
+#undef STRIX_PT_CALL
+}
+template <int MT, bool Packed> __global__ __launch_bounds__(128) void pipe_tail_new_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    pipe_tail_arm<MT, Packed>(it, bx, by, bz);
+}
+// N16 PIPE (item_pipe Tiles 1, 256 threads) on MT8 blocks; Tail false sends partial blocks to the scalar core.
+template <bool Packed, bool Tail> __global__ __launch_bounds__(256) void pipe_n16_new_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: opt::pfk::pipe_or_tail<3, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 4: opt::pfk::pipe_or_tail<4, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 5: opt::pfk::pipe_or_tail<5, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 6: opt::pfk::pipe_or_tail<6, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        default: opt::pfk::pipe_or_tail<8, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+    }
+}
+
+template <int MT>
+std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsigned in, unsigned out, std::mt19937& rng) {
+    const std::vector<unsigned> row_set = MT == 8 ? std::vector<unsigned>{113, 120, 127, 128, 256} : std::vector<unsigned>{1, 15, 17, 47, 100, 112, 120};
+    const unsigned tiles_k = in / 16;
+    std::size_t cells = 0;
+    for (const unsigned live : row_set)
+        for (const unsigned row0 : {0U, 128U}) {
+            const unsigned gy = (live + 16U * MT - 1U) / (16U * MT), padded = row0 + gy * 16U * MT, rows = row0 + live;
+            // Tile-major input: [padded / 16][tiles_k][16 rows][16 halves]; NaN in every row >= rows.
+            std::vector<std::uint16_t> x(static_cast<std::size_t>(padded) * in);
+            std::uniform_real_distribution<float> u(-1.0F, 1.0F);
+            for (unsigned r = 0; r < padded; ++r)
+                for (unsigned k = 0; k < in; ++k) {
+                    const std::size_t at = (static_cast<std::size_t>(r / 16) * tiles_k + k / 16) * 256 + (r % 16) * 16 + k % 16;
+                    x[at] = r < rows ? f16_bits(u(rng)) : std::uint16_t{0x7e00};
+                }
+            _Float16* x_d = nullptr;
+            hip_ok(hipMalloc(&x_d, x.size() * 2), "pipe tail x");
+            hip_ok(hipMemcpy(x_d, x.data(), x.size() * 2, hipMemcpyHostToDevice), "pipe tail x copy");
+            for (const unsigned splits : {1U, 2U, 4U, 8U}) {
+                const std::size_t n = static_cast<std::size_t>(splits) * rows * out;
+                const std::string cell = "test_prefill_pipe_tail: bits " + std::to_string(bits) + " MT " + std::to_string(MT) +
+                                         " K " + std::to_string(in) + " rows " + std::to_string(live) + " row0 " +
+                                         std::to_string(row0) + " splits " + std::to_string(splits);
+                const auto check_output = [&](const std::vector<std::uint32_t>& output, const char* arm) {
+                    for (std::size_t i = 0; i < output.size(); ++i) {
+                        const bool prefix = (i / out) % rows < row0;
+                        const bool sentinel = output[i] == 0xa5a5a5a5U;
+                        if (prefix ? !sentinel : sentinel)
+                            throw std::runtime_error(cell + " " + arm + (prefix ? ": prefix overwritten at word " : ": live output unwritten at word ") +
+                                                     std::to_string(i));
+                    }
+                };
+                float *a_d = nullptr, *b_d = nullptr;
+                hip_ok(hipMalloc(&a_d, n * 4), "pipe tail part");
+                hip_ok(hipMalloc(&b_d, n * 4), "pipe tail part");
+                hip_ok(hipMemset(a_d, 0xA5, n * 4), "pipe tail sentinel");
+                hip_ok(hipMemset(b_d, 0xA5, n * 4), "pipe tail sentinel");
+                opt::pfk::Item it{};
+                it.trellis = trellis_d;
+                it.x = x_d;
+                it.input = in;
+                it.output = out;
+                it.bits = bits;
+                it.rows = rows;
+                it.splits = splits;
+                it.gx = out / 128;
+                it.gy = gy;
+                it.row0 = row0;
+                const dim3 grid(it.gx * gy * splits);
+                it.part = a_d;
+                hipLaunchKernelGGL((pipe_tail_ref_kernel<MT>), grid, dim3(128), 0, nullptr, it);
+                hip_ok(hipGetLastError(), (cell + " reference launch").c_str());
+                std::vector<std::uint32_t> ref(n), got(n);
+                hip_ok(hipMemcpy(ref.data(), a_d, n * 4, hipMemcpyDeviceToHost), "pipe tail ref");
+                check_output(ref, "reference");
+                // Arms 0 / 1: PIPE scalar / packed decode. MT 8 also 2 / 3: N16 PIPE scalar / packed (row guard on
+                // item_pipe), 4: N16 packed with the partial blocks on the scalar core (Tail false).
+                for (int a = 0; a < (MT == 8 ? 5 : 2); ++a) {
+                    const bool packed = a == 1 || a >= 3;
+                    hip_ok(hipMemset(b_d, 0xA5, n * 4), "pipe tail sentinel");
+                    it.part = b_d;
+                    const char* names[] = {"scalar", "packed", "n16 scalar", "n16 packed", "n16 packed v3 tail"};
+                    const char* arm = names[a];
+                    if (a == 2) hipLaunchKernelGGL((pipe_n16_new_kernel<false, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 3) hipLaunchKernelGGL((pipe_n16_new_kernel<true, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 4) hipLaunchKernelGGL((pipe_n16_new_kernel<true, false>), grid, dim3(256), 0, nullptr, it);
+                    else if (packed) hipLaunchKernelGGL((pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
+                    else hipLaunchKernelGGL((pipe_tail_new_kernel<MT, false>), grid, dim3(128), 0, nullptr, it);
+                    hip_ok(hipGetLastError(), (cell + " " + arm + " launch").c_str());
+                    hip_ok(hipMemcpy(got.data(), b_d, n * 4, hipMemcpyDeviceToHost), "pipe tail got");
+                    check_output(got, arm);
+                    if (std::memcmp(ref.data(), got.data(), n * 4) != 0) {
+                        std::size_t i = 0;
+                        while (ref[i] == got[i]) ++i;
+                        throw std::runtime_error(cell + " " + arm + ": first diff at word " + std::to_string(i));
+                    }
+                    ++cells;
+                }
+                (void)hipFree(a_d);
+                (void)hipFree(b_d);
+            }
+            (void)hipFree(x_d);
+        }
+    return cells;
+}
+
+void test_prefill_pipe_tail() {
+    constexpr unsigned kOut = 256;  // two CTA columns
+    std::mt19937 rng(20261114U);
+    std::size_t cells = 0;
+    for (const unsigned bits : {3U, 4U, 5U, 6U, 8U}) {
+        std::size_t words = 0;
+        switch (bits) {
+            case 3: words = opt::pfk::Norm<3>::kWords; break;
+            case 4: words = opt::pfk::Norm<4>::kWords; break;
+            case 5: words = opt::pfk::Norm<5>::kWords; break;
+            case 6: words = opt::pfk::Norm<6>::kWords; break;
+            default: words = opt::pfk::Norm<8>::kWords; break;
+        }
+        for (const unsigned kIn : {512U, 80U, 16U}) {
+            std::vector<std::uint32_t> w(words * (kIn / 16) * (kOut / 16));
+            for (auto& v : w) v = static_cast<std::uint32_t>(rng());
+            std::uint32_t* w_d = nullptr;
+            hip_ok(hipMalloc(&w_d, w.size() * 4), "pipe tail weights");
+            hip_ok(hipMemcpy(w_d, w.data(), w.size() * 4, hipMemcpyHostToDevice), "pipe tail weights copy");
+            cells += pipe_tail_cells<1>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<2>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<3>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<4>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<5>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<6>(w_d, bits, kIn, kOut, rng) +
+                     pipe_tail_cells<7>(w_d, bits, kIn, kOut, rng) + pipe_tail_cells<8>(w_d, bits, kIn, kOut, rng);
+            (void)hipFree(w_d);
+        }
+    }
+    hip_ok(hipDeviceSynchronize(), "pipe tail sync");
+    std::printf("test_prefill_pipe_tail: PASS, %zu cells bitwise (partials memcmp vs item_core_v3, NaN padded rows; MT8 also N16 PIPE)\n", cells);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3182,6 +3633,7 @@ int main(int argc, char** argv) {
                 return argv[++i];
             };
             if (a == "--test") o.test = true;
+            else if (a == "--pipe-tail-test") { test_prefill_pipe_tail(); return 0; }  // synthetic, no model
             else if (a == "--bench") o.bench = true;
             else if (a == "--reps") o.reps = std::stoi(next());
             else if (a == "--iters") o.iters = std::stoi(next());
@@ -3194,6 +3646,7 @@ int main(int argc, char** argv) {
             else if (a == "--tests") { o.tests = next(); o.test = true; }
             else if (a == "--no-load") o.no_load = true;
             else if (a == "--syn-bits") o.syn_bits = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--dense-bits") o.dense_bits = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--diverse") o.diverse = true;
             else if (a == "--diverse-fallback") { o.diverse = true; o.diverse_fallback = true; }
             else if (a == "--singletons") o.singletons = next();
@@ -3203,6 +3656,8 @@ int main(int argc, char** argv) {
         if (o.reps < 1 || o.iters < 1 || o.reps > 1000 || o.iters > 10000)
             throw std::invalid_argument("reps/iters must be positive (maximum 1000/10000)");
         if (o.rank > 1) throw std::invalid_argument("rank must be 0 or 1");
+        if (o.dense_bits != 3 && o.dense_bits != 4 && o.dense_bits != 5 && o.dense_bits != 6 && o.dense_bits != 8)
+            throw std::invalid_argument("dense-bits must be 3, 4, 5, 6 or 8");
         if (!o.test && !o.bench) o.test = o.bench = true;
         hipDeviceProp_t prop{};
         hip_ok(hipGetDeviceProperties(&prop, 0), "props");
@@ -3241,6 +3696,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_device", [&] { b.test_prefill_device(); });
             if (!o.no_moe) test_section("test_prefill_group", [&] { b.test_prefill_group(); });
+            if (!o.no_moe) test_section("test_prefill_chunk_invariance", [&] { b.test_prefill_chunk_invariance(); });
             if (!o.no_moe) test_section("test_prefill_mtfit", [&] { b.test_prefill_mtfit(); });
             if (!o.no_moe) test_section("test_prefill_core8", [&] { b.test_prefill_core8(); });
             if (!o.no_moe && o.tests == "test_prefill_pipe") test_section("test_prefill_pipe", [&] { b.test_prefill_pipe(); });
@@ -3248,6 +3704,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_prefill_table_ring", [&] { b.test_prefill_table_ring(); });
             if (!o.no_moe) test_section("test_prefill_gather", [&] { b.test_prefill_gather(); });
             test_section("test_prefill_dense", [&] { b.test_prefill_dense(); });
+            test_section("test_prefill_dense_chunk_invariance", [&] { b.test_prefill_dense_chunk_invariance(); });
             if (g_fail == 0) std::printf("TESTS PASS\n");
             else std::printf("TESTS FAIL (%d failures)\n", g_fail);
             std::fflush(stdout);

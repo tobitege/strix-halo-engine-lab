@@ -8,6 +8,8 @@
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
 #include "glm/prefill/glm_pf_attn_wmma.hpp"
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
+#include "glm/prefill/glm_pf_wmma.hpp"
 #include "attn_core/sparse_flash_wmma.hpp"
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
@@ -1248,14 +1250,29 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_v2_kernel(const float* A, c
 // Grid: x = column tile (fastest), y = row tile, z = head, so the NC / 128 CTAs that share one A tile run back to back
 // and read it from L2 (with rows fastest, a head's whole A slice, C x 1 KiB at a 32 KiB row stride, was streamed once
 // per column tile: absorb per row went 2.3 -> 4.1 us from C 2048 to 4096). Placement only: same per-output chains.
+// Heads-mid order (STRIX_GLM_PF_MLA_GEMM_HEADS, default 1; 0 = the order above): grid x = column tile, y = head,
+// z = row tile. With one head in flight every resident CTA reads rows of the same 1 KiB head slice at the 32 / 64 KiB
+// row stride of [C][H][K], so the requests camp on a few memory channels; with the heads of a row tile in flight the
+// slices spread over the whole row. Measured on the shared WMMA tile core (same layout, C 4096): absorb 6.8 -> 3.4 ms,
+// out 6.4 -> 4.5 ms; group sizes 4..16 equal the plain heads-mid order. Placement only: the same bits.
 constexpr unsigned kG3R = 128, kG3C = 128, kG3K = 16, kG3Pad = 132;
+inline dim3 g3_grid(unsigned nc, unsigned C, unsigned heads, bool heads_mid) {
+    const unsigned rows = (C + kG3R - 1) / kG3R;
+    return heads_mid ? dim3(nc / kG3C, heads, rows) : dim3(nc / kG3C, rows, heads);
+}
 #include "glm/prefill/glm_pf_mla_gemm_vopd.inc"
-template <bool kOut>
-__global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y) {
+// kQ16 (absorb only): the epilogue stores the bf16 image tile::to_bf16(acc) of the unchanged FP32 chains, [C][H][512]
+// u16 in Y's memory, i.e. exactly the operand bits the FAST flash core makes of FP32 q-tilde (frag_from_f32<bf16>):
+// half the q-tilde bytes written here and read there.
+template <bool kOut, bool kQ16 = false>
+__global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* Y,
+                                                               bool heads_mid) {
+    static_assert(!(kOut && kQ16), "the out GEMM keeps its FP32 output");
     constexpr unsigned K = kOut ? kKvLora : kMlaDim, NC = kOut ? kMlaDim : kKvLora;
     __shared__ alignas(16) float as[kG3K][kG3Pad];
     __shared__ alignas(16) float ws[kG3K][kG3Pad];
-    const unsigned r0 = blockIdx.y * kG3R, c0 = blockIdx.x * kG3C, h = blockIdx.z, tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
+    const unsigned r0 = (heads_mid ? blockIdx.z : blockIdx.y) * kG3R, c0 = blockIdx.x * kG3C, h = heads_mid ? blockIdx.y : blockIdx.z;
+    const unsigned tid = threadIdx.x, tr = tid / 16, tc = tid % 16;
     float4 ar[2];
     uint4 wr;
     auto load = [&](unsigned k0) {
@@ -1322,7 +1339,14 @@ __global__ __launch_bounds__(256) void mla_gemm_rows_v3_kernel(const float* A, c
 #pragma unroll
     for (unsigned i = 0; i < 8; ++i) {
         const unsigned r = r0 + tr * 8 + i;
-        if (r < C) {
+        if (r < C && kQ16) {
+            namespace T = strix::attn_core::tile;
+            std::uint16_t* dst = reinterpret_cast<std::uint16_t*>(Y) + (static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4;
+            *reinterpret_cast<uint2*>(dst) = uint2{T::pack2<T::Operand::bf16>(acc[8 * i], acc[8 * i + 1]),
+                                                   T::pack2<T::Operand::bf16>(acc[8 * i + 2], acc[8 * i + 3])};
+            *reinterpret_cast<uint2*>(dst + 64) = uint2{T::pack2<T::Operand::bf16>(acc[8 * i + 4], acc[8 * i + 5]),
+                                                        T::pack2<T::Operand::bf16>(acc[8 * i + 6], acc[8 * i + 7])};
+        } else if (r < C) {
             float* dst = Y + (static_cast<std::size_t>(r) * heads + h) * NC + c0 + tc * 4;
             *reinterpret_cast<float4*>(dst) = float4{acc[8 * i], acc[8 * i + 1], acc[8 * i + 2], acc[8 * i + 3]};
             *reinterpret_cast<float4*>(dst + 64) = float4{acc[8 * i + 4], acc[8 * i + 5], acc[8 * i + 6], acc[8 * i + 7]};
@@ -3430,12 +3454,86 @@ struct GlmMlaFlashPolicy {
     __device__ static const float* query(const Args& a, unsigned r) { return a.qt + static_cast<std::size_t>(r) * kHeads * kKvLora; }
     __device__ static float* out(const Args& a, unsigned r) { return a.ob + static_cast<std::size_t>(r) * kHeads * kKvLora; }
 };
+// Same core on the bf16 q-tilde image the absorb GEMM wrote in qt's memory (mla_gemm_rows_v3_kernel<false, true>).
+struct GlmMlaFlashQ16Policy : GlmMlaFlashPolicy {
+    __device__ static const std::uint16_t* query_op(const Args& a, unsigned r) {
+        return reinterpret_cast<const std::uint16_t*>(a.qt) + static_cast<std::size_t>(r) * kHeads * kKvLora;
+    }
+};
+// FP16 o-bar image (FAST MLA WMMA out GEMM only: it rounds its FP32 A operand with the same static_cast<_Float16>, so
+// the out GEMM sees the same bits from half the bytes; flash writes half too). [C][H][512] u16 in ob's memory.
+template <class Base> struct GlmMlaFlashOb16 : Base {
+    static constexpr attn_core::tile::Operand kOutOp = attn_core::tile::Operand::f16;
+    __device__ static std::uint16_t* out_op(const typename Base::Args& a, unsigned r) {
+        return reinterpret_cast<std::uint16_t*>(a.ob) + static_cast<std::size_t>(r) * Base::kHeads * kKvLora;
+    }
+};
+// Diagnostic (STRIX_GLM_PF_TOPK_OVERLAP=1; reads the lists only, no effect on bits; syncs the stream per call, so not for
+// timing): how many keys neighbouring query rows share, the input of the row-group flash analysis. Per aligned group of
+// 8 rows: the sum of the list sizes and the union size of each aligned pair, quad and the octet (LDS bitmap of cache
+// positions mod 2^17), split dense (every row's n < kIdxTopk: causal prefix, all keys) / sparse.
+__device__ unsigned long long g_topk_ovl[2][4];  // [dense, sparse][sum n, union 2, union 4, union 8]
+constexpr unsigned kOvlBits = 1U << 17;
+__global__ void __launch_bounds__(256) topk_overlap_kernel(const std::uint32_t* tokens, const std::uint32_t* n, unsigned C) {
+    __shared__ unsigned bm[kOvlBits / 32];
+    __shared__ unsigned cnt;
+    const unsigned r0 = blockIdx.x * 8, rows = min(8U, C - r0);
+    bool dense = true;
+    unsigned long long sum = 0;
+    for (unsigned i = 0; i < rows; ++i) {
+        sum += n[r0 + i];
+        dense = dense && n[r0 + i] < kIdxTopk;
+    }
+    const unsigned cls = dense ? 0U : 1U;
+    for (unsigned lg = 1; lg <= 3; ++lg) {
+        const unsigned g = 1U << lg;
+        for (unsigned s0 = 0; s0 < rows; s0 += g) {
+            for (unsigned w = threadIdx.x; w < kOvlBits / 32; w += blockDim.x) bm[w] = 0;
+            if (threadIdx.x == 0) cnt = 0;
+            __syncthreads();
+            unsigned mine = 0;
+            for (unsigned i = s0; i < min(s0 + g, rows); ++i) {
+                const std::uint32_t* t = tokens + static_cast<std::size_t>(r0 + i) * kMaxTokens;
+                for (unsigned j = threadIdx.x; j < n[r0 + i]; j += blockDim.x) {
+                    const unsigned p = t[j] % kOvlBits, bit = 1U << (p & 31U);
+                    if (!(atomicOr(&bm[p >> 5], bit) & bit)) ++mine;
+                }
+            }
+            atomicAdd(&cnt, mine);
+            __syncthreads();
+            if (threadIdx.x == 0) atomicAdd(&g_topk_ovl[cls][lg], static_cast<unsigned long long>(cnt));
+            __syncthreads();
+        }
+    }
+    if (threadIdx.x == 0) atomicAdd(&g_topk_ovl[cls][0], sum);
+}
+static void topk_overlap_diag(const std::uint32_t* tokens, const std::uint32_t* n, unsigned C, hipStream_t s) {
+    static strix::env_arms::Resolved<bool> enabled;
+    if (!enabled.get([] { return strix::envcfg::flag("STRIX_GLM_PF_TOPK_OVERLAP", false); })) return;
+    unsigned long long z[2][4] = {};
+    ok(hipMemcpyToSymbolAsync(HIP_SYMBOL(g_topk_ovl), z, sizeof z, 0, hipMemcpyHostToDevice, s), "glm pf topk overlap clear");
+    topk_overlap_kernel<<<(C + 7) / 8, 256, 0, s>>>(tokens, n, C);
+    ok(hipGetLastError(), "glm pf topk overlap");
+    ok(hipMemcpyFromSymbolAsync(z, HIP_SYMBOL(g_topk_ovl), sizeof z, 0, hipMemcpyDeviceToHost, s), "glm pf topk overlap read");
+    ok(hipStreamSynchronize(s), "glm pf topk overlap sync");
+    std::printf("glm pf topk overlap C %u dense n %llu u2 %llu u4 %llu u8 %llu sparse n %llu u2 %llu u4 %llu u8 %llu\n", C, z[0][0], z[0][1],
+                z[0][2], z[0][3], z[1][0], z[1][1], z[1][2], z[1][3]);
+}
 static void mla_flash_rows(const DsaSlot& sl, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, float* ob, unsigned C,
-                    unsigned keys, hipStream_t s) {
+                    unsigned keys, bool q16, hipStream_t s, bool ob16 = false) {
     namespace M = strix::attn_core::sparse;
+    topk_overlap_diag(tokens, n, C, s);
     const GlmMlaFlashPolicy::Args a{sl.latent, tokens, n, qt, ob};
-    if (keys == 16) M::flash_rows_kernel<GlmMlaFlashPolicy, 16><<<C, M::Geometry<32, kKvLora, 16>::kThreads, 0, s>>>(a);
-    else M::flash_rows_kernel<GlmMlaFlashPolicy, 32><<<C, M::Geometry<32, kKvLora, 32>::kThreads, 0, s>>>(a);
+    using O16 = GlmMlaFlashOb16<GlmMlaFlashPolicy>;
+    using QO16 = GlmMlaFlashOb16<GlmMlaFlashQ16Policy>;
+    if (ob16 && q16 && keys == 16) M::launch_flash_rows<QO16, 16>(a, C, s);
+    else if (ob16 && q16) M::launch_flash_rows<QO16, 32>(a, C, s);
+    else if (ob16 && keys == 16) M::launch_flash_rows<O16, 16>(a, C, s);
+    else if (ob16) M::launch_flash_rows<O16, 32>(a, C, s);
+    else if (q16 && keys == 16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 16>(a, C, s);
+    else if (q16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 32>(a, C, s);
+    else if (keys == 16) M::launch_flash_rows<GlmMlaFlashPolicy, 16>(a, C, s);
+    else M::launch_flash_rows<GlmMlaFlashPolicy, 32>(a, C, s);
     ok(hipGetLastError(), "glm pf mla flash (attn-wmma)");
     attn_wmma::calls.fetch_add(1, std::memory_order_relaxed);
 }
@@ -3448,11 +3546,14 @@ void mla_mark(unsigned i, hipStream_t s) {
 }  // namespace
 void set_mla_profile(hipEvent_t* ev6) { g_mla_prof = ev6; }
 // FAST glm-pf-attn-wmma (default with STRIX_GLM_PF_WMMA=1, STRIX_GLM_PF_ATTN_WMMA=0 opts out; heads 32): the fused core
-// (20 = T 32, 21 = T 16) instead of the o-bar selector; absorb / out keep the exact GEMM selector.
+// (20 = T 32, 21 = T 16; 22 / 23 = the same with the bf16 q-tilde image, same bits, STRIX_GLM_PF_MLA_QT16=0 opts out)
+// instead of the o-bar selector; absorb / out keep the exact GEMM selector (the image needs absorb v3 or the FAST MLA
+// WMMA GEMM, which stores the same bf16 image of its own sums; else 22/23 = 20/21).
 static unsigned obar_env_version(unsigned heads) {
     static const bool fused = attn_wmma::enabled();
     static const unsigned keys = attn_wmma::block_keys();
-    if (fused && heads == 32) return keys == 16 ? 21U : 20U;
+    static const unsigned image = attn_wmma::qt16() ? 2U : 0U;
+    if (fused && heads == 32) return (keys == 16 ? 21U : 20U) + image;
     return obar_version();
 }
 bool mla_e_lane_major(unsigned heads) {
@@ -3460,25 +3561,47 @@ bool mla_e_lane_major(unsigned heads) {
     return !mla_v1() && (v == 5 || v == 7 || v == 10) && heads == 32;
 }
 
-void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+// FAST glm-pf-mla-wmma-v1: absorb (kOut = false) / out GEMM on the shared short-K FP16
+// WMMA tile GEMM (glm_pf_mla_wmma.hpp); false = not selected, the caller runs its exact GEMM version.
+bool mla_wmma_selected(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C,
+                       const mla_gemm::Dispatch& dispatch) {
+    return dispatch.use_wmma(mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C));
+}
+// image (absorb only): y receives the bf16 q-tilde image the fused core 22 / 23 reads (same bits as its own conversion).
+template <bool kOut>
+bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, const mla_gemm::Dispatch& dispatch,
+                   bool image = false, bool a16 = false) {
+    if (!mla_wmma_selected(x, kv_b, heads, C, dispatch)) return false;
+    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s, image, a16);
+    mla_wmma::calls.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, const mla_gemm::Dispatch& dispatch) {
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
     if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
-    if (obar_v == 20 || obar_v == 21) {  // FAST fused core (T = 32 / 16): absorb GEMM, flash core, out GEMM
+    if (obar_v >= 20 && obar_v <= 23) {  // FAST fused core (T = 32 / 16, FP32 / bf16 q-tilde): absorb GEMM, flash core, out GEMM
         if (heads != 32) throw std::runtime_error("glm pf mla_attention_rows_versions: the fused attn-wmma core needs heads 32");
+        const bool q16 = obar_v >= 22 && (gemm_v == 3 || mla_wmma_selected(q, kv_b, heads, C, dispatch));
+        const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch, q16)) {
+        } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
+        else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         ok(hipGetLastError(), "glm pf mla absorb");
         mla_mark(1, s);
         mla_mark(2, s);
         mla_mark(3, s);
-        mla_flash_rows(slot, tokens, n, qt, ob, C, obar_v == 21 ? 16U : 32U, s);
+        const bool ob16 = dispatch.ob16 && mla_wmma_selected(ob, kv_b, heads, C, dispatch);  // out GEMM on WMMA: FP16 o-bar image
+        mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16);
         mla_mark(4, s);
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch, false, ob16)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         ok(hipGetLastError(), "glm pf mla out");
@@ -3498,7 +3621,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         if (heads == 32) mla_scores_rows_kernel<32><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
         else mla_scores_rows_kernel<64><<<sg, 256, 0, s>>>(slot, tokens, n, qt, e);
     } else {
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<dim3(kKvLora / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, dispatch)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, dispatch.heads_mid), 256, 0, s>>>(q, kv_b, heads, C, qt, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         else mla_gemm_rows_kernel<false><<<dim3((C + kGT - 1) / kGT, kKvLora / kGT, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
         mla_mark(1, s);
@@ -3541,7 +3665,8 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
         else if (obv == 4) mla_obar_v4_kernel<<<dim3(heads / kOb4Heads, kKvLora / kOb4Dims, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         else mla_obar_v2_kernel<<<dim3(kKvLora / kOb2Lat, C), 256, 0, s>>>(slot, tokens, n, heads, e, ob);
         mla_mark(4, s);
-        if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<dim3(kMlaDim / kG3C, (C + kG3R - 1) / kG3R, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
+        if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch)) {
+        } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<true><<<dim3((C + kG2R - 1) / kG2R, kMlaDim / kG2C, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
         else mla_gemm_rows_kernel<true><<<dim3((C + kGT - 1) / kGT, kMlaDim / kGT, heads), 256, 0, s>>>(ob, kv_b, heads, C, o);
     }
@@ -3549,33 +3674,48 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     mla_mark(5, s);
 }
 
-void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
-                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s) {
-    mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version());
-}
-
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
+    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s, scores_v, obar_v, gemm_v, {});
+}
+
+void mla_attention_rows_selected(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window,
+                        mla_gemm::Dispatch dispatch) {
     if (C == 0) return;
     const unsigned Q = attention_scratch_rows(C, query_window);
     // All KV is already appended/selected. Reuse qt/e/ob on the existing stream;
     // only the query/list/count/output origins move. No recursion or extra waits.
     for (unsigned begin = 0; begin < C; begin += Q) {
         const std::size_t offset = std::size_t{begin} * heads * kMlaDim;
-        mla_attention_rows_versions(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
-            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v);
+        mla_attention_rows_impl(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
+            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v, dispatch);
     }
+}
+
+void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
+    mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+                                scores_v, obar_v, gemm_v, query_window, {});
+}
+
+void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                        const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                        hipStream_t s) {
+    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+        mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
+        mla_gemm::automatic_dispatch());
 }
 
 void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned query_window) {
-    mla_attention_rows_versions(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
-                                query_window);
+    mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
+        mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
+        query_window, mla_gemm::automatic_dispatch());
 }
 
 }  // namespace strix::glm::pf

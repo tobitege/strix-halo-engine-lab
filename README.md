@@ -16,12 +16,12 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 
 | Model | Hardware | Decode | Prompt reading |
 |---|---|---|---|
-| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,695 tok/s at 4K (exact) |
+| Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,885 tok/s at 8K, 1,845-1,856 at 32K, 1,755-1,762 at 128K (exact); 2,008 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Qwen3.8-Flash-Next | 2 nodes (two replicas, server) | 158.1 tok/s total with 8 streams (68.2 with 1) | - |
-| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | ~2,660 tok/s at 32K, ~2,800 at 128K (exact) |
-| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,057 tok/s at 8.4K, 1,172 at 32.5K (exact) |
-| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 596 tok/s at 8K, 529 at 32K (exact) |
-| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 541 tok/s at 8K, 529 at 32K (exact) |
+| Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | 2,968 tok/s at 32K (exact), 3,191 (`fast`, opt-in; quality qualification in progress); below 28,672 prompt rows the pair runs the prompt on one node |
+| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,165 tok/s at 8K, 1,285 at 32K (exact); 1,377 / 1,546 with the FAST prefill profile (opt-in; [floor-relative quality gate passed](docs/models/deepseek-v4.1/README.md#fast-prefill-quality-gate)) |
+| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 669 tok/s at 8K, 529 at 32K (exact) |
+| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 664 tok/s at 8K (exact, warm second prefill), 642 at 32K (exact); `fast` (opt-in; quality qualification in progress) at 8K: 957 warm, 918 fresh process |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |
@@ -80,15 +80,17 @@ Every engine's build and launch command: [getting started](docs/getting-started/
 
 `default` is exact. `fast` adds qualified bit-changing options. `quality` uses a higher-precision pack where one exists.
 
-| Model | Single / pair | Exact / FAST | Memory |
-|---|---|---|---|
-| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node |
-| DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB |
-| MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB |
-| GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB |
-| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node |
-| MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node |
-| MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node |
+| Model | Single / pair | Exact / FAST | Memory | Weights |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next (UD-Q4_K_XL) | single (2 replicas behind a router) | exact default; `fast` | 111 GB weights on a 128 GB node | [UD-Q4_K_XL GGUF](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth`, read as published); [distilled Q8_0 MTP draft head](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) |
+| DeepSeek V4.1 Flash (2-bit experts, 6.5-bit trellis dense) | pair over USB4 | exact default; `fast` | 2 x 128 GB | [expert GGUF](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror), [dense overlay](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6), [trellis packs](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) |
+| MiniMax M3.1 Flash (EXL3 3.06 bpw) | pair TP2 | exact | 2 x 128 GB | [EXL3 3.06 bpw](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (mirror of `Mia-AiLab`, with our EXL3 draft); [draft source](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) |
+| GLM-5.3 Flash (EXL3 4.05 bpw) | pair TP2 | exact; opt-in WMMA prefill | 2 x 128 GB | [EXL3 4.05 bpw](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp`) |
+| Nemotron 3.5 Bolt E4B (Q4_K_M; EXL3 for `quality`) | single, opt-in build; opt-in pair prompt prefill (`STRIX_G4_PAIR=1`, same bytes) | exact default; `fast`; `quality` | 128 GB node | official Q4_K_M GGUF (not mirrored by us); [EXL3 pack](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-EXL3); [MTP drafter](https://huggingface.co/hyukudan/Nemotron-3.5-Bolt-E4B-MTP-Drafter) |
+| MiniMax H3 (audio + video) | single or pair, opt-in build | dense reference; FAST levers each with its own flag | 128 GB per node | not published by us; upstream [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707) ([files](docs/models/minimax-h3/README.md#install-and-run)) |
+| MiniMax-H3-Image (int8 or W4A8) | single or pair (`strix-h3-image`), opt-in build | GPU VAE; `--parallel sequence` for one image, `request` for several | 128 GB per node | not published by us; upstream [Comfy-Org/MiniMax-H3-Image](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/0bb149f51e3156ed4b90dd45d5620346bfe1df8f) |
+
+Our weights on Hugging Face: [huggingface.co/hyukudan](https://huggingface.co/hyukudan). Mirrors keep the upstream files; revisions, file names and licenses: [models and provenance](docs/reproduce.md#models-and-provenance).
 
 <a id="discrete-gpu"></a>
 
@@ -96,6 +98,26 @@ Optional RTX PRO 6000 (96 GB) routes: DeepSeek standalone, DeepSeek RTX + pair, 
 GLM on one card (draft). See [using a discrete GPU](docs/discrete-gpu.md).
 
 Every switch, its default and when other hardware wants a different value: [toggles](docs/toggles.md).
+
+## Image input
+
+DeepSeek V4.1 on the two-node pair accepts images in OpenAI-style chat completions. Add an `image_url` part to a user
+message. It is off by default: start the server with `--vision <vision GGUF>` on rank 0, together with
+`--prefill-path device`.
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]}]}'
+```
+
+Measured on the two-node pair, DeepSeek V4.1 Q2, one 37x23 PNG upscaled to 1550 patches (200 image rows + 21 text
+tokens): first request 1.46-1.87 s to first token (image encode 0.93-1.07 s, 2.0 MB frame to rank 1 in 4-5 ms, LM
+prefill about 0.46 s); the same image again 0.53-0.61 s (embed cache hit); decode 39-41 tok/s.
+
+Limits: PNG and JPEG only; images over the row budget, video, and image requests with `session_id` are refused. Other
+models do not take images yet. Details: [image input](docs/engine/vision.md).
 
 ## How it works
 
@@ -110,6 +132,7 @@ Every switch, its default and when other hardware wants a different value: [togg
   20 KB exchange ([pair](docs/pair.md)).
 - Every default has a measured gain and an off switch ([optimizations](docs/optimizations.md)).
 - Adding a model: [docs/engine/adding-a-model.md](docs/engine/adding-a-model.md).
+- Map of the shared cores and which model uses each: [docs/engine/shared-cores.md](docs/engine/shared-cores.md).
 
 ## Documentation
 
@@ -120,7 +143,7 @@ Every switch, its default and when other hardware wants a different value: [togg
 | Pair and serving | [pair](docs/pair.md) · [pair setup](docs/pair-setup.md) · [serving](docs/serving.md) · [discrete GPU](docs/discrete-gpu.md) |
 | Switches | [toggles](docs/toggles.md) · [optimizations](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Numbers | [performance](docs/performance.md) · [measured gains](docs/measured-gains.md) · [methodology](docs/methodology.md) |
-| Internals | [architecture](docs/architecture/README.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
+| Internals | [architecture](docs/architecture/README.md) · [shared cores](docs/engine/shared-cores.md) · [decision register](docs/decisions/decision-register.md) · [implementation status](docs/reference/implementation-status.md) · [sources](docs/reference/sources-ledger.md) |
 | Index | [full documentation index](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>

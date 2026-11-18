@@ -64,8 +64,24 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
         else P::dense_rows(dx, pr[0].dw, D::WType::F16, in, 0, pr[0].n, pr[0].dy_exact, R, nullptr);
     };
     const auto wmma = [&] { K::dense_group(dx, in, pw.data(), count, R, nullptr); };
+    // x16 tile form (core f16_dense_tall X16Cols, taken from kX16Rows rows): must give the direct form's bits.
+    const bool x16 = R >= strix::core::f16_dense_tall::kX16Rows;
+    _Float16* xt = x16 ? alloc<_Float16>(std::size_t{R} * in) : nullptr;
+    std::vector<P::DenseProj> px;
+    std::vector<float*> dyx;
+    for (const auto& p : pr) {
+        const std::size_t yn = std::size_t{R + 1} * p.n;
+        std::vector<float> guard(yn, kGuard);
+        dyx.push_back(alloc<float>(yn));
+        ok(hipMemcpy(dyx.back(), guard.data(), yn * 4, hipMemcpyHostToDevice), "g");
+        px.push_back({p.dw, 0, p.n, dyx.back()});
+    }
+    const auto wmma16 = [&] { K::dense_group(dx, in, px.data(), count, R, nullptr, xt); };
     exact();
     wmma();
+    const auto x16_before = K::x16_calls.load(std::memory_order_relaxed);
+    if (x16) wmma16();
+    check(K::x16_calls.load(std::memory_order_relaxed) == x16_before + (x16 ? 1U : 0U), tag + " x16 dispatch count");
     ok(hipDeviceSynchronize(), "sync");
     for (unsigned i = 0; i < count; ++i) {
         const unsigned n = pr[i].n;
@@ -93,6 +109,11 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
             }
         }
         for (unsigned o = 0; o < n; ++o) guard = guard && yw[std::size_t{R} * n + o] == kGuard;
+        if (x16) {
+            std::vector<float> yx(yw.size());
+            ok(hipMemcpy(yx.data(), dyx[i], yx.size() * 4, hipMemcpyDeviceToHost), "yx");
+            check(std::memcmp(yx.data(), yw.data(), yx.size() * 4) == 0, tag + " x16 form same bits as the direct form (guard row too)");
+        }
         const double drift = std::sqrt(num / std::max(den, 1e-300)), contract = std::sqrt(cnum / std::max(cden, 1e-300));
         std::uint64_t fnv = 1469598103934665603ULL;  // FNV-1a of the output bytes, guard row included
         for (const float v : yw) {
@@ -108,14 +129,14 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
         check(drift < 2e-3, tag + " drift against the exact chains");
     }
     if (!timing) return;
-    std::vector<double> te, tw;
+    std::vector<double> te, tw, tx;
     for (unsigned rep = 0; rep < 9; ++rep) {
-        for (unsigned arm = 0; arm < 2; ++arm) {
+        for (unsigned arm = 0; arm < (x16 ? 3U : 2U); ++arm) {
             ok(hipDeviceSynchronize(), "sync");
             const auto a = std::chrono::steady_clock::now();
-            for (unsigned q = 0; q < 8; ++q) { if (arm) wmma(); else exact(); }
+            for (unsigned q = 0; q < 8; ++q) { if (arm == 2) wmma16(); else if (arm) wmma(); else exact(); }
             ok(hipDeviceSynchronize(), "sync");
-            (arm ? tw : te).push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count() / 8.0);
+            (arm == 2 ? tx : arm ? tw : te).push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count() / 8.0);
         }
     }
     double mac = 0;
@@ -123,6 +144,11 @@ void run_case(std::mt19937& rng, unsigned in, const std::vector<unsigned>& ns, u
     const double e = median(te), w = median(tw);
     std::printf("TIME %s exact %.3f ms (%.2f TMAC/s) kda-wmma %.3f ms (%.2f TMAC/s) ratio %.3f\n", tag.c_str(), e, mac / e * 1e-9, w,
                 mac / w * 1e-9, w / e);
+    if (x16) {
+        const double t = median(tx);
+        std::printf("TIME %s x16 (convert + column-fast WMMA) %.3f ms (%.2f TMAC/s) ratio-vs-exact %.3f ratio-vs-kda-wmma %.3f\n",
+                    tag.c_str(), t, mac / t * 1e-9, t / e, t / w);
+    }
 }
 }  // namespace
 
@@ -135,7 +161,10 @@ int main() {
             run_case(rng, 128, {4096}, R, false);           // f_b / g_b
         }
         run_case(rng, 128, {8192}, 513, false);
+        run_case(rng, 4096, {128, 128, 32}, 2049, false);  // x16 form, partial last row block (indexer / KDA shape)
+        run_case(rng, 4096, {128, 128, 64}, 4100, false);  // x16 form, 20 tiles -> 4-tile columns
         run_case(rng, 256, {48}, 33, false);  // 4-tile kernel only, dead tile
+        run_case(rng, 256, {48}, 2049, false);  // odd tile count: dense_x16_kernel<1>, partial row block
         const P::DenseProj bad{nullptr, 0, 24, nullptr};
         check(!K::supported(D::WType::F16, 4096, &bad, 1, 8), "ragged width is not supported");
         check(!K::supported(D::WType::BF16, 4096, &bad, 1, 8), "BF16 weights are not supported");
@@ -145,6 +174,9 @@ int main() {
         run_case(rng, 4096, {128, 128, 32}, 4096, true);
         run_case(rng, 128, {8192}, 4096, true);
         run_case(rng, 128, {4096}, 4096, true);
+        // Pair shapes (32 KDA heads per rank) at 8192 rows: regime of the in-app chunk when it is not split.
+        run_case(rng, 4096, {128, 128, 32}, 8192, true);
+        run_case(rng, 128, {4096}, 8192, true);
         for (void* p : allocs) (void)hipFree(p);
         std::printf("glm pf kda wmma: %u checks, %u failures\n", checks, failures);
         return failures ? 1 : 0;

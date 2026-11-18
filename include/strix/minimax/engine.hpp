@@ -39,6 +39,9 @@ struct Options {
     std::uint32_t slots = 1;        // independent sequences (decode rows), each with its own KV / index-key cache
     std::uint64_t capacity = 8256;  // positions per slot
     std::uint32_t max_rows = 4096;  // rows per forward call (prefill chunk / gate); sizes the activations
+    // Prefill unit cap in max_rows chunks; group width can cap it further and units may cross layer-cut blocks.
+    // 0 = STRIX_MM_PF_GROUP. Bit-neutral: chunk bits do not depend on the unit (strix/pair/prefill_group.hpp).
+    std::uint32_t unit_chunks = 0;
 };
 
 struct LoadReport {
@@ -90,6 +93,13 @@ public:
     // rows and arguments); step() of OTHER slots may run between two resumes, on both ranks in the same order. cancel
     // abandons it (the slot's caches are then partial). While open: no prefill / gate / copy_slot / state rows / set_taps.
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    using CutFetch = std::function<void(std::uint64_t row0, std::size_t rows, float* h_device_dst, hipStream_t)>;
+    // Fetches residual h at the cut. Caller retains fetched host rows until the stream has consumed them.
+    // link_relay: only rank 0 calls `fetch`; its rows reach rank 1 over the pair link in one control exchange per
+    // chunk, enqueued at the same point of the schedule on both ranks (before the chunk's first layer, so it is ordered
+    // with the layer collectives on the same stream). Bytes are those rank 0 fetched: no arithmetic change.
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                           unsigned first_layer, CutFetch fetch, bool link_relay = false);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
     using PfTaskId = std::uint64_t;
@@ -214,6 +224,26 @@ public:
     [[nodiscard]] bool prefill_index_tile() const;
     void set_prefill_msa_batch(bool on);  // STRIX_MM_PF_MSA_BATCH, default off; prefill only
     [[nodiscard]] bool prefill_msa_batch() const;
+    void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
+    [[nodiscard]] bool prefill_headless() const;
+    // STRIX_TP2_EXCHANGE_FMT (explicit FAST policy, resolved at construction): f16 = binary16 prefill exchange partials. At runtime
+    // (--ab x16fmt) only between f32 and a format resolved at load: set_prefill_exchange_f16(true) throws unless the
+    // process resolved f16 (its device partials and FAST policy exist). Both ranks must make the same calls.
+    void set_prefill_exchange_f16(bool on);
+    [[nodiscard]] bool prefill_exchange_f16() const;
+    void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
+    void set_prefill_flash_keys(unsigned mode);  // STRIX_MM_PF_FLASH_KEYS, default 2 (key halves): FAST flash key-load schedule (same bits)
+    unsigned prefill_flash_keys() const;
+    void set_prefill_rg_rows(unsigned rows);  // STRIX_MM_PF_MSA_RG_ROWS: 0 auto (8 dense windows, 4 sparse), 4, 8 (same bits)
+    unsigned prefill_rg_rows() const;
+    void set_prefill_msa_flash(unsigned mode);  // A/B only: the FAST flash mode (0 off, 1, 2, 3 row groups) of the flash layers
+    unsigned prefill_msa_flash() const;
+    unsigned prefill_flash_mode() const;  // effective FAST admission: 0 = declined, 1/2 = operand terms
+    std::array<std::uint64_t, 7> prefill_flash_launches() const;  // submissions: key schedules 0/1/2, modes 11/12, mode 13 rows 4/8
+    [[nodiscard]] bool prefill_dense_mlp() const;
+    [[nodiscard]] std::uint64_t prefill_dense_mlp_count() const;  // submitted dense MLP pieces; read between tasks
+    [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank
+    [[nodiscard]] std::size_t prefill_headless_expected(std::size_t rows) const;  // qualification target, independent of admission
     void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..10; prefill only, default 10
     [[nodiscard]] unsigned prefill_msa_rework() const;
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only
@@ -293,6 +323,10 @@ public:
     void set_shared_first(bool on);  // STRIX_MM_SHARED_FIRST: shared expert overlaps the route copy (same sums)
     [[nodiscard]] bool shared_first() const;
     void set_profiling(bool on);  // STRIX_MM_PROFILE: synchronised per-phase times (slows the run)
+    // Bench-only override of the split-producer chunk frames: -1 resolved policy (default), 0 off, 1 on at every row count.
+    // Both ranks must flip at the same step.
+    void set_split_frame(int mode);
+    [[nodiscard]] int split_frame() const;
     void set_trace(bool on);      // StepTrace of every decode step (events only, same bits)
     [[nodiscard]] const StepTrace& last_trace() const;
     // prefill exchange module (src/minimax/pfx): set before load() (it sizes the per-chunk buffers);

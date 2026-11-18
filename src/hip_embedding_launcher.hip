@@ -1,3 +1,5 @@
+#include "strix/hip_mtp_prime_rows.hpp"
+#include <type_traits>
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/hip_embedding_launcher.hpp"
@@ -137,20 +139,20 @@ EmbeddingWeightKind weight_kind(
     }
 }
 
-__device__ float bf16_to_float(
+__device__ __forceinline__ float bf16_to_float(
     std::uint16_t bits) {
     return __uint_as_float(
         static_cast<std::uint32_t>(
             bits) << 16U);
 }
 
-__device__ void store_output(
+__device__ __forceinline__ void store_output(
     float* destination,
     float value) {
     *destination = value;
 }
 
-__device__ void store_output(
+__device__ __forceinline__ void store_output(
     std::uint16_t* destination,
     float value) {
     const auto bits =
@@ -164,7 +166,7 @@ __device__ void store_output(
             rounded >> 16U);
 }
 
-__device__ std::uint8_t iq4_local_scale(
+__device__ __forceinline__ std::uint8_t iq4_local_scale(
     const IQ4XSBlock& block,
     std::uint32_t subblock) {
     const auto low_byte =
@@ -189,14 +191,14 @@ __device__ std::uint8_t iq4_local_scale(
 }
 
 template <EmbeddingWeightKind Kind>
-__device__ float load_weight(
+__device__ __forceinline__ float load_weight(
     const void* weights,
     std::uint32_t row_width,
     std::uint32_t row,
     std::uint32_t feature);
 
 template <>
-__device__ float load_weight<
+__device__ __forceinline__ float load_weight<
     EmbeddingWeightKind::f32>(
     const void* weights,
     std::uint32_t row_width,
@@ -213,7 +215,7 @@ __device__ float load_weight<
 }
 
 template <>
-__device__ float load_weight<
+__device__ __forceinline__ float load_weight<
     EmbeddingWeightKind::f16>(
     const void* weights,
     std::uint32_t row_width,
@@ -231,7 +233,7 @@ __device__ float load_weight<
 }
 
 template <>
-__device__ float load_weight<
+__device__ __forceinline__ float load_weight<
     EmbeddingWeightKind::bf16>(
     const void* weights,
     std::uint32_t row_width,
@@ -249,7 +251,7 @@ __device__ float load_weight<
 }
 
 template <>
-__device__ float load_weight<
+__device__ __forceinline__ float load_weight<
     EmbeddingWeightKind::q8_0>(
     const void* weights,
     std::uint32_t row_width,
@@ -274,7 +276,7 @@ __device__ float load_weight<
 }
 
 template <>
-__device__ float load_weight<
+__device__ __forceinline__ float load_weight<
     EmbeddingWeightKind::iq4_xs>(
     const void* weights,
     std::uint32_t row_width,
@@ -324,7 +326,7 @@ __device__ float load_weight<
 
 #define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
     template <>                                                                                   \
-    __device__ float load_weight<EmbeddingWeightKind::kind>(                                               \
+    __device__ __forceinline__ float load_weight<EmbeddingWeightKind::kind>(                                               \
         const void* weights, std::uint32_t row_width, std::uint32_t row, std::uint32_t feature) { \
         return hip_ggml::element<type>(weights, row_width, row, feature);                        \
     }
@@ -388,13 +390,24 @@ __global__ void device_token_embedding_kernel(
 // word with its out-of-vocabulary row-0 rule, or a host token already admitted by preflight).
 struct MtpEmbeddingRows { const std::uint32_t* token[8]; std::uint32_t value[8]; std::uint16_t* output[8]; };
 template <typename Output, EmbeddingWeightKind Kind>
+__device__ __forceinline__ void mtp_embedding_row_body(const void* weights,std::uint32_t row_width,
+    std::uint32_t id,Output* output) {
+    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         feature < row_width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        store_output(&output[feature], load_weight<Kind>(weights, row_width, id, static_cast<std::uint32_t>(feature)));
+}
+template <typename Output, EmbeddingWeightKind Kind>
 __global__ void mtp_embedding_rows_kernel(const void* weights, std::uint32_t row_width, std::uint32_t vocabulary_size,
     MtpEmbeddingRows rows) {
     const auto r = blockIdx.y;
     const auto id = rows.token[r] ? (*rows.token[r] < vocabulary_size ? *rows.token[r] : 0U) : rows.value[r];
-    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         feature < row_width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
-        store_output(&rows.output[r][feature], load_weight<Kind>(weights, row_width, id, static_cast<std::uint32_t>(feature)));
+    mtp_embedding_row_body<Output,Kind>(weights,row_width,id,rows.output[r]);
+}
+template <EmbeddingWeightKind Kind>
+__global__ void mtp_embedding_prime_rows_kernel(const void* weights,std::uint32_t row_width,std::uint32_t,
+    HipMtpEmbeddingPrimeRows rows) {
+    mtp_embedding_row_body<std::uint16_t,Kind>(weights,row_width,rows.value[blockIdx.y],
+        reinterpret_cast<std::uint16_t*>(rows.output[blockIdx.y]));
 }
 
 template <typename Output, EmbeddingWeightKind Kind>
@@ -1101,6 +1114,33 @@ void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,st
     }
     check_hip(hipGetLastError(),"MTP embedding batch launch");
 }
+namespace {
+template<class Rows> void enqueue_mtp_embedding_rows_to(const MtpNativeContext& c,const Rows& rows,unsigned count,void* stream) {
+    auto launch=[&]<EmbeddingWeightKind Kind>() {
+        if constexpr (std::is_same_v<Rows,MtpEmbeddingRows>) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_embedding_rows_kernel<std::uint16_t,Kind>),
+                dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads,count),
+                dim3(kThreads),0,reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
+                static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->vocab_size),rows);
+        } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_embedding_prime_rows_kernel<Kind>),
+                dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads,count),
+                dim3(kThreads),0,reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
+                static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->vocab_size),rows);
+        }
+    };
+    switch(weight_kind(c.tensors->embedding.manifest->ggml_type)) {
+    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
+    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
+    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
+    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
+    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+}
+}
 void launch_hip_mtp_embedding_rows_to(const MtpNativeContext& c,std::span<const std::uint32_t> tokens,
     std::span<std::uint16_t* const> outputs,void* stream) {
     if(tokens.empty() || tokens.size()>8U || outputs.size()!=tokens.size() || !stream)
@@ -1113,23 +1153,19 @@ void launch_hip_mtp_embedding_rows_to(const MtpNativeContext& c,std::span<const 
     }
     mtp_native::stream(c,stream);
     check_hip(hipGetLastError(),"MTP embedding row batch pending HIP error");
-    auto launch=[&]<EmbeddingWeightKind Kind>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_embedding_rows_kernel<std::uint16_t,Kind>),
-            dim3((static_cast<std::uint32_t>(c.model->hidden_size)+kThreads-1)/kThreads,static_cast<unsigned>(tokens.size())),
-            dim3(kThreads),0,reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c.tensors->embedding.runtime->address),
-            static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->vocab_size),rows);
-    };
-    switch(weight_kind(c.tensors->embedding.manifest->ggml_type)) {
-    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
-    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
-    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
-    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
-    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
-#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
-    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
-#undef STRIX_GGML_KIND_CASE
-    }
+    enqueue_mtp_embedding_rows_to(c,rows,static_cast<unsigned>(tokens.size()),stream);
     check_hip(hipGetLastError(),"MTP embedding row batch launch");
+}
+void launch_hip_mtp_embedding_prime_rows(const MtpNativeContext& c,std::span<const std::uint32_t> tokens,
+    HipMtpPrimeStride output,void* stream) {
+    if(tokens.empty() || tokens.size()>hip_mtp_prime_rows_max || !output.base || !output.stride || !stream)
+        throw std::invalid_argument("MTP embedding prime batch is invalid");
+    HipMtpEmbeddingPrimeRows rows{};rows.output=output;
+    for(std::size_t t=0;t<tokens.size();++t) {preflight_hip_mtp_embedding(c,tokens[t]);rows.value[t]=tokens[t];}
+    mtp_native::stream(c,stream);
+    check_hip(hipGetLastError(),"MTP embedding prime batch pending HIP error");
+    enqueue_mtp_embedding_rows_to(c,rows,static_cast<unsigned>(tokens.size()),stream);
+    check_hip(hipGetLastError(),"MTP embedding prime batch launch");
 }
 void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32_t* token,void* stream) {
     if(!token) throw std::invalid_argument("MTP device-token embedding requires a token word");

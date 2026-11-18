@@ -281,8 +281,9 @@ std::array<float, hc_copies> engram_gates(std::span<const float> stream, std::sp
 }
 
 void engram_inject(std::span<float> stream, std::span<const float> kv, std::span<const float> qn, std::span<const float> kn,
-                   float eps) {
-    const auto gates = engram_gates(stream, kv, qn, kn, eps);
+                   float eps, bool gate_off) {
+    auto gates = engram_gates(stream, kv, qn, kn, eps);
+    if (gate_off) gates.fill(0.0F);
     const std::size_t hidden = stream.size() / hc_copies;
     const float* value = kv.data() + hc_copies * hidden;
     for (std::uint32_t c = 0; c < hc_copies; ++c)

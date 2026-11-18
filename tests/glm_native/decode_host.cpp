@@ -1,20 +1,20 @@
 // CPU-only decode contract tests: no CUDA runtime, device or model data.
-#include "glm/rtxpf/producer/runtime.hpp"
-#include "glm/rtxpf/dsa_semantics.hpp"
-#include "glm/rtxpf/producer/decode_command.hpp"
-#include "glm/rtxpf/producer/session.hpp"
-#include "glm/rtxpf/producer/head_select.hpp"
-#include "glm/rtxpf/producer/expert_tier.hpp"
-#include "glm/rtxpf/producer/decode_timeline.hpp"
-#include "glm/rtxpf/c1_schedule.hpp"
-#include "glm/rtxpf/producer/schedule.hpp"
-#include "glm/rtxpf/producer/profile.hpp"
-#include "glm/rtxpf/producer/generate_request.hpp"
-#include "glm/rtxpf/producer/shards.hpp"
-#include "glm/rtxpf/producer/state_slices.hpp"
-#include "glm/rtxpf/producer/unit_file.hpp"
-#include "glm/rtxpf/producer/tierstream_binding.hpp"
-#include "glm/rtxpf/producer/unit_auth.hpp"
+#include "cuda/models/glm/producer/runtime.hpp"
+#include "cuda/models/glm/dsa_semantics.hpp"
+#include "cuda/models/glm/producer/decode_command.hpp"
+#include "cuda/models/glm/producer/session.hpp"
+#include "cuda/models/glm/producer/head_select.hpp"
+#include "cuda/models/glm/producer/expert_tier.hpp"
+#include "cuda/models/glm/producer/decode_timeline.hpp"
+#include "cuda/models/glm/c1_schedule.hpp"
+#include "cuda/models/glm/producer/schedule.hpp"
+#include "cuda/models/glm/producer/profile.hpp"
+#include "cuda/models/glm/producer/generate_request.hpp"
+#include "cuda/models/glm/producer/shards.hpp"
+#include "cuda/models/glm/producer/state_slices.hpp"
+#include "cuda/models/glm/producer/unit_file.hpp"
+#include "cuda/models/glm/producer/tierstream_binding.hpp"
+#include "cuda/models/glm/producer/unit_auth.hpp"
 #include <winioctl.h>
 #include <algorithm>
 #include <functional>
@@ -104,8 +104,10 @@ float row(unsigned i){return 1.f+float(i%7)*0.137f+float(i%3)*1.e-3f;}
 void kda_schedule_tests(){
     for(unsigned P:{0u,1u,30u,31u,32u,33u,62u,63u,64u,65u,96u}){
         check(kda_block_start(P)%32==0&&kda_block_start(P)+kda_open_rows(P)==P&&kda_replay_rows(P)==kda_open_rows(P)+1,"open-block arithmetic");
+        check(kda_block_start(P)==strix::chunk_contract::plan_call(0,P,kda_block,false).commit_end&&kda_open_rows(P)==strix::chunk_contract::plan_call(0,P,kda_block,false).carry_tokens,"KDA open block = chunk_contract plan_call");
         check(kda_promotes(P)==(P%32==31),"promotion at the block's 32nd row");
     }
+    check(kda_chunk_identity()=="glm-kda-b32+chunkinv-attn-state-v1/b32/s0","KDA chunk identity");
     bool naive_differs=false;
     for(unsigned N:{2u,31u,32u,33u,34u,63u,64u,65u,66u}){
         // Fresh prefill of rows [0,P): absolute B32 blocks; checkpoint = start of the open block.

@@ -2,8 +2,8 @@
 // GGUF files, the GPU decode of every 32-value group must equal the host decode bit for bit (the host decode equals the
 // host reference oracle: qwen_quant_host_test), and transcode::to_q8_0 must equal the same rule computed on the host.
 //   qwen_quant_device_test <file.gguf>...       (GPU; exit 0 = all equal)
-#include "strix/cuda_qwen_quant.cuh"
-#include "strix/cuda_qwen_transcode.hpp"
+#include "strix/cuda/qwen_quant.cuh"
+#include "strix/cuda/qwen_transcode.hpp"
 #include "strix/ggml_dequant.hpp"
 #include "strix/gguf_reader.hpp"
 
@@ -64,7 +64,16 @@ int main(int argc, char** argv) {
                         if (bad++ < 6) std::printf("DECODE DIFF %s row %llu group %u\n", t.name.c_str(), static_cast<unsigned long long>(r), g);
                     }
                 // Q8_0 transcode of the row vs the same rule on the host
+                strix::cuda::transcode::to_f32(d_raw, t.ggml_type, width, d_out, nullptr);
+                ck(cudaMemcpy(dev.data(), d_out, width * 4, cudaMemcpyDeviceToHost), "d2h production decode");
+                if (std::memcmp(host.data(), dev.data(), width * 4) != 0) {
+                    std::fprintf(stderr, "PRODUCTION DECODE DIFF %s row %llu host0 %.9g device0 %.9g\n", t.name.c_str(),
+                                 static_cast<unsigned long long>(r), static_cast<double>(host[0]), static_cast<double>(dev[0]));
+                    return 4;
+                }
+                ck(cudaMemset(d_q8, 0xA5, width / 32 * 34), "poison q8");  // an unwritten group cannot pass as zeros
                 strix::cuda::transcode::to_q8_0(d_raw, t.ggml_type, width, d_q8, nullptr);
+                ck(cudaDeviceSynchronize(), "q8 transcode");
                 std::vector<std::uint8_t> got(width / 32 * 34);
                 ck(cudaMemcpy(got.data(), d_q8, got.size(), cudaMemcpyDeviceToHost), "d2h q8");
                 for (std::uint32_t g = 0; g < groups; ++g) {
@@ -76,8 +85,13 @@ int main(int argc, char** argv) {
                     std::uint8_t want[34];
                     want[0] = static_cast<std::uint8_t>(h & 255U); want[1] = static_cast<std::uint8_t>(h >> 8U);
                     for (int j = 0; j < 32; ++j) want[2 + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(std::round(v[j] * id)));
-                    if (std::memcmp(want, got.data() + 34ULL * g, 34) != 0 && q8_bad++ < 6)
-                        std::printf("Q8 DIFF %s row %llu group %u\n", t.name.c_str(), static_cast<unsigned long long>(r), g);
+                    if (std::memcmp(want, got.data() + 34ULL * g, 34) != 0 && q8_bad++ < 6) {
+                        int at = 0;
+                        while (want[at] == got[34ULL * g + at]) ++at;  // first differing byte: 0-1 = FP16 scale, 2.. = quants
+                        std::printf("Q8 DIFF %s row %llu group %u byte %d want %u got %u (amax %.9g)\n", t.name.c_str(),
+                                    static_cast<unsigned long long>(r), g, at, want[at], got[34ULL * g + at],
+                                    static_cast<double>(amax));
+                    }
                 }
             }
             cudaFree(d_raw); cudaFree(d_out); cudaFree(d_q8);

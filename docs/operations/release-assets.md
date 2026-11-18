@@ -146,8 +146,8 @@ plans are not supplied by that bench asset set; add their explicit roles and
 trusted pins before claiming a complete serving release. Toolchain pins and
 bench-kit schema import/export coordination remain release work.
 
-As described in [reproduction prerequisites](../reproduce.md), the fetcher does
-not supply the locally distilled distill-g head. Its in-code size/hash pin agrees
-with this spec, but publication/access is still required. Never substitute the
+As described in [reproduction prerequisites](../reproduce.md), the distill-g head is
+published at [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) and the Qwen fetch recipe downloads it at a pinned revision, verified by its `SHA256SUMS`. Its in-code size/hash pin agrees
+with this spec and with the published file. Never substitute the
 base MTP asset. No full target/head verification was performed by the tiny CPU
 fixture tests; they also establish no model qualification.

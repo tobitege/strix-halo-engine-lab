@@ -191,13 +191,116 @@ __device__ __forceinline__ void relaxed_products(unsigned char* lds, const unsig
     }
 }
 
+// FP16 operands; row scaling is computed from this row alone, independent of batching.
+template<unsigned R>
+__device__ __forceinline__ void relaxed_f16_exponents(unsigned width,const unsigned* rows,unsigned count,
+    const signed char* codes,const float* deltas,int* exponents) {
+    const unsigned lane=threadIdx.x%32U,wave=threadIdx.x/32U;
+    for(unsigned r=wave;r<R;r+=8U) {
+        float mx=0;
+        if(r<count) for(unsigned k=lane;k<width;k+=32U)
+            mx=fmaxf(mx,fabsf(float(codes[static_cast<unsigned long long>(rows[r])*width+k]) *
+                deltas[static_cast<unsigned long long>(rows[r])*(width/32U)+k/32U]));
+        for(int d=16;d;d/=2) mx=fmaxf(mx,__shfl_xor(mx,d,32));
+        if(lane==0) exponents[r]=mx==0 ? 0 : max(0,ilogbf(mx)-14);
+    }
+    __syncthreads();
+}
+template<WeightFormat Format,unsigned R>
+__device__ __forceinline__ void relaxed_f16_products(unsigned char* lds,const unsigned char* weights,unsigned width,
+    const unsigned* rows,unsigned count,const signed char* codes,const float* deltas,const unsigned long long* grid,
+    float (&acc)[R/16U][2][8],const int* exponents) {
+    using namespace strix::moe_core;
+    auto* a=reinterpret_cast<A8F16Word8*>(lds);
+    const unsigned lane=threadIdx.x%32U,i16=lane%16U,h=lane/16U;
+    A8F16Float8 sums[R/16U][2]{};
+#pragma unroll 1
+    for(unsigned chunk=0;chunk<width/256U;++chunk) {
+        __syncthreads();
+        for(unsigned item=threadIdx.x;item<16U*R;item+=relaxed_threads) {
+            const unsigned r=item%R,kh=(item/R)%2U,g=8U*chunk+item/(2U*R);
+            A8F16Word8 v{};
+            if(r<count) {
+                const auto off=static_cast<unsigned long long>(rows[r])*width+32U*g+16U*kh;
+                const v4i packed=__builtin_bit_cast(v4i,GroupedF16Issue::load16<A8F16Word4>(codes+off));
+                const float delta=deltas[static_cast<unsigned long long>(rows[r])*(width/32U)+g];
+                const float inv=__uint_as_float(unsigned(127-exponents[r])<<23U);
+#pragma unroll
+                for(unsigned j=0;j<8U;++j) {
+                    const unsigned word=static_cast<unsigned>(packed[j/2U]),shift=16U*(j%2U);
+                    v[j]=a8_f16_pair((float(static_cast<signed char>(word>>shift))*delta)*inv,
+                        (float(static_cast<signed char>(word>>(shift+8U)))*delta)*inv);
+                }
+            }
+            a[item]=v;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for(unsigned gg=0;gg<8U;++gg) {
+            const auto raw=load_raw<Format>(weights,8U*chunk+gg);
+            A8F16Word8 own[2];
+            if constexpr(Format==WeightFormat::iq2_xxs) {
+                const unsigned aux0=static_cast<unsigned>(raw.aux),aux1=static_cast<unsigned>(raw.aux>>32U);
+                const float scale=half_bits(raw.d)*(0.5F+float(aux1>>28U))*0.25F;
+                // IQ2_XXS has three magnitudes. Form each FP32 value once, round once,
+                // select by the grid byte's high nibble (8,25,43 -> 0,1,2), then XOR sign.
+                const A8F16Table table(scale*8.0F,scale*25.0F,scale*43.0F,0.0F);
+#pragma unroll
+                for(unsigned l=0;l<4U;++l) {
+                    const unsigned long long magnitudes=grid[(aux0>>(8U*l))&255U];
+                    const unsigned signs=Ds41Decode::sign_byte(aux1>>(7U*l));
+#pragma unroll
+                    for(unsigned j=0;j<4U;++j) {
+                        const unsigned packed_codes=(static_cast<unsigned>(magnitudes>>(32U*(j/2U)))>>4U)&0x03030303U;
+                        const unsigned sg=signs>>(2U*j);
+                        const unsigned value=(j%2U==0) ? table.packed_pair<0>(packed_codes) : table.packed_pair<1>(packed_codes);
+                        own[l/2U][4U*(l%2U)+j]=value ^ (((sg&1U)<<15U)|((sg&2U)<<30U));
+                    }
+                }
+            } else {
+                const float d=half_bits(raw.dm&65535U),dm=half_bits(raw.dm>>16U);
+#pragma unroll
+                for(unsigned kh=0;kh<2U;++kh) {
+                    const unsigned sc=(raw.scales>>(8U*kh))&255U;
+                    const A8F16Table table(d*float(sc&15U),dm*float(sc>>4U));
+#pragma unroll
+                    for(unsigned j=0;j<8U;++j) {
+                        const unsigned w=(raw.q[4U*kh+j/2U]>>raw.shift)&0x03030303U;
+                        own[kh][j]=(j%2U==0) ? table.packed_pair<0>(w) : table.packed_pair<1>(w);
+                    }
+                }
+            }
+#pragma unroll
+            for(unsigned kh=0;kh<2U;++kh) {
+                A8F16Word8 swapped;
+#pragma unroll
+                for(unsigned j=0;j<8U;++j) swapped[j]=static_cast<unsigned>(other_half(static_cast<int>(own[kh][j])));
+#pragma unroll
+                for(unsigned mt=0;mt<R/16U;++mt) {
+                    if(16U*mt>=count) break;
+                    const A8F16Word8 av=a[(2U*gg+kh)*R+16U*mt+i16];
+#pragma unroll
+                    for(unsigned t=0;t<2U;++t)
+                        sums[mt][t]=A8F16Fragments::f16_wmma(av,(t==h)?own[kh]:swapped,sums[mt][t]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for(unsigned mt=0;mt<R/16U;++mt)
+#pragma unroll
+        for(unsigned t=0;t<2U;++t)
+#pragma unroll
+            for(unsigned e=0;e<8U;++e) acc[mt][t][e]=sums[mt][t][e]*__uint_as_float(unsigned(127+exponents[16U*mt+2U*e+h])<<23U);
+}
+
 // Gate/up: wave w = 2q + m (matrix m: gate, up; outputs 32 q .. of the block's 128).
 // Swap (STRIX_DS41_FAST_MOE_ORDER, default 1): the grid's x walks the output blocks and y the batches, so the output blocks of one
 // row group run together and share its activations and its expert's weights in the cache; only the block order changes.
-template <WeightFormat Format, bool Swap>
-__global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(PrefillGateUpView view) {
+template <WeightFormat Format, bool Swap, bool F16>
+__device__ __forceinline__ void relaxed_gate_up_body(PrefillGateUpView view) {
     const unsigned bx = Swap ? blockIdx.y : blockIdx.x, by = Swap ? blockIdx.x : blockIdx.y;
-    __shared__ __attribute__((aligned(16))) unsigned char lds[relaxed_lds_bytes];
+    __shared__ __attribute__((aligned(16))) unsigned char lds[F16 ? 32768U : relaxed_lds_bytes];
     __shared__ unsigned long long grid[Format == WeightFormat::iq2_xxs ? 256 : 1];
     __shared__ unsigned row_of[relaxed_rows], slot_of[relaxed_rows];
     RelaxedRows b;
@@ -213,8 +316,12 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(Prefil
     const unsigned out0 = by * 128U;
     const auto* weights = static_cast<const unsigned char*>(m == 0U ? view.gate : view.up) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(out0 + 32U * q + lane) * view.row_bytes;
+    __shared__ int exponents[relaxed_rows];
     float acc[relaxed_tiles][2][8];
-    relaxed_products<Format>(lds, weights, view.hidden, row_of, b.count, view.codes, view.deltas, grid, acc);
+    if constexpr(F16) {
+        relaxed_f16_exponents<relaxed_rows>(view.hidden,row_of,b.count,view.codes,view.deltas,exponents);
+        relaxed_f16_products<Format,relaxed_rows>(lds,weights,view.hidden,row_of,b.count,view.codes,view.deltas,grid,acc,exponents);
+    } else relaxed_products<Format>(lds, weights, view.hidden, row_of, b.count, view.codes, view.deltas, grid, acc);
     auto* values = reinterpret_cast<float(*)[128]>(lds);
     __syncthreads();
     if (m == 1U)
@@ -270,10 +377,10 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(Prefil
 // Down: wave w: outputs 32 w .. of the block's 256.
 // R: row groups of up to R rows; 32 (the default, STRIX_DS41_FAST_MOE_DOWN_ROWS=64 keeps 64) holds half the accumulators
 // and staged items of 64 and compiles without register spills. Each output's terms keep their order: the same bits.
-template <WeightFormat Format, bool Swap, unsigned R = relaxed_rows>
-__global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDownView view) {
+template <WeightFormat Format, bool Swap, unsigned R, bool F16>
+__device__ __forceinline__ void relaxed_down_body(PrefillDownView view) {
     const unsigned bx = Swap ? blockIdx.y : blockIdx.x, by = Swap ? blockIdx.x : blockIdx.y;
-    __shared__ __attribute__((aligned(16))) unsigned char lds[relaxed_down_lds_bytes];
+    __shared__ __attribute__((aligned(16))) unsigned char lds[F16 ? 512U*R : relaxed_down_lds_bytes];
     __shared__ unsigned slot_of[R];
     RelaxedRows b;
     if (!relaxed_rows_of<R>(view.routes, b, bx)) return;
@@ -286,7 +393,11 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDo
     float acc[R / 16U][2][8];
     const auto* tile_base = static_cast<const unsigned char*>(view.weights) + b.expert * view.expert_stride_bytes +
         static_cast<unsigned long long>(by) * 256U * view.row_bytes;
-    relaxed_products<Format, R>(lds, weights, view.width, slot_of, b.count, view.codes, view.deltas, nullptr, acc, tile_base, view.row_bytes);
+    __shared__ int exponents[R];
+    if constexpr(F16) {
+        relaxed_f16_exponents<R>(view.width,slot_of,b.count,view.codes,view.deltas,exponents);
+        relaxed_f16_products<Format,R>(lds,weights,view.width,slot_of,b.count,view.codes,view.deltas,nullptr,acc,exponents);
+    } else relaxed_products<Format, R>(lds, weights, view.width, slot_of, b.count, view.codes, view.deltas, nullptr, acc, tile_base, view.row_bytes);
 #pragma unroll
     for (unsigned mt = 0; mt < R / 16U; ++mt)
 #pragma unroll
@@ -297,3 +408,12 @@ __global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDo
                 if (r < b.count) view.out[static_cast<unsigned long long>(slot_of[r]) * view.outputs + first + 16U * t + i16] = acc[mt][t][e];
             }
 }
+
+template<WeightFormat F,bool S>
+__global__ __launch_bounds__(relaxed_threads) void relaxed_gate_up_kernel(PrefillGateUpView v) { relaxed_gate_up_body<F,S,false>(v); }
+template<WeightFormat F,bool S>
+__global__ __launch_bounds__(relaxed_threads) void relaxed_f16_gate_up_kernel(PrefillGateUpView v) { relaxed_gate_up_body<F,S,true>(v); }
+template<WeightFormat F,bool S,unsigned R=relaxed_rows>
+__global__ __launch_bounds__(relaxed_threads) void relaxed_down_kernel(PrefillDownView v) { relaxed_down_body<F,S,R,false>(v); }
+template<WeightFormat F,bool S,unsigned R=relaxed_rows>
+__global__ __launch_bounds__(relaxed_threads) void relaxed_f16_down_kernel(PrefillDownView v) { relaxed_down_body<F,S,R,true>(v); }

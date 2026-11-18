@@ -1,4 +1,5 @@
 #include "strix/ds41_expert_tp.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,7 +26,7 @@ float butterfly(std::array<float, lanes> v) noexcept {
 
 bool enabled_from_env() {
     static const bool on = [] {
-        const char* v = std::getenv("STRIX_DS41_EXPERT_TP");
+        const char* v = envcfg::text("STRIX_DS41_EXPERT_TP");
         return v != nullptr && v[0] == '1';
     }();
     return on;
@@ -39,7 +40,7 @@ void set_decode_default(bool on) { decode_default = on; }
 
 bool decode_enabled(std::uint32_t world, std::uint32_t moe_inter, bool stream_experts) {
     static const int env = [] {
-        const char* v = std::getenv("STRIX_DS41_EXPERT_TP");
+        const char* v = envcfg::text("STRIX_DS41_EXPERT_TP");
         return v == nullptr || v[0] == 0 ? -1 : v[0] == '1' ? 1 : 0;
     }();
     if (env >= 0) return env == 1;
@@ -55,7 +56,7 @@ void set_packed(int mode) { packed_override = mode; }
 bool packed_from_env() {
     if (packed_override >= 0) return packed_override == 1;
     static const bool packed = [] {
-        const char* v = std::getenv("STRIX_DS41_EXPERT_TP_LAYOUT");
+        const char* v = envcfg::text("STRIX_DS41_EXPERT_TP_LAYOUT");
         return !(v != nullptr && std::strcmp(v, "dup") == 0);
     }();
     return packed;

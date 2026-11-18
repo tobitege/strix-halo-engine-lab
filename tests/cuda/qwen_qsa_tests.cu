@@ -1,4 +1,4 @@
-// Bit-exact tests of src/cuda/qwen_qsa.cu (QSA layer core) against literal host references of the HIP kernels
+// Bit-exact tests of src/cuda/models/qwen/qwen_qsa.cu (QSA layer core) against literal host references of the HIP kernels
 // (src/hip_indexed_attention_launcher.hip). Usage: qwen_qsa_tests [--no-real] [--bench]
 //   tables: qrtx-build\tables (STRIX_QRTX_TABLES); RoPE table: qrtx-build\fx\rope_cs_262144.bin when
 //   present (else a synthetic cos/sin table: the kernels only consume it); GGUF via qwen_gguf_host.hpp.
@@ -18,8 +18,8 @@
 
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
-#include "strix/cuda_qwen_qsa.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_qsa.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 
 namespace q = strix::cuda::qwen_qsa;
 namespace am = strix::cuda::amdmath;
@@ -75,7 +75,7 @@ static float v_exp(float x) {
     const float f = static_cast<float>(r);
     if (mag < (102U << 23)) return f;
     if (auto it = exp_hard.find(b); it != exp_hard.end()) return u2f(it->second);
-    const std::uint32_t index = (b >> 31) * (25U << 23) + (mag - (102U << 23));  // as qwen_amd_math.cuh 95ac29be
+    const std::uint32_t index = (b >> 31) * (25U << 23) + (mag - (102U << 23));  // as amd_math.cuh 95ac29be
     return bit(exp_bits, index) ? other(f, r) : f;
 }
 static float v_rsq(float x) {

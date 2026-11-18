@@ -1,7 +1,7 @@
 # deepseek41 expert server and parts-host (strix/ds41-expert-rpc-v1)
 
 Status: implemented (wire, server loop, CPU reference and HIP backends, probe and exactness check); the CUDA parts-host
-side is `include/strix/cuda_ds41_parts_host*.hpp` / `src/cuda/ds41_parts_host*`. Numbers in this file are qualification evidence only where stated.
+side is `include/strix/cuda/ds41_parts_host*.hpp` / `src/cuda/models/ds41/ds41_parts_host*`. Numbers in this file are qualification evidence only where stated.
 
 ## Roles
 

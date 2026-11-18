@@ -1597,6 +1597,52 @@ void known_window_trellis_profile_tests(const strix::ModelContract& model) {
     }
 }
 
+// Issue 758: the six reported HTTP-serve rows on the Qwen3.8-Flash contract. Context is not an input of the
+// tiled-prefill workspace (the request carries T and the budget only), so rows differ by T and budget.
+// HTTP serving compiles with exact_memory=false: no QSA score ring, no terminal logits stripe, uniform
+// per-row arena. Admission holds iff that arena fits the budget, and a rejection names its terms.
+void known_prefill_issue758_tests(const strix::ModelContract& model) {
+    const auto fixture=make_known_fixture(model,0U,false,false,true);
+    constexpr std::uint64_t G=1ULL<<30, per_row=998400U;
+    const auto request=[](std::uint32_t rows,std::uint64_t budget,bool exact) {
+        // The command-line owner's field order (apps/hip_decode_token_main.cpp, known_prefill_plan).
+        return strix::KnownPrefillRequest{rows,true,true,true,false,strix::KnownWindowOutputPolicy::terminal_row,budget,G,
+            true,true,true,true,true,false,exact,true};
+    };
+    const auto rejection=[&](const strix::KnownPrefillRequest& q) -> std::string {
+        try { (void)strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,q); }
+        catch(const strix::KnownPrefillBudgetExceeded& e) { return e.what(); }
+        return {};
+    };
+    struct Row { std::uint32_t rows; std::uint64_t budget; bool admitted; };
+    // Row 1 ("automatic"): the server sizes its budget from the plan itself; the UMA ceiling bounds it.
+    for(const Row r:{Row{8192,120*G,true},Row{8192,4*G,false},Row{8192,64*G,true},Row{8192,16*G,true},Row{1024,8*G,true},Row{16,4*G,true}}) {
+        const auto q=request(r.rows,r.budget,false);
+        const auto why=rejection(q);
+        expect(why.empty()==r.admitted,"issue758: uniform HTTP arena admission matches T x per-row bytes against the budget");
+        if(r.admitted) {
+            const auto plan=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,q);
+            expect(!plan.external_qsa_score_bytes && !plan.terminal_logits_arena && plan.arena.physical.total_bytes==per_row*r.rows,
+                "issue758: HTTP owner keeps the uniform layout, T x 998400 bytes");
+        } else {
+            for(const char* term:{"known prefill workspace exceeds its explicit arena budget: T = 8192 needs 8178892800 bytes",
+                    "998400 per row","--known-prefix-workspace-budget-bytes 4294967296","layout uniform","QSA score ring off",
+                    "HTTP serving","largest row buffers: logits 993280"})
+                expect(why.find(term)!=std::string::npos,"issue758: workspace rejection names T, bytes, per-row bytes, budget, layout and largest buffer");
+        }
+    }
+    expect(rejection(request(8192,per_row*8192,false)).empty() && !rejection(request(8192,per_row*8192-1,false)).empty(),
+        "issue758: the uniform owner admits exactly its arena");
+    // The compact single-request owner: the packed-arena check reports its layout.
+    const auto compact=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request(8192,120*G,true));
+    expect(compact.external_qsa_score_bytes==262144U && compact.terminal_logits_arena,"issue758: single-request owner is compact");
+    const auto packed=rejection(request(8192,compact.arena.physical.total_bytes-1,true));
+    expect(packed.find("packed T-row arena")!=std::string::npos && packed.find("layout compact")!=std::string::npos &&
+        packed.find("needs "+std::to_string(compact.arena.physical.total_bytes)+" bytes")!=std::string::npos &&
+        packed.find("HTTP serving")==std::string::npos,"issue758: compact rejection names the packed arena and its layout");
+    expect(rejection(request(8192,compact.arena.physical.total_bytes,true)).empty(),"issue758: compact owner admits exactly its arena");
+}
+
 void known_window_qsa_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
@@ -2633,6 +2679,7 @@ int main() {
     known_window_lm_head_rows_tests(model);
     known_window_routed_union_runtime_tests(model);
     known_window_hyper_rows_tests(model);
+    known_prefill_issue758_tests(model);
     known_window_qsa_tests(model);
     known_window_trellis_profile_tests(model);
     known_window_qsa_bf16_indexer_tests(model);

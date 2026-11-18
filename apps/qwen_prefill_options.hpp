@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/eager_code_load.hpp"
 #include "strix/prefill_identity.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include <fstream>
@@ -11,38 +12,10 @@
 
 namespace strix::decode_cli {
 
-// An explicitly supplied HIP value always wins; the callback must not overwrite either.
-// Returns true when it set the value. The HIP runtime reads it while code objects register
-// during static initialization, so the caller restarts the process image for it to apply.
-template<class Get, class Put>
-inline bool apply_eager_code_loading(bool enabled, Get get, Put put) {
-    const char* policy = get("STRIX_EAGER_CODE_LOAD");
-    if (!enabled || (policy && policy[0] == '0') || get("HIP_ENABLE_DEFERRED_LOADING")) return false;
-    if (!put("HIP_ENABLE_DEFERRED_LOADING", "0"))
-        throw std::runtime_error("cannot configure HIP eager code loading");
-    return true;
-}
-// After a restart that failed: the image keeps deferred loading, so the value that apply_eager_code_loading
-// set must not stay behind (receipts, cache identities and child processes read the environment).
-template<class Erase>
-inline void withdraw_eager_code_loading(Erase erase) {
-    if (!erase("HIP_ENABLE_DEFERRED_LOADING"))
-        throw std::runtime_error("cannot withdraw HIP eager code loading");
-}
-
-// The restart must repeat the process's own arguments: a runner that wraps the decoder entry
-// forwards a reduced argv, and restarting with that would drop the runner's options.
-// Splits /proc/self/cmdline (NUL-terminated arguments); empty when the buffer is not complete.
-inline std::vector<std::string> split_process_arguments(std::string_view cmdline) {
-    std::vector<std::string> arguments;
-    if (cmdline.empty() || cmdline.back() != '\0') return arguments;
-    for (std::size_t begin = 0; begin < cmdline.size();) {
-        const auto end = cmdline.find('\0', begin);
-        arguments.emplace_back(cmdline.substr(begin, end - begin));
-        begin = end + 1U;
-    }
-    return arguments;
-}
+// Eager code loading lives in the shared start gate home (strix/device/eager_code_load.hpp); this engine resolves its
+// own policy (CodeLoad::engine) and calls the same functions.
+using ::strix::device::apply_eager_code_loading;
+using ::strix::device::split_process_arguments;
 
 // Shared by CLI receipts, host inspection and HTTP capability discovery.
 inline std::string prefill_identity_fields(unsigned mask, std::uint32_t qsa_budget = qsa_prefill_budget_active()) {

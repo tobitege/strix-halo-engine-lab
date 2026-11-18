@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "moe_core/route.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -1909,7 +1910,7 @@ void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext
 }
 void moe_route_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipMoeRouteLauncherConfig& config) {
-    if(segments.size()<2U || segments.size()>8U || config.hidden_size%kWaveRowsChunk || !config.wave_topk)
+    if(segments.size()<2U || segments.size()>kCohortWideMaxSessions || config.hidden_size%kWaveRowsChunk || !config.wave_topk)
         throw std::invalid_argument("wide router cohort geometry or topology differs");
     RouterCohortRowsArgs args{};
     const auto lead=prepare_router_rows(segments[0],config);

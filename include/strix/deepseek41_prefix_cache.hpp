@@ -259,6 +259,12 @@ struct PrefixNamespace {
 // STRIX_DS41_TRELLIS_SITES, STRIX_DS41_TRELLIS_MIX, STRIX_DS41_SHEXP_TP, STRIX_DS41_EP_MAP). expert_tp_decode: the decode
 // forward's identity (BatchForward::expert_tp()); the device prefill is expert parallel.
 [[nodiscard]] PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode);
+// Why the configured prefill cannot resume from a stored state (empty: it can). A namespace names the arithmetic of a
+// cold run; a state restored at P0 > 0, or the same prompt cut into other pieces, must continue with that arithmetic.
+// Not true today for FAST attention bf16flash-v1 (only a run from position 0 takes it) nor for FAST dense (its route
+// is chosen by the rows of each piece): the serve prefix and session caches stay off for them (ServeCachePolicy) until
+// their continuation is qualified.
+[[nodiscard]] std::string prefix_continuation_decline();
 // Identity of a model file and configuration for the disk tier: SHA-256 of the file size, its first 16 MiB (header,
 // metadata and tensor table), the layer count and the namespace text (hashing the whole file would take minutes).
 [[nodiscard]] std::array<std::uint8_t, 32> prefix_model_id(const std::filesystem::path& model, std::uint32_t layers, const PrefixNamespace& ns);

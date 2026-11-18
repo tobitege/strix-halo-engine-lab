@@ -13,6 +13,11 @@ instructions: [getting started](../../getting-started/README.md).
 
 ## Run
 
+**Weights:** [hyukudan/Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) (mirror of `unsloth/Qwen3.8-Flash-Next-GGUF`): the engine reads the
+`UD-Q4_K_XL` GGUF as published, merged into one file; opt-in levers only add device copies at load. The distilled
+Q8_0 MTP draft head is published at [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) (the mirror's base `MTP/*.gguf` is a different head).
+Files and revisions: [reproduce](../../reproduce.md#models-and-provenance).
+
 Recommended run: the plain command selects the production defaults, 256 tokens.
 
 ```sh
@@ -214,8 +219,22 @@ node decodes; 64 generated tokens identical to the node-only run at every length
 | Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Build |
 |---|---|---:|---:|---:|---:|---:|---|
 | Prefill, TTFT | 1 node | **0.77 s** | **2.42 s** | | **9.47 s** | **19.13 s** | main `85353311b`, plain command |
+| Prefill, TTFT | 1 node | | | **4.35 s** | | **17.7 s** | main `ae06f9466` / `e5886cb79`, engine command, warm |
+| Prefill, `fast` (opt-in; quality qualification in progress), TTFT | 1 node | | | **4.08 s** | | 16.59 s (one run) | same |
+| Pipelined prefill, TTFT | 2 nodes | | | 3.67 s (pipeline forced) | | **11.04 s** (one run) | main `e5886cb79` |
 | Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | `70b93af3` |
 | Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | same server build |
+
+**Measured on current main** (one node, engine command, real chat-template prompts, warm page cache): exact 8K 1,853-1,885 tok/s at
+1.19-1.25 M GPU clocks per token, 32K 1,845-1,856, 128K 1,755-1,762 (74.4-74.7 s); `--profile fast` (opt-in; quality qualification in progress; changes
+logits) 8K 1,971-2,008 at 1.10-1.17 M clocks per token, 32K 1,975. Two nodes, prompt pipelined over USB4 in 4,096-row
+chunks with the recurrent and attention state handed to rank 1: 32K 2,968 tok/s exact, 3,191 `fast` (1.60x one node),
+logits and the first token after the hand-off equal one node; two nodes spend 13-23 % more GPU clocks per token. Below
+28,672 prompt rows the pair runs the prompt on one node by default; the 8K pipeline figure (2,224-2,233 exact,
+2,381-2,389 `fast`) was measured with the pipeline forced. The server reads a prompt at 0.92 (1K / 8K) and 0.87 (32K)
+of the engine command's rate with identical output tokens; the difference is the MTP priming of the prompt rows, which
+the plain engine command does not run, plus a tile choice at 32K. Priming in 64-row groups (default since #585) cut
+the 8K priming lap from 450-461 to 418-434 ms.
 
 The offload compares against the same production server it forwards to (2,048-row prompt tiles), which reads
 prompts more slowly than the one-node prefill row above (automatic row tiles). At 32K the RTX path is 4.9× faster than

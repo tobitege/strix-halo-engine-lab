@@ -2,12 +2,20 @@
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/session/embed_splice.hpp"
+#include "strix/serve/prefill_group.hpp"
+#include "strix/prefill_dense_plan.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include "strix/lever_cache.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <span>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <array>
 #include <vector>
@@ -33,9 +41,26 @@ struct PrefillOptions {
     // FAST lever ds41-attn-f16wmma-v1 (STRIX_DS41_FAST_ATTN=1): non-exact f16 WMMA attention, prefill only, layers
     // [approx_layer_first, approx_layer_end); bf16_attention wins where both are set
     bool fast_attention = false;
+    // with fast_attention: FAST lever ds41-attn-bf16flash-v1 (STRIX_DS41_FAST_ATTN=2) instead of ds41-attn-f16wmma-v1:
+    // the shared sparse flash core on BF16 WMMA, one pass per product, keys from BF16 mirrors. Runs of a new prompt
+    // (start 0) require a multiple of 32 heads; extensions keep ds41-attn-f16wmma-v1.
+    bool fast_attention_flash = false;
     // FAST lever ds41-moe-relaxed-v1 (STRIX_DS41_FAST_MOE=1): routed experts in relaxed order. Read from the environment by
     // the MoE dispatch; set_precision_for_new_sequence applies an explicit value (quality arms).
     bool fast_moe = false;
+    bool fast_dense = false;  // FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE=1): dense Q8_0 x A8 products in one FP16 WMMA chain
+    // FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1, explicit, not in the FAST bundle yet): the Engram KV
+    // projection on the shared FP16 WMMA core; views with an x that would overflow FP16 keep the exact kernel.
+    // Resolved at construction (option OR environment), then passed per execution; the precision setter replaces it.
+    bool fast_engram = false;
+    // FAST lever ds41-shared-f16-v1 (STRIX_DS41_FAST_SHARED=1, explicit, not in the FAST bundle until its gate receipt): the
+    // shared expert's gate, up and down on the FAST dense core (FP16 WMMA, dense-q8a8-f16-v1) with the exact epilogue
+    // (swiglu_a8) between them, as the CUDA backend's FAST shared expert; calls under STRIX_DS41_FAST_DENSE_MIN_ROWS rows and
+    // views the core does not take keep the exact expert kernels. Resolved like fast_engram.
+    bool fast_shared = false;
+    // FAST lever ds41-moe-f16wmma-v1 (STRIX_DS41_FAST_MOE_F16=1, explicit; acts with fast_moe): the relaxed routed-expert kernels
+    // in their FP16-operand form (A8 rows and decoded weights rounded once to FP16, FP32 accumulation over the whole K).
+    bool fast_moe_f16 = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -61,7 +86,7 @@ struct PrefillOptions {
     std::uint32_t window_rows = 8;       // rows per attention window (1..attn::kMaxCallRows; also the unit of the row split)
     // rows per routed-MoE chunk (a multiple of chunk_rows; the expert weights are read once per chunk); world 2 sends
     // a chunk's half sums in pieces of chunk_rows rows on a communication stream while the next chunk runs
-    std::uint32_t moe_chunk_rows = 4096;
+    std::uint32_t moe_chunk_rows = 0;  // 0: automatic, starting at 4096; nonzero: hard upper bound
     std::uint32_t attention_lanes = 4;   // streams the windows of a chunk are spread over (index, select, attention)
     // world 2: tensor-parallel attention as the two-rank decode forward: rank r runs q_b of heads [32r, 32r + 32), their
     // attention, wo_a of o-groups [4r, 4r + 4) and wo_b's K-half r; the halves of every chunk are exchanged and
@@ -90,6 +115,11 @@ struct PrefillOptions {
     // the last row's logits depend on (ds41_prefill.hpp plan_suffix_replay); every result and the live attention state
     // equal those of a full prefill.
     bool cone = true;
+    // FAST policy ds41-decoder-replay-bounded-v1: the bound R (rows, a multiple of 128) of the next runs from position 0;
+    // 0 inherits STRIX_DS41_DECODER_REPLAY unless decoder_replay_override is set (explicit OFF).
+    // set_precision_for_new_sequence applies both fields (quality arms).
+    std::uint32_t decoder_replay_rows = 0;
+    bool decoder_replay_override = false;
     // rows of the drafter's seed (0: none): the last draft_rows rows of a run; the cone also covers them, and the run
     // keeps their inputs of the last three layers (both ranks hold every seed row; draft_seed())
     std::uint32_t draft_rows = 0;
@@ -115,6 +145,16 @@ struct PrefillOptions {
     // owned; the others are loaded as usual. Serving keeps one copy of the weights per node this way. The owner must
     // outlive the prefill.
     std::map<std::string, std::pair<const void*, std::uint64_t>> shared_weights;
+    // Group pass (run_group): sequence states for up to group_members fresh short sequences of at most group_rows rows
+    // each, beside the full-size one of run / extend. 0 = none (run_group throws; no memory). Serving sets them from its
+    // prefill group policy (serve::PrefillGroupPolicy max_members / short_rows); the CLI never groups (one prompt).
+    std::uint32_t group_members = 0;
+    std::uint32_t group_rows = 64;
+};
+
+// One member of a group pass: a fresh sequence from position 0 (no resume, no snapshot points, no splice).
+struct PrefillSegment {
+    std::span<const std::uint32_t> tokens;
 };
 
 // timing (diagnostic: the stream is synchronized around each part, which removes overlap across parts). attention
@@ -137,9 +177,33 @@ struct PrefillResult {
     std::vector<PrefillLayerTrace> trace; // options.trace
     std::vector<float> logits;        // last row (world 2 without gather_logits: this rank's slice, other entries zero)
     std::uint32_t next_token = 0;
+    std::uint32_t decoder_replay_rows = 0;  // resolved bound of this run; continuations report 0
+    bool decoder_replay_oracle = false;
     bool decoder_deferred = false;     // set_decoder_deferral admitted: no logits / next token / seed, decode state completed by the next run
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
     bool embed_dead_hash_checked = false, embed_image_router_checked = false; // verify_embed_extras evidence
+    // Local sampled evidence only: every observed image residual stays bitwise unchanged,
+    // and a text residual in the same run changes in at least one Engram layer.
+    // Missing local rows/layers are inconclusive, never a distributed qualification.
+    bool embed_image_engram_checked = false;
+    bool embed_engram_image_seen = false, embed_engram_text_seen = false;
+    bool embed_engram_image_kept = true, embed_engram_text_moved = false;
+    void observe_embed_engram(std::span<const float> image_before, std::span<const float> image_after,
+                             std::span<const float> text_before, std::span<const float> text_after) {
+        const auto same_bits = [](std::span<const float> a, std::span<const float> b) {
+            return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size_bytes()) == 0);
+        };
+        if (!image_before.empty()) {
+            embed_engram_image_seen = true;
+            embed_engram_image_kept = embed_engram_image_kept && same_bits(image_before, image_after);
+        }
+        if (!text_before.empty() && text_before.size() == text_after.size()) {
+            embed_engram_text_seen = true;
+            embed_engram_text_moved = embed_engram_text_moved || !same_bits(text_before, text_after);
+        }
+        embed_image_engram_checked = embed_engram_image_seen && embed_engram_image_kept &&
+                                     embed_engram_text_seen && embed_engram_text_moved;
+    }
     double seconds = 0.0, engram_seconds = 0.0, head_seconds = 0.0;
     double engram_wait_seconds = 0.0;  // overlapped Engram read: the part the run waited for (before the Engram layers)
     std::vector<PrefillLayerTiming> layers;
@@ -234,6 +298,7 @@ public:
     ~DevicePrefill();
     // The overlay's path, identity, tensor count, bytes and content FNV (empty without an overlay).
     [[nodiscard]] std::string overlay_description() const;
+    [[nodiscard]] std::filesystem::path overlay_path() const;  // effective loaded overlay, empty if absent
     DevicePrefill(const DevicePrefill&) = delete;
     DevicePrefill& operator=(const DevicePrefill&) = delete;
 
@@ -241,11 +306,19 @@ public:
     // must use separate precision identities. Intended for controlled quality comparisons.
     void set_precision_for_new_sequence(bool fp16_dense, bool bf16_attention);
     // The same, with every diagnostic/selection field of PrefillOptions (fp16_*, approx_*, null_ulp_layer, trace).
+    // Enabling flash prepares its mirrors before changing precision; allocation failure propagates.
+    // FAST dense/MoE overrides are process-wide: serialize this call with execution in all engine instances.
     void set_precision_for_new_sequence(const PrefillOptions& precision);
     // The exact dense selector for the next sequences (same bits either way; in-process A/B of its speed): on = every
     // exact dense call with the per-site form of STRIX_DS41_DENSE_TALL=auto and q_b / o_a on the dense kernel; off =
     // the loaded configuration (environment).
     void set_dense_select(bool on);
+    // The exact suffix replay (PrefillOptions::cone) for the next runs (same results either way). With quality_head_rows
+    // > 1 a cone run computes no teacher rows, only its last row's logits: the quality runner's gate mode prefills with
+    // the cone and teacher-forces the continuation (extend) without it.
+    void set_cone(bool on);
+    // Re-resolve the per-object STRIX_DS41_PREFILL_* / DENSE_* switches from the current environment and the construction options (resident runner arms); allocation and weight-layout switches are not touched.
+    void apply_levers();
     // The whole prompt from position 0 (a fresh sequence).
     PrefillResult run(std::span<const std::uint32_t> tokens);
     // The next piece of the same sequence: tokens at positions [rows so far, + tokens.size()), reading the attention
@@ -315,6 +388,81 @@ public:
     // export_state / export_state_at / state_hashes refuse and draft_seed is empty. STRIX_DS41_DEFER_DECODER=0: never admitted.
     void set_decoder_deferral(std::uint32_t next_rows);
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
+
+    // ---- group pass (PFFIX spec (a): several short prompts admitted together = ONE pass over the layers) ----
+    // The route class a fresh sequence of `rows` rows takes ALONE: every row-count threshold of the run that can change
+    // the bits (kernel / split / joint selection) evaluated on these rows. Prompts group only within one class (serve::
+    // plan_prefill_group, R1), and run_group forces that class instead of re-selecting it from the summed rows.
+    // Bits 0-1: row split / joint MoE; bits 8 and up: the member's dense route class (the interned arithmetic signature of
+    // its route plan, dense_plan(rows); 0..255 for 1..group_rows rows, kSoloRouteClass when it cannot be represented).
+    [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
+    static constexpr std::uint32_t kSoloRouteClass = 0x80000000U;  // a class no other prompt shares (stays solo)
+    // The dense route of every projection site (both ranks, every layer) of a fresh solo run of `rows` rows: the shared
+    // descriptor of the group pass and the bounded decoder replay (strix/ds41_dense_plan.hpp).
+    // Throws std::invalid_argument when rows exceeds a nonzero chunk_rows; multi-chunk runs are not represented.
+    [[nodiscard]] prefill_plan::DensePlan dense_plan(std::uint32_t rows) const;
+    [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
+    // Why options keep every prompt solo (nullptr: a group pass is supported). The FAST levers group (GRPFAST): flash
+    // attention runs on per-member BF16 mirrors, FAST dense keeps each member's solo route per site (the route plan,
+    // strix/ds41_dense_plan.hpp: a call's bits depend on its route and K split, never on its rows), the relaxed MoE's
+    // products are per row (grouping changes which rows share an expert's weights, not a row's sum); BF16 / f16wmma
+    // attention run per window on the member's own view. Still solo (limits of this implementation, not of the math):
+    //   fp16-solver-geometry-unpinned   the hipBLASLt FP16 backend picks its solver by the call's shape
+    //   diagnostic-output-not-segmented trace / stream hashes / routing loads / quality head rows / null ULP / embed extras
+    //                                   report one sequence's run
+    //   shared-fast-group-unqualified FAST shared expert retains its solo-only admission
+    //   moe-f16-fast-group-unqualified  FAST MoE FP16 operands (ds41-moe-f16wmma-v1) keep the solo-only admission they were
+    //                                   qualified under. PROVISIONAL (owner dspf2k): the row scaling is per row
+    //                                   (relaxed_f16_exponents, src/hip_ds41_prefill_relaxed.inl), so the fixture "group
+    //                                   member i == solo run i under FAST MoE F16" lifts it.
+    //   engram-fast-flag-per-view       FAST Engram (ds41-engram-f16wmma-v1) takes its exact fallback for a whole view when
+    //                                   any x of the view would overflow FP16 (one flag per view: engram_x_f16_scan,
+    //                                   src/hip_ds41_layer.hip enqueue_engram_f16_wmma); a group view spans members, so one
+    //                                   member's rows would change another's bits. PROVISIONAL (owner dspf2k): lifted by a
+    //                                   per-row flag + the fixture "group member i == solo run i under FAST Engram".
+    [[nodiscard]] static const char* group_decline_reason(const PrefillOptions& o) noexcept {
+        if (o.fp16_dense) return "fp16-solver-geometry-unpinned";
+        if (o.trace || o.stream_hashes || o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
+            return "diagnostic-output-not-segmented";
+        if (o.fast_shared) return "shared-fast-group-unqualified";
+        if (o.fast_moe_f16) return "moe-f16-fast-group-unqualified";
+        if (o.fast_engram) return "engram-fast-flag-per-view";
+        return nullptr;
+    }
+    [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept { return group_decline_reason(o) == nullptr; }
+    // The PrefillOptions part of the per-object lever resolution: the request's values, then the current environment
+    // (the FAST profile strix/ds41_fast_profile.hpp, STRIX_DS41_PREFILL_FP16_* / _BF16_ATTN / _APPROX_LAYERS). ONE
+    // resolver: Impl::resolve_levers (constructor and apply_levers) and the serve's group admission
+    // (apps/deepseek41_serve_main.cpp slot_prefill_options) call it, so a group decision taken before construction
+    // sees the options the object runs with (no group states, and no group_state_bytes in the serve's memory room, for
+    // options group_decline_reason refuses: FAST shared / MoE FP16 / Engram, FP16 dense). Throws on a malformed list.
+    static void resolve_option_levers(PrefillOptions& opts, const PrefillOptions& req);
+    [[nodiscard]] static PrefillOptions resolved_options(const PrefillOptions& req) {
+        PrefillOptions o = req;
+        resolve_option_levers(o, req);
+        return o;
+    }
+    // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
+    [[nodiscard]] std::uint32_t group_members() const noexcept;
+    [[nodiscard]] std::uint32_t group_rows() const noexcept;
+    // Run 2..group_members() fresh sequences (each 1..group_rows() rows, all of one route_class) as ONE pass: rows
+    // concatenated, every member's first row on an attention-window boundary; stateless work (hyper-connections, norms,
+    // projections, router, shared expert, MoE) once over all rows, stateful work (rings, caches, compressor carry, index
+    // count, Engram hashing, attention) per member on its own state; one exchange per layer per kind for the whole group;
+    // the head over the members' last rows in one launch. Result i equals run(segments[i].tokens) of a fresh sequence:
+    // logits, next_token and (export_state(i)) the attention state, bitwise. Levers that plan for one sequence (cone,
+    // decoder deferral, draft seed, snapshot points) are per member or off in a group pass (exact levers: same bits).
+    // World 2: both ranks call it with the same segments. Not during a task; afterwards the live sequence of run /
+    // extend is discarded (the next single-sequence operation must be run() or import_state()).
+    std::vector<PrefillResult> run_group(std::span<const PrefillSegment> segments);
+    // Member `segment` of the last run_group, as export_state() of its solo run (position = its rows).
+    [[nodiscard]] AttentionState export_state(std::size_t segment) const;
+    // Member `segment` of the last run_group: its draft seed (PrefillOptions::draft_rows), as draft_seed() of its solo run
+    // (its last min(draft_rows, rows) rows; first = rows - seed rows), valid until the next run. Empty for a missing member.
+    [[nodiscard]] DraftSeed draft_seed(std::size_t segment) const noexcept;
+    // Device bytes the group states and the group scratch of these options hold (0 when group_members is 0): memory admission
+    // adds them to the prefill's scratch estimate (serve::sched::prefill_piece_bytes covers the one-sequence buffers only).
+    [[nodiscard]] static std::uint64_t group_state_bytes(const PrefillOptions& options);
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
     // The bytes of weights a prefill with these options would load itself (not found in options.shared_weights; streamed
@@ -331,5 +479,58 @@ private:
     std::unique_ptr<PrefillTask> begin_from(std::span<const std::uint32_t> tokens, bool extend, const PrefillTaskOptions& task);
     std::unique_ptr<Impl> impl_;
 };
+
+inline void DevicePrefill::resolve_option_levers(PrefillOptions& opts, const PrefillOptions& req) {
+    opts.fp16_dense = req.fp16_dense;
+    opts.bf16_attention = req.bf16_attention;
+    opts.fast_attention = req.fast_attention;
+    opts.fast_attention_flash = req.fast_attention_flash;
+    opts.fp16_projections = req.fp16_projections;
+    opts.fp16_min_rows = req.fp16_min_rows;
+    opts.approx_layer_first = req.approx_layer_first;
+    opts.approx_layer_end = req.approx_layer_end;
+    opts.fp16_keep_a8 = req.fp16_keep_a8;
+    opts.fp16_fast = req.fp16_fast;
+    opts.fp16_wsplit = req.fp16_wsplit;
+    if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
+    if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
+    if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
+        opts.fast_attention = true;
+        if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
+    }
+    opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
+    opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
+    opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
+    static strix::lever_cache<bool> shared_on{[] { return ds41::fast_profile::shared_on(); }};
+    opts.fast_shared = req.fast_shared || shared_on.get();
+    opts.fast_moe_f16 = req.fast_moe_f16 || ds41::fast_profile::moe_f16_on();
+    // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
+    // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
+    // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
+        std::uint32_t mask = 0;
+        std::stringstream ss(e);
+        for (std::string t; std::getline(ss, t, ',');) {
+            if (t == "q_a") mask |= 1U;
+            else if (t == "kv") mask |= 2U;
+            else if (t == "q_b") mask |= 4U;
+            else if (t == "o_a") mask |= 8U;
+            else if (t == "o_b") mask |= 16U;
+            else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
+        }
+        opts.fp16_projections = mask;
+    }
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
+        opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
+        char* end = nullptr;
+        opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
+        if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
+        opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+    }
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
+}
 
 }  // namespace strix::deepseek41

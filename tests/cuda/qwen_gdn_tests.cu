@@ -1,9 +1,9 @@
-// Tests of the CUDA GDN prefill core (src/cuda/qwen_gdn.cu) against literal host references of the HIP kernels
+// Tests of the CUDA GDN prefill core (src/cuda/models/qwen/qwen_gdn.cu) against literal host references of the HIP kernels
 // (src/hip_gdn_launcher.hip :2750 gates, :2807 conv, :2896 lanes, :3000 norm) and, when present, the HIP step dump.
 //   qwen_gdn_tests [--tables DIR] [--no-real] [--replay-only] [--bench ROWS] [--fixture DIR]
 // Host references follow the HIP lane structure literally (256-lane chains + LDS/shuffle trees, permlanex16/DPP key sums,
 // the G=4 lanes recurrence with DPP row_xmask). Transcendentals come from a device oracle running the same
-// qwen_amd_math.cuh emulation (verified separately by qwen_amd_math_tests), so these tests check the arithmetic structure.
+// amd_math.cuh emulation (verified separately by qwen_amd_math_tests), so these tests check the arithmetic structure.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -17,8 +17,8 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_gdn.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_gdn.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 

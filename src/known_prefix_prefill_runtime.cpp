@@ -59,9 +59,9 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
     std::uint32_t pp_layers = 0;
     static const char* const pp_env = std::getenv("STRIX_QWEN_PF_LAYER_RANGE"); // R2-13: read once
-    if (pp_env) for (const auto& pp_source : serial.execution.steps)
+    if (pp_env || qwen_pp::pipe_step.active) for (const auto& pp_source : serial.execution.steps)
         if (pp_source.layer) pp_layers = std::max(pp_layers, *pp_source.layer + 1U);
-    const auto pp_range = qwen_pp::parse_range(pp_env, pp_layers);
+    const auto pp_range = qwen_pp::step_or_process_range(pp_env, pp_layers); // PR-3: the step's range when a step runs
     const char* pp_test_env = std::getenv("STRIX_QWEN_PF_SPLIT_TEST");
     const bool pp_test = pp_test_env && std::string_view(pp_test_env) == "1";
     if (pp_test && (!pp_range.enabled || pp_range.begin != 0 || pp_range.end != 24 || pp_layers != 48))
@@ -564,7 +564,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         if (pp_range.enabled && pp_range.end < pp_layers && !pp_test) {
             hooks.complete();
             session.state = result.execution.state;
-            if (qwen_pp::pipe_context.pipe) {
+            if (qwen_pp::pipe_context.pipe || qwen_pp::pipe_step.active) {
                 materialize(context(steps-1U,rows-1U),post-1U);
                 session.next_position = post;
                 session.committed_tokens = committed;

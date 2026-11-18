@@ -60,3 +60,15 @@ allow_pending_env = "STRIX_G4_PROFILE_ALLOW_PENDING"
 defaults = ["src/gemma4/engine/profile.cpp", "include/strix/profiles/gemma4.hpp"]
 apps = ["apps/gemma4_decode_main.cpp", "apps/gemma4_serve_main.cpp"]
 adapter = ["src/gemma4/model/description.hpp"]
+
+[models.qwen3_8_27b]
+name = "qwen3.8-27b"
+description = "models/qwen3.8-27b.toml"
+family = "qwen35"
+cmake = "STRIX_FAMILY_QWEN35"
+profile_tag = "qwen35"
+allow_pending_env = ""
+defaults = ["include/strix/qwen35/config.hpp"]
+apps = ["apps/hip_qwen35_decode_main.hip", "apps/hip_qwen35_spec_main.hip",
+        "apps/cuda_qwen35_decode_main.cu", "apps/cuda_qwen35_spec_main.cu", "tools/qwen35/ref_forward.py"]
+adapter = ["include/strix/qwen35/config.hpp"]

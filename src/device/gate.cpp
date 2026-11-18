@@ -1,4 +1,6 @@
 #include "strix/device/gate.hpp"
+#include "strix/device/process_budget.hpp"
+#include "strix/device/profiles.hpp"
 
 #include <cctype>
 #include <cstdio>
@@ -58,6 +60,16 @@ std::vector<Descriptor> other_units(const Declaration& declaration) {
 }
 
 [[noreturn]] void refuse(const std::string& why) { throw Refusal("device gate: refusing to start: " + why); }
+
+// Absent when nothing is declared, so a receipt without a profile keeps its bytes.
+bool budget_declared(const MemoryBudget& b) { return !b.profile.empty() || b.device_capped() || b.host_capped(); }
+std::string budget_text(const MemoryBudget& b) {
+    if (!budget_declared(b)) return {};
+    char text[160];
+    std::snprintf(text, sizeof text, " profile=%s budget_gib=%.2f/%.2f", b.profile.empty() ? "-" : b.profile.c_str(),
+                  b.device_capped() ? b.device_gib() : 0.0, b.host_capped() ? b.host_gib() : 0.0);
+    return text;
+}
 
 // Identity comparison of one declared entry against one enumerated device.
 enum class Match { none, yes, conflict };
@@ -171,6 +183,31 @@ Verdict classify(const Declaration& declaration, const Visible& visible) {
     return out;
 }
 
+namespace {
+const Descriptor* cpu_unit(const std::vector<Descriptor>& units) {
+    for (const auto& u : units)
+        if (u.kind == Kind::cpu) return &u;
+    return nullptr;
+}
+
+// The profile named on the command line replaces the entry's, and the memory every route plans for is resolved once.
+Bound finish(Bound bound, const Request& request) {
+    if (!request.profile.empty()) {
+        if (!find_profile(request.profile))
+            refuse("unknown device profile " + request.profile + "; known: " + profile_names());
+        if (request.profile == "custom") refuse("device profile custom needs memory_gib in the declaration entry");
+        bound.device.profile = request.profile;
+        bound.device.budget_bytes = 0;
+    }
+    try {
+        bound.budget = resolve_budget(bound.device, cpu_unit(bound.units), bound.visible.memory_bytes);
+    } catch (const std::invalid_argument& e) {
+        refuse(e.what());
+    }
+    return bound;
+}
+} // namespace
+
 Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, const Request& request) {
     const std::string vendor(vendor_name(request.vendor));
     std::vector<Visible> visible;
@@ -180,7 +217,7 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
 
     if (!declaration) {
         if (request.vendor == Vendor::amd && visible.size() == 1 && visible.front().integrated && request.select.empty())
-            return Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}};
+            return finish(Bound{implicit_integrated(visible.front()), visible.front(), "implicit", {}, {}}, request);
         std::string list;
         for (const auto& v : visible) list += (list.empty() ? "" : "; ") + describe(v);
         refuse("no device declaration was found, so every " + vendor +
@@ -208,10 +245,10 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
     };
     const auto bind = [&](std::size_t i) {
         if (!verdicts[i].eligible) refuse("device " + describe(visible[i]) + " is " + verdicts[i].reason + "." + listing());
-        Bound bound{*verdicts[i].declared, visible[i], declaration->source, other_units(*declaration)};
+        Bound bound{*verdicts[i].declared, visible[i], declaration->source, other_units(*declaration), {}};
         if (!request.role.empty())
             if (auto why = role_refusal(bound.device, request.role); !why.empty()) refuse(why + "." + listing());
-        return bound;
+        return finish(std::move(bound), request);
     };
 
     if (!request.select.empty()) {
@@ -219,6 +256,10 @@ Bound resolve(const Declaration* declaration, const std::vector<Visible>& all, c
         for (const auto& d : declaration->devices)
             if (d.id == request.select) wanted = &d;
         if (!wanted) refuse("device id " + request.select + " is not declared." + listing());
+        if (wanted->planned)
+            refuse("device id " + request.select + " is a planned shape (profile " + wanted->profile +
+                   (wanted->count > 1 ? ", count " + std::to_string(wanted->count) : std::string()) +
+                   ", no identity): it is sized by the planners and never bound." + listing());
         if (wanted->kind != Kind::gpu)
             refuse("device id " + request.select + " is a " + std::string(kind_name(wanted->kind)) + " unit, not a GPU." + listing());
         if (wanted->vendor != request.vendor) refuse("device id " + request.select + " is not a " + vendor + " device." + listing());
@@ -259,6 +300,7 @@ Environment read_environment() {
     Environment out;
     out.devices_path = env("STRIX_DEVICES");
     out.select = env("STRIX_DEVICE");
+    out.profile = env("STRIX_DEVICE_PROFILE");
     if (out.devices_path.empty()) {
         std::error_code ignored;
         if (const auto fallback = default_devices_path(); !fallback.empty() && std::filesystem::exists(fallback, ignored))
@@ -271,6 +313,7 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
     const auto environment = read_environment();
     const auto path = devices_path.empty() ? environment.devices_path : devices_path;
     if (request.select.empty()) request.select = environment.select;
+    if (request.profile.empty()) request.profile = environment.profile;
     request.vendor = enumerator.vendor();
     Declaration declaration;
     if (!path.empty()) {
@@ -280,7 +323,9 @@ Bound start_gate(Enumerator& enumerator, Request request, const std::string& dev
             refuse(std::string("the device declaration is not usable: ") + e.what());
         }
     }
-    return resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
+    auto bound = resolve(path.empty() ? nullptr : &declaration, enumerator.enumerate(), request);
+    process_device_budget_bytes().store(bound.budget.device_bytes);
+    return bound;
 }
 
 std::string units_text(const std::vector<Descriptor>& units) {
@@ -304,7 +349,8 @@ std::string receipt_line(const Bound& bound) {
     return "device: id=" + d.id + " vendor=" + std::string(vendor_name(v.vendor)) + " uuid=" + shown_uuid(v.vendor, v.uuid) +
            " pci=" + (v.pci.empty() ? std::string("-") : v.pci) + " name=\"" + v.name + "\" arch=" + (v.arch.empty() ? std::string("-") : v.arch) +
            " ordinal=" + std::to_string(v.ordinal) + " attach=" + attach_text(d.attach) + " roles=" + roles_text(d) +
-           " declared=" + bound.source + (bound.units.empty() ? std::string() : " units=" + units_text(bound.units));
+           " declared=" + bound.source + (bound.units.empty() ? std::string() : " units=" + units_text(bound.units)) +
+           budget_text(bound.budget);
 }
 
 namespace {
@@ -338,7 +384,12 @@ std::string receipt_json(const Bound& bound) {
     return "{\"id\":" + json_string(d.id) + ",\"vendor\":" + json_string(vendor_name(v.vendor)) +
            ",\"uuid\":" + json_string(v.uuid.empty() ? std::string() : shown_uuid(v.vendor, v.uuid)) + ",\"pci\":" + json_string(v.pci) +
            ",\"name\":" + json_string(v.name) + ",\"arch\":" + json_string(v.arch) + ",\"attach\":" + json_string(attach_text(d.attach)) +
-           ",\"roles\":" + json_string(roles_text(d)) + ",\"declared\":" + json_string(bound.source) + units_json(bound.units) + "}";
+           ",\"roles\":" + json_string(roles_text(d)) + ",\"declared\":" + json_string(bound.source) + units_json(bound.units) +
+           (budget_declared(bound.budget) ? ",\"memory_budget\":" + bound.budget.json() : std::string()) + "}";
+}
+
+MemoryBudget route_budget(const Bound& bound, const BudgetOverrides& overrides) {
+    return resolve_budget(bound.device, cpu_unit(bound.units), bound.visible.memory_bytes, overrides);
 }
 
 CommandLine take_command_line(int& argc, char** argv) {
@@ -348,6 +399,7 @@ CommandLine take_command_line(int& argc, char** argv) {
         std::string* target = nullptr;
         if (std::strcmp(argv[i], "--devices") == 0) target = &out.devices_path;
         else if (std::strcmp(argv[i], "--device-id") == 0) target = &out.select;
+        else if (std::strcmp(argv[i], "--device-profile") == 0) target = &out.profile;
         if (!target) {
             argv[kept++] = argv[i];
             continue;

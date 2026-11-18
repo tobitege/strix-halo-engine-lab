@@ -1,8 +1,8 @@
 // Exact GPU-vs-GPU gates and optional graph microbench of decode launch fusions.
 // STRIX_DS41_FIXTURE_GGUF=... ds41-dense-0-1-2-20.gguf; [--bench] [--overlay FILE]
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_layer_core.hpp"
-#include "strix/cuda_ds41_weights.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_layer_core.hpp"
+#include "strix/cuda/ds41_weights.hpp"
 
 #include <algorithm>
 #include <cstdio>

@@ -14,8 +14,11 @@ import tempfile
 PREFIX = 'hyukudan/'
 TRELLIS = 'DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3'
 QWEN = 'Qwen3.8-Flash-Next-GGUF-mirror'
+# The distill-g MTP draft head (the engine default), distilled from the mirror's base MTP head.
+QWEN_DRAFT = 'Qwen3.8-Flash-Next-MTP-distillG-Q8_0'
 UPSTREAM = {
     QWEN: 'unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee',
+    QWEN_DRAFT: 'hyukudan/'+QWEN_DRAFT,
     'deepseek-v4.1-flash-gguf-mirror': 'kyuz0/deepseek-v4.1-flash-gguf@20408f69',
     'GLM-5.3-Flash-exl3-mirror': 'turboderp/GLM-5.3-Flash-exl3@2a30229e (4.05bpw)',
     'MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror': 'Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw@c33e7a66',
@@ -29,6 +32,7 @@ U6 = 'DeepSeek-V4.1-Flash-1017-strix-dense-U6'
 # Every mirror is read at a fixed revision: its SHA256SUMS and the selected files come from the same commit.
 REVISION = {
     QWEN: 'b056e49fcdf2f3251f956c8a89512397e2d2470d',
+    QWEN_DRAFT: '1233b2ca95ed5d6f927a3573c3ce5838e52a33c7',
     'deepseek-v4.1-flash-gguf-mirror': '311b7b64963b8eaa38ef18800c62e8046fd44faf',
     'GLM-5.3-Flash-exl3-mirror': 'f162df61e2bbab8d5c626840f0e5b99c16c5ddc8',
     'MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror': '3534d6330ea6285fed2d50ac7f81d0eb5a201ac3',
@@ -50,6 +54,8 @@ def recipe(engine, profile):
         return jobs
     if engine == 'qwen':
         jobs = [(QWEN, '', ['MTP/*.gguf'] + ([] if profile == 'gsq' else ['UD-Q4_K_XL/*.gguf']))]
+        # Both profiles draft with distill-g; it lands beside the target. Its SHA256SUMS lists the GGUF and LICENSE.
+        jobs += [(QWEN_DRAFT, '', ['mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf'])]
         if profile == 'gsq': jobs += [('Qwen3.8-Flash-Next-GSQ-hybrid-Q2', '', ['hybrid-q2.gguf'])]
         return jobs
     patterns = ['*.safetensors', '*.json', '*.txt', '*.jinja', '*.model']
@@ -138,7 +144,7 @@ def main():
     if engine == 'qwen':
         if a.profile != 'gsq':
             if a.dry_run: command(['llama-gguf-split','--merge',a.model_dir/'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',a.model_dir/'Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf'],True)
-        print('Public MTP is the base sidecar; the default distill-g sidecar must be supplied separately. Do not rename base to distill-g.')
+        print('The mirror MTP/*.gguf is the base head; the default distill-g head is mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf (SHA-256 5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c). Do not rename base to distill-g.')
     if engine == 'deepseek-rtx': print('Supply a valid MODEL.receipt.json and exported STATE.bin separately.')
     return 0
 

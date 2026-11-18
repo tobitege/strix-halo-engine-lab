@@ -13,7 +13,9 @@ API routes) is host-only code with no GPU dependency; its contracts are tested w
 ## Starting the server
 
 Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP request (see
-[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](../speculative/mtp-native-cli.md)) plus:
+[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](../speculative/mtp-native-cli.md)) plus
+the flags below. The serve options can also come from a TOML file (`--serve-config FILE`, the command line wins,
+`--print-serve-config` shows the result): see [serve-config.md](serve-config.md).
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -198,6 +200,68 @@ configuration to serve with it. `--known-prefix-prefill-rows T` and its explicit
 win, including with that environment switch set. `--baseline` / `STRIX_BASELINE=1` suppresses
 the automatic T and the 1024-row checkpoint default. Inspect `--print-effective-config` for T,
 `serve_automatic_prefill` and `prefix_cache_block_rows`.
+
+An explicit tiled server owner keeps the uniform row layout: every one of its T rows holds its own
+logits and QSA block scores. The bounded QSA score ring and the terminal logits stripe belong to
+the single-request command (`compact_prompt_memory`) and are not command-line options. The server's
+workspace is therefore T times the per-row arena, independent of the context: on Qwen3.8 Flash
+the CPU plan test measures 998,400 bytes per row, i.e. 8,178,892,800 bytes at T = 8192 and
+1,022,361,600 bytes at T = 1024, so `--known-prefix-workspace-budget-bytes 4294967296` refuses
+T8192 and `8589934592` admits it. A refusal prints T, the bytes needed and per row, the budget,
+the layout and the largest row buffers. Prefer the automatic owner: omit the tiled flags and
+budgets, keep the MTP calibration, golden, sidecar, pins and window budgets, and read the
+`Qwen serve-prefill:` line printed at load for the reason whenever it declines. A server with
+low-level organization flags keeps their organization instead of the single-request decode
+profile; without them it takes that profile, which is qualified at context 8192, so a longer
+explicit `--context` also needs `--unqualified-context` (the single-request rule).
+
+### One node: explicit-sidecar MTP recipe
+
+The MTP target windows of a sidecar recipe (for example
+`recipes/qwen-distill-g-yarn.mtp-bundle.json`, passed as `--mtp` plus its pins) run on a fixed
+target organization, and the server checks it before loading the model, naming the missing
+flags: the D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
+flags (window hyper-mix), and `--virtual-q8-lm-head --prefetch-q8-lm-head` (the greedy window
+rows run on that LM head; the automatic owner adds the prefetch itself unless `STRIX_SERVE_ROUTE=0`,
+an explicit T needs it). Runs that build no window (`--mtp-golden-dump`, a fixed single-request
+session) are not held to the hyper-mix and LM-head checks.
+The calibration golden is dumped once with the tiled single-request command, so that its
+calibration rows are those the server replays (a golden from a non-tiled command is refused with
+`calibration row geometry differs`):
+
+```bash
+ORG=(--deferred-moe-status --virtual-q8-gdn-input --prefetch-q8-gdn-input
+  --virtual-q8-gdn-output --wave8-q8-gdn-input --wave8-q8-gdn-output
+  --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down
+  --parallel-hyper-mix --staged-hyper-projections --fused-staged-hyper-mix
+  --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output
+  --virtual-q8-lm-head --prefetch-q8-lm-head)
+# MTP=(--mtp ...the recipe's pins as flags...); IDS = the calibration token ids
+strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 --context 33280 "${MTP[@]}" "${ORG[@]}" \
+  --known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows 8192 \
+  --known-prefix-workspace-budget-bytes 8589934592 \
+  --known-prefix-host-metadata-budget-bytes 2147483648 \
+  --known-prefix-uma-budget-bytes 128849018880 \
+  --known-prefix-host-headroom-bytes 4294967296 \
+  --mtp-golden-dump GOLDEN            # prints mtp_golden_sha256
+STRIX_SERVE_T16K=0 strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 \
+  --context 33280 --http-batch 4 "${MTP[@]}" "${ORG[@]}" \
+  --mtp-golden GOLDEN --mtp-golden-sha256 SHA \
+  --http-serve --http-bind 127.0.0.1 --http-port 8082
+```
+
+On one 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target and the distill-G sidecar,
+the server line reads `Qwen serve-prefill: automatic T8192`, four slots are built and
+`strix serve: listening` follows after 37 s (first chat request answered; 34-94 s across the seven
+verified automatic and explicit-T starts). For an explicit T add
+`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T` with all four
+budgets: workspace at least T x 998,400 bytes (8,178,892,800 at T8192, so 4 GiB is refused
+with the message above and 8 GiB admits it), metadata
+2 GiB, UMA as above or the node's explicit value, host headroom 4 GiB. The headroom must cover the
+native prefill pools, about 2.5 GB at T16 and 3.6 GB at T8192; 1 GiB is refused with
+`known prefill native pools exceed --known-prefix-host-headroom-bytes; required N`.
+Explicit rows started this way: context 33,280 and 8,192 at T8192, 16,384 at T1024 and T16,
+8,192 at T16.
 
 GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
 IDs and committed target state matched; service/nesting also checked prompt state, and slots
@@ -507,6 +571,12 @@ with `input_schema`, `thinking` (`{"type":"enabled"}` or `{"type":"disabled"}`),
 `end_turn`, `max_tokens`, `stop_sequence` or `tool_use`. Streaming emits `message_start`,
 `content_block_start`, `content_block_delta` (`thinking_delta`, `text_delta`, `input_json_delta`),
 `content_block_stop`, `message_delta` and `message_stop`.
+
+### Ollama-compatible routes
+
+`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps` and `/api/version` run on the same chat and
+completions handlers (same prompt IDs, tokens, admission and counters as the equivalent OpenAI request), with NDJSON
+streaming and `{"error": ...}` bodies. See [ollama-api.md](ollama-api.md).
 
 ### Responses (stateless)
 
@@ -1278,6 +1348,25 @@ token 1.6 s against 1.8 s; one to four concurrent requests run the same order (n
 `STRIX_SERVE_ADMIT_FIRST_MIN_LIVE` moves the crossover and `STRIX_SERVE_ADMIT_FIRST_GAP_MS` the wait bound.
 `STRIX_DS41_SERVE_STEP_TRACE=1` prints one line per decode step, device prefill and held step. The rule is
 `serve::AdmitFirst` in `include/strix/serve/prompt_service.hpp`, engine neutral.
+
+**Prefill chunks grouped by the decode cohort.** A server that prefills a new prompt in chunks between decode rounds
+pays a cost per prefill call on top of the cost per token, so many small chunks cost more per token than a few large
+ones; a chunk also stalls every decoding request while it runs. `serve::PrefillInterleave`
+(`include/strix/serve/prefill_interleave.hpp`, engine neutral, pure arithmetic) sizes the chunk by the cohort: the
+first chunk of a prompt stays at the server's base chunk and measures the cost per token; later chunks group up to
+four base chunks while at most two requests decode, half as many for every doubling of the cohort. Grouping admission
+uses a 3 s stall estimate from the latest call, not a latency ceiling; the base is never reduced and costs can rise.
+The cap constrains grouping only: engines must safely split or validate base, unchunked and no-cohort calls that exceed it.
+A chunk of k base chunks is followed by k decode rounds, including across prompt completion before a queued successor
+prefills; debt is cleared when no decoder remains. GLM supplies a startup-captured dense-route guard: grouping must
+preserve the routes of the base calls and their tails, otherwise the group shrinks. Whole-prompt execution and separate
+tails retain their shape-dependent routes. This does not establish native numerical equality or timing qualification.
+The GLM-5.3 server uses it by default (see its model page for the measured
+gain); `STRIX_SERVE_PREFILL_INTERLEAVE=0` restores one base chunk per decode round,
+`STRIX_SERVE_PREFILL_INTERLEAVE_SCALE`, `_STALL_MS`, `_SMALL_COHORT` and `_ROUNDS=1` (one decode round per chunk)
+move the rule. `STRIX_SERVE_PREFILL_TIMELINE=1` prints one `prefill-timeline` line per chunked prompt: per chunk its
+tokens, the decoding requests, the call time, and the decode rounds and time before it. This optional diagnostic
+allocates and writes synchronously on the scheduler thread; a slow stderr consumer can perturb the measured workload.
 The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
 and cancellation are inspected between resumes. One indivisible unit, decode sweep,
 state import or allocation can exceed the target; it is not a latency guarantee.

@@ -25,12 +25,15 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
                  '805d28cb942d481051eff23bec9db3b6a33550029a3d8a36db643e9ab1ec81df'),
  'half_bits': ('__device__ __forceinline__ float half_bits(',
                '400a96d242e35c0e5c5ce571d9a3d961cfcc1b59e1ea3ed5164c16d5c9dc9b26'),
- 'transform_block': ('__device__ __forceinline__ void transform_block(',
-                     'b80294ea076bb566c207cb3d3cb7eb918c8cc9aade169887f76cff7802f4c567'),
+ # The three input-transform bodies now live in hip/weight/trellis_sources.hpp (the registered source) under the names
+ # input_block / input_values / input_registers; exl3_trellis.hpp keeps the old names as forwarders. The statements are the
+ # pinned ones (same text apart from the name and the core:: qualifier of hadamard128), pinned again at the new home.
+ 'transform_block': ('__device__ __forceinline__ void input_block(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin, unsigned lane) {' + chr(10) + '    float v[4];',
+                     'f0a904c17a3c1d19bae48f862e15bded7f34cbafd39e28fed8c7560714564948'),
  'transform_block_at': ('__device__ __forceinline__ void transform_block_at(',
                         'ca3ec83be67cae50e55a320ad27be0ed3024855645fc23af2641654ed3ee051e'),
- 'transform_block_values': ('__device__ __forceinline__ void transform_block_values(',
-                            '9d05fdb97c360160fc2c8c0e98fc4a01987b1695418105a95a26a006b12a3df3'),
+ 'transform_block_values': ('__device__ __forceinline__ void input_values(',
+                            'aecda516097e0174fe77fe1d1a9b228573425f7c4354c658410c211da64b5c51'),
  'hash16': ('template <std::uint32_t Multiplier> __device__ __forceinline__ std::uint32_t hash16(',
             'd7d2186bbf360419b55b3641173e4f7f3ac2bde1bb3ad5d3b09b9f91cc8f539c'),
  'mul1_pair': ('__device__ __forceinline__ Half2 mul1_pair(',
@@ -53,8 +56,8 @@ EXPECTED = {'Half2': ('using Half2 =', 'b6555aa71356cdb36d3994f7842cbe84710742e3
           '04ef312cc30c03ba24a21f800ab460a76af638be01bd2cbd6605bf4044b651a2'),
  'compute_slot': ('template <int Bits, int R>\n__device__ __forceinline__ void compute_slot(',
                   'cd8719287c82d138e57a9c9f63cea026a31c7dcd49ae64708d23ab5bd9989f69'),
- 'transform_values': ('__device__ __forceinline__ void transform_values(',
-                      '3bd06fa97279278867af1dee16c0283614519949ecd456df0713acd950f4bba7'),
+ 'transform_values': ('__device__ __forceinline__ void input_registers(',
+                      '6dcf0c390811cc273debc456729a317af305eb8ab02d9142f2dd5b9b392347a2'),
  'vector_splits': ('__host__ __device__ constexpr unsigned vector_splits(',
                    'b1df182d0fd0a443356251c8705c9b4e99a00906a4a2c631aa6017286848dcb2')}
 
@@ -86,25 +89,41 @@ DEVICE_BRANCH = re.compile(
     r"^#if defined\(__HIP_DEVICE_COMPILE__\)\n(.*?)^#else\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
 
 
+CAPTURE_HOOK = re.compile(
+    r"^#if defined\(STRIX_WFMT_CAPTURE\) && STRIX_WFMT_CAPTURE\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
+
+
 def device_view(source):
-    """Device-compiled text of declarations that also carry a host emulation."""
+    """Device-compiled text of declarations that also carry a host emulation (test-only capture hooks are no production text)."""
+    source = CAPTURE_HOOK.sub("", source)
     source = DEVICE_BRANCH.sub(r"\1", source)
     return source.replace("__host__ __device__ __forceinline__", "__device__ __forceinline__")
 
 
+SOURCE_DEPENDENCIES = {
+    'materialize': ('__device__ __forceinline__ float materialize(', 'ef6358e037a04bbd077ed8e912dd5d9bb742bf8ae79249d2b6d5094352f7b720'),
+    'half_bits': ('__device__ __forceinline__ float half_bits(', '400a96d242e35c0e5c5ce571d9a3d961cfcc1b59e1ea3ed5164c16d5c9dc9b26')
+}
+
 def main():
     adapter = (ROOT / "src/glm/moe/glm_trellis_device.hpp").read_text()
     # The codec primitives (hash16 .. TileStates) live in the shared codec header; moe_core re-exports them.
+    sources = device_view((ROOT / "src/hip/weight/trellis_sources.hpp").read_text())
+    moved = ("transform_block", "transform_block_values", "transform_values")
     shared = device_view((ROOT / "src/moe_core/exl3_trellis.hpp").read_text() +
                          (ROOT / "src/core/trellis_codec.hpp").read_text())
     imports = re.findall(r"^using strix::moe_core::(\w+);$", adapter, re.MULTILINE)
     assert sorted(imports) == sorted(EXPECTED), imports
     for name, (marker, expected) in EXPECTED.items():
-        actual = sha256(declaration(shared, marker).encode()).hexdigest()
+        actual = sha256(declaration(sources if name in moved else shared, marker).encode()).hexdigest()
         assert actual == expected, name + " original GLM declaration changed"
     for name, (marker, expected) in DEPENDENCIES.items():
         actual = sha256(declaration(shared, marker).encode()).hexdigest()
         assert actual == expected, name + " codec dependency changed"
+    # The moved bodies call helpers in their new namespace, not the old forwarder helpers.
+    for name, (marker, expected) in SOURCE_DEPENDENCIES.items():
+        actual = sha256(declaration(sources, marker).encode()).hexdigest()
+        assert actual == expected, name + " moved transform dependency changed"
     # Permit only imports in the adapter (the split policy is the shared one too).
     remainder = re.sub(r"//[^\n]*", "", adapter)
     remainder = re.sub(r"^using strix::moe_core::\w+;$", "", remainder, flags=re.MULTILINE)

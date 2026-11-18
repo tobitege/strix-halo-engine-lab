@@ -85,12 +85,21 @@ std::uint32_t parse_qwen_rope_yarn(std::string_view value) {
     if (value == "4") return 4;
     throw std::invalid_argument("--rope-yarn / STRIX_QWEN_ROPE_YARN must be off, 2 or 4");
 }
+std::uint32_t recommended_qwen_rope_yarn(std::uint64_t context) noexcept {
+    for (const std::uint32_t factor : {2U, 4U})
+        if (context > RotaryDescriptor::original_max && context <= RotaryDescriptor::original_max * factor) return factor;
+    return 0;
+}
 RotaryDescriptor validate_qwen_rotary_request(std::uint32_t factor,
     bool explicit_context, std::uint64_t context, bool baseline) {
     if (baseline) factor = 0;
     if (!factor) {
-        if (context > RotaryDescriptor::original_max)
-            throw std::invalid_argument("native rotary context cannot exceed 262144; --unqualified-context does not extend RoPE");
+        if (context > RotaryDescriptor::original_max) {
+            const auto recommendation = recommended_qwen_rope_yarn(context);
+            throw std::invalid_argument("native rotary context cannot exceed 262144; --unqualified-context does not extend RoPE; " +
+                (recommendation ? "experimental opt-in requires --rope-yarn " + std::to_string(recommendation) +
+                    " --context " + std::to_string(context) : "requested extent exceeds supported YaRN factors"));
+        }
         return RotaryDescriptor::native();
     }
     const auto descriptor = RotaryDescriptor::yarn(factor);

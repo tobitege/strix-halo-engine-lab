@@ -5,16 +5,16 @@
 // of the SwiGLU outputs) bitwise; timings alternate v1 / v2 per window, cold L2 (a 256 MB read before each) unless
 // cold = 0; GB/s = union experts' bytes / time.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_moe.hpp"
-#include "strix/cuda_ds41_moe_v2.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_router_v2.hpp"
-#include "strix/cuda_ds41_parts_host.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_moe.hpp"
+#include "strix/cuda/ds41_moe_v2.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_router_v2.hpp"
+#include "strix/cuda/ds41_parts_host.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/ds41_attention.hpp"
 #include "strix/ds41_layer.hpp"
-#include "../../src/cuda/ds41_moe_device.cuh"
+#include "../../src/cuda/models/ds41/ds41_moe_device.cuh"
 
 #include <cuda_runtime.h>
 

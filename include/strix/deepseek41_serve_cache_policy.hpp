@@ -18,6 +18,9 @@ struct ServeCachePolicy {
     bool set_cache_mb = false, set_reserve = false, set_disk_mb = false, set_dir = false;
     bool set_inrun = false, set_reach = false, set_session = false;
     bool no_cache = false, no_disk = false, no_before_tail = false, no_session = false, no_inrun = false;
+    // set before resolve(): why the prefill cannot resume a stored state (prefix_continuation_decline(); empty: it can).
+    // Non-empty turns every prefix tier off like --no-prefix-cache, whatever the flags; the caller prints the reason.
+    std::string continuation_decline;
 
     static bool takes_value(std::string_view s) {
         return s == "--prefix-cache-mb" || s == "--prefix-reserve-mb" || s == "--prefix-cache-disk-mb" ||
@@ -72,7 +75,7 @@ struct ServeCachePolicy {
             else if (!home.empty()) prefix_dir = std::string(home) + "/.cache/strix/ds41-prefix";
         }
         if (!prefix_dir.empty() && !set_disk_mb) prefix_disk_mb = 4096;
-        if (no_cache) {
+        if (no_cache || !continuation_decline.empty()) {
             prefix_cache_mb = prefix_disk_mb = 0;
             prefix_dir.clear();
             prefix_before_tail = prefix_session = prefix_inrun = false;

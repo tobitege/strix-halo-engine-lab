@@ -102,6 +102,10 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
 // one expert per block; same A8 activations, weight integers and group dots. Test override: 1 on, 0 off, -1 environment.
 void set_fast_moe(int mode);
 [[nodiscard]] bool fast_moe();
+[[nodiscard]] bool fast_moe_f16();  // ds41-moe-f16wmma-v1 (with fast_moe): the FP16-operand form of the relaxed down kernel
+// Metadata-only FP16 range bound of a host IQ2_XXS / Q2_K tensor (false: keep the relaxed integer kernels for it). Q2_K needs
+// |d| * 45 + |dmin| * 15 <= 65504, i.e. superblock scales near 1e3: never seen in a trained tensor (measured scales ~1e-3).
+[[nodiscard]] bool ds41_f16_moe_weights_fit(WeightFormat format, const void* host_data, std::uint64_t bytes);
 // Draft FAST_I4: original GGUF weights decoded in-kernel to IU4, A8 input
 // requantized to A4 per K32. Default OFF. STRIX_DS41_FAST_I4=1; scope
 // STRIX_DS41_FAST_I4_SCOPE=all (default) or gu. Separate numerical identity

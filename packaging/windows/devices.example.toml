@@ -1,0 +1,16 @@
+# Example GPU declaration (strix-devices-v1). The CUDA servers start only on a declared card, matched by UUID.
+# Copy to devices.toml in the same directory, put the UUIDs from `nvidia-smi -L`, and strix-start.ps1 passes it
+# with --devices. Rules and every key: docs/discrete-gpu.md ("Declare the GPU to use").
+schema = "strix-devices-v1"
+
+[devices.main]
+vendor = "nvidia"
+uuid = "GPU-00000000-0000-0000-0000-000000000000"
+roles = ["replica", "prefill"]
+
+# A card the servers must never use (e.g. the desktop GPU):
+# [devices.desktop]
+# vendor = "nvidia"
+# uuid = "GPU-11111111-1111-1111-1111-111111111111"
+# excluded = true
+# reason = "kept for the desktop"

@@ -39,10 +39,10 @@ the public numerical build recipe (`sm_120`, `--fmad=false`, precise div/sqrt,
 `/fp:strict`). Pass an absolute build directory to keep artifacts out of source:
 
 ```bat
-src\minimax\rtxpf\cuda\build_tests.bat BUILD_DIR
-src\minimax\rtxpf\cuda\build_bench.bat BUILD_DIR
+src\cuda\models\minimax\build_tests.bat BUILD_DIR
+src\cuda\models\minimax\build_bench.bat BUILD_DIR
 cuobjdump --dump-sass BUILD_DIR\mm_fp32_core_bench.exe > BUILD_DIR\core.sass
-python src\minimax\rtxpf\cuda\bench\count_core_sass.py BUILD_DIR\core.sass
+python src\cuda\models\minimax\bench\count_core_sass.py BUILD_DIR\core.sass
 ```
 
 The benchmark compares only v3 and v3.1, using production core dispatch and

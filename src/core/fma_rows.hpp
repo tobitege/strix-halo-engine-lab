@@ -15,6 +15,8 @@
 // NP > 1: one work group runs up to NP projections that share the activation tile (count <= NP).
 #include <hip/hip_runtime.h>
 
+#include "strix/hip/arch.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -347,7 +349,10 @@ inline void launch(const float* x, Weight wt, unsigned in, unsigned rows, Group 
 //     tile 0.91 / 0.72.
 enum class Form : unsigned { Auto = 0, Pipe128 = 1, Pipe64 = 2, PipeNp3 = 3, Xres16 = 4, Xres8 = 5, Xres4 = 6, Pipe128K16 = 7 };
 inline constexpr unsigned kFormCount = 8;
-inline constexpr unsigned kXresIn = 128, kLongRows = 4096, kFillGroups = 80, kComputeUnits = 40;
+inline constexpr unsigned kXresIn = 128, kLongRows = 4096, kFillGroups = 80;
+// CU count of the tuning target (gfx1151: 40); the selection below was measured there.
+inline constexpr unsigned kComputeUnits = strix::hip::arch::Tuning::value.compute_units;
+static_assert(kComputeUnits == 40U, "fma_rows selection is tuned for 40 CUs");
 
 constexpr bool form_admits(Form f, unsigned in, unsigned rows, unsigned count) {
     if (!admits(in, rows, 32) || count == 0 || count > kGroupMax) return false;

@@ -48,6 +48,13 @@ template <unsigned TC> __global__ __launch_bounds__(256) void dense_kernel(Args 
     core::f16_dense_tall::core<TC>(a.x, a.in, a.rows, Columns{a}, lds, core::f16_dense_tall::RawStore{}, a.skip_idle != 0U);
 }
 
+// x16 form (core X16Cols): A fragments from the shared FP16 k-tile-major tiles, column-fast; same bits as dense_kernel.
+template <unsigned TC> __global__ __launch_bounds__(256) void dense_x16_kernel(Args a, const _Float16* xt) {
+    __shared__ core::f16_dense_tall::Storage<TC> lds;
+    core::f16_dense_tall::core<TC>(a.x, a.in, a.rows, core::f16_dense_tall::X16Cols<Columns>{{a}, xt, a.rows}, lds,
+                                   core::f16_dense_tall::RawStore{}, a.skip_idle != 0U);
+}
+
 // True if the shapes fit the core (FP16 weights, in % 128 == 0, every n a positive multiple of 16).
 inline bool supported(dev::WType wt, unsigned in, const DenseProj* p, unsigned count, unsigned rows) {
     if (wt != dev::WType::F16 || count == 0 || count > kDenseGroupMax || rows == 0 || in == 0 || in % 128U) return false;
@@ -58,8 +65,13 @@ inline bool supported(dev::WType wt, unsigned in, const DenseProj* p, unsigned c
 }
 
 // y_i[r][o] for every projection i; the caller checked supported(). 16-tile CTA columns first, the remainder in
-// the column width core::f16_dense_tall::plan picks.
-inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigned count, unsigned rows, hipStream_t s) {
+// the column width core::f16_dense_tall::plan picks. With a workspace xt (core::f16_dense_tall::x16_bytes(rows, in))
+// and rows >= kX16Rows: x converted once to the core's x16 tiles, then ONE column-fast launch of x16_tc(tiles)-tile
+// columns (same bits; the 16-tile form put 32 CTAs on 40 CUs at 4096 rows and re-streamed FP32 x per launch).
+inline bool x16_form(const _Float16* xt, unsigned rows) { return xt != nullptr && rows >= core::f16_dense_tall::kX16Rows; }
+// `counter` counts the call for the caller's identity line (default: the KDA identity's).
+inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigned count, unsigned rows, hipStream_t s,
+                        _Float16* xt = nullptr, std::atomic<std::uint64_t>& counter = calls) {
     const bool tail = core::f16_dense_tall::tail_policy();
     Args a{x, in, rows, 0U, count, {}, tail ? 1U : 0U};
     unsigned tiles = 0;
@@ -68,6 +80,21 @@ inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigne
         tiles += p[i].n / 16U;
     }
     const unsigned gx = (rows + core::f16_dense_tall::kRows - 1U) / core::f16_dense_tall::kRows;
+    if (x16_form(xt, rows)) {
+        core::f16_dense_tall::enqueue_x16_tiles(x, xt, rows, in, s);
+        const unsigned tc = core::f16_dense_tall::x16_tc(tiles);
+        const dim3 grid(tiles / tc, gx);
+        switch (tc) {
+        case 4: dense_x16_kernel<4><<<grid, 256, 0, s>>>(a, xt); break;
+        case 2: dense_x16_kernel<2><<<grid, 256, 0, s>>>(a, xt); break;
+        default: dense_x16_kernel<1><<<grid, 256, 0, s>>>(a, xt); break;
+        }
+        const hipError_t e = hipGetLastError();
+        if (e != hipSuccess) throw std::runtime_error(std::string("glm pf kda wmma dense x16: ") + hipGetErrorString(e));
+        counter.fetch_add(1, std::memory_order_relaxed);
+        x16_calls.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const core::f16_dense_tall::Plan pl = core::f16_dense_tall::plan(tiles, rows, tail);
     if (pl.full) dense_kernel<16><<<dim3(gx, pl.full), 256, 0, s>>>(a);
     a.tile0 = pl.full * 16U;
@@ -80,7 +107,7 @@ inline void dense_group(const float* x, unsigned in, const DenseProj* p, unsigne
     }
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("glm pf kda wmma dense: ") + hipGetErrorString(e));
-    calls.fetch_add(1, std::memory_order_relaxed);
+    counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace strix::glm::pf::kda_wmma

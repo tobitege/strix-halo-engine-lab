@@ -10,7 +10,7 @@ const Bound& bind_hip(Request, const std::string&, std::FILE*) {
     throw Refusal("device gate: refusing to start: this build has no HIP runtime");
 }
 
-void bind_hip_main(int& argc, char** argv, std::FILE*) {
+void bind_hip_main(int& argc, char** argv, std::FILE*, CodeLoad) {
     try {
         (void)take_command_line(argc, argv);
     } catch (const std::exception& e) {

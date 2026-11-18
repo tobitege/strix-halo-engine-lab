@@ -80,16 +80,26 @@ struct FakeChannel {
     std::uint64_t sent_ = 0, received_ = 0;
     unsigned drains = 0;
     bool fail = false;
+    bool idle = true;
+    strix::xport::Stats totals{};
     explicit FakeChannel(Runtime& value) : runtime(value) {}
     const Options& options() const { return opt; }
     std::uint64_t sent() const { return sent_; }
     void* tx() { return txs[static_cast<std::size_t>(sent_ % opt.depth)].data(); }
     void send(std::size_t bytes, const InputTag& tag) {
         require(bytes && bytes <= opt.capacity, "invalid mock channel size");
+        idle = false;
         const auto slot = static_cast<std::size_t>(sent_++ % opt.depth);
         auto job = std::make_shared<Node>();
         job->deps = {runtime.tails[opt.stream], previous};
-        job->action = [this, slot, bytes] { std::memcpy(rxs[slot].data(), txs[slot].data(), bytes); };
+        job->action = [this, slot, bytes] {
+            std::memcpy(rxs[slot].data(), txs[slot].data(), bytes);
+            ++totals.exchanges;
+            totals.bytes += bytes;
+            totals.producer_wait += 1.0;
+            totals.wire += 2.0;
+            totals.check += 3.0;
+        };
         previous = job;
         runtime.nodes.push_back(job);
         wire.push_back(job);
@@ -104,7 +114,11 @@ struct FakeChannel {
         const auto slot = static_cast<std::size_t>(received_++ % opt.depth);
         return {rxs[slot].data(), received_, wire.at(static_cast<std::size_t>(received_))};
     }
-    void drain() { ++drains; runtime.run(); if (fail) throw std::runtime_error("CRC failure"); }
+    void drain() { ++drains; runtime.run(); if (fail) throw std::runtime_error("CRC failure"); idle = true; }
+    strix::xport::Stats stats() const {
+        require(idle, "Channel statistics read before successful drain");
+        return totals;
+    }
 };
 struct Legacy {
     const void* source = nullptr;
@@ -122,6 +136,37 @@ struct Legacy {
     void release_staged_ready(unsigned s) { release_staged(s); }
 };
 using Facade = strix::xport::ChannelCommunicator<FakeChannel, Legacy, Runtime>;
+void accounting_test() {
+    Runtime runtime;
+    FakeChannel channel{runtime};
+    Legacy legacy;
+    Facade facade(&legacy, &channel, runtime);
+    std::array<std::byte, 31> source{}, output{};
+    source.fill(std::byte{0x62});
+    std::uint64_t exchanges = 10, bytes = 20;
+    double seconds = 30.0;
+    auto account = [&](std::uint64_t count, std::uint64_t size, double producer, double wire, double check) {
+        require(channel.idle, "accounted before drain");
+        exchanges += count;
+        bytes += size;
+        seconds += producer + wire + check;
+    };
+    for (std::uint64_t step = 1; step <= 2; ++step) {
+        facade.exchange(0, source.data(), output.data(), source.size(), {});
+        facade.drain_and_account(account);
+        facade.drain_and_account(account);
+        require(output == source && legacy.calls == 0, "gather bypassed Channel or changed bytes");
+        require(exchanges == 10 + 3 * step && bytes == 20 + source.size() * step,
+                "Channel deltas lost or counted twice across leases");
+        require(seconds == 30.0 + 18.0 * static_cast<double>(step), "Channel elapsed components lost");
+    }
+    channel.fail = true;
+    facade.exchange(0, source.data(), output.data(), source.size(), {});
+    bool threw = false;
+    try { facade.drain_and_account(account); } catch (const std::runtime_error&) { threw = true; }
+    require(threw && exchanges == 16 && bytes == 82 && seconds == 66.0,
+            "failed drain sampled or published mutable statistics");
+}
 void lease_test() {
     Runtime runtime;
     FakeChannel channel{runtime};
@@ -239,7 +284,7 @@ void wire_test() {
 }
 }
 int main() try {
-    lease_test(); staged_and_seed_test(); legacy_and_failure_test(); ds41_adapter_test(); read_ahead_test(); wire_test();
+    accounting_test(); lease_test(); staged_and_seed_test(); legacy_and_failure_test(); ds41_adapter_test(); read_ahead_test(); wire_test();
     std::cout << "DS41 structure host tests: PASS (leases, wrap, chunks, seeds, fallback, failures, layer readiness, wire)\n";
     return 0;
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

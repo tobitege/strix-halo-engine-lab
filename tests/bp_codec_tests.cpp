@@ -188,7 +188,7 @@ std::string class_of(const std::string& name) {
     if (name.find("convolution") != std::string::npos) return "conv histories (bf16)";
     return "host words";
 }
-// The element width the producer uses (src/cuda/qwen_handoff.cpp, element_width).
+// The element width the producer uses (src/cuda/models/qwen/qwen_handoff.cpp, element_width).
 std::uint32_t width_of(const std::string& name) {
     return (name == "recurrent_matrix" || name == "ngram_history" || name == "position_history") ? 4U : 2U;
 }

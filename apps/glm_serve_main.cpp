@@ -47,8 +47,10 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
+#include "glm_auto_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "glm_rank_startup.hpp"
 #include "glm_rank_transport.hpp"
@@ -59,6 +61,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/glm_chat.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/serve/http_server.hpp"
 
@@ -96,6 +99,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -108,6 +112,8 @@ namespace rd = strix::glm::rank_defaults;
 namespace sp = strix::glm::spec;
 namespace gi = strix::glm::import;
 #include "glm_deploy.inc"
+
+using strix::glm::serve_prefill_interleave;  // apps/glm_route_levers.hpp: one definition for the live run and the dry run
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_signal{0};
@@ -405,6 +411,69 @@ struct EngineOps {
         }
         return b.y0;
     }
+    // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1): the chunked bootstrap above as one prefill_mtp session over
+    // [pos0, pos0 + tokens) paused at layer boundaries. `start` begins it (tokens sent once), every call runs at most
+    // `units` layer units; the call that completes the prompt seeds the slot as the `last` chunk does and returns y0,
+    // the others gs::kPrefillPending. Same pieces as the whole-prompt call, so its trunk rows and drafter pairs are the
+    // idle run's. `units` 0: cancel the session (a cancelled request).
+    std::uint64_t units_end = 0;  // the session's prompt end (the seed's position)
+    std::uint32_t prefill_units(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0, bool start,
+                                std::uint32_t units) {
+        if (units == 0) {
+            eng.prefill_mtp_cancel();
+            return gs::kPrefillPending;
+        }
+        plain_call();
+        if (start) {
+            if (bootstrap != sp::BootstrapPolicy::Chunked) throw std::logic_error("prefill units need the chunked MTP bootstrap");
+            if ((prefix_bootstrap_pending >> slot) & 1U) {
+                control.calibration = sp::Calibration{};
+                control.cycle = control.step = 0;
+                spec.at(slot) = {};
+                hp_row.at(slot) = 0;
+                prefix_bootstrap_pending &= ~(1U << slot);
+            }
+            if (pos0 == 0) {  // a new prompt: as sp::bootstrap
+                control.calibration = sp::Calibration{};
+                control.cycle = control.step = 0;
+            }
+            eng.prefill_mtp_begin(slot, tokens, pos0);
+            units_end = pos0 + tokens.size();
+        }
+        const std::uint64_t at = eng.prefill_units_done(), total = eng.prefill_units_total();
+        const bool finishing = at + units >= total;
+        const auto saved = eng.identity_mode();
+        eng.set_identity_mode(ge::IdentityMode::kR1);
+        ge::Engine::MtpPrefillOut b;
+        bool done = false;
+        try {
+            if (finishing) {
+                auto c = control.next(2);
+                done = eng.prefill_mtp_advance(units, c, b);
+                control.consume(c);
+            } else {
+                ge::Exchange::MergeCtl unused{};  // read only by the call that completes the prompt
+                done = eng.prefill_mtp_advance(units, unused, b);
+            }
+        } catch (...) {
+            eng.set_identity_mode(saved);
+            throw;
+        }
+        eng.set_identity_mode(saved);
+        if (done != finishing) throw std::logic_error("prefill units: completion differs from the unit arithmetic");
+        if (!done) return gs::kPrefillPending;
+        sp::Seed sd;
+        sd.y0 = b.y0;
+        sd.draft = b.mtp.id.at(0);
+        sd.confidence = b.mtp.confidence;
+        sd.hp = b.hp;
+        sd.flagged = b.mtp.flagged;
+        sd.p = units_end;
+        seed = sd;
+        seed_slot = slot;
+        seed_slot_spec(slot, sd);
+        return b.y0;
+    }
     // import: the payload staged under `id` (the RTX producer's per-rank state at frontier P = |tokens| - 1, the
     // Engine::restore_state layout), then the last prompt token through the same call the slot's own prefill makes for
     // it (prefill at P, or the MTP bootstrap from P with its seed kept). Returns the first generated token.
@@ -458,6 +527,9 @@ struct EngineOps {
     // 'DSA once' (--import-dsa-once on every rank): the receivers expect hand-off version 2 and import_state relays rank
     // 0's DSA components to rank 1 (relay: one pair exchange; layout: the full per-rank component list at frontier P).
     bool dsa_once = false;
+    // Index tail (--import-index-tail on every rank: hand-off v3/v4): the DSA index key / gate arrive as the open pool
+    // block only and restore_state leaves the closed blocks' rows at their reset value (never read).
+    strix::state::RawRows index_rows = strix::state::RawRows::full;
     std::function<void(std::span<const std::byte> local, std::span<std::byte> remote, std::uint64_t seq)> relay{};
     std::function<std::vector<gs::StateComponent>(std::uint64_t frontier, std::uint64_t total)> state_layout{};
     std::size_t relay_chunk = 0;
@@ -528,8 +600,8 @@ struct EngineOps {
             },
             [&] {
                 t0 = std::chrono::steady_clock::now();
-                if (!merged.empty()) eng.restore_state(slot, merged, p);
-                else eng.restore_state(slot, mine, p);
+                if (!merged.empty()) eng.restore_state(slot, merged, p, index_rows);
+                else eng.restore_state(slot, mine, p, index_rows);
                 t1 = std::chrono::steady_clock::now();
             },
             [&]() -> std::uint32_t {
@@ -778,6 +850,8 @@ int main(int argc, char** argv) {
         bool import_gate_on = false;          // --import-gate given (an empty list is a gate that FAILs, not serving)
         unsigned import_gate_tokens = 64;
         bool import_dsa_once = false;         // every rank: hand-off v2, rank 0 relays the DSA components to rank 1
+        int import_dsa_once_cli = -1;         // --import-dsa-once 1 / --no-import-dsa-once 0; resolved below
+        bool import_index_tail = false;       // every rank: hand-off v3/v4, DSA index key/gate as the open pool block only
         std::vector<std::string> rank_args;  // the options the rank defaults depend on (rd::scan)
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -796,10 +870,17 @@ int main(int argc, char** argv) {
             else if (a == "--baseline") rank_args.push_back(a);
             // Product profile: resolved by the shared resolver in rd::scan, the same rule as strix-glm5-rank.
             else if (a == "--allow-pending") rank_args.push_back(a);
+            else if (const std::string key = a.substr(0, a.find('='));
+                     key == strix::profile::turbo::kWeightsOption || key == strix::profile::turbo::kBitsOption ||
+                     key == strix::profile::turbo::kPackOption) {  // the same weight toggle as strix-glm5-rank
+                // Both spellings, as strix::profile::take_options reads them: "--opt VALUE" and "--opt=VALUE".
+                rank_args.push_back(a);
+                if (key.size() == a.size()) rank_args.push_back(next());
+            }
             else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
                 const std::string name = a == "--profile" ? next() : a.substr(10);
                 if (!strix::profile::is_name(name))
-                    throw std::invalid_argument("--profile must be default, fast or quality (got '" + name + "')");
+                    throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + name + "')");
                 rank_args.push_back("--profile");
                 rank_args.push_back(name);
             }
@@ -846,7 +927,9 @@ int main(int argc, char** argv) {
                 import_gate_on = true;
             }
             else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
-            else if (a == "--import-dsa-once") import_dsa_once = true;
+            else if (a == "--import-dsa-once") import_dsa_once_cli = 1;
+            else if (a == "--no-import-dsa-once") import_dsa_once_cli = 0;
+            else if (a == "--import-index-tail") import_index_tail = true;
             else if (strix::session::speculation_opt_out_argument(a)) serve_mtp = false;
             else throw std::invalid_argument("unknown option " + a);
         }
@@ -862,6 +945,16 @@ int main(int argc, char** argv) {
         if (opt.capacity == 0 || opt.capacity % 4 != 0) throw std::invalid_argument("--capacity must be a positive multiple of 4");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
+        {
+            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in state_decls.hpp): the
+            // flag, then STRIX_HANDOFF_SHARED_ONCE, then the family default (DSA once, v2: the same bytes, relayed). The
+            // automatic default applies where v2 runs (import receiver on, a pair); an explicit request elsewhere refuses below.
+            namespace ps = strix::pair::state;
+            const ps::Resolved owners = ps::resolve(ps::decl::glm, import_dsa_once_cli, -1);
+            import_dsa_once = import_dsa_once_cli == 1 || (owners.shared_once && import_dsa_once_cli != 0 && !import_listen.empty() && opt.world == 2);
+            if (owners.prefix_first && !import_listen.empty())
+                std::printf("serve import: STRIX_HANDOFF_PREFIX_FIRST is not bound on the GLM import route yet (imports skip the prefix cache)\n");
+        }
         if (import_gate_on && import_gate.find_first_not_of(',') == std::string::npos)
             return import_gate_empty(import_gate);  // --import-gate "" or ",": an explicit empty suite FAILs before loading
         if (import_gate_on && (opt.rank != 0 || rtx_prefill.empty()))  // before the follower dispatch: rank 1 must not exit 0
@@ -872,20 +965,10 @@ int main(int argc, char** argv) {
         if (selftest > 32) throw std::invalid_argument("--selftest N: 1..32");
 
         // Engine configuration: the rank app's resolution of a normal decode (MTP self-speculation and its exact chunked
-        // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). No decode
-        // handshake here (both ranks resolve on their own and hello compares the result), so automatic max-rows takes its
-        // fixed fallback.
-        rank_args.push_back("--decode");
-        rank_args.push_back("1");
-        if (!serve_mtp) {
-            rank_args.push_back("--mtp-spec");
-            rank_args.push_back("0");
-        }
-        const auto request = rd::scan(rank_args);
-        auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
-        rd::fallback_without_handshake(eff, request, rd::process_env());
+        // bootstrap when the model has a complete MTP head; STRIX_GLM_SERVE_MTP=0 resolves as --mtp-spec 0). Automatic
+        // max-rows runs the CLI's load-time admission (rd::admit_auto_rows) and a row merge between the two ranks.
+        auto eff = rd::resolve_serve(rank_args, serve_mtp, rd::process_env(), rd::probe_model_mtp(argv[1]));
         const bool mtp_on = eff.mtp_spec.value == "1" && (eff.prefill == "gemv" || eff.prefill == "ref");
-        if (rd::max_rows_auto(eff)) eff.max_rows = {std::to_string(rd::kFallbackMaxRows), "auto-4096-serve"};
         if (!deployment.file.empty() || deployment.check) {
             opt.mtp = mtp_on; opt.spec = mtp_on;
             std::string refusal;
@@ -897,12 +980,18 @@ int main(int argc, char** argv) {
         }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
-            {   // Dry run: the shared chunk resolver over the resolved (not yet applied) environment.
-                const auto chunk = strix::glm::pending_prefill_chunk(
-                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
-                    [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
+            {   // Dry run: the shared chunk and interleave resolvers over the resolved (not yet applied) environment,
+                // so app-set values (STRIX_GLM_PF_EXACT_X, STRIX_GLM_PF_PIPELINE) count as in the live run.
+                const auto apply_pending = [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); };
+                const unsigned rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+                const auto chunk = strix::glm::pending_prefill_chunk(prefill_chunk_explicit, prefill_chunk, opt.world, rows, eff.prefill,
+                                                                     apply_pending);
                 std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
                 prefill_chunk = chunk.tokens;
+                const strix::glm::PendingEnv pending(apply_pending);
+                const unsigned pipeline = strix::glm::xfer::prefill_pipeline(opt.pf_pipeline, pending("STRIX_GLM_PF_PIPELINE"));
+                std::fputs(("effective serve-" + serve_prefill_interleave(eff.prefill, rows, pipeline, pending).describe(prefill_chunk) + "\n").c_str(),
+                           stdout);
             }
             std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
@@ -910,8 +999,9 @@ int main(int argc, char** argv) {
                         mtp_on ? "on" : "off", eff.kmax, eff.adaptive ? 1 : 0, mtp_cycles);
             // The RTX import route (FAST identity glm-pf-rtx-native-v1: imported prompts are not bitwise the pair's own
             // prefill; off unless --rtx-prefill / --import-listen are given).
-            std::printf("serve import-route=%s import-listen=%s wire=v%u identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
-                        import_listen.empty() ? "off" : "on", import_dsa_once ? 2U : 1U,
+            std::printf("serve import-route=%s import-listen=%s wire=v%u index-rows=%s identity=%s\n", rtx_prefill.empty() ? "off" : "rtx",
+                        import_listen.empty() ? "off" : "on", gi::wire_version(import_dsa_once, import_index_tail),
+                        import_index_tail ? "open_tail" : "full",
                         rtx_prefill.empty() && import_listen.empty() ? "exact" : "exact+FAST(glm-pf-rtx-native-v1, imported prompts)");
             return 0;
         }
@@ -919,12 +1009,17 @@ int main(int argc, char** argv) {
         opt.mtp = mtp_on;
         opt.spec = mtp_on;
         opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-        opt.auto_rows = false;
-        opt.exchange_rows = opt.max_rows;
+        opt.auto_rows = rd::max_rows_auto(eff);
+        // As the CLI: the exchange starts at the fallback and grows once the 8192-row candidate is admitted on both ranks.
+        opt.exchange_rows = opt.auto_rows ? rd::kFallbackMaxRows : opt.max_rows;
+        // Prefill units (rd::resolve, serving-only): the decode row window is reserved at load, before admission.
+        opt.prefill_units = mtp_on && eff.prefill == "gemv" && eff.prefill_units.value == "1";
         const std::string& id = eff.identity.value;
         if (id != "r1" && id != "r1b" && id != "r1b-all") throw std::invalid_argument("--identity r1|r1b|r1b-all");
         opt.identity = id == "r1" ? ge::IdentityMode::kR1 : id == "r1b" ? ge::IdentityMode::kR1b : ge::IdentityMode::kR1bAll;
         opt.decode_xfer = eff.decode_xch.value == "xfer";
+        opt.split_frame_mode = static_cast<unsigned>(eff.split_policy.mode);
+        opt.split_frame_crossover = static_cast<unsigned>(eff.split_policy.crossover);
         std::string prefill_mode = eff.prefill;
         if (prefill_mode != "ref" && prefill_mode != "gemv" && prefill_mode != "wmma")
             throw std::invalid_argument("prefill must resolve to ref, gemv or wmma");
@@ -954,13 +1049,38 @@ int main(int argc, char** argv) {
         }
         opt.host_budget = prefix_cache_bytes;  // the prefix snapshots are this process's RSS: not a watchdog breach
         ge::Engine eng(opt, comm.get());
-        const auto lr = eng.load([&](const ge::mem::LoadAdmission&) { return opt.max_rows; });
-        if (prefill_mode != "ref") {
-            namespace pf = strix::glm::pf;
-            const unsigned heads = 64 / opt.world;
-            eng.set_prefill(pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows,
-                                                  prefill_mode == "gemv" ? pf::TierB::gemv : pf::TierB::wmma));
-        }
+        const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
+        rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier}};
+        bool rows_mode_checked = false;
+        const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
+            // Both ranks must be in the same max-rows mode before the automatic admission's votes (a peer in a fixed mode
+            // would never answer them).
+            if (!rows_mode_checked && comm) {
+                rows_mode_checked = true;
+                std::uint32_t mode = opt.auto_rows ? 1U : 0U, peer_mode = mode;
+                comm->exchange_host(std::as_bytes(std::span{&mode, 1}), std::as_writable_bytes(std::span{&peer_mode, 1}),
+                                    {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFAU, 0U});
+                if (peer_mode != mode) throw std::runtime_error("TP2 ranks resolved different max-rows modes (automatic vs fixed)");
+            }
+            prefill_load.margin = std::max(strix::glm::pf::admission_margin_bytes(), admission.margins.ram);
+            if (!opt.auto_rows) return opt.max_rows;
+            // The CLI's margins: the 8 GiB OS/peer/runtime headroom at both checks.
+            prefill_load.margin = std::max({strix::glm::pf::admission_margin_bytes(), admission.margins.ram, rd::kMaxRowsSafetyBytes});
+            const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
+            opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_load.margin, [&](std::uint32_t fits) {
+                std::uint32_t peer_fits = fits;
+                if (comm)
+                    comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
+                        {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
+                return peer_fits;
+            }, [&](unsigned rows) {
+                return rd::recheck_rows(rows, comm != nullptr,
+                    [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
+            });
+            if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
+            std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
+            return opt.max_rows;
+        });
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB, identity %s, decode-xch %s, prefill %s pipeline %u\n",
                     opt.rank, lr.seconds, lr.gib_read, lr.device_gib, ge::identity_mode_name(eng.identity_mode()),
                     opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm", prefill_mode.c_str(), eng.prefill_pipeline());
@@ -1000,6 +1120,9 @@ int main(int argc, char** argv) {
             const auto chunk = strix::glm::record_prefill_chunk("http", prefill_chunk_explicit, prefill_chunk, opt.world, opt.max_rows, prefill_mode);
             prefill_chunk = chunk.tokens;
             std::printf("rank %u %s", opt.rank, strix::glm::pf::dense_policy::chunk_line(chunk).c_str());
+            if (opt.rank == 0)
+                std::printf("rank 0 effective serve-%s\n",
+                            serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline()).describe(prefill_chunk).c_str());
             hello.route_fingerprint = static_cast<std::uint32_t>(fp ^ (fp >> 32));
             std::printf("rank %u: route fingerprint %016llx\n", opt.rank, static_cast<unsigned long long>(fp));
         }
@@ -1034,7 +1157,7 @@ int main(int argc, char** argv) {
             const auto model = gi::unhex(import_model_sha);
             const unsigned rank = opt.rank;
             const std::string ep = import_listen, node = import_node;
-            const unsigned version = import_dsa_once ? 2U : 1U;
+            const unsigned version = gi::wire_version(import_dsa_once, import_index_tail);
             // One hand-off per import_expect: the header must equal this rank's expectation (model, prompt hash,
             // frontier, layout, rank, node); the frames' payloads, in order, are the Engine::restore_state bytes.
             ops.stager = std::make_unique<gs::ImportStager>([key, model, rank, ep, node, version](std::uint32_t iid, std::span<const std::uint32_t> t,
@@ -1080,9 +1203,11 @@ int main(int argc, char** argv) {
                 };
             }
             ops.dsa_once = import_dsa_once;
+            ops.index_rows = gi::index_form(version);
             // The full per-rank component list of a v1 hand-off (= this rank's restore_state layout) at frontier P.
-            ops.state_layout = [rank](std::uint64_t frontier, std::uint64_t total) {
+            ops.state_layout = [rank, tail = import_index_tail](std::uint64_t frontier, std::uint64_t total) {
                 gi::Begin b;
+                b.version = gi::wire_version(false, tail);  // every component of this rank, index tail when on
                 b.rank = rank;
                 b.frontier = frontier;
                 b.total = total;
@@ -1109,8 +1234,8 @@ int main(int argc, char** argv) {
 
         // RTX import settings every rank must share: a mismatch refuses at hello, before serving.
         if (!import_listen.empty()) {
-            hello.import_flags = 1U | (import_dsa_once ? 2U : 0U);
-            hello.import_wire = import_dsa_once ? 2U : 1U;
+            hello.import_flags = 1U | (import_dsa_once ? 2U : 0U) | (import_index_tail ? 4U : 0U);
+            hello.import_wire = gi::wire_version(import_dsa_once, import_index_tail);
             hello.import_model_hash = gs::attested_model_hash(import_model_sha);  // canonical: the parsed 32 bytes
         }
         std::signal(SIGINT, on_signal);
@@ -1139,7 +1264,13 @@ int main(int argc, char** argv) {
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
+        lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
+        lc.prefill_chunk_cap = opt.max_rows;
+        lc.prefill_timeline = static_cast<unsigned>(std::max(0, strix::envcfg::integer("STRIX_SERVE_PREFILL_TIMELINE", 0)));
         lc.prefill_chunk_mtp = prefill_chunk_mtp;
+        lc.prefill_units_rows = opt.prefill_units && prefill_chunk_mtp ? opt.max_rows : 0U;  // max_rows after admission
+        lc.prefill_units_layers = opt.layers;
+        lc.prefill_units_admit = [&eng](std::uint64_t rows) { return eng.prefill_units_admit(rows); };
         lc.mtp = mtp_on;
         lc.mtp_cycles = mtp_cycles;
         lc.g2 = g2_on;
@@ -1161,11 +1292,13 @@ int main(int argc, char** argv) {
             // The RTX producer prefills and sends each rank its state (POST /v1/prefill, the hand-off of service.cpp);
             // it answers only after both ranks sealed, so the call runs off the lead's thread. Any non-200 marks the
             // import failed and the slot prefills itself at once.
-            lc.rtx_prefill = [failed, rtx, ep0, ep1, node, key_hex, dsa_once = import_dsa_once](std::span<const std::uint32_t> prompt, std::uint32_t iid) {
+            lc.rtx_prefill = [failed, rtx, ep0, ep1, node, key_hex, dsa_once = import_dsa_once,
+                              index_tail = import_index_tail](std::span<const std::uint32_t> prompt, std::uint32_t iid) {
                 std::string body = "{\"tokens\":[";
                 for (std::size_t i = 0; i < prompt.size(); ++i) body += (i ? "," : "") + std::to_string(prompt[i]);
                 body += "],\"identity\":\"glm-pf-rtx-native-v1\",\"handoff\":{\"rank0\":\"" + ep0 + "\",\"rank1\":\"" + ep1 + "\",\"key\":\"" +
-                        key_hex + "\",\"node_identity\":\"" + node + "\"" + (dsa_once ? ",\"dsa_once\":true" : "") + "}}";
+                        key_hex + "\",\"node_identity\":\"" + node + "\"" + (dsa_once ? ",\"dsa_once\":true" : "") +
+                        (index_tail ? ",\"index_tail\":true" : "") + "}}";
                 std::thread([failed, rtx, body, iid] {
                     int status = 0;
                     std::string reply;
@@ -1482,7 +1615,7 @@ int main(int argc, char** argv) {
                                     (rtx_prefill.empty() ? std::string()
                                                          : std::string("; prompts of >= ") + std::to_string(import_min_tokens) +
                                                                " tokens may take the RTX prefill route (FAST identity glm-pf-rtx-native-v1, wire v" +
-                                                               (import_dsa_once ? "2" : "1") + ", not bitwise the pair's own prefill; "
+                                                               std::to_string(gi::wire_version(import_dsa_once, import_index_tail)) + ", not bitwise the pair's own prefill; "
                                                                "each response's prefill_route names its route)");
         if (!api_key_file.empty()) {
             auto key = file_text(api_key_file);

@@ -50,6 +50,8 @@ inline std::string kernel_id(
             request.request_concurrency) + (request.device_graph_inputs ? ".device" : ".scalar") +
         std::string(gdn_recurrent_layout_marker(config.recurrent_layout)) +
         std::string(gdn_recurrent_storage_marker(config.recurrent_storage)) +
+        (config.model.recurrent_state != RecurrentStateType::f32
+             ? std::string(".state-") + recurrent_state_type_name(config.model.recurrent_state) + "-rne-v1" : std::string()) +
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
         (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +

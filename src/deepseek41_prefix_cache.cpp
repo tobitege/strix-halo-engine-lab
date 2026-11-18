@@ -1,4 +1,6 @@
+#include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/turbo.hpp"
 
 #include "strix/ds41_attention.hpp"
 #include "strix/env_flags.hpp"
@@ -496,6 +498,25 @@ std::string env_or(const char* name, const char* fallback = "") {
 
 }  // namespace
 
+std::string prefix_continuation_decline() {
+    namespace fp = strix::ds41::fast_profile;
+    std::string why;
+    const auto add = [&why](const std::string& s) { why += (why.empty() ? "" : "; ") + s; };
+    // DevicePrefill::Impl::flash_attn_at (src/hip_deepseek41_prefill.hip): flash_run = (P0 == 0)
+    if (fp::attention_on() && fp::attention_flash())
+        add("FAST attention ds41-attn-bf16flash-v1 runs only from position 0: a restored state or a later piece continues on "
+            "ds41-attn-f16wmma-v1");
+    // enqueue_fast_dense (src/hip_ds41_layer.hip): rows < STRIX_DS41_FAST_DENSE_MIN_ROWS keep the exact kernels, and the
+    // prefill's dense selectors test the rows of the piece as well: another cut changes the route of the same prompt
+    if (fp::dense_on())
+        add("FAST dense ds41-dense-f16-v1 selects its route by the rows of each piece (dense_min_rows=" +
+            std::to_string(fp::dense_min_rows()) + "): a cache hit or another cut changes the arithmetic of the same prompt");
+    if (fp::shared_on())
+        add("FAST shared ds41-shared-f16-v1 selects its route by the locally owned rows of each piece (dense_min_rows=" +
+            std::to_string(fp::dense_min_rows()) + "): a cache hit or another cut changes the arithmetic of the same prompt");
+    return why;
+}
+
 PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     // bump the version when the meaning of a state changes without any of the inputs below changing
     std::string t = "ds41-prefix-ns=1;";
@@ -515,12 +536,22 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     t += "prefill=ep;";
     // Approximate prefill states must never alias the incumbent namespace.
     if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN")) t += "prefill_attention=bf16-hilo-v1;";
-    else if (strix::env_flag_default_off("STRIX_DS41_FAST_ATTN")) t += "prefill_attention=f16wmma-v1;";
+    else if (strix::ds41::fast_profile::attention_on())
+        t += strix::ds41::fast_profile::attention_flash() ? "prefill_attention=bf16flash-v1;" : "prefill_attention=f16wmma-v1;";
+    if (strix::ds41::fast_profile::dense_on())
+        t += "prefill_dense=q8a8-f16-v1;dense_min_rows=" + std::to_string(strix::ds41::fast_profile::dense_min_rows()) + ";";
+    if (strix::ds41::fast_profile::engram_on()) t += "prefill_engram=f16wmma-v1;";
+    if (strix::ds41::fast_profile::shared_on()) {
+        t += "prefill_shared=q8a8-f16-v1;";
+        if (!strix::ds41::fast_profile::dense_on())
+            t += "dense_min_rows=" + std::to_string(strix::ds41::fast_profile::dense_min_rows()) + ";";
+    }
+    if (strix::ds41::fast_profile::moe_on() && strix::ds41::fast_profile::moe_f16_on()) t += "prefill_moe=f16wmma-v1;";
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
-    if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE")) t += "prefill_moe=relaxed-v1;";
+    if (strix::ds41::fast_profile::moe_on()) t += "prefill_moe=relaxed-v1;";
     if (strix::env_flag_default_off("STRIX_DS41_FAST_I4")) {
-        if (strix::env_flag_default_off("STRIX_DS41_FAST_MOE"))
+        if (strix::ds41::fast_profile::moe_on())
             throw std::invalid_argument("FAST_I4 and FAST_MOE are distinct policies");
         const auto scope = env_or("STRIX_DS41_FAST_I4_SCOPE");
         if (!scope.empty() && scope != "all" && scope != "gu")
@@ -534,13 +565,20 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
         t += "prefill_dense=fp16-lt-v1:" + path_digest(picks) + ";";
     }
     // every knob that changes an approximate prefill's arithmetic (unset in the exact default: no change to its namespace)
-    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN") || strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE") || strix::env_flag_default_off("STRIX_DS41_FAST_ATTN"))
+    if (strix::env_flag_default_off("STRIX_DS41_PREFILL_BF16_ATTN") || strix::env_flag_default_off("STRIX_DS41_PREFILL_FP16_DENSE") || strix::ds41::fast_profile::attention_on())
         for (const char* k : {"STRIX_DS41_PREFILL_APPROX_LAYERS", "STRIX_DS41_BF16_ATTN_VARIANT", "STRIX_DS41_PREFILL_FP16_PROJ",
                               "STRIX_DS41_PREFILL_FP16_MIN_ROWS", "STRIX_DS41_PREFILL_FP16_A8", "STRIX_DS41_PREFILL_FP16_FAST",
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})
             t += std::string(k + 11) + "=" + env_or(k) + ";";
 
+    // FAST policy ds41-decoder-replay-bounded-v1: a bounded run's decoder state is not the full prefill's
+    if (const auto replay = env_or("STRIX_DS41_DECODER_REPLAY"); !replay.empty() && replay != "0")
+        t += "prefill_decoder=replay-bounded-v1:rows=" + replay + ";";
     t += std::string("decode=") + (expert_tp_decode ? "ds41-expert-tp2-i1152-v1" : "ep") + ";";
+    // TURBO (--profile turbo): versioned name + effective levers + weight identity, exported by the shared profile
+    // resolver (strix/turbo.hpp); absent outside turbo, so every legacy namespace keeps its text and tag.
+    if (const auto turbo = strix::profile::turbo::exported_namespace(); !turbo.empty())
+        t += turbo + ";";
     const auto* b = reinterpret_cast<const std::byte*>(t.data());
     PrefixNamespace ns;
     ns.text = t;

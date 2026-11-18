@@ -160,35 +160,24 @@ Index::Index(const std::string& dir) {
         ::closedir(d);
         std::sort(names.begin(), names.end());
     }
+    weight::TensorIndex common; common.container=weight::Container::safetensors; common.schema="safetensors@1";
     for (const std::string& n : names) {
         const std::string path = dir + "/" + n;
-        std::ifstream f(path, std::ios::binary);
-        if (!f) throw std::runtime_error("cannot open " + path);
-        std::uint64_t hlen = 0;
-        f.read(reinterpret_cast<char*>(&hlen), 8);
-        if (!f || hlen == 0 || hlen > (std::uint64_t{1} << 30)) throw std::runtime_error("bad safetensors header " + path);
-        std::string h(hlen, '\0');
-        f.read(h.data(), static_cast<std::streamsize>(hlen));
-        const Json j = parse_json(h);
-        const auto file = static_cast<std::uint32_t>(files_.size());
-        files_.push_back(path);
-        for (const auto& [k, v] : j.obj()) {
-            if (k == "__metadata__") continue;
-            TensorInfo t;
-            t.dtype = v.obj().at("dtype").str();
-            std::uint64_t n_el = 1;
-            for (const Json& d : v.obj().at("shape").arr()) {
-                t.shape.push_back(u64(d.num()));
-                n_el *= t.shape.back();
-            }
-            const auto& off = v.obj().at("data_offsets").arr();
-            t.file = file;
-            t.offset = 8 + hlen + u64(off.at(0).num());
-            t.bytes = u64(off.at(1).num()) - u64(off.at(0).num());
-            if (t.bytes != n_el * dtype_bytes(t.dtype)) throw std::runtime_error("size mismatch " + k);
-            if (!tensors_.emplace(k, std::move(t)).second) throw std::runtime_error("duplicate tensor " + k);
+        std::shared_ptr<const weight::Source> source;
+        auto status=weight::open_source(path,source,n);
+        weight::TensorIndex index;
+        if(status)status=weight::index_safetensors(source,index);
+        if(!status)throw std::runtime_error("GLM index: "+status.detail);
+        const auto file=static_cast<std::uint32_t>(files_.size());files_.push_back(path);
+        for(const auto& raw:index.tensors) {
+            TensorInfo t;t.dtype=raw.wire_dtype;t.shape=raw.extents;
+            t.file=file;t.offset=raw.payload.range.offset;t.bytes=raw.payload.range.bytes;
+            if(!tensors_.emplace(raw.name,std::move(t)).second)throw std::runtime_error("duplicate tensor "+raw.name);
+            common.tensors.push_back(raw);
         }
     }
+    auto status=weight::bind_glm(common,weights_);
+    if(!status)throw std::runtime_error("GLM admission: "+status.detail);
 }
 
 const TensorInfo* Index::find(const std::string& name) const {

@@ -3,6 +3,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#ifdef _WIN32
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+#endif
 using namespace strix;
 namespace {
 void require(bool ok,const char* why) {if(!ok) throw std::runtime_error(why);}

@@ -60,6 +60,15 @@ void KnownPromptChunkCursor::set_tail_backend(KnownPromptWindowBackend& tail) {
     tails_.push_back(&tail);
 }
 
+KnownPromptChunkStageView KnownPromptChunkCursor::stage_view() const {
+    if(deferred_) throw std::logic_error("known-prompt cursor stage view with a deferred block");
+    return {progress_,last_unit_,balanced_,logits_,selection_,has_logits_};
+}
+void KnownPromptChunkCursor::swap_stage(KnownPromptChunkStageView& view) {
+    if(deferred_) throw std::logic_error("known-prompt cursor stage swap with a deferred block");
+    std::swap(progress_,view.progress);std::swap(last_unit_,view.last_unit);std::swap(balanced_,view.balanced);
+    std::swap(logits_,view.logits);std::swap(selection_,view.selection);std::swap(has_logits_,view.has_logits);
+}
 bool KnownPromptChunkCursor::advance() {
     if(progress_.failed) throw std::logic_error("failed known-prompt cursor cannot resume");
     if(progress_.cancelled || progress_.prefill_complete) {

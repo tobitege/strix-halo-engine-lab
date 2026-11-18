@@ -1,0 +1,9 @@
+{
+ "class": "prose",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Write a 600-word essay on why the sea is salty, aimed at curious teenagers."
+  }
+ ]
+}

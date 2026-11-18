@@ -413,6 +413,94 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
     }
 }
 
+// FAST gdn_gates_f16 (STRIX_PREFILL_GDN_GATES_F16=1, only inside the FAST gdn_fp16_chunk route; default OFF): the gates
+// product (hidden -> value_heads beta + value_heads alpha outputs) on the shared dense FP16 core
+// (core/f16_dense_tall.hpp) instead of gdn_qpf2k_gates_kernel's FP32 chains. Adapter only:
+//   fragment: the lane's BF16 row values, rounded to FP16 by the _Float16 cast (the core's own row contract);
+//   stage:    the FP32 beta / alpha weight rows rounded to FP16 (RNE) once per (CTA, stage) into the core's LDS;
+//   store:    every raw sum takes the incumbent epilogue unchanged: round_bf16, then beta = round_bf16(sigmoid) or
+//             gate = a * softplus(raw + dt), at rows.beta / rows.gate[row * stride + out].
+// One WMMA chain per (row tile, 16 outputs) over ascending k units with FP32 accumulation: changes logits (tag gatef16).
+namespace gates_f16 {
+namespace c16 = strix::core::f16_dense_tall;
+using Half8 = _Float16 __attribute__((ext_vector_type(8)));
+struct Cols {
+    const std::uint16_t* input; std::uint64_t input_stride;  // BF16 rows, element stride
+    const float* beta; const float* alpha; unsigned in, heads, tile0, tiles;
+    __device__ __forceinline__ c16::ColumnTile tile(unsigned i) const { return {nullptr, nullptr, 0U, tile0 + i < tiles}; }
+    __device__ __forceinline__ c16::Half16 fragment(unsigned row, unsigned unit) const {
+        const auto* p = reinterpret_cast<const c16::U4*>(input + row * input_stride + unit * 16U);
+        const c16::U4 v0 = p[0], v1 = p[1];
+        c16::Half16 h;
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) {
+            const unsigned w = i < 4U ? v0[i] : v1[i - 4U];
+            h[2U * i] = static_cast<_Float16>(__uint_as_float(w << 16U));
+            h[2U * i + 1U] = static_cast<_Float16>(__uint_as_float(w & 0xffff0000U));
+        }
+        return h;
+    }
+    // Column col of tile `tile` (launch-relative), k units [unit, unit + 4): 64 FP16 weights. Dead tiles read output 0.
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, c16::U4* nb) const {
+        unsigned o = (tile0 + tile) * 16U + col;
+        if (o >= 2U * heads) o = 0U;
+        const float* p = (o >= heads ? alpha + static_cast<std::uint64_t>(o - heads) * in : beta + static_cast<std::uint64_t>(o) * in) +
+            unit * 16U;
+#pragma unroll
+        for (unsigned i = 0; i < 8U; ++i) {
+            const c16::Float4 a = reinterpret_cast<const c16::Float4*>(p)[2U * i], b = reinterpret_cast<const c16::Float4*>(p)[2U * i + 1U];
+            Half8 h;
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) { h[j] = static_cast<_Float16>(a[j]); h[4U + j] = static_cast<_Float16>(b[j]); }
+            nb[i] = __builtin_bit_cast(c16::U4, h);
+        }
+    }
+};
+struct Store {
+    GdnPrefillRows rows; const void* dt_p; SmallWeightKind dt_kind; const void* a_p; SmallWeightKind a_kind; unsigned heads, tile0;
+    struct Tile { unsigned out; bool alpha; float dt, a; };
+    __device__ __forceinline__ Tile open(unsigned i, const c16::ColumnTile&, unsigned c) const {
+        const unsigned o = (tile0 + i) * 16U + c;
+        const bool alpha = o >= heads;
+        const unsigned out = alpha ? o - heads : o;
+        return {out, alpha, alpha ? load_small(dt_p, dt_kind, out) : 0.0F, alpha ? load_small(a_p, a_kind, out) : 0.0F};
+    }
+    __device__ __forceinline__ void put(const Tile& t, unsigned row, float v) const {
+        const float raw = round_bf16(v);
+        const auto offset = row * rows.stride + t.out;
+        if (t.alpha) {
+            const float biased = raw + t.dt;
+            rows.gate[offset] = t.a * softplus(biased);
+        } else rows.beta[offset] = round_bf16(1.0F / (1.0F + expf(-raw)));
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
+};
+template <unsigned TC> __global__ __launch_bounds__(256) void kernel(Cols cols, Store store, unsigned rows, unsigned skip) {
+    __shared__ c16::Storage<TC> lds;
+    c16::core<TC>(nullptr, cols.in, rows, cols, lds, store, skip != 0U);
+}
+// Shapes the core and this adapter take: in % 128 (core), 16-output tiles, 16-byte aligned BF16 rows.
+inline bool supported(unsigned in, unsigned heads, std::uint32_t rows, std::uint64_t input_stride, const void* input) {
+    return rows > 0U && in > 0U && in % 128U == 0U && (2U * heads) % 16U == 0U && input_stride % 8U == 0U &&
+        reinterpret_cast<std::uintptr_t>(input) % 16U == 0U;
+}
+// 16-tile CTA columns first, the remainder by c16::plan (the core's measured rule).
+inline void launch(Cols cols, Store store, std::uint32_t rows, hipStream_t stream) {
+    const unsigned tiles = 2U * cols.heads / 16U, gx = (rows + c16::kRows - 1U) / c16::kRows, skip = c16::tail_policy() ? 1U : 0U;
+    const auto p = c16::plan(tiles, rows, c16::tail_policy());
+    cols.tiles = tiles;
+    const auto go = [&]<unsigned TC>(unsigned tile0, unsigned gy) {
+        cols.tile0 = store.tile0 = tile0;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(kernel<TC>), dim3(gx, gy), dim3(256), 0, stream, cols, store, rows, skip);
+    };
+    if (p.full) go.template operator()<16U>(0U, p.full);
+    if (p.tc == 4U) go.template operator()<4U>(16U * p.full, p.gy);
+    else if (p.tc == 2U) go.template operator()<2U>(16U * p.full, p.gy);
+    else if (p.tc == 1U) go.template operator()<1U>(16U * p.full, p.gy);
+}
+}  // namespace gates_f16
+
 // ---------------------------------------------------------------------------------------------------------------
 // Fused GDN core (STRIX_QPF2K_GDN_PARTS bit 4): (1) the q/k conv/SiLU/L2-norm of gdn_prefill_conv_kernel run once per
 // q/k head and per row segment (gdn_qk_boundary_kernel saves the BF16 raw rows before every segment start first);

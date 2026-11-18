@@ -11,7 +11,7 @@
 //   stage P  pageable source, 3 host threads copying into 4 persistent P MiB pinned buffers, DMA from those
 // --interleave K: instead, K passes over {hot, whole, piece 64/256, pool 64/256}, one slot's worth each (the host's
 // load drifts: alternating the shapes compares them under the same conditions); median and best GB/s per shape.
-#include "strix/cuda_ds41_common.hpp"
+#include "strix/cuda/ds41_common.hpp"
 
 #include <algorithm>
 #include <map>

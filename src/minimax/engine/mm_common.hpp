@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 // MiniMax engine (fork of the DeepSeek V4.1 TP2 engine): shared pieces. The small FP32 kernels are copied verbatim from
 // the minimax-m3 layer gates (tests/minimax_gate_common.hpp) so the engine reproduces the G4 harness
 // bit for bit; the safetensors reader replaces the gate's mmap Pack with O_DIRECT reads (the DS DirectLoader pattern):
@@ -44,10 +45,12 @@ public:
     const strix::core::WeightSource& source(const TensorInfo& t) const { return *sources_.at(t.file); }
     void count_read(std::uint64_t n) { bytes_read_ += n; }
     const LoaderSnapshot& loader_snapshot() const { return snapshot_; }
+    const weight::WeightMap& weight_map() const noexcept { return weights_; }
     double gib_read() const { return static_cast<double>(bytes_read_) / 1073741824.0; }
 
 private:
     LoaderSnapshot snapshot_;
+    weight::WeightMap weights_;
     std::string dir_;
     std::vector<int> fds_;
     std::vector<int> direct_;  // 1 if opened with O_DIRECT

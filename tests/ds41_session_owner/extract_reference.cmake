@@ -18,6 +18,11 @@ anchors={
  'owner':(b'    std::vector<std::uint32_t> pending_commits;  // rank 0',b'// --prefill-rows auto (the pair default):'),
 }
 m={}
+begin=b'strix::serve::ReservationRule pool_rule('
+end=b'using strix::deepseek41::BatchForward;'
+reservation=s[s.index(begin):s.index(end)] if begin in s else b''
+(o/'reservation.inc').write_bytes(reservation)
+m['reservation']={'sha256':hashlib.sha256(reservation).hexdigest(),'bytes':len(reservation)}
 start=b'    std::function<void(serve::SessionRuntime&)> native_turn;'
 end=b'    // DS41 request ownership binding ends.'
 ownership=s[s.index(start):s.index(end)] if start in s else b''

@@ -58,8 +58,11 @@ def main():
         assert normalized.count(new) == 1
         normalized = normalized.replace(new, previous)
     assert canon(normalized) == canon(body(before, "rmsnorm_kernel")), "device arithmetic"
-    for helper in ("lds_tree", "wload"):
+    for helper in ("wload",):
         assert canon(body(before, helper)) == canon(body(after, helper)), helper
+    # lds_tree now runs levels 16..1 in wave 0 registers with the same pairing (core/ordered_reduce.hpp); its bits
+    # against the LDS loop are checked on device by tests/hip_exact_reduce_tests.hip.
+    assert "ordered_reduce::tree_broadcast<L>(s, part, threadIdx.x)" in body(after, "lds_tree"), "lds_tree"
     traits = read("src/glm/kernels/glm_norm.hpp")
     for alias in ("using Input = float;", "using Output = float;", "using Scale = void;",
                   "using ScaleFormat = WType;", "static constexpr float epsilon = kEps;"):

@@ -48,7 +48,10 @@ modelo/estado, el perfil y los argumentos de rango/transporte obligatorios:
 `--deploy auto` busca entre las opciones del proveedor. `--deploy FILE` restringe
 la búsqueda mediante TOML. `--deploy-check` imprime el plan y termina antes de
 cargar los datos de pesos, construir los recursos del dispositivo o conectar el
-par; los metadatos deben seguir siendo legibles. La inspección del par necesita
+par; los metadatos deben seguir siendo legibles. La puerta de arranque sigue
+admitiendo y ligando un dispositivo; `--devices` / `--device-id` conservan sus
+comprobaciones de admisión. La inspección sin dispositivo requiere integrar el
+modo de ejecución validado por el analizador del motor. La inspección del par necesita
 por tanto un inventario medido del otro nodo. Revise `refused`, `refusal`, los
 motivos de los candidatos, `requested`, `chosen` y los presupuestos por rango.
 No ejecute un plan rechazado. Quite `--deploy-check` para ejecutar una configuración
@@ -213,7 +216,10 @@ prefill = "exl3"
 
 Use la escritura del transporte que acepte el motor seleccionado. Para TP2 mantenga
 un proceso por rango y la configuración habitual de enlace/transporte. Para
-inspeccionar sin conexión, añada una tabla `[[devices]]` por nodo. Incluya los seis
+aportar el inventario medido, añada la clave raíz `devices = [{...}, {...}]`
+antes de la primera cabecera de tabla (`[hardware]` en estos ejemplos), nunca
+después de `[format]`. Use una tabla en línea por nodo en orden de rango
+(el subconjunto TOML del analizador no admite tablas `[[devices]]`). Incluya los seis
 campos: `gfx_target` (cadena), `cu_count` (entero), `mem_total_bytes` y
 `mem_free_bytes` (enteros), `unified` (booleano) y `source` (cadena no vacía que
 describa la procedencia de la medida). Copie observaciones reales; no duplique el
@@ -283,3 +289,42 @@ y presupuestos.
 Los controles individuales están en [toggles](toggles.md). Al validar un cambio,
 mantenga modelo, perfil, contexto, slots e identidad numérica; compare todos los
 IDs de token y logits/estado antes de medir la carga completa.
+
+## Repartir un prefill entre dispositivos
+
+La declaración de dispositivos indica qué une las unidades. Una línea por dispositivo fija el modelo de enlace:
+
+```toml
+[devices.node-a]
+vendor = "amd"
+pci = "0000:c3:00.0"
+roles = ["pair", "decode", "prefill"]
+attach = { kind = "remote", link = "2.5gbe" }   # clases: 1gbe 2.5gbe 5gbe 10gbe 25gbe usb4 usb4-gen2
+                                                #         pcie3x4 pcie4x4 oculink4x4 pcie4x16 pcie5x16
+[links.pair]                                    # un cable entre dos dispositivos declarados
+between = ["node-a", "node-b"]
+class = "usb4"
+```
+
+Una clase da tasas nominales con incertidumbre amplia; `gbps_measured` (Gbit/s útiles) y `rtt_us_measured` las
+sustituyen. Los dispositivos remotos de una máquina comparten su puerto de red (`port`) salvo que se declare otro.
+Un rol que exige una tasa medida (`prefill` en un dispositivo remoto) se sigue rechazando hasta declarar la medida.
+
+`strix::deploy::plan_route` (include/strix/deploy/route.hpp) es un planificador host compartido aún sin integrar;
+faltan los llamadores CLI/servidor y los adaptadores de modelos de producción. Con la
+declaración, su grafo de enlaces y los costes medidos por etapa (`strix-stage-costs-v1`: unidad, identidad
+aritmética, longitud, bloque, ms totales y fijos, trabajo por capa opcional, dispersión, frío/caliente, recibo)
+enumera cada ruta que anuncia el modelo: prefill donde decodifica, prefill en otro sitio con entrega del estado, o
+reparto por capas en bloques con cortes equilibrados según las tasas medidas. Cada opción lleva etapas y rangos,
+bloque, bytes por enlace, identidad, tiempo previsto con incertidumbre, caudal, memoria por rank (con el
+FootprintProvider del modelo) y el motivo de rechazo. Memoria desconocida, importación sin medir, enlace sin tasa ni
+clase o ruta sin recibo de puerta se informan y nunca se eligen. El objetivo es `ttft` o `throughput`; un pin fuerza
+una opción o falla con su motivo. `contrast()` compara la previsión con recibos y marca desvíos de más del 30 %.
+
+La preferencia por recibos en caliente, el trabajo por capa prestado, la extrapolación y el caudal del pipeline son
+supuestos del modelo. Las pruebas host sintéticas y una cadena de puerta no vacía no cualifican el rendimiento ni
+la ejecución numérica nativa. Antes de integrar adaptadores se debe definir la correspondencia entre identidades
+aritméticas y formatos de memoria; escoger el primer formato compatible es solo una convención sintética actual.
+Los límites rechazan el plan entero: 100.000 pasos, 4.096 capas/recibos, 256 dispositivos, 128 protocolos y 64
+etapas/bloques por protocolo. Un decodificador externo figura como etapa sin prefill y con presupuestos del modelo
+completo por rank. Las unidades solapadas no tienen contrato de propiedad compartida y no pueden formar un handoff.

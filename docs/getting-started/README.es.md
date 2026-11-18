@@ -93,6 +93,6 @@ contrato de lanzamiento, los perfiles y las opciones de contexto largo de cada m
   [RTX independiente](../models/deepseek-v4.1/README.es.md#deepseek-standalone-rtx); RTX + par:
   [etapas del pipeline](../models/deepseek-v4.1/pipeline-stages.md).
 - [Par MiniMax M3.1 Flash](../models/minimax-m3.1/README.es.md#minimax-pair).
-- [Par GLM-5.3 Flash](../models/glm-5.3/README.es.md#glm-pair) y [GLM en una RTX PRO 6000](../../src/glm/rtxpf/README.md).
+- [Par GLM-5.3 Flash](../models/glm-5.3/README.es.md#glm-pair) y [GLM en una RTX PRO 6000](../../src/cuda/models/glm/README.md).
 - [Nemotron 3.5 Bolt E4B](../models/nemotron-3.5-bolt-e4b/README.es.md#compilación-y-ejecución) (compilación opcional).
 - Exposición de los servidores, autenticación y límites: [servicio](../serving.es.md#exposición-de-los-servidores).

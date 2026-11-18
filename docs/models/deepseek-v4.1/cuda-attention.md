@@ -1,8 +1,8 @@
 # deepseek41 CUDA attention (sm_120)
 
 The CSA2 attention of the deepseek41 family on CUDA, for the layer backend behind `STRIX_ENABLE_CUDA_DS41` (off by
-default): `include/strix/cuda_ds41_attention.hpp`, `src/cuda/ds41_attention.cu` (kernels),
-`src/cuda/ds41_attention_state.cu` (per-layer state and the layer sequence), tests
+default): `include/strix/cuda/ds41_attention.hpp`, `src/cuda/models/ds41/ds41_attention.cu` (kernels),
+`src/cuda/models/ds41/ds41_attention_state.cu` (per-layer state and the layer sequence), tests
 `tests/cuda/ds41_attention_tests.cu` (`strix-cuda-ds41-attention-tests`). Conventions (namespace, `enqueue_*`,
 checks, flags) are those of `cuda_ds41_common.hpp`; the attention lives in `strix::ds41::cuda::attn`.
 

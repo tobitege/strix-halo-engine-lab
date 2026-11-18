@@ -31,7 +31,11 @@ struct DeviceFacts {
 // "hip+dxgi+pdh". Without HIP the facts stay unknown.
 [[nodiscard]] std::vector<DeviceFacts> probe_devices(const std::string& sysfs_root = "",
                                                      const std::string& drm_device = "");
-// Refuses ambiguous selection by returning unknown facts. Never silently selects GPU 0.
+// A declared device budget (strix/device/budget.hpp) over observed facts: total = the budget, free = what the budget
+// leaves after what is already in use. 0 or a budget at/above the device leaves the facts unchanged.
+void apply_budget(DeviceFacts& facts, std::uint64_t device_bytes);
+// Refuses ambiguous selection by returning unknown facts. Never silently selects GPU 0. A single device carries the
+// bound device's declared budget (strix::device::process_budget(), set by the start gate).
 [[nodiscard]] DeviceFacts probe_device(const std::string& sysfs_root = "",
                                       const std::string& drm_device = "");
 // KFD's gfx_target_version of an architecture name: major * 10000 + minor * 100 + stepping, where the name

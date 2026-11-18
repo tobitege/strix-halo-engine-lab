@@ -1,19 +1,21 @@
 """Source closure audit; no CUDA or native result is inferred."""
 from pathlib import Path
-import argparse, json, subprocess
+import argparse, json, subprocess, sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from source_audit import legacy_path, moved_paths  # CUDA backend move: old parent paths and renames
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--git-dir',required=True);ap.add_argument('--source',type=Path,required=True)
     a=ap.parse_args();root=a.source;parent='0f8b7a083cace7bb61f2fe2cf303bc8c69f2dfe3'
     def old(p):
-        return subprocess.check_output(['git','--git-dir='+a.git_dir,'show',parent+':'+p]).decode('utf-8').replace('\r\n','\n')
+        return moved_paths(subprocess.check_output(['git','--git-dir='+a.git_dir,'show',parent+':'+legacy_path(p)]).decode('utf-8').replace('\r\n','\n'))
     results={}
-    for p in ['src/cuda/qwen_mtp_draft.cu','include/strix/cuda_qwen_mtp_draft.hpp','src/cuda/qwen_moe.cu',
-              'src/cuda/qwen_qsa.cu','src/cuda/qwen_plemtp.cu','include/strix/cuda_qwen_route_bf16.hpp',
+    for p in ['src/cuda/models/qwen/qwen_mtp_draft.cu','include/strix/cuda/qwen_mtp_draft.hpp','src/cuda/models/qwen/qwen_moe.cu',
+              'src/cuda/models/qwen/qwen_qsa.cu','src/cuda/models/qwen/qwen_plemtp.cu','include/strix/cuda/qwen_route_bf16.hpp',
               'apps/cuda_qwen_serve_main.cu','apps/cuda_qwen_prefix_cache.hpp','include/strix/prefill_identity.hpp',
-              'include/strix/qwen_profile_table.hpp','src/cuda/qwen_handoff.cpp']:
+              'include/strix/qwen_profile_table.hpp','src/cuda/models/qwen/qwen_handoff.cpp']:
         results['unchanged:'+p]=(root/p).read_text()==old(p)
-    driver=(root/'src/cuda/qwen_prefill_driver.cu').read_text();prior=old('src/cuda/qwen_prefill_driver.cu')
+    driver=(root/'src/cuda/models/qwen/qwen_prefill_driver.cu').read_text();prior=old('src/cuda/models/qwen/qwen_prefill_driver.cu')
     def math(s):
         s=s[s.index('Draft Prefill::draft(SessionId'):];s=s[s.index('    const auto mw ='):]
         return s[:s.index('\nstd::vector<Draft> Prefill::draft_cohort')]
@@ -29,7 +31,7 @@ def main():
     results['replay_actual_not_repaired']='e.restore_canonical(actual);const auto replay=e.step' in fixture
     cmake=(root/'cmake/QwenCuda.cmake').read_text()
     results['production_link']='target_link_libraries(qwen_bf16_mtp_e2e PRIVATE strix_qwen_cuda)' in cmake
-    for name in ['include/strix/cuda_qwen_mtp_diagnostic.hpp','tests/cuda/qwen_bf16_mtp_e2e.cu','src/cuda/qwen_prefill_driver.cu']:
+    for name in ['include/strix/cuda/qwen_mtp_diagnostic.hpp','tests/cuda/qwen_bf16_mtp_e2e.cu','src/cuda/models/qwen/qwen_prefill_driver.cu']:
         results['LF:'+name]=b'\r' not in (root/name).read_bytes()
     print(json.dumps({'checks':len(results),'passed':sum(results.values()),'results':results},indent=2))
     return 0 if all(results.values()) else 1

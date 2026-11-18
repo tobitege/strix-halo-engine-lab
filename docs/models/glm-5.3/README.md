@@ -13,6 +13,9 @@ read and what "exact" covers: [methodology](../../methodology.md). Build instruc
 
 ## Run: the pair
 
+**Weights:** [hyukudan/GLM-5.3-Flash-exl3-mirror](https://huggingface.co/hyukudan/GLM-5.3-Flash-exl3-mirror) (mirror of `turboderp/GLM-5.3-Flash-exl3`, 4.05 bpw, used as
+published). Files and revisions: [reproduce](../../reproduce.md#models-and-provenance).
+
 Optional GLM token sharding is a qualified FAST memory profile. It is off by default; `STRIX_GLM_KV_SHARD=auto`
 (with `STRIX_GLM_PF_PIPELINE=1`) selects sharding only after all permitted replicated scratch/window candidates
 fail startup admission on either rank;
@@ -105,7 +108,7 @@ and read the tokenizer from `MODEL_DIR/tokenizer.json`:
 
 Defaults: 8 request slots (`--slots`, at most 8), 8192 positions per slot (`--capacity`), exact MTP self-speculation
 with one request in flight, batched MTP verify with more (`STRIX_GLM_SERVE_G2=0` = batched plain steps), decode-first
-chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). The chunk is resolved by the same route policy as the CLI: both ranks print `effective serve-prefill-chunk=...` with the dense core its calls take, and the reason whenever a chunk declines the large-call core. `--serial` admits one
+chunked prefill of 512 tokens while others decode (`--prefill-chunk 0` = whole prompts). The chunk is resolved by the same route policy as the CLI: both ranks print `effective serve-prefill-chunk=...` with the dense core its calls take, and the reason whenever a chunk declines the large-call core. After a prompt's first chunk the chunks are grouped by the decode cohort (up to 4 x 512 tokens while at most two requests decode, admitted by a 3 s stall estimate from the latest call, not a latency ceiling, with base and tail dense routes preserved and decode debt retained across prompt completion; `STRIX_SERVE_PREFILL_INTERLEAVE=0` = one 512-token chunk per round; rank 0 prints `effective serve-prefill-interleave=...`): an 8,192-token prompt admitted while one request decodes reaches its first token in 15.0 to 15.1 s against 18.5 to 18.7 s (three runs each, fast profile, same 16 tokens as the prompt alone), and the decoding request receives 2.3 to 2.5 tokens/s during that prefill against 2.0, with a longest gap of 1.8 s against 1.2 to 1.3 s. `--serial` admits one
 request at a time; `--api-key-file F` requires a bearer key. `--selftest N` on rank 0 (no HTTP) runs N built-in
 prompts together and each alone and reports EXACT/FAIL with tok/s per concurrency level.
 
@@ -128,11 +131,11 @@ are unchanged. Disabling the cache restores the 8 GiB default.
 
 ## Run: one RTX PRO 6000
 
-Windows only, opt-in: build with `pwsh src/glm/rtxpf/producer/build.ps1` against a tierstream source export, build
+Windows only, opt-in: build with `pwsh src/cuda/models/glm/producer/build.ps1` against a tierstream source export, build
 the unit file once with `glm_unit_file.exe`, then run `decode_qualification_window.py --full-card --allow-gpu`. The service itself also takes
 `--dgpu auto|<uuid>` to pick the RTX PRO before CUDA starts (`off` is refused: no CPU path). Every
 step, the pinned tierstream commit and the options (`--profile`, `--print-effective-config`, `--vram-total-gib`) are
-in the [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+in the [GLM RTX guide](../../../src/cuda/models/glm/README.md).
 
 <a id="how-fast"></a>
 
@@ -174,6 +177,10 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 
 | Mode | Prompt / context | Measured | Build / exactness |
 |---|---|---:|---|
+| Prefill, `fast` profile (opt-in; quality qualification in progress) | 8K, engine, fresh process, more than 110 GiB free memory on both nodes | **8.92 s = 918 tok/s**; with one node's memory full of page cache at launch the same run took 9.5-10.1 s (the driver pauses the GPU queues while pages are reclaimed during load): free memory on both nodes before a pair timing | main `ae06f9466`; logits and state hashes equal across runs |
+| Prefill, wave-parallel router (exact, default) and FAST shared expert on 128-row slices (opt-in with `fast`; quality qualification in progress; `STRIX_GLM_PF_WMMA_SHARED128=0` restores 64 rows) | 8K / 32K, engine, warm second prefill in the process, strict ABAB | exact 8K **12.366 s = 664 tok/s** vs 12.478 s (3 pairs), 32K 51.064 s = 642 tok/s vs 51.265 s (1 pair); `fast` 8K warm **8.571 s = 957 tok/s** vs 8.606 s (2 pairs); router kernel at 4,096 rows 1.116 -> 0.033 ms | #637; exact logits bitwise, FAST same bits as the 64-row slices |
+| Served prefill under load, `fast` (opt-in; quality qualification in progress) | 8K prompt admitted while one stream decodes, ABAB x3 | TTFT **15.03-15.06 s** with chunks grouped by the decode cohort (default) vs 18.50-18.55 s with `STRIX_SERVE_PREFILL_INTERLEAVE=0`; decoding lane 2.32 vs 1.89 tok/s during the prefill, longest gap 1.80 vs 1.20 s | #590; 8K request tokens equal the request alone |
+| Served prefill under load, cut by layers, `fast` (opt-in; quality qualification in progress) | same 8K prompt beside one decoding stream, 3 runs per arm | median TTFT **10.82 s** with layer units (default) vs 15.14 s with `STRIX_GLM_SERVE_PREFILL_UNITS=0` (-28.5 %); decoding lane 4.10-4.12 vs 3.20-3.30 tok/s, longest gap 0.96 vs 1.81 s; a 7,999-token prompt keeps token chunks (14.85 s); tokens equal idle vs load | #601 (measured on its final head) |
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | `1836c99c`; tokens equal the reference |
 | Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
@@ -200,6 +207,7 @@ workspace, install/staging, late safety and startup reserve terms in GiB.
 | Exact chunked prefill, mHC mix collapse + norm in one kernel (default; `STRIX_GLM_PF_MIXNORM=0` restores the two kernels) | 8K / 32K benchmark prompts (8,192 / 32,768 tokens), alternating on / off arms | TTFT 8K **15.07 → 14.95 s** (−0.8 %, 544 → 548 tok/s), 32K **63.23 → 62.23 s** (−1.6 %, 518 → 527 tok/s, against the mean of the bracketing off arms). Roofline: at 14.95 s for 8,192 tokens (548 tok/s) and 62.23 s for 32,768 tokens (527 tok/s) the exact pair prefill runs at about 16 % / 15 % of its linears-only compute floor (31.8 GFLOP/token on 2 x 54 TF = 2.4 s at 8K, 9.6 s at 32K); the binding limit is the exact kernel schedule rather than memory bandwidth or the cable: the MoE and dense linears run on FP32 VALU tiles to keep the bitwise identity, and this change only removes one memory round trip per hyper-connection site. | logits bitwise equal the anchors on the pair at 1K, 8K and 32K; device gate bitwise over 1 to 4096 rows and special values (only propagated NaN payloads may differ) |
 | FAST WMMA prefill linear cores (`glm-pf-wmma-x`, opt-in `STRIX_GLM_PF_WMMA=1`) | 8K / 32K benchmark prompts, 8,192-row chunks, fresh process per arm | TTFT **15.45 → 12.94 s (−16.3 %)** at 8K and **62.3 → 51.2 s (−17.8 %)** at 32K (mean of both run orders); rank-0 linear kernels at 8K: MoE 5.15 → 3.42 s, dense X3 2.61 → 1.71 s | FAST, not bitwise the exact prefill: pre-registered quality-parity check passed at 1K / 8K / 32K; off (`STRIX_GLM_PF_WMMA=0` or unset, the default) equals the exact logits anchors on both ranks |
 | FAST KDA plain-weight projections on WMMA (`glm-pf-kda-wmma-v1`, on with `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_KDA_WMMA=0` turns it off) | 8K / 32K benchmark prompts, fresh process per arm, against FAST without it | Prefill 8K **9.25 → 9.05 s (−2.1 %)** (2 alternating pairs), 32K **37.74 → 37.13 s (−1.6 %)** (2 off / 3 on runs; one disturbed run of each arm discarded) | FAST, not bitwise: teacher-forced 3 × 256 positions KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, NLL change −0.006 / +0.001 / +0.002; off keeps the previous bytes |
+| FAST MLA absorb / out GEMMs on the shared FP16 WMMA tile core (`glm-pf-mla-wmma-v1`, on with `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_MLA_WMMA=0` turns it off), with bf16 q-tilde and FP16 o-bar images | 8K / 32K benchmark prompts, fresh process per arm, against FAST without it | Prefill 8K **8.504 → 8.399 s warm (−1.2 %), 9.847 → 9.489 s cold (−3.6 %)** (3 alternating pairs, before the q-tilde / o-bar images; layer bench with both images −5.0 ms per call) | FAST, not bitwise: gate vs FAST KL 0.0053, top-1 98.2 %, dNLL -0.0002 (1,536 rows prose / code / chat) |
 | FAST fused MLA/DSA attention core (`glm-pf-attn-wmma`, on with `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_ATTN_WMMA=0` turns it off) | 8K / 32K benchmark prompts, 8,192-row chunks, fresh process per arm, against FAST without the core | Prefill 8K **10.600 → 9.695 s (−8.5 %)** (2 alternating pairs), 32K **44.30 → 40.26 s (−9.1 %)** (one off / on / off set); layer bench: scores + softmax + o-bar 2.6× / 3.2× faster at the 8K / 32K positions | FAST, not bitwise: prefill-logits KL 7.8e-4 nats at 8K, top-1 and greedy equal over 8 decode steps; exact mode unchanged (logits equal the anchors on both ranks); teacher-forced check over 3 prompts pending |
 | Exact chunked prefill, mHC expand + norm two rows per block (default; `STRIX_GLM_PF_HC_EXPAND_ROWS=1` restores one row per block) | 8K benchmark prompt (8,192 tokens), alternating on / off arms, other exact prefill levers of that build enabled | TTFT 8K **13.671 → 13.611 s** (−0.44 %, above the 0.024 s spread within an arm) | logits bitwise equal the anchors on both ranks at 8K; host and device gates bitwise against the one-row kernel |
 | Exact / FAST chunked prefill, token-ordered MoE gate/up input transform (default; `STRIX_GLM_PF_IN_TOKEN=0` restores the tile-ordered transform) | 8K / 32K benchmark prompts, on / off arms in both orders, fresh process per arm | FAST 8K TTFT **10.55 → 10.21 s** (median of 4 pairs); exact 8K 13.195 → 12.868 s; FAST 32K 43.49 → 42.39 s (one pair); exact 32K: 56.32 -> 53.41 s and 57.63 -> 55.52 s in two pairs (off first, on first): -2.9 / -2.1 s, mean -2.5 s (-4.5 %), identical full logits files on both ranks (an earlier single pair showed -5.5 s from a slow off arm; it did not reproduce). | logits and state digests identical in every arm on both ranks; full logits files identical in the exact arms |
@@ -269,15 +277,23 @@ With 24 GiB VRAM + 32 GiB host RAM (most experts streamed from the unit file on 
 (auto, 76 % of the experts on the unit file) decode is **0.77 / 0.75 tok/s** warm / cold at 1K (mean of two loads,
 24-token bench). With the opt-in two-stage file prefetch (`--tier-landing-blocks 16`, three striped
 drives) decode was 20-40 % faster than without it in the same windows, identical output (repeats varied by 15-55 %).
-Build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md).
+Build, unit file and options: [GLM RTX guide](../../../src/cuda/models/glm/README.md).
 
 **RTX prefill into the pair (FAST, off by default).** `strix-glm5-serve --rtx-prefill HOST:PORT --import-listen IP:PORT
 --import-peer IP:PORT --import-key FILE --import-model-sha SHA` (every rank `--import-listen`; engines with their MTP
 layer only) lets the RTX producer prefill long prompts and hand each rank its state. Both ranks stage the hand-off,
 vote on it (the authenticated binding, then both restored) before the last prompt token runs, and any failure before
 that vote falls back to the pair's own prefill on both ranks; a failure inside the last-token collectives stops the
-server (fatal). `--import-dsa-once` (with the producer's `dsa_once`) sends the DSA state to rank 0 only and relays it
-to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). Imported prompts carry the FAST identity
+server (fatal). DSA once (hand-off version 2, the default on a pair with `--import-listen`; `--no-import-dsa-once` or
+`STRIX_HANDOFF_SHARED_ONCE=0` restores version 1) sends the DSA state to rank 0 only and relays it to rank 1 over the
+pair link, hash checked (8K: 480 -> 316 MB on the producer link, 4.05 -> 2.67 s at 1 GbE; 32K: 1,461 -> 807 MB,
+12.38 -> 6.90 s; rank 1's merged payload is byte-identical to its version 1 payload, tokens equal). See
+[hand-off owners](../../pair.md#prompt-state-hand-off-one-copy-per-owner). `--import-index-tail`
+(every rank, with the producer's `index_tail`; wire version 3, or 4 with DSA once) sends the DSA index key and
+gate of the open pool block only (`P % 4` rows): the closed blocks travel as their pooled FP32 rows, which is all the
+decode, prefill and MTP kernels read (`include/strix/block_summary_state.hpp`). 32K: 806.92 -> 605.62 MB for both ranks
+with DSA once; 128K: -805.28 MB. Opt-in; `tests/hip_glm_dsa_tests.hip` checks the continuation bitwise with the omitted
+rows poisoned, and `scripts/bench/handoff/glm_wire_versions.sh` times the wire versions over a real link. Imported prompts carry the FAST identity
 `glm-pf-rtx-native-v1` (not bitwise the pair's own prefill; each response's `prefill_route` names it).
 `--import-gate` fails unless every routed arm really imported (and a suite with no prompt fails). `--import-model-sha` is
 an operator attestation: the receiver compares it with the producer's hand-off header, it is not computed from the
@@ -298,5 +314,5 @@ prefill time for long prompts. With the producer launched with its cache (first 
 
 The changelog of every default-on GLM lever with its measured gain, exactness evidence and off switch is in
 [measured gains](../../measured-gains.md); the full catalog is [docs/optimizations.md](../../optimizations.md#glm).
-GLM RTX build, unit file and options: [GLM RTX guide](../../../src/glm/rtxpf/README.md); native RTX prefill notes:
+GLM RTX build, unit file and options: [GLM RTX guide](../../../src/cuda/models/glm/README.md); native RTX prefill notes:
 [docs/models/glm/rtx-prefill-native.md](../glm/rtx-prefill-native.md).

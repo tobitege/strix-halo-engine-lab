@@ -130,6 +130,7 @@ cosine at least 0.99999 per row; device backend mean cosine at least 0.9995, min
 | Preprocessing against Pillow, 6 images | patch tensor bit-equal |
 | Host FP32 tower + adapter against the numpy implementation | cosine 1.000000, relative L2 0.00000 (rows differ only by their BF16 storage) |
 | Device arithmetic `vision-f16-v1`, 7 images | single FP16 operands: 4 pass, 3 fail the row minimum; split activations: 1 of the 5 run fails it |
+| Device arithmetic `vision-f16-attn2-v1` (opt-in: split activations + two-term attention), 7 images | **pass**: row minimum at least 0.999800, mean at least 0.999997, relative L2 at most 0.2 % |
 | Reference processor (checkpoint code), 6 images | patch tensor bit-equal (maximum difference 0), same grids, including grids with partial cells |
 | Reference model in FP32, 7 images, same patches | tower and rows cosine 1.000000, row minimum at least 0.999994, relative L2 at most 0.0002; special rows bit-equal |
 | Reference processor + model in FP32 against `preprocess` + `encode`, 6 images | rows cosine 1.000000, row minimum at least 0.999999, relative L2 at most 0.0001 |
@@ -148,9 +149,38 @@ rings): the mean cosine stays at or above 0.998 while single rows fall far below
 
 The error is therefore clustered in rows, input dependent and a precision effect, not a wiring fault. The adapter
 requests split activations (`device_options()`); with them the gradient and the upscaled image pass and the rings
-image misses the minimum on one row (0.9969; mean 0.99999, relative L2 0.3 %). The device arithmetic of this
-tower is **not accepted yet**: the remaining single-row flips need either more precision in the first blocks
-and in the attention operands, or a judgement on the language model's output instead of a per-row minimum.
+image misses the minimum on one row (0.9969; mean 0.99999, relative L2 0.3 %). With the two-term attention
+below, the device arithmetic passes the gate on all seven images.
+
+### Tower attention precision (two-term operands)
+
+With split activations one row still failed: row 40 of the upscaled 16 x 16 checkerboard (cosine 0.9958 against
+the 0.998 minimum). That row comes from a high-norm outlier token (norm 0.80 against a median 0.16), and its error is
+the single FP16 rounding of the attention operands. A host model of the device rounding (`--rounding attention:QKVP`
+of the gate tool, FP16 terms per operand Q, K, V, P) attributes it: rounding Q alone gives 0.9893, K alone 0.99999,
+V alone 0.99996, P alone 0.999998. The rounding of the outlier's query, amplified by the softmax, carries the error.
+
+With `STRIX_VISION_ATTN_TERMS=2` the tower attention carries Q, K, V and P as two FP16 terms (hi + lo, lo = the FP16 rounding of
+the remainder; the shared mechanism `tile::to_operand2` that the key-split sparse core already uses). Every product
+runs as hi.hi + hi.lo + lo.hi, at three times the attention WMMA. The gain is conditioned on format and range, not a
+fixed figure: per FP16 operand the error goes from max(2^-11 |x|, 2^-25) to max(2^-22 |x|, 2^-25), so per product
+from about 2^-10 |ab| to about 3 x 2^-22 |ab| while the remainders are normal FP16 (|x| above about 2^-3); smaller
+values keep the 2^-25 absolute floor and below 2^-14 two terms equal one. The FP32 WMMA chain adds about 2^-24 per
+step relative to the sum of |a_i b_i|, so a score with cancellation keeps a large relative error in both forms.
+`src/attn_core/two_term_model.hpp` holds the bounds and a host model of the three products in the core's order
+(gate `--rounding order1|order2`); the operand-only model (`--rounding attention:QKVP`) stays as the diagnostic. Host model with two terms: row 40 at 0.999998; device: 0.999800, and all seven images pass at the unchanged
+threshold.
+
+| Switch | Value | Rows | Cost on the minimum image (1,550 patches, steady) |
+|---|---|---|---|
+| `STRIX_VISION_ATTN_TERMS=2` (opt-in) | two-term attention, arithmetic `vision-f16-attn2-v1` | encoder gate passes; the preprocessing re-check fails, so not the default yet | attention core 23 -> 48 ms; encode about 207 -> 236 ms |
+| `STRIX_VISION_ATTN_TERMS` unset or `1` (default) | one-term attention, arithmetic `vision-f16-v1`: faster, lower precision | byte-equal to the previous rows | as before |
+
+The value is resolved once (`vision::attention_terms_from_env`) and is the default of every `EncoderOptions`, so the
+server, the command-line tools and the memory plan see the same value; any other value is rejected. The two-term
+form holds the lo terms of K and V^T on the device (2 x key slots x heads x head dim x 2 bytes, 12 MiB at 1,550
+patches). The arithmetic name is part of the image cache key, so rows cached under one form are never served for the
+other. Other vision adapters on the shared encoder get the same default.
 
 Measured tower time on one node (warm, no per-layer synchronisation): 111 ms for 1,521 patches (the minimum
 image), 388 ms for 3,888, 1,907 ms for 9,216 (the token cap); about 2.1 x, 1.8 x and 1.4 x that with split

@@ -1,3 +1,4 @@
+#include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
@@ -56,6 +57,7 @@
 #include "glm/prefill/glm_pf_load_admission.hpp"
 #include "strix/device_profile.hpp"
 #include "glm_rank_startup.hpp"
+#include "glm_auto_rows.hpp"
 #include "glm_rank_transport.hpp"
 
 #include "strix/dist/communicator.hpp"
@@ -148,10 +150,15 @@ int main(int argc, char** argv) {
         std::string transport_spec, g3_tokens, prompt, out_path, tf_tokens, state_out, state_in;
         std::string mtp_prefill = "ref", mtp_prefill_gate;
         std::string prefill_mode = "auto", pf_gate, pf_ttft, pf_ttft_mode = "gemv", pf_null_study, pf_nulls;
+        std::string pf_ttft_arms;  // strix::env_arms spec: in-process ABAB arms for --pf-ttft (bundle tickets)
+        int pf_ttft_reps = 1;
         bool reference_gate = false;
         bool pf_before_load = false, pf_swap_moe = false;
         std::uint64_t tf_stop = 0;
         unsigned idcheck_n = 0;
+        std::string split_ab_prompt;  // --split-ab PROMPT.u32:STEPS:R1,R2,...: in-process split-frame A/B (own prompt, not --prompt)
+        unsigned split_ab_steps = 0;
+        std::vector<unsigned> split_ab_rs;
         unsigned prompt_max = 0, ab_n = 0, aba_n = 0, aba3_n = 0, aba_xch_n = 0;
         std::string aba_xch_rows = "1";
         bool g3_sweep = false;
@@ -184,6 +191,20 @@ int main(int argc, char** argv) {
             else if (a == "--decode") decode_n = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prompt") prompt = next();
             else if (a == "--prompt-max") prompt_max = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--split-ab") {
+                const std::string v = next();
+                const auto c1 = v.find(':'), c2 = c1 == std::string::npos ? c1 : v.find(':', c1 + 1);
+                if (c2 == std::string::npos) throw std::invalid_argument("--split-ab PROMPT.u32:STEPS:R1,R2,...");
+                split_ab_prompt = v.substr(0, c1);
+                split_ab_steps = static_cast<unsigned>(std::stoul(v.substr(c1 + 1, c2 - c1 - 1)));
+                for (std::size_t q = c2 + 1; q < v.size();) {
+                    const auto e = v.find(',', q);
+                    split_ab_rs.push_back(static_cast<unsigned>(std::stoul(v.substr(q, e - q))));
+                    q = e == std::string::npos ? v.size() : e + 1;
+                }
+                if (split_ab_steps < 2 || split_ab_rs.empty()) throw std::invalid_argument("--split-ab: STEPS >= 2 and at least one R");
+                for (unsigned r : split_ab_rs) if (r < 2) throw std::invalid_argument("--split-ab: GLM splits only R >= 2");
+            }
             else if (a == "--ab") ab_n = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--g3-sweep") g3_sweep = true;
             else if (a == "--aba-xch") aba_xch_n = static_cast<unsigned>(std::stoul(next()));
@@ -206,6 +227,8 @@ int main(int argc, char** argv) {
             else if (a == "--pf-swap-moe") pf_swap_moe = true;  // --pf-gate test (world 2): a fresh fast MoE seam set right before the gemv run  // test: --prefill path set before load() (installed at its end)
             else if (a == "--pf-gate") pf_gate = next();  // prompt file: ref vs gemv (bitwise) vs wmma (D10) prefill, one process
             else if (a == "--pf-ttft") pf_ttft = next();  // comma-separated prompt files: chunked prefill TTFT
+            else if (a == "--pf-ttft-arms") pf_ttft_arms = next();  // "B:-/C:K=V+K=V": per rep every arm runs every prompt, one load
+            else if (a == "--pf-ttft-reps") pf_ttft_reps = std::stoi(next());  // arm cycles (strict ABAB order), default 1
             else if (a == "--pf-ttft-mode") pf_ttft_mode = next();  // gemv (default, exact identity) | wmma | wmma,gemv (each prompt in both, one load)
             else if (a == "--pf-null-study") pf_null_study = next();  // prompt file: exact (gemv) vs wmma vs 1-ulp nulls
             else if (a == "--pf-null") pf_nulls = next();  // comma-separated LAYER:POS:ELEM 1-ulp residual flips (test hook)
@@ -288,6 +311,8 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--mtp-prefill-gate requires --spec 1 --mtp 1");
         if (eff.identity.source == "baseline") opt.identity = ge::IdentityMode::kR1;
         if (eff.decode_xch.source == "baseline") opt.decode_xfer = false;
+        opt.split_frame_mode = static_cast<unsigned>(eff.split_policy.mode);
+        opt.split_frame_crossover = static_cast<unsigned>(eff.split_policy.crossover);
         if (eff.baseline) std::printf("baseline: default-on optimizations off (old path), explicit settings kept\n");
         prefill_mode = eff.prefill_requested.value;
         if (prefill_mode != "ref" && prefill_mode != "gemv" && prefill_mode != "wmma" && prefill_mode != "auto")
@@ -309,6 +334,7 @@ int main(int argc, char** argv) {
             prefill_mode = rd::resolve_prefill_auto(opt.mtp, opt.spec, g3_only, smoke_head, mem_plan, r1b_all, idcheck_n, reference_gate, mtp_spec_on);
         if (prefill_mode != eff.prefill) throw std::logic_error("prefill resolution differs from --print-effective-config");
         if (batch_r > opt.slots) opt.slots = batch_r;
+        for (unsigned r : split_ab_rs) opt.slots = std::max<std::uint32_t>(opt.slots, r);
         if (g4_rmax > opt.slots) opt.slots = g4_rmax;
         if (mem_plan) {  // no peer, no weights: the engine stops after the admission check
             (void)::setenv("STRIX_GLM_LOAD_TEST", "1", 1);
@@ -373,19 +399,32 @@ int main(int argc, char** argv) {
             }
         }
         if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate, !tf_tokens.empty());
+        const bool startup_handshake = rd::has_config_agreement(opt.world, xch_kind, decode_n > 0, reference_gate,
+                                                                !tf_tokens.empty() || !pf_ttft.empty());
         // FAST glm-pf-wmma-x is a per-rank env switch, checked by the startup agreement (kPfWmmaConfig). Modes without
-        // that handshake (or the --tf config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
+        // that handshake (or the --tf / --pf-ttft config-only agreement) cannot verify that both ranks run the same identity, so FAST is refused there (no new exchange).
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::attn_wmma::enabled())
             throw std::invalid_argument("the FAST attention core (STRIX_GLM_PF_ATTN_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
-                                        "needs the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "needs the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::kda_wmma::enabled())
             throw std::invalid_argument("the FAST KDA projections (STRIX_GLM_PF_KDA_WMMA, default with STRIX_GLM_PF_WMMA=1) with --world 2 "
-                                        "need the startup agreement (--decode N or --tf, comm exchange) so both ranks "
+                                        "need the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks "
                                         "are checked to run the same prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::mla_wmma::enabled())
+            throw std::invalid_argument("the FAST MLA GEMMs (STRIX_GLM_PF_MLA_WMMA=1) with --world 2 need the startup agreement "
+                                        "(--decode N, --tf or --pf-ttft, comm exchange) so both ranks are checked to run the same "
+                                        "prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::idxproj_wmma::enabled())
+            throw std::invalid_argument("the FAST indexer projections (STRIX_GLM_PF_IDXPROJ_WMMA) with --world 2 need the startup "
+                                        "agreement (--decode N, --tf or --pf-ttft, comm exchange) so both ranks are checked to run "
+                                        "the same prefill identity");
+        if (opt.world == 2 && !startup_handshake && strix::glm::pf::router_wmma::enabled())
+            throw std::invalid_argument("the FAST prefill router (STRIX_GLM_PF_ROUTER_WMMA=1) with --world 2 needs the startup agreement "
+                                        "(--decode N, --tf or --pf-ttft, comm exchange) so both ranks are checked to run the same "
+                                        "prefill identity");
         if (opt.world == 2 && !startup_handshake && strix::glm::pf::wmma_x::enabled())
-            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N or --tf, "
+            throw std::invalid_argument("STRIX_GLM_PF_WMMA=1 with --world 2 needs the startup agreement (--decode N, --tf or --pf-ttft, "
                                         "comm exchange) so both ranks are checked to run the same prefill identity");
         // FAST indexer scores (STRIX_IDX_WMMA) change the DSA selection: the same agreement rule as glm-pf-wmma-x.
         // Unset or exact: WMMA scores with exact rescoring of the cut-off, the pool lists of the exact kernels, so it is
@@ -395,7 +434,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("STRIX_IDX_WMMA: GLM takes 0, bf16, f16 or exact (bf16x2 needs BF16 keys)");
         const unsigned idx_wmma = idx_mode == strix::attn_core::idx::kModeExact ? 0U : idx_mode;
         if (opt.world == 2 && !startup_handshake && idx_wmma != 0)
-            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N or --tf, comm exchange) "
+            throw std::invalid_argument("STRIX_IDX_WMMA with --world 2 needs the startup agreement (--decode N, --tf or --pf-ttft, comm exchange) "
                                         "so both ranks are checked to run the same indexer identity");
         if (idx_wmma != 0)
             std::printf("rank %u prefill identity glm-idx-wmma FAST (STRIX_IDX_WMMA=%s, DSA indexer scores on WMMA)\n", opt.rank,
@@ -431,6 +470,9 @@ int main(int argc, char** argv) {
                 (eng.model_fast_i4() ? rd::kFastI4Config : 0U) |                 // and the model format (also in the load vote)
                 (strix::glm::pf::attn_wmma::enabled() ? rd::kPfAttnWmmaConfig : 0U) |
                 (strix::glm::pf::kda_wmma::enabled() ? rd::kPfKdaWmmaConfig : 0U) |
+                (strix::glm::pf::mla_wmma::enabled() ? rd::kPfMlaWmmaConfig : 0U) |
+                (strix::glm::pf::idxproj_wmma::enabled() ? rd::kPfIdxProjWmmaConfig : 0U) |
+                (strix::glm::pf::router_wmma::enabled() ? rd::kPfRouterWmmaConfig : 0U) |
                 (idx_wmma << rd::kIdxWmmaShift);                                   // FAST indexer identity, ditto
             const auto result = rd::startup_agreement(
                 {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
@@ -443,106 +485,38 @@ int main(int argc, char** argv) {
                 std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
         };
         const auto pf_tier = prefill_mode == "gemv" ? strix::glm::pf::TierB::gemv : strix::glm::pf::TierB::wmma;
-        std::uint64_t prefill_margin = 0;
-        std::uint64_t prefill_first_forward = 0;
-        std::uint64_t admitted_prefill_path = 0, admitted_device_free = 0, admitted_mem_available = 0;
-        const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
+        rd::PrefillLoad prefill_load{{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier},
+                                    0, 0, pf_before_load, mem_plan};
+        std::uint64_t admitted_device_free = 0, admitted_mem_available = 0;
+        const auto lr = prefill_load.load(eng, opt, [&](const ge::mem::LoadAdmission& admission) {
             namespace pf = strix::glm::pf;
             namespace mem = strix::glm::engine::mem;
             // Keep the existing 8 GiB OS/peer/runtime headroom, now at both checks.
-            prefill_margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
+            prefill_load.margin = std::max(pf::admission_margin_bytes(), admission.margins.ram);
             admitted_device_free = admission.device_free;
             admitted_mem_available = admission.snapshot.mem_available;
-            if (rd::max_rows_auto(eff)) prefill_margin = std::max(prefill_margin, rd::kMaxRowsSafetyBytes);
+            if (rd::max_rows_auto(eff)) prefill_load.margin = std::max(prefill_load.margin, rd::kMaxRowsSafetyBytes);
             if (rd::max_rows_auto(eff)) {
-                auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
-                const auto comm_bytes = opt.world > 1 && !admission.recheck
-                    ? std::uint64_t{rd::kAutoMaxRows} * (3 * 4096 * 4 + 16) + 16384 : 0;
-                rd::select_max_rows(eff, [&] {
-                    if (prefill_mode == "ref") {
-                        auto terms = admission.terms;
-                        terms.push_back({"communication growth and chunk staging", 3 * comm_bytes, 0});
-                        return mem::fits(terms, admission.snapshot, admission.margins, admission.device_free);
-                    }
-                    // Preserve the preferred chunk size if ANY scratch candidate
-                    // admits locally. The engine later votes the SAME layout on
-                    // both ranks before installation, including at fallback rows.
-                    const auto saved = pf::capacity_layout();
-                    std::exception_ptr install_error;
-                    std::uint32_t fits = 0;
-                    try {
-                        for (const auto layout : pf::capacity_candidates(pf::capacity_policy(), admission.kv_shard)) {
-                            try {
-                                pf::capacity_layout() = layout;
-                                b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity,
-                                                       rd::kAutoMaxRows, opt.mtp, pf_tier, admission.kv_shard);
-                                pf::capacity_layout() = saved;
-                                pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                                fits = 1;
-                                break;
-                            } catch (const std::runtime_error&) {
-                                // A local refusal is only a row-size probe here.
-                            }
-                        }
-                    } catch (...) {
-                        install_error = std::current_exception();
-                        fits = 2;
-                    }
-                    pf::capacity_layout() = saved;
-                    // One vote per probe, even if ranks admit different candidates.
+                const rd::AutoRowsPlan plan{opt.rank, opt.world, opt.capacity, opt.mtp, prefill_mode == "ref", pf_tier};
+                opt.max_rows = rd::admit_auto_rows(eff, admission, plan, prefill_load.margin, [&](std::uint32_t fits) {
                     std::uint32_t peer_fits = fits;
-                    if (comm) {
+                    if (comm)
                         comm->exchange_host(std::as_bytes(std::span{&fits, 1}), std::as_writable_bytes(std::span{&peer_fits, 1}),
                             {static_cast<std::uint32_t>(strix::dist::TagKind::raw_slots), 0xFFFFFFFBU, admission.recheck ? 1U : 0U});
-                        if (peer_fits > 2U) throw std::runtime_error("glm capacity: invalid row probe vote");
+                    return peer_fits;
+                }, [&](unsigned rows) {
+                    opt.max_rows = rows;
+                    if (!admission.recheck) {
+                        startup_agree();
+                        return opt.max_rows;
                     }
-                    if (install_error) std::rethrow_exception(install_error);
-                    if (peer_fits == 2U) throw std::runtime_error("peer install failed");
-                    return fits == 1U;
-                });
-                opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-                std::fprintf(stderr, "rank %u max-rows admission: %s; candidate %u, path %.2f GiB, workspace %.2f GiB, install %.2f GiB\n",
-                             opt.rank, mem::describe(admission.snapshot).c_str(), opt.max_rows,
-                             mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install));
-                if (!admission.recheck) startup_agree();
-                else {
-                    const auto rows = rd::recheck_rows(opt.max_rows, comm != nullptr,
+                    return rd::recheck_rows(rows, comm != nullptr,
                         [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
-                    rd::agree_max_rows(eff, rows);
-                    opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
-                }
+                });
                 if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
             }
             std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
             return opt.max_rows;
-        }, [&](const ge::mem::LoadAdmission& admission) {
-            namespace pf = strix::glm::pf;
-            namespace mem = strix::glm::engine::mem;
-            prefill_first_forward = admission.first_forward_reserve;
-            // The recheck sees actual communication pools and the replanned row
-            // count; the provisional auto callback still has the 8192-row plan.
-            // Explicit sizes and --mem-plan also admit before the first weight.
-            if (prefill_mode != "ref" && (!opt.auto_rows || admission.recheck)) {
-                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows, opt.mtp, pf_tier, admission.kv_shard);
-                admitted_prefill_path = b.path;
-                const auto comm_bytes = opt.world > 1 && !admission.recheck
-                    ? std::uint64_t{opt.max_rows} * (3 * 4096 * 4 + 16) + 16384 : 0;
-                pf::admit_prefill_load(admission, b.path, b.workspace, prefill_margin, 3 * comm_bytes);
-                std::fprintf(stderr, "rank %u prefill admission: path %.3f GiB, workspace %.3f GiB, install/staging %.3f GiB, late safety %.3f GiB, first-forward reserve %.3f GiB, layout %s%s, grouped-moe legacy-wmma=%u exact=%u, attention-scratch-rows=%u\n",
-                             opt.rank, mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install),
-                             mem::gib(prefill_margin), mem::gib(prefill_first_forward),
-                             admission.kv_shard ? "sharded" : "replicated", admission.candidate ? " (candidate)" : "",
-                             unsigned(b.moe_route.legacy_wmma), unsigned(b.moe_route.exact), b.attention_rows);
-            }
-            if (!admission.candidate && pf_before_load && !mem_plan && (!opt.auto_rows || admission.recheck)) {
-                eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                      pf_tier, prefill_margin, admission.kv_shard, prefill_first_forward));
-                std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
-            }
-        }, [&](bool sharded) -> std::shared_ptr<ge::PrefillPath> {
-            if (prefill_mode == "ref" || pf_before_load || mem_plan) return {};
-            return strix::glm::pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                    pf_tier, prefill_margin, sharded, prefill_first_forward);
         });
         eff.kv_shard = eng.kv_shard_enabled();
         const auto admitted_layout = strix::glm::pf::capacity_layout();
@@ -555,9 +529,9 @@ int main(int argc, char** argv) {
         if (!eff.kv_shard) {
             const auto kv_bytes = opt.capacity * strix::glm::kvshard::bytes_per_token;
             std::printf("rank %u kv-budget layout=replicated dsa_layer_kv_bytes=%llu pf_path=%llu pf_window_budget=0 device_free=%llu mem_available=%llu margin=%llu\n",
-                opt.rank, static_cast<unsigned long long>(kv_bytes), static_cast<unsigned long long>(admitted_prefill_path),
+                opt.rank, static_cast<unsigned long long>(kv_bytes), static_cast<unsigned long long>(prefill_load.admitted_path),
                 static_cast<unsigned long long>(admitted_device_free), static_cast<unsigned long long>(admitted_mem_available),
-                static_cast<unsigned long long>(prefill_margin));
+                static_cast<unsigned long long>(prefill_load.margin));
         }
         const auto load_identity = eng.identity_mode();
         std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) model-format %s identity %s decode-xch %s%s%s%s%s",
@@ -1125,7 +1099,18 @@ int main(int argc, char** argv) {
                                 "T %u, calls %llu)\n", opt.rank, strix::glm::pf::attn_wmma::block_keys(), static_cast<unsigned long long>(ac));
                 if (const auto kc = strix::glm::pf::kda_wmma::calls.exchange(0); kc != 0)
                     std::printf("rank %u prefill identity glm-pf-kda-wmma-v1 FAST (KDA plain-weight projections on the dense "
-                                "FP16 WMMA core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(kc));
+                                "FP16 WMMA core, calls %llu, x16 form %llu)\n", opt.rank, static_cast<unsigned long long>(kc),
+                                static_cast<unsigned long long>(strix::glm::pf::kda_wmma::x16_calls.exchange(0)));
+                if (const auto ic = strix::glm::pf::idxproj_wmma::calls.exchange(0); ic != 0)
+                    std::printf("rank %u prefill identity glm-pf-idxproj-wmma-v1 FAST (DSA indexer projections on the dense "
+                                "FP16 WMMA core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(ic));
+                if (const auto rc = strix::glm::pf::router_wmma::calls.exchange(0); rc != 0)
+                    std::printf("rank %u prefill identity glm-pf-router-wmma-v1 FAST (router product on the dense FP16 WMMA "
+                                "core, form %s, calls %llu)\n", opt.rank, strix::glm::pf::router_wmma::form_used.load(),
+                                static_cast<unsigned long long>(rc));
+                if (const auto mc = strix::glm::pf::mla_wmma::calls.exchange(0); mc != 0)
+                    std::printf("rank %u prefill identity glm-pf-mla-wmma-v1 FAST (MLA absorb/out GEMMs on the short-K FP16 "
+                                "WMMA tile core, calls %llu)\n", opt.rank, static_cast<unsigned long long>(mc));
             }
             if (!logits_out.empty()) {
                 std::vector<float> lg(eng.vocab_slice());
@@ -1500,6 +1485,54 @@ int main(int argc, char** argv) {
             }
             eng.set_identity_mode(load_identity);
         }
+        bool split_ab_fail = false;
+        if (!split_ab_rs.empty()) {  // see --split-ab: A = Engine::set_split_frame(0), B = 1; A B A B A B A, blocks 1..6 replay block 0's tokens
+            const auto toks = read_u32(split_ab_prompt);
+            const std::size_t P = toks.size();
+            if (P == 0 || P + split_ab_steps > opt.capacity) throw std::invalid_argument("--split-ab: prompt + STEPS exceeds the capacity");
+            auto med = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v.size() % 2 == 1 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+            };
+            for (unsigned R : split_ab_rs) {
+                eng.set_split_frame(0);
+                const auto t0 = Clock::now();
+                std::uint32_t first = 0;
+                for (unsigned r = 0; r < R; ++r) {  // no slot copy in the GLM engine: one prefill per slot (same prompt, same bits)
+                    eng.reset(r);
+                    first = eng.prefill(r, toks, 0);
+                }
+                std::printf("rank %u split-ab R=%u: prefill %.3f s (%zu tokens x %u slots)\n", opt.rank, R, secs(t0, Clock::now()), P, R);
+                std::vector<std::vector<std::uint32_t>> gen(R, std::vector<std::uint32_t>{first});
+                std::vector<double> cell[7];
+                std::size_t diff = 0;
+                std::vector<ge::Row> rows(R);
+                for (int b = 0; b < 7; ++b) {
+                    eng.set_split_frame(b % 2 == 1 ? 1 : 0);
+                    for (unsigned k = 0; k < split_ab_steps; ++k) {
+                        for (unsigned r = 0; r < R; ++r) rows[r] = ge::Row{r, gen[r][k], P + k};
+                        const auto a0 = Clock::now();
+                        const auto out = eng.step(rows);
+                        cell[b].push_back(1000.0 * secs(a0, Clock::now()));
+                        for (unsigned r = 0; r < R; ++r) {
+                            if (b == 0) gen[r].push_back(out[r]);
+                            else diff += out[r] != gen[r][k + 1] ? 1U : 0U;
+                        }
+                    }
+                }
+                eng.set_split_frame(-1);
+                double m[7];
+                for (int b = 0; b < 7; ++b) m[b] = med(std::vector<double>(cell[b].begin() + 1, cell[b].end()));
+                const double ma = med({m[0], m[2], m[4], m[6]}), mb = med({m[1], m[3], m[5]});
+                if (opt.rank == 0)
+                    std::printf("split-ab R=%u ctx=%zu A %.3f B %.3f delta %+.3f (%+.2f%%) A-blocks %.3f,%.3f,%.3f,%.3f B-blocks %.3f,%.3f,%.3f replay-diff %zu\n",
+                                R, P, ma, mb, mb - ma, (mb - ma) / ma * 100.0, m[0], m[2], m[4], m[6], m[1], m[3], m[5], diff);
+                std::printf("rank %u split-ab R=%u: matched replay %zu differences%s\n", opt.rank, R, diff, diff == 0 ? " (IDENTICAL)" : " (DIFFER)");
+                if (diff != 0) split_ab_fail = true;
+                std::fflush(stdout);
+            }
+            eng.set_split_frame(-1);
+        }
         if (batch_r > 0) {
             std::vector<ge::Row> rows(batch_r);
             std::vector<std::uint32_t> all;  // every step's tokens, row-major per step
@@ -1806,6 +1839,12 @@ int main(int argc, char** argv) {
                     const std::string mode = pf_ttft_mode.substr(mb, me - mb);
                     if (mode != "wmma" && mode != "gemv") throw std::invalid_argument("--pf-ttft-mode: wmma | gemv | wmma,gemv");
                     guarded_install(mode.c_str());
+                    const auto arms = strix::env_arms::parse(pf_ttft_arms.empty() ? std::string("-:-") : pf_ttft_arms);
+                    if (pf_ttft_reps < 1) throw std::invalid_argument("--pf-ttft-reps must be >= 1");
+                    for (int rep = 0; rep < pf_ttft_reps; ++rep)
+                    for (const auto& arm : arms.arms) {
+                    strix::env_arms::apply(arms, arm);
+                    const std::string tag = pf_ttft_arms.empty() ? mode : mode + "." + arm.label;
                     std::size_t a = 0;
                     while (a <= pf_ttft.size()) {
                         const std::size_t b = std::min(pf_ttft.find(',', a), pf_ttft.size());
@@ -1814,10 +1853,10 @@ int main(int argc, char** argv) {
                         // Snapshot after the TTFT timer stops. The ordinary timing route
                         // retains its old cost; qualification explicitly requests full anchors.
                         const char* anchor = std::getenv("STRIX_GLM_PF_TTFT_ANCHOR");
-                        const Run r = guarded_run(toks, anchor && *anchor, (mode + " ttft").c_str());
+                        const Run r = guarded_run(toks, anchor && *anchor, (tag + " ttft").c_str());
                         if (anchor && *anchor) {
                             const std::string prefix = std::string(anchor) + ".n" + std::to_string(toks.size()) +
-                                ".r" + std::to_string(opt.rank) + "." + mode;
+                                ".r" + std::to_string(opt.rank) + "." + tag;
                             auto save = [&](const char* suffix, const void* data, std::size_t bytes) {
                                 std::ofstream file(prefix + suffix, std::ios::binary);
                                 file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
@@ -1828,9 +1867,11 @@ int main(int argc, char** argv) {
                             save(".state.u8", r.state.data(), r.state.size());
                             std::printf("rank %u pf anchor: %zu logits, %zu state bytes\n", opt.rank, r.logits.size(), r.state.size());
                         }
-                        digest((mode + "-ttft").c_str(), r, toks.size());
+                        digest((tag + "-ttft").c_str(), r, toks.size());
                         a = b + 1;
                     }
+                    }
+                    strix::env_arms::restore(arms);
                     mb = me + 1;
                 }
             }
@@ -1881,7 +1922,8 @@ int main(int argc, char** argv) {
             std::printf("rank %u pf modes complete\n", opt.rank);
         }
         std::printf("rank %u: done %.1f s\n", opt.rank, secs(t_start, Clock::now()));
-        return 0;
+        if (split_ab_fail) std::printf("rank %u: EXACTNESS FAILURE (split-ab replay)\n", opt.rank);
+        return split_ab_fail ? 4 : 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

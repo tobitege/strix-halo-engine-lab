@@ -27,6 +27,21 @@ __device__ __forceinline__ float reduce(const float* local, const float* peer, u
     return rank == 0 ? a + b : b + a;
 }
 
+// Split-producer chunk frame (xport/split_frame.hpp, SplitLayout{rows = gridDim.y, kHidden, kSplitHeadCols}): the payload
+// element (r, d) sits at the chunk-major index. kSplit = false is the row-major kernel, its code unchanged.
+constexpr unsigned kSplitHeadCols = kHidden / 2;
+template <bool kSplit>
+__device__ __forceinline__ std::size_t payload_index(unsigned r, unsigned d) {
+    if constexpr (kSplit) {
+        return d < kSplitHeadCols ? static_cast<std::size_t>(r) * kSplitHeadCols + d
+                                  : static_cast<std::size_t>(gridDim.y) * kSplitHeadCols +
+                                        static_cast<std::size_t>(r) * (kHidden - kSplitHeadCols) + (d - kSplitHeadCols);
+    } else {
+        return static_cast<std::size_t>(r) * kHidden + d;
+    }
+}
+
+template <bool kSplit>
 __global__ __launch_bounds__(256) void post_expand_kernel(const float* X, const float* mix, const float* local, const float* peer,
                                                           RxView v, unsigned rank, float* Xo, unsigned* flag, unsigned flag_stride) {
     if (peer == nullptr) {
@@ -38,7 +53,7 @@ __global__ __launch_bounds__(256) void post_expand_kernel(const float* X, const 
     const float* m = mix + static_cast<std::size_t>(r) * kHcMix;
     const float* c = m + 2 * kHc;
     const float* Xr = X + static_cast<std::size_t>(r) * kHc * kHidden;
-    const float yd = reduce(local, peer, rank, static_cast<std::size_t>(r) * kHidden + d);
+    const float yd = reduce(local, peer, rank, payload_index<kSplit>(r, d));
     for (unsigned i = 0; i < kHc; ++i) {
         const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
                          c[3 * kHc + i] * Xr[3 * kHidden + d];
@@ -159,8 +174,13 @@ void hc_pre_v2(const float* X, const float* fn, const float* base, const float* 
 
 void post_expand(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
                  float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
-    post_expand_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
+    post_expand_kernel<false><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand");
+}
+void post_expand_split(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
+                       float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
+    post_expand_kernel<true><<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
+    ok(hipGetLastError(), "glm post_expand split");
 }
 void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipStream_t s) {
     hc_bracket_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, B);

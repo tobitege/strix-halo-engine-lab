@@ -1,0 +1,31 @@
+# Exercise the real early-exit inspection path without device or model assets.
+foreach(case IN ITEMS unset enabled invalid lookup_disabled)
+    set(env_args --unset=STRIX_DS41_COPY_ROWS --unset=STRIX_DS41_SPEC_ARBITER
+        --unset=STRIX_DS41_LOOKUP --unset=STRIX_DS41_PROFILE STRIX_DS41_PACKS=0)
+    set(rows "6 (default)")
+    set(arbiter "0 (default)")
+    if(case STREQUAL "enabled" OR case STREQUAL "lookup_disabled")
+        list(APPEND env_args STRIX_DS41_COPY_ROWS=8 STRIX_DS41_SPEC_ARBITER=1)
+        set(rows "8 (set)")
+        set(arbiter "1 (set)")
+    elseif(case STREQUAL "invalid")
+        list(APPEND env_args STRIX_DS41_COPY_ROWS=invalid)
+        set(rows "6 (set)")
+    endif()
+    if(case STREQUAL "lookup_disabled")
+        list(APPEND env_args STRIX_DS41_LOOKUP=0)
+    endif()
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env ${env_args}
+        "${TEST_EXE}" --print-effective-config MODEL.gguf --rank 0
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    if(NOT result STREQUAL "0")
+        message(FATAL_ERROR "${case}: inspection failed: ${result}: ${error}")
+    endif()
+    foreach(expected IN ITEMS "env STRIX_DS41_COPY_ROWS ${rows}\n"
+                              "env STRIX_DS41_SPEC_ARBITER ${arbiter}\n")
+        string(FIND "${output}" "${expected}" found)
+        if(found EQUAL -1)
+            message(FATAL_ERROR "${case}: missing inspection line: ${expected}")
+        endif()
+    endforeach()
+endforeach()

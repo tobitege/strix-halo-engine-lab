@@ -10,6 +10,7 @@
 #include "strix/hip_token_sampling.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/mtp_step_logits_digest.hpp"
+#include "strix/mtp_logits_dump.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
@@ -184,11 +185,13 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
             i.active->row_digests.push_back(raw_fp32_logits_digest(row));
         }
     }
-    if(mtp_logits_digest_enabled() || mtp_step_logits_digest_enabled()) {
+    if(mtp_logits_digest_enabled() || mtp_step_logits_digest_enabled() || mtp_logits_dump_enabled()) {
         i.active->logit_digests.reserve(i.rows);
         for(std::uint32_t row=0;row<i.rows;++row) {
             std::vector<float> logits;
             read_hip_logits_row(i.logit_views[row],i.vocab,i.scope.stream,logits);
+            dump_mtp_logits(i.active->base.next_position+row,i.active->base.next_position,row,i.rows,
+                std::span<const std::uint32_t>(i.active->tokens).first(row+1U),i.active->base.arithmetic_lineage.history_identity,logits);
             const auto bytes=std::as_bytes(std::span<const float>(logits));
             const auto sha=sha256_bytes(bytes);i.active->logit_digests.push_back(sha);
             if(mtp_step_logits_digest_enabled())

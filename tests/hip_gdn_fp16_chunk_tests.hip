@@ -391,6 +391,35 @@ void case_bitwise(const std::string& name, const Problem& p, std::uint32_t split
     std::printf("%-34s determinism + split at %u checked\n", name.c_str(), split);
 }
 
+// chunkinv-attn-state-v1 open tail (src/core/chunk_contract.hpp plan_call): a call cut at `cut` (any row) commits the
+// state at the last absolute 32-row boundary a, runs its open tail [a, cut) from a scratch copy of that state, and the
+// next call recomputes from a. Committed rows + recomputed rows + final state == monolithic, bit for bit. Also
+// reports (not asserted) whether the open-tail rows already equal the monolithic rows, and the negative control
+// (closing the tail per call).
+int g_tail_rows_equal = 0, g_tail_rows_differ = 0, g_naive_differ = 0;
+void case_open_tail(const std::string& name, const Problem& p, std::uint32_t cut) {
+    const std::uint32_t a32 = cut / 32U * 32U;
+    Device mono(p), commit(p), tail(p), naive(p);
+    mono.run(p, 0U, p.count, true);
+    if (a32) commit.run(p, 0U, a32, true);
+    ck(hipMemcpy(tail.state, commit.state, p.state.size() * 4U, hipMemcpyDeviceToDevice), "copy state");
+    ck(hipMemcpy(tail.history, commit.history, p.history.size() * 2U, hipMemcpyDeviceToDevice), "copy history");
+    if (cut > a32) tail.run(p, a32, cut - a32, true);   // open tail: rows emitted, state discarded
+    commit.run(p, a32, p.count - a32, true);            // next call recomputes from the committed boundary
+    naive.run(p, 0U, cut, true);
+    naive.run(p, cut, p.count - cut, true);
+    const auto om = mono.read(p), oc = commit.read(p), ot = tail.read(p), on = naive.read(p);
+    const auto same = [](const auto& x, const auto& y) { return std::memcmp(x.data(), y.data(), x.size() * sizeof(x[0])) == 0; };
+    expect_true(same(om.rows, oc.rows) && same(om.state, oc.state) && same(om.history, oc.history), name + " open-tail recompute");
+    const std::size_t s = p.g.stride, lo = std::size_t{a32} * s, hi = std::size_t{cut} * s;
+    if (cut > a32) {
+        const bool eq = std::memcmp(om.rows.data() + lo, ot.rows.data() + lo, (hi - lo) * 4U) == 0;
+        (eq ? g_tail_rows_equal : g_tail_rows_differ) += 1;
+    }
+    if (!(same(om.rows, on.rows) && same(om.state, on.state))) ++g_naive_differ;
+    std::printf("%-34s open tail cut %u (commit %u) checked\n", name.c_str(), cut, a32);
+}
+
 // The BF16-row route equals the FP32-row route bit for bit (same values, BF16 loads).
 void case_b16(const std::string& name, const Problem& p, std::uint32_t split) {
     Device a(p), b(p);
@@ -533,6 +562,12 @@ int main(int argc, char** argv) {
         case_bitwise("bitwise 16/48 kv", make_problem(300U, 16U, 48U, false, 22U), 128U);
         case_b16("b16 16/48 vk", make_problem(333U, 16U, 48U, true, 23U), 160U);
         case_b16("b16 4/12 kv", make_problem(97U, 4U, 12U, false, 24U), 64U);
+        for (const bool vk : {false, true})
+            for (const std::uint32_t cut : {1U, 15U, 31U, 33U, 47U, 64U, 100U, 255U})
+                case_open_tail(std::string("open tail 4/12") + (vk ? " vk" : " kv"), make_problem(300U, 4U, 12U, vk, 30U + cut), cut);
+        std::printf("open tail: tail rows equal monolithic %d, differ %d; per-call closing differs %d (negative control)\n",
+            g_tail_rows_equal, g_tail_rows_differ, g_naive_differ);
+        expect_true(g_naive_differ > 0, "negative control: closing the tail per call changes bits");
         for (const bool vk : {false, true}) {
             const std::string layout = vk ? " vk" : " kv";
             for (const float scale : {0x1p-12F, 0x1p12F}) {

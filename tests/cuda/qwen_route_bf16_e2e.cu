@@ -1,7 +1,7 @@
 // Same-target execution diagnostic, not a model-quality campaign.
 // qwen_route_bf16_e2e MODEL TABLES ROPE PROMPT_IDS N G MAX_POS OUTPUT candidate|off [all|serial|window:W|chunk:R]
 // Requires explicit STRIX_QRTX_GRAPHS=0 for candidate. No MTP/cache composition.
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 
 #include <algorithm>
 #include <cstdio>

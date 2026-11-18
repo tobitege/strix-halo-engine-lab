@@ -1,4 +1,5 @@
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/ds41_decode_xport.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 
 #include <algorithm>
@@ -432,6 +433,18 @@ void test_profile() {
         const auto head = std::string("app ") + pd::app_name(app) + "\nprofile default\nprofile qualification qualified\n";
         check(d.rfind(head, 0) == 0, "describe: profile lines right after the app line");
         check(base.profile && base.profile->json().find("\"pending\":[]") != std::string::npos, "default: nothing pending");
+        // The added explicit-only rows must not invalidate existing OFF pair identities.
+        auto legacy = *base.profile;
+        legacy.entries.resize(2);
+        check(base.profile->fingerprint() == legacy.fingerprint(), "default: legacy OFF fingerprint");
+        auto off_world = w;
+        off_world.env["STRIX_DS41_FAST_ATTN"] = "0";
+        off_world.env["STRIX_DS41_FAST_MOE"] = "0";
+        off_world.env["STRIX_DS41_FAST_DENSE"] = "0";
+        off_world.env["STRIX_DS41_FAST_PREFILL"] = "0";
+        const auto explicit_off = off_world.run(app, plain_args);
+        check(explicit_off.profile->fingerprint() == legacy.fingerprint(), "explicit OFF: legacy fingerprint");
+
 
         auto fast_args = plain_args;
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
@@ -446,7 +459,7 @@ void test_profile() {
               "fast: provisional moe_relaxed still runs");
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == pd::profile_table.size() - 1U && f.notices.size() == base.notices.size() + pending + 1U,
+        check(pending == 1U && f.profile->find("attention_f16wmma")->status == pr::Status::pending && f.notices.size() == base.notices.size() + pending + 1U,
               "fast: one notice per pending row and one for the provisional row");
         check(std::count(f.notices.begin(), f.notices.end(),
                          "deepseek41-pair profile fast: moe_relaxed=1 is bit-changing; qualification in progress") == 1,
@@ -571,7 +584,9 @@ void test_common_adapter() {
             check(result.set_env == expected, "baseline preserves individual OFF and every other row: " + std::string(row.name));
             for (const char* value : {"", "1"}) {
                 w.env[row.env] = value;
-                check(w.run(rc.app, args).set_env == expected, "baseline preserves explicit empty/ON: " + std::string(row.name));
+                const bool automatic_transport = row.env == strix::ds41::decode_xport_lever.env && *value == '\0';
+                check(w.run(rc.app, args).set_env == (automatic_transport ? pd::baseline_off_items() : expected),
+                      "baseline overrides automatic transport and preserves other explicit empty/ON: " + std::string(row.name));
             }
         }
         const auto result = World{}.run(rc.app, args);
@@ -623,9 +638,96 @@ void test_common_adapter() {
     }
 }
 
+// ONE RESOLVER: STRIX_DS41_DECODE_XPORT resolves to the same transport for the CLI apps and the server, through the
+// same rule the engine applies (strix/ds41_decode_xport.hpp), and a bad value is refused at startup.
+void test_decode_xport() {
+    namespace ds = strix::ds41;
+    const std::pair<const char*, const char*> cases[] = {
+        {nullptr, "channel (default)"}, {"", "channel (default)"}, {"communicator", "communicator (explicit)"}, {"channel", "channel (explicit)"},
+        {"0", "communicator (explicit)"}, {"1", "channel (explicit)"}};
+    for (const auto& [value, expected] : cases) {
+        World w;
+        if (value) w.env[std::string(ds::decode_xport_lever.env)] = value;
+        const auto engine = ds::decode_xport_choice(value);
+        for (const auto app : {pd::App::rank, pd::App::batch, pd::App::serve}) {
+            const auto r = w.run(app, plain(receipts[0]));
+            check(r.decode_xport == expected, std::string("decode xport ") + pd::app_name(app) + " " + (value ? value : "unset") + ": " +
+                                                  r.decode_xport);
+            check(r.decode_xport.rfind(ds::decode_xport_name(engine.on), 0) == 0,
+                  std::string("decode xport: engine and ") + pd::app_name(app) + " disagree");
+            check(pd::describe(app, r).find("decode_xport " + std::string(expected)) != std::string::npos,
+                  std::string("decode xport: effective config of ") + pd::app_name(app));
+        }
+    }
+    World bad;
+    bad.env[std::string(ds::decode_xport_lever.env)] = "fast";
+    bool refused = false;
+    try {
+        (void)bad.run(pd::App::serve, plain(receipts[0]));
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    check(refused, "decode xport: an unknown value is refused");
+    check(ds::decode_xport_lever.exactness == strix::lever::Exactness::bitwise && ds::decode_xport_lever.default_on,
+          "decode xport: bitwise lever, channel by default");
+    World base;
+    base.env["STRIX_DS41_BASELINE"] = "1";
+    const auto b = base.run(pd::App::serve, plain(receipts[0]));
+    check(env_of(b)["STRIX_DS41_DECODE_XPORT"] == "0" && b.decode_xport == "communicator (baseline)", "decode xport: STRIX_DS41_BASELINE=1 sets the communicator");
+    for (const char* value : {"", "0", "1", "communicator", "channel"}) {
+        for (const auto app : {pd::App::rank, pd::App::batch, pd::App::serve}) {
+            World inherited;
+            inherited.env["STRIX_DS41_BASELINE"] = "1";
+            inherited.env["STRIX_DS41_DECODE_XPORT"] = value;
+            const auto resolved = inherited.run(app, plain(receipts[0]));
+            for (const auto& [key, exported] : resolved.set_env) inherited.env[key] = exported;
+            const auto actual = ds::decode_xport_choice(inherited.env.at("STRIX_DS41_DECODE_XPORT").c_str());
+            const bool expected_channel = std::string_view(value) == "1" || std::string_view(value) == "channel";
+            check(actual.on == expected_channel, "baseline applied exports preserve explicit values and override empty");
+            check(resolved.decode_xport.starts_with(ds::decode_xport_name(actual.on)),
+                  "baseline inspection agrees with engine after applying exports");
+        }
+    }
+    for (const bool selected : {false, true}) {
+        for (const bool actual : {false, true}) {
+            for (const bool logits : {false, true}) {
+                bool rejected = false;
+                try { ds::check_decode_xport_step(selected, actual, logits); }
+                catch (const std::runtime_error&) { rejected = true; }
+                check(rejected == (selected && !actual && logits), "logit qualification refuses Channel fallback");
+            }
+        }
+    }
+}
+
 }  // namespace
 
-int main() {
+void test_pending_weights_inspection() {
+    for (const auto app : {pd::App::rank, pd::App::serve}) {
+        try {
+            const auto r = World{}.run(app, {MODEL, "--rank", "0", "--transport", "usb4auto", "--profile", "turbo",
+                                           "--turbo-weights", "onfly", "--print-effective-config"});
+            const auto text = pd::describe(app, r);
+            check(r.print_only && r.profile && !r.profile->weights.honoured(), "pending weights inspect without admission");
+            check(text.find("onfly") != std::string::npos && text.find("pending") != std::string::npos,
+                  "inspection displays requested weights and pending reason");
+            bool refused = false, exported = false;
+            try { strix::profile::apply(*r.profile, [&](const char*, const char*) { exported = true; return true; }); }
+            catch (const std::invalid_argument&) { refused = true; }
+            check(refused && !exported, "execution refuses pending weights before exporting");
+        } catch (const std::exception& e) {
+            check(false, std::string("pending weight inspection threw: ") + e.what());
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--print-effective-config") {
+        pd::Effective effective(pd::App::serve, argc, argv, {});
+        return 1;  // Inspection must exit successfully before returning here.
+    }
+    test_pending_weights_inspection();
+    test_decode_xport();
     test_equivalence();
     test_off_switches();
     test_fallbacks();

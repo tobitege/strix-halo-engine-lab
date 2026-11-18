@@ -3,6 +3,8 @@
 #include "../examples/skeleton_engine/skeleton_engine.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -10,6 +12,9 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 
 namespace {
 namespace sv = strix::serve;
@@ -85,8 +90,42 @@ void embed_rows() {
     CHECK(interner.status().live == 1); // lease + table still hold it
 }
 
+void shell_config_tests() {
+    namespace fs = std::filesystem;
+    const auto dir = fs::current_path() / "serve-shell-config-fixture";
+    fs::create_directories(dir / "models");
+    std::ofstream(dir / "models/registry.toml") << "schema = \"strix-registry/v1\"\n[models.fixture]\n"
+        "name = \"fixture\"\nfamily = \"fixture\"\ndescription = \"models/m.toml\"\n";
+    std::ofstream(dir / "models/m.toml") << "schema = \"strix-model/v1\"\nname = \"fixture\"\n";
+    const auto config = dir / "serve.toml";
+    std::ofstream(config) << "registry_root = \".\"\nregistry = \"models/registry.toml\"\n"
+        "description = \"models/m.toml\"\nport = 9000\n";
+#if !defined(_WIN32)
+    ::chmod(config.c_str(), 0600);
+#endif
+    const auto invoke = [&](std::vector<std::string> args, bool print) {
+        std::vector<char*> pointers;
+        for (auto& a : args) pointers.push_back(a.data());
+        std::ostringstream out, error;
+        const sv::ServiceFactories factories;
+        const int result = sv::run(static_cast<int>(pointers.size()), pointers.data(), factories, out, error);
+        if (result) std::cerr << error.str();
+        CHECK(result == 0);
+        if (print) {
+            CHECK(out.str().find("port = \"9000\"") != std::string::npos);
+            CHECK(out.str().find("1234") == std::string::npos);
+        } else CHECK(out.str().find("fixture\tfixture\tfixture\tmodels/m.toml") != std::string::npos);
+    };
+    invoke({"serve", "--serve-config", config.string(), "--inspect"}, false);
+    invoke({"serve", "--serve-config", fs::relative(config).string(), "--inspect"}, false);
+    invoke({"serve", "--serve-config", config.string(), "--print-serve-config", "--", "--port", "1234",
+        "--serve-config", "missing.toml", "--print-serve-config"}, true);
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
+    shell_config_tests();
     embed_rows();
     sv::ServiceFactories factories;
     skeleton::install_session_service(factories);

@@ -1,13 +1,15 @@
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // MiniMax M3.1 defaults-on resolver, CPU only: the host invocation matches the measured production
 // receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), serve's routed default is checked separately, every off switch restores its item's former
 // value, STRIX_MM_BASELINE=1 restores all of them, and apply() exports what --print-effective-config prints.
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/transport_spec.hpp"
 #include "strix/minimax/session_startup.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <array>
 #include <cstring>
@@ -106,6 +108,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_MARKOV", "full"},           {"STRIX_MM_MARKOV_C", "1024"},      {"STRIX_MM_MARKOV_H", "2048"},
     {"STRIX_MM_MARKOV_TOPC", "v1"},
     {"STRIX_MM_PF_ATTEND4", "0"},          {"STRIX_MM_PF_ROUTER_BATCH", "0"},  {"STRIX_MMX_PREFILL_MTFIT", "0"},
+    {"STRIX_MM_PF_MSA_Q16", "0"},
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
@@ -114,11 +117,16 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},      {"STRIX_MM_SELECT_ONCE", "0"},
     {"STRIX_MMX_PREFILL_GATHER_TOK", "0"}, {"STRIX_MM_PF_DENSE_QKV", "0"},
-    {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"},
+    {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"}, {"STRIX_MMX_PREFILL_PIPE_TAIL", "0"},
     {"STRIX_MM_PF_ROUTER_ROWS", "8"}, {"STRIX_MM_PF_MSA_SCRATCH_MB", "512"}, {"STRIX_MM_PF_DENSE_O", "0"},
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
     {"STRIX_MMX_MOE_PIPE", "0"},
+    {"STRIX_MM_PF_HEADLESS", "0"},
+    {"STRIX_MM_PF_DENSE_MLP", "0"},         {"STRIX_MMX_PF_ORDER", "adaptive"},
+    {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
+// Cache identity field of the default chunk-invariant linear order (table item pf_order).
+const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
 
 void test_table() {
     static_assert(std::is_same_v<md::Item, strix::profile::DefaultItem>);
@@ -150,7 +158,10 @@ void test_receipts(const char* path) {
         const std::string got = md::effective_config(md::parse_cli(r.app, plain), lookup(none));
         auto numerical = [](const std::string& text) {
             std::istringstream input(text); std::string result, line;
-            while (std::getline(input,line)) if (!line.starts_with("session_")) result += line + "\n";
+            // The order's request line shows how it was asked (receipt: explicit; plain: "default"); the effective line
+            // and the item value are compared.
+            while (std::getline(input,line))
+                if (!line.starts_with("session_") && !line.starts_with("STRIX_MMX_PF_ORDER.requested=")) result += line + "\n";
             return result;
         };
         check(numerical(got) == numerical(want), r.app + ": host configuration == receipt\n--- receipt\n" + want + "--- host\n" + got);
@@ -161,6 +172,38 @@ void test_receipts(const char* path) {
             check(found, r.app + ": receipt env " + k + "=" + v + " is an item's default");
         }
     }
+}
+
+// Execution residency is independent of the hypothetical 8K FAST capacity/timing estimate.
+void test_pair_pipeline_declaration() {
+    const std::string actual = "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
+        "reason=layout: tensor-split weights; pipeline execution unimplemented";
+    const std::string reference = "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 "
+        "assumed_free_gb=31.0 assumed_extra_gb=41.6 pair.pipeline mode=tensor chunk=";
+    const std::string reason = "reason=layout: src/minimax/engine/engine.hip:89-91,1120-1131 needs +41.6 GB/node, free 31.0 GB";
+    const char* apps[2] = {"rank", "serve"};
+    for (const char* fast : {"0", "1"}) {
+        const EnvMap env{{"STRIX_MM_FAST_PREFILL", fast}};
+        std::string estimates[2];
+        for (int i = 0; i < 2; ++i) {
+            const std::vector<std::string> args = i == 0 ? std::vector<std::string>{"model", "0", "tcp", "out"} : std::vector<std::string>{};
+            std::string row;
+            for (const auto& line : lines(md::effective_config(md::parse_cli(apps[i], args), lookup(env)))) {
+                if (line.rfind("prefill.pair_pipeline=", 0) == 0) row = line;
+                if (line.rfind("prefill.pair_pipeline_reference=", 0) == 0) estimates[i] = line;
+            }
+            check(row == actual, std::string(apps[i]) + ": execution stays tensor with memory pending, FAST=" + fast);
+            check(estimates[i].rfind(reference, 0) == 0 && estimates[i].find(reason) != std::string::npos,
+                std::string(apps[i]) + ": reference labels its profile, rows and assumed memory, FAST=" + fast);
+        }
+        check(estimates[0] == estimates[1], "rank and serve format the same reference estimate");
+    }
+    const auto at8k = md::pair_pipeline_choice(8192U);
+    check(at8k.pipeline_ms > 9500.0 && at8k.pipeline_ms < 9700.0 && at8k.alt_ms > 9809.0 && at8k.alt_ms < 9811.0,
+        "MiniMax 8K reference estimate: pipeline ~9.6 s vs TP2 9.81 s");
+    const auto at32k = md::pair_pipeline_choice(32768U);
+    check(at32k.mode == strix::pair::Mode::tensor && "reason=" + at32k.reason == reason,
+        "32K reference stays TP2 because the assumed layout does not fit");
 }
 
 void test_off_switches() {
@@ -180,7 +223,10 @@ void test_off_switches() {
             if (cli.app == "rank") {
                 std::size_t diff = 0;
                 for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
-                check(diff == 1, std::string(it.env) + " off changes one rank line");
+                // The linear order also prints its request / effective inspection and names its cache identity, so its
+                // off form changes those three lines too.
+                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 4 : 1;
+                check(diff == want, std::string(it.env) + " off changes one rank line (plus inspection + identity for the order)");
             }
         }
     }
@@ -536,6 +582,15 @@ void test_apply() {
             check(md::from_defaults(it.env), std::string("from_defaults ") + it.env);
         }
     }
+    // Shared recorder: a read of an exported default records as default; a user value stays "set" (receipt switches).
+    for (const char* name : {"STRIX_MM_PF_MSA_REWORK", "STRIX_MM_XB_PUBLISH"}) {
+        (void)strix::envcfg::text(name);
+        bool found = false, set = false;
+        for (const auto& e : strix::envcfg::registered())
+            if (e.name == name) { found = true; set = e.set; }
+        const bool user = std::strcmp(name, "STRIX_MM_XB_PUBLISH") == 0;
+        check(found && set == user, std::string("envcfg records exported default as default, user value as set: ") + name);
+    }
     // Exercise the actual app entry with and without inspection, for both rank arguments.
     for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
                              "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST", "STRIX_MM_SERVE_DSPARK", "STRIX_MM_SERVE_DSPARK_INFLIGHT"}) {
@@ -576,7 +631,440 @@ void test_apply() {
     }
 }
 
+// TURBO product profile: '--profile turbo' of rank and serve (exported as STRIX_MM_PRODUCT_PROFILE by print_or_apply)
+// resolves once; its cache identity is minimax-turbo-v1 even with every row off; the timing session moved to
+// --timing-profile with the old spelling kept; an unhonoured weight request is visible and refused.
+void test_turbo_product_profile() {
+    const EnvMap plain, turbo{{md::kProductProfileEnv, "turbo"}};
+    const auto pr = md::profile_resolution(lookup(turbo));
+    check(pr.is_turbo() && pr.versioned() == "minimax-turbo-v1", "turbo: versioned name");
+    check(md::prefill_identity(lookup(plain)) == kOrderId, "turbo: default cache identity unchanged");
+    check(md::prefill_identity(lookup(turbo)).find("turbo=minimax-turbo-v1") != std::string::npos,
+          "turbo: cache identity carries the turbo namespace with every row off");
+    check(pr.fingerprint() != md::profile_resolution(lookup(plain)).fingerprint(), "turbo: ranks never agree with default");
+    const md::Cli rank = md::parse_cli("rank", {"/m", "0", "usb4gpu", "/o"}), serve = md::parse_cli("serve", {"/m"});
+    const auto rank_text = md::effective_config(rank, lookup(turbo)), serve_text = md::effective_config(serve, lookup(turbo));
+    const auto profile_lines = [](const std::string& text) {
+        std::string out;
+        std::size_t at = 0;
+        while ((at = text.find("profile.", at)) != std::string::npos) {
+            const auto end = text.find('\n', at);
+            out += text.substr(at, end - at) + "|";
+            at = end;
+        }
+        return out;
+    };
+    check(!profile_lines(rank_text).empty() && profile_lines(rank_text) == profile_lines(serve_text),
+          "turbo: rank and serve print the same profile resolution");
+    std::string timing;
+    std::vector<std::string> values{"turbo"};
+    auto next = [&]() { auto v = values.back(); values.pop_back(); return v; };
+    check(md::product_option("--profile", next, &timing) && timing.empty(), "turbo: --profile NAME is the product profile");
+    values = {"s:prompt.u32:8"};
+    check(md::product_option("--profile", next, &timing) && timing == "s:prompt.u32:8", "turbo: old timing spelling kept");
+    values = {"t:prompt.u32:4"};
+    timing.clear();
+    check(md::product_option("--timing-profile", next, &timing) && timing == "t:prompt.u32:4", "turbo: --timing-profile");
+    values = {"s:prompt.u32:8"};
+    bool refused = false;
+    try { (void)md::product_option("--profile", next, nullptr); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "turbo: serve refuses a timing spec as a product profile");
+    const EnvMap onfly{{md::kProductProfileEnv, "turbo"}, {"STRIX_TURBO_WEIGHTS", "onfly"}};
+    const auto w = md::profile_resolution(lookup(onfly)).weights;
+    check(!w.honoured() && md::effective_config(serve, lookup(onfly)).find("profile.weights_reason=pending") != std::string::npos,
+          "turbo: unbuilt onfly is printed as pending, never run silently");
+}
+
+// Split-producer chunk frames: one lever row, one policy for the rank CLI and serve entry points.
+void test_split_frame() {
+    namespace sx = strix::xport;
+    const auto& row = md::split_frame_row();
+    check(std::string(row.name) == "mm_split_frame" && row.regime.crossover == 4, "split frame row");
+    const auto unset = sx::split_frame_policy(row, nullptr);
+    check(!unset.on(1) && !unset.on(4) && !unset.on(8) && !unset.on(1024), "unqualified split frame stays off by default");
+    check(!sx::split_frame_policy(row, "").on(8), "empty split frame stays off");
+    check(!sx::split_frame_policy(row, "0").on(8), "split frame explicit 0");
+    check(sx::split_frame_policy(row, "1").on(2) && !sx::split_frame_policy(row, "1").on(1), "split frame explicit 1, never 1 row");
+    bool rejected = false;
+    try { (void)sx::split_frame_policy(row, "maybe"); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "split frame invalid text rejected");
+    // Both entry points end with the same effective value (one cached resolution; the env is read once).
+    (void)::unsetenv("STRIX_XPORT_SPLIT_ROWS");
+    char flag[] = "--print-effective-config", app[] = "strix-minimax-rank", m[] = "M", r0[] = "0", tr[] = "usb4-auto", out[] = "OUT";
+    char rank_flag[] = "--rank";
+    char* rank_argv[] = {app, m, r0, tr, out, flag};
+    char* serve_argv[] = {app, m, rank_flag, r0, flag};
+    (void)md::print_or_apply("rank", 6, rank_argv);
+    const auto a = md::split_frame_policy();
+    (void)md::print_or_apply("serve", 5, serve_argv);
+    const auto b = md::split_frame_policy();
+    check(a.mode == b.mode && a.crossover == b.crossover && a.mode == unset.mode, "rank and serve resolve the same split policy");
+}
+
+// FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy
+// field omission with every row OFF, rank agreement.
+void test_fast_prefill_profile() {
+    const EnvMap off;
+    const auto none_fp = strix::profile::resolve(strix::profile::Engine{"minimax-pair", "", {}, false}, {}).fingerprint();
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    {
+        const auto p = md::prefill_policy(lookup(off));
+        check(p.msa_flash == 0 && p.msa_flash_asked == "default" && p.policies.empty() && p.note.empty() && p.canonical.empty(),
+              "fast profile: plain invocation runs nothing");
+        // The chunk-invariant linear order is the table default (pf_order): a plain invocation names it; the
+        // baseline switch and the explicit off form keep the legacy (empty) identity.
+        check(md::prefill_identity(lookup(off)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(off)) == "invariant",
+              "fast profile: plain cache identity names the default invariant order");
+        const EnvMap base{{md::kBaselineEnv, "1"}};
+        check(md::prefill_identity(lookup(base)).empty() && md::linear_order(lookup(base)) == "adaptive",
+              "linear order: baseline restores the adaptive order and the legacy cache identity");
+        EnvMap inv{{"STRIX_MMX_PF_ORDER", "invariant"}}, ada{{"STRIX_MMX_PF_ORDER", "adaptive"}};
+        check(md::prefill_identity(lookup(inv)) == "prefill_order=mmx-pf-linear-s1-v1" && md::linear_order(lookup(inv)) == "invariant",
+              "linear order: invariant names its cache identity");
+        check(md::prefill_identity(lookup(ada)).empty() && md::linear_order(lookup(ada)) == "adaptive",
+              "linear order: adaptive keeps the legacy cache identity");
+        check(fp(off) == none_fp, "fast profile: rows at builtin leave the legacy fingerprint unchanged");
+        for (const auto& e : md::profile_resolution(lookup(off)).entries)
+            check(e.status == strix::profile::Status::builtin && e.value == e.lever->builtin, "fast profile: builtin row " + std::string(e.lever->name));
+        const EnvMap unused{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "10-59"}, {"STRIX_MM_FAST_PREFILL", "01"}};
+        check(fp(unused) == none_fp && md::prefill_policy(lookup(unused)).msa_flash == 0,
+              "fast profile: an unused layer set and a non-'1' switch keep the legacy fingerprint");
+        const EnvMap zero{{"STRIX_MM_PF_MSA_FLASH", "0"}};
+        check(md::prefill_identity(lookup(zero)) == kOrderId && fp(zero) == none_fp,
+              "fast profile: explicit OFF alone is the plain identity (only the default order field)");
+    }
+    const EnvMap bundle{{"STRIX_MM_FAST_PREFILL", "1"}};
+    for (const auto& guard : {std::pair{"STRIX_MM_PF_MSA_REWORK", "0"},
+                              std::pair{"STRIX_MM_PF_MSA_FLASH_LAYERS", "none"},
+                              std::pair{"STRIX_MM_PF_MSA_FLASH_LAYERS", "!0-59"},
+                              std::pair{"STRIX_MM_ATTN_PREFILL", "off"},
+                              std::pair{"STRIX_MM_BASELINE", "1"}}) {
+        EnvMap declined = bundle;
+        declined[guard.first] = guard.second;
+        const auto p = md::prefill_policy(lookup(declined));
+        check(p.msa_flash == 0 && p.msa_flash_requested == 1 && p.policies.empty() && !p.note.empty() && p.msa_flash_asked == "fast_prefill",
+              "fast admission: static guard declines flash and preserves request: " + std::string(guard.first));
+        const std::string order_id = md::linear_order(lookup(declined)) == "invariant" ? kOrderId : std::string();
+        // The router member does not depend on the flash guards: it still runs and is the only FAST identity left
+        // beside the default linear-order field (none under the baseline switch, which restores adaptive).
+        const std::string router_id = "prefill_router=mm-pf-router-wmma-v1-l40-59";
+        const std::string want_id = order_id.empty() ? router_id : router_id + ";" + order_id;
+        check(md::prefill_identity(lookup(declined)) == want_id && p.router_wmma &&
+                  fp(declined) == fp(EnvMap{{"STRIX_MM_PF_ROUTER_WMMA", "1"}}),
+              "fast admission: declined flash leaves only the router member in the cache field and agreement input");
+        const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(declined));
+        check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=0\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_policies=none\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile=mm-fast-pf-v2\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile_requested=mm-fast-pf-v2\n") != std::string::npos &&
+              cfg.find("\nprefill.msa_flash_requested=1\n") != std::string::npos &&
+              cfg.find("\nprefill.msa_flash_layers_requested=" + p.msa_flash_layers_requested + "\n") != std::string::npos &&
+              cfg.find("\nprefill.identity=" + want_id + "\n") != std::string::npos,
+              "fast admission: effective receipt matches disabled execution route");
+    }
+    check(md::msa_flash_decline_reason(false, true, 20) != nullptr &&
+          md::msa_flash_decline_reason(true, false, 20) != nullptr &&
+          md::msa_flash_decline_reason(true, true, 0) != nullptr &&
+          md::msa_flash_decline_reason(true, true, 20) == nullptr,
+          "fast admission: live engine receipt guards match static admission");
+    {
+        const auto p = md::prefill_policy(lookup(bundle));
+        check(p.msa_flash == 1 && p.msa_flash_layers == "40-59" && p.msa_flash_asked == "fast_prefill" &&
+              p.policies == "msa-flash-bf16-l40-v1", "fast profile: bundle selects msa-flash-bf16-l40-v1");
+        check(p.router_wmma && p.router_wmma_layers == "40-59", "fast profile: bundle selects mm-pf-router-wmma-v1 on 40-59");
+        check(md::prefill_identity(lookup(bundle)) ==
+                  "prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+              "fast profile: cache identity names both policies");
+        check(fp(bundle) != none_fp, "fast profile: bundle changes the profile fingerprint");
+        const auto r = md::profile_resolution(lookup(bundle));
+        check(r.find("msa_flash") != nullptr && r.find("msa_flash")->value == "1", "fast profile: governed row carries the member");
+        const auto cfg = md::effective_config(md::parse_cli("rank", {}), lookup(bundle));
+        check(cfg.find("\nSTRIX_MM_PF_MSA_FLASH=1\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_policies=msa-flash-bf16-l40-v1\n") != std::string::npos &&
+              cfg.find("\nprefill.fast_profile=mm-fast-pf-v2\n") != std::string::npos, "fast profile: effective config prints the rows");
+    }
+    {   // An explicit member wins: OFF beats the bundle, 2 replaces its value.
+        const EnvMap explicit_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}};
+        const auto p = md::prefill_policy(lookup(explicit_off));
+        check(p.msa_flash == 0 && p.policies.empty() &&
+                  md::prefill_identity(lookup(explicit_off)) == "prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+              "fast profile: explicit OFF beats the bundle (the other member stays)");
+        const EnvMap router_off{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_ROUTER_WMMA", "0"}};
+        check(!md::prefill_policy(lookup(router_off)).router_wmma &&
+                  md::prefill_identity(lookup(router_off)) == "prefill_msa=msa-flash-bf16-l40-v1;" + kOrderId,
+              "fast profile: explicit router OFF beats the bundle");
+        const auto r = md::profile_resolution(lookup(explicit_off));
+        const auto* row = r.find("msa_flash");
+        check(row != nullptr && row->status == strix::profile::Status::off, "fast profile: explicit OFF recorded as off");
+        const EnvMap two_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "2"}};
+        const auto two = md::prefill_policy(lookup(two_env));
+        check(two.msa_flash == 2 && two.msa_flash_asked == "2" && two.policies == "msa-flash-bf16-2term-l40-59", "fast profile: explicit 2 wins");
+        const EnvMap rg_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "3"}};
+        const auto rg = md::prefill_policy(lookup(rg_env));
+        check(rg.msa_flash == 3 && rg.policies == "msa-flash-bf16-rg4-l40-59", "fast profile: explicit 3 = row-group form");
+        const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
+        const auto legacy = md::prefill_policy(lookup(legacy_env));
+        check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
+        // A named layer set is reported by its policy id, whatever the mask syntax.
+        const EnvMap l30_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "30-39,40-59"}};
+        const auto l30 = md::prefill_policy(lookup(l30_env));
+        check(l30.msa_flash == 1 && l30.msa_flash_layers == "30-59" && l30.policies == "msa-flash-bf16-l30-v1" &&
+                  md::prefill_identity(lookup(l30_env)) ==
+                      "prefill_msa=msa-flash-bf16-l30-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+              "fast profile: layers 30-59 = msa-flash-bf16-l30-v1");
+    }
+    {   // EXL3 base only: the bundle does not select it on FAST_I4; an explicit value still does.
+        const EnvMap i4{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}};
+        const auto p = md::prefill_policy(lookup(i4));
+        check(p.msa_flash == 0 && !p.note.empty(), "fast profile: bundle excludes the flash member on fast_i4");
+        check(md::prefill_identity(lookup(i4)) == "moe_prefill_format=fast_i4;" + kOrderId, "fast profile: fast_i4 is part of the cache identity");
+        EnvMap i4_explicit = i4;
+        i4_explicit["STRIX_MM_PF_MSA_FLASH"] = "1";
+        check(md::prefill_policy(lookup(i4_explicit)).msa_flash == 1, "fast profile: explicit flash on fast_i4 wins");
+    }
+    {
+        bool threw = false;
+        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "4"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
+        try { (void)md::prefill_policy(lookup(bad_mode)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast profile: invalid flash mode rejected");
+        threw = false;
+        try { (void)md::prefill_policy(lookup(bad_layers)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast profile: invalid layer set rejected");
+    }
+    {   // Rank agreement over the control channel: same resolution passes, asymmetric ranks are rejected.
+        const auto hello = [](const strix::profile::Resolution& r) {
+            std::vector<unsigned char> bytes;
+            md::check_peer(r, [&](const void* o, void* i, std::size_t n) {
+                bytes.assign(static_cast<const unsigned char*>(o), static_cast<const unsigned char*>(o) + n);
+                std::memcpy(i, o, n);
+            });
+            return bytes;
+        };
+        const auto agree = [&](const EnvMap& mine, const EnvMap& peer) {
+            const auto peer_bytes = hello(md::profile_resolution(lookup(peer)));
+            try {
+                md::check_peer(md::profile_resolution(lookup(mine)), [&](const void*, void* i, std::size_t n) {
+                    std::memcpy(i, peer_bytes.data(), n < peer_bytes.size() ? n : peer_bytes.size());
+                });
+            } catch (const std::runtime_error&) { return false; }
+            return true;
+        };
+        const EnvMap one{{"STRIX_MM_PF_MSA_FLASH", "1"}}, two{{"STRIX_MM_PF_MSA_FLASH", "2"}};
+        const EnvMap same{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "1"}};
+        check(agree(off, off) && agree(bundle, bundle), "fast profile: symmetric ranks agree");
+        check(!agree(bundle, off) && !agree(off, bundle), "fast profile: bundle on one rank only is rejected");
+        check(!agree(two, one), "fast profile: member value mismatch rejected");
+        check(agree(same, bundle), "fast profile: an explicit value equal to the bundle's is the same run");
+        const EnvMap members{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_ROUTER_WMMA", "1"}};
+        check(agree(members, bundle) && agree(bundle, members), "fast agreement: bundle-only and explicit-only agree");
+        check(!agree(one, bundle) && !agree(bundle, one), "fast agreement: a missing bundle member is a different run");
+        for (const char* layers : {"40-49,50-59", "!0-39", "50-59,40-55", "040-059"}) {
+            const EnvMap equivalent{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", layers}};
+            check(agree(one, equivalent) && agree(equivalent, one), "fast agreement: equivalent parsed layer masks agree");
+            check(md::prefill_identity(lookup(equivalent)) == md::prefill_identity(lookup(one)),
+                  "fast agreement: equivalent masks name the same cache policy");
+        }
+        const EnvMap different{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "41-59"}};
+        check(!agree(one, different), "fast agreement: different masks remain rejected");
+        // FAST index projections (minimax-index-proj-wmma-v1): opt-in member, its own layer set (builtin 40-59).
+        EnvMap idx = bundle;
+        idx["STRIX_MM_PF_IDX_WMMA"] = "1";
+        const auto pi = md::prefill_policy(lookup(idx));
+        check(pi.idx_wmma && pi.idx_wmma_layers == "40-59" && pi.msa_flash == 1 &&
+                  pi.router_wmma && pi.router_wmma_layers == "40-59" &&
+                  pi.policies == "msa-flash-bf16-l40-v1+minimax-index-proj-wmma-v1-l40-59" &&
+                  md::prefill_identity(lookup(idx)) ==
+                      "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+              "fast idx: explicit member runs beside the bundle, own cache field");
+        auto idx_router_off = idx;
+        idx_router_off["STRIX_MM_PF_ROUTER_WMMA"] = "0";
+        const auto pi_router_off = md::prefill_policy(lookup(idx_router_off));
+        check(pi_router_off.idx_wmma && pi_router_off.idx_wmma_layers == "40-59" && pi_router_off.msa_flash == 1 &&
+                  !pi_router_off.router_wmma && pi_router_off.policies == pi.policies &&
+                  md::prefill_identity(lookup(idx_router_off)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;" + kOrderId &&
+                  !agree(idx, idx_router_off) && !agree(idx_router_off, idx),
+              "fast idx: router OFF preserves index policy and separates rank identities");
+        check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
+        for (const char* layout : {"tiled", "off"}) {
+            auto declined = idx;
+            declined["STRIX_MM_INDEX_PROJ"] = layout;
+            auto disabled = declined;
+            disabled["STRIX_MM_PF_IDX_WMMA"] = "0";
+            const auto policy = md::prefill_policy(lookup(declined));
+            check(!policy.idx_wmma && !policy.note.empty() && policy.idx_wmma_asked == "1" &&
+                      policy.policies == md::prefill_policy(lookup(disabled)).policies &&
+                      md::prefill_identity(lookup(declined)) == md::prefill_identity(lookup(disabled)) && agree(declined, disabled),
+                  "fast idx: incompatible layout declines in policy, identity and rank agreement");
+            for (const char* app : {"rank", "serve"}) {
+                const auto cfg = md::effective_config(md::parse_cli(app, {}), lookup(declined));
+                check(cfg.find("\nprefill.idx_wmma=0\n") != std::string::npos &&
+                          cfg.find("\nprefill.idx_wmma_layers=none\n") != std::string::npos &&
+                          cfg.find("minimax-index-proj-wmma") == std::string::npos,
+                      "fast idx: effective config declines incompatible layout");
+            }
+        }
+        auto idx_fp32 = idx;
+        idx_fp32["STRIX_MM_PREFILL_IDENTITY"] = "fp32";
+        check(!md::prefill_policy(lookup(idx_fp32)).idx_wmma, "fast idx: FP32 prefill declines");
+        check(agree(idx, idx) && !agree(idx, bundle) && !agree(bundle, idx), "fast idx: one rank only is rejected");
+        EnvMap idx_zero = bundle;
+        idx_zero["STRIX_MM_PF_IDX_WMMA"] = "0";
+        idx_zero["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "0-59";
+        check(agree(idx_zero, bundle) && md::prefill_identity(lookup(idx_zero)) == md::prefill_identity(lookup(bundle)),
+              "fast idx: explicit OFF with an unused layer set is the bundle's run");
+        EnvMap idx_other = idx;
+        idx_other["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "30-59";
+        check(!agree(idx, idx_other), "fast idx: different layer sets rejected");
+        const EnvMap idx_only{{"STRIX_MM_PF_IDX_WMMA", "1"}, {"STRIX_MM_PF_IDX_WMMA_LAYERS", "40-49,50-59"}};
+        check(md::prefill_identity(lookup(idx_only)) == "prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;" + kOrderId,
+              "fast idx: alone, only the idxproj field");
+        EnvMap idx_none = idx;
+        idx_none["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "none";
+        check(!md::prefill_policy(lookup(idx_none)).idx_wmma && !md::prefill_policy(lookup(idx_none)).note.empty(),
+              "fast idx: empty layer set declines with a note");
+        bool threw = false;
+        try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_IDX_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "fast idx: invalid value rejected");
+        {   // The FAST resolution consults only its own switches (the engine records every read into the receipt).
+            const auto base = lookup(idx);
+            std::set<std::string> seen;
+            (void)md::prefill_policy([&](const char* k) -> const char* { seen.insert(k); return base(k); });
+            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == 1,
+                  "fast receipt: the flash guard reads the rework item, not the whole defaults set");
+        }
+        // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
+        const auto prefill_lines = [](const std::string& cfg) {
+            std::string out;
+            for (std::size_t a = 0; a < cfg.size();) {
+                const std::size_t b = std::min(cfg.find('\n', a), cfg.size());
+                if (cfg.compare(a, 8, "prefill.") == 0 || cfg.compare(a, 19, "STRIX_MM_PF_IDX_WMM") == 0) out += cfg.substr(a, b - a + 1);
+                a = b + 1;
+            }
+            return out;
+        };
+        const auto rank_cfg = md::effective_config(md::parse_cli("rank", {}), lookup(idx));
+        const auto serve_cfg = md::effective_config(md::parse_cli("serve", {}), lookup(idx));
+        check(prefill_lines(rank_cfg) == prefill_lines(serve_cfg) && rank_cfg.find("\nprefill.idx_wmma=1\n") != std::string::npos &&
+                  rank_cfg.find("\nprefill.idx_wmma_layers=40-59\n") != std::string::npos,
+              "fast idx: rank and serve resolve the same prefill policy");
+    }
+}
+
+// FAST mm-pf-router-wmma-v1: one resolver (prefill_policy) for the engine, the cache identity, the effective config and
+// the rank agreement; opt-in, its layer set read only while it runs.
+void test_router_wmma() {
+    const auto none_fp = strix::profile::resolve(strix::profile::Engine{"minimax-pair", "", {}, false}, {}).fingerprint();
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    const EnvMap off, zero{{"STRIX_MM_PF_ROUTER_WMMA", "0"}}, unused{{"STRIX_MM_PF_ROUTER_WMMA_LAYERS", "3-59"}};
+    for (const EnvMap* m : {&off, &zero, &unused}) {
+        const auto p = md::prefill_policy(lookup(*m));
+        check(!p.router_wmma && p.policies.empty() && md::prefill_identity(lookup(*m)) == kOrderId && fp(*m) == none_fp,
+              "router wmma: off / unused layer set keep the legacy identity");
+    }
+    const EnvMap on{{"STRIX_MM_PF_ROUTER_WMMA", "1"}}, all{{"STRIX_MM_PF_ROUTER_WMMA", "1"}, {"STRIX_MM_PF_ROUTER_WMMA_LAYERS", "3-59"}};
+    const auto p = md::prefill_policy(lookup(on));
+    check(p.router_wmma && p.router_wmma_layers == "40-59" && p.msa_flash == 0 && p.policies.empty(), "router wmma: default layer set 40-59");
+    check(md::prefill_identity(lookup(on)) == "prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+          "router wmma: cache identity names policy and layers");
+    check(md::prefill_identity(lookup(all)) == "prefill_router=mm-pf-router-wmma-v1-l3-59;" + kOrderId && fp(all) != fp(on) && fp(on) != none_fp,
+          "router wmma: the layer set is part of the identity while on");
+    const auto cfg = md::effective_config(md::Cli{}, lookup(on));
+    check(cfg.find("STRIX_MM_PF_ROUTER_WMMA=1\n") != std::string::npos && cfg.find("STRIX_MM_PF_ROUTER_WMMA_LAYERS=40-59\n") != std::string::npos &&
+              cfg.find("prefill.identity=prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId + "\n") != std::string::npos,
+          "router wmma: effective config shows the resolved values");
+    const EnvMap both{{"STRIX_MM_PF_ROUTER_WMMA", "1"}, {"STRIX_MM_PF_MSA_FLASH", "1"}};
+    check(md::prefill_identity(lookup(both)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+          "router wmma: composes with the MSA flash member");
+    bool threw = false;
+    try { (void)md::prefill_policy(lookup(EnvMap{{"STRIX_MM_PF_ROUTER_WMMA", "2"}})); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "router wmma: values other than 0 / 1 are refused");
+    const auto hello = [](const strix::profile::Resolution& r) {
+        std::vector<unsigned char> bytes;
+        md::check_peer(r, [&](const void* o, void* i, std::size_t n) {
+            bytes.assign(static_cast<const unsigned char*>(o), static_cast<const unsigned char*>(o) + n);
+            std::memcpy(i, o, n);
+        });
+        return bytes;
+    };
+    const auto agree = [&](const EnvMap& mine, const EnvMap& peer) {
+        const auto peer_bytes = hello(md::profile_resolution(lookup(peer)));
+        try {
+            md::check_peer(md::profile_resolution(lookup(mine)), [&](const void*, void* i, std::size_t n) {
+                std::memcpy(i, peer_bytes.data(), n < peer_bytes.size() ? n : peer_bytes.size());
+            });
+        } catch (const std::runtime_error&) { return false; }
+        return true;
+    };
+    check(agree(on, on) && !agree(on, off) && !agree(off, on) && !agree(on, all), "router wmma: ranks must resolve the same switch and layer set");
+    check(agree(off, zero) && agree(off, unused), "router wmma: off forms agree with the plain invocation");
+}
+
 }  // namespace
+
+// ONE RESOLVER: the same request through both entry points. Every host-path default is one row of one table; the
+// server may end with another value only where the row names the reason, and effective_config() prints both.
+void test_entry_points_host_defaults() {
+    const EnvMap none;
+    md::Cli rank, serve; rank.app = "rank"; serve.app = "serve";
+    const auto rank_lines = lines(md::effective_config(rank, lookup(none)));
+    const auto serve_lines = lines(md::effective_config(serve, lookup(none)));
+    check(!md::host_defaults().empty(), "host defaults table is not empty");
+    std::size_t differing = 0;
+    for (const md::HostDefault& row : md::host_defaults()) {
+        const char* a = md::host_default_value(row, "rank", lookup(none));
+        const char* b = md::host_default_value(row, "serve", lookup(none));
+        const std::string av = a ? a : "unset", bv = b ? b : "unset", key = std::string("host.") + row.name;
+        check(rank_lines.count(key + "=" + av) == 1, key + " printed by the CLI");
+        check(serve_lines.count(key + "=" + bv) == 1, key + " printed by the server");
+        if (av != bv) {
+            ++differing;
+            check(row.serving_reason != nullptr && std::string(row.serving_reason).size() > 20, key + " differs with a named reason");
+            check(serve_lines.count(key + ".serving_reason=" + row.serving_reason) == 1, key + " reason printed by the server");
+        } else {
+            check(row.serving_reason == nullptr, key + " equal on both entry points carries no reason");
+        }
+        // An explicit value wins on both entry points and removes the difference (and the reason line).
+        const EnvMap set = {{row.name, "7"}};
+        check(std::string(md::host_default_value(row, "rank", lookup(set))) == "7" &&
+              std::string(md::host_default_value(row, "serve", lookup(set))) == "7", key + " explicit value wins");
+        check(lines(md::effective_config(serve, lookup(set))).count(key + "=7") == 1, key + " explicit value printed");
+    }
+    check(differing == 3, "exactly the two transport timeouts and the prefill table ring differ between the entry points");
+    const EnvMap base = {{"STRIX_MM_BASELINE", "1"}};
+    for (const md::HostDefault& row : md::host_defaults())
+        if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
+}
+
+// Shared TP2 exchange format (xport/exchange_format.hpp) through the one MiniMax resolver: default f32 everywhere with
+// the legacy identity and fingerprint; an explicit f16 is the named FAST policy tp2-xchg-f16-v0 (identity field,
+// fingerprint input, effective-config line); the exact baseline refuses it; bf16 / junk are refused.
+void test_tp2_exchange_format() {
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    const EnvMap off;
+    const auto p0 = md::prefill_policy(lookup(off));
+    check(p0.exchange_fmt == strix::xport::ExchangeFormat::f32 && p0.policies.empty(), "tp2 exchange: default f32, no policy");
+    const EnvMap f32{{"STRIX_TP2_EXCHANGE_FMT", "f32"}};
+    check(md::prefill_identity(lookup(f32)) == kOrderId && fp(f32) == fp(off), "tp2 exchange: explicit f32 keeps the legacy identity");
+    const EnvMap f16{{"STRIX_TP2_EXCHANGE_FMT", "f16"}};
+    const auto p = md::prefill_policy(lookup(f16));
+    check(p.exchange_fmt == strix::xport::ExchangeFormat::f16 && p.policies == "tp2-xchg-f16-v0" && p.msa_flash == 0,
+          "tp2 exchange: explicit f16 = named FAST policy");
+    check(md::prefill_identity(lookup(f16)) == "tp2_exchange_fmt=f16;" + kOrderId, "tp2 exchange: f16 enters the cache identity");
+    check(fp(f16) != fp(off), "tp2 exchange: f16 enters the rank-agreement fingerprint");
+    const EnvMap stack{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_TP2_EXCHANGE_FMT", "f16"}};
+    const auto ps = md::prefill_policy(lookup(stack));
+    check(ps.policies == "msa-flash-bf16-l40-v1+tp2-xchg-f16-v0", "tp2 exchange: joins the bundle's policy list: " + ps.policies);
+    check(md::prefill_identity(lookup(stack)) == "prefill_msa=msa-flash-bf16-l40-v1;tp2_exchange_fmt=f16;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+          "tp2 exchange: bundle identity keeps its MSA field: " + md::prefill_identity(lookup(stack)));
+    for (const auto& bad : {EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "f16"}, {"STRIX_MM_BASELINE", "1"}},
+                            EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "bf16"}}, EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "F16"}}}) {
+        bool threw = false;
+        try { (void)md::prefill_policy(lookup(bad)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "tp2 exchange: refused (baseline f16 / unknown format)");
+    }
+    check(md::effective_config(md::Cli{}, lookup(f16)).find("prefill.tp2_exchange_fmt=f16 (explicit f16 under tp2-xchg-f16-v0") != std::string::npos,
+          "tp2 exchange: effective-config line");
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -587,6 +1075,7 @@ int main(int argc, char** argv) {
         test_table();
         test_receipts(argv[1]);
         test_off_switches();
+        test_pair_pipeline_declaration();
         test_resolution_sources();
         test_baseline();
         test_host_receipt();
@@ -597,6 +1086,12 @@ int main(int argc, char** argv) {
         test_session_defaults();
         test_session_startup();
         test_apply();
+        test_entry_points_host_defaults();
+        test_split_frame();
+        test_fast_prefill_profile();
+        test_tp2_exchange_format();
+        test_router_wmma();
+        test_turbo_product_profile();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

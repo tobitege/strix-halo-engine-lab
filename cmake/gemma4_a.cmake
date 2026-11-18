@@ -9,7 +9,7 @@ else()
 endif()
 add_library(strix_gemma4_model STATIC src/gemma4/model/manifest.cpp src/gemma4/model/safetensors.cpp
     src/gemma4/model/gguf.cpp src/gguf_reader.cpp src/model_content_hash.cpp src/model_runtime_binding.cpp src/serve/json.cpp)
-target_link_libraries(strix_gemma4_model PUBLIC strix_gemma4_contracts Threads::Threads)
+target_link_libraries(strix_gemma4_model PUBLIC strix_gemma4_contracts Threads::Threads strix_weight_archive)
 strix_target_warnings(strix_gemma4_model)
 add_library(strix_gemma4_description STATIC src/gemma4/model/description.cpp)
 target_link_libraries(strix_gemma4_description PUBLIC strix_gemma4_contracts strix_model_description)

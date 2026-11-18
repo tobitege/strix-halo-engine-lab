@@ -1,6 +1,6 @@
 // Native bounded stage-level tests. CPU oracles are generated independently by
 // tools/trellis_reference.py. This executable never downloads or loads a model.
-#include "strix/cuda_trellis.hpp"
+#include "strix/cuda/trellis.hpp"
 
 #include <cuda_fp16.h>
 #include <algorithm>

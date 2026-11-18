@@ -1,4 +1,5 @@
 #include "../apps/qwen_prompt_organization.hpp"
+#include "strix/serve_cli_parity.hpp"
 #include "../apps/qwen_http_memory.hpp"
 #include "../apps/mtp_asset_verification.hpp"
 #include "../apps/qwen_cache_family_contract.hpp"
@@ -297,6 +298,34 @@ PrefillMemory ample_memory() {
 }
 // CPU regression: production organizations/window ceilings with synthetic tokens,
 // asset pins and backing requirements. No model, golden, HIP or external files.
+// Exercise the runtime environment/CLI override path independently of inspection.
+void expect_runtime_prefill_identity(const EffectiveConfig& config) {
+    const auto saved_override = detail::prefill_identity_override();
+    std::map<std::string, std::optional<std::string>> saved_environment;
+    const auto install = [&](const std::string& name) {
+        const auto* old = std::getenv(name.c_str());
+        saved_environment[name] = old ? std::optional<std::string>(old) : std::nullopt;
+        const auto it = config.environment.find(name);
+        if (it == config.environment.end()) unsetenv(name.c_str());
+        else setenv(name.c_str(), it->second.c_str(), 1);
+    };
+    install("STRIX_PREFILL_EXACT_FP16");
+    for (const auto& option : kPrefillOptions) install(std::string(option.env));
+    detail::prefill_identity_override() = {};
+    set_prefill_identity_override(config.options.prefill_exact_fp16, config.options.prefill_disabled);
+    const auto runtime = prefill_options_active();
+    expect(config.prefill_option_mask == runtime && config.options.resolved_prefill_option_mask == runtime,
+        "inspection and runtime dependency-filtered masks agree");
+    expect(prefill_identity_name(config.prefill_option_mask) == prefill_identity_name(runtime) &&
+        prefill_identity_hash(config.prefill_option_mask) == prefill_identity_hash(runtime),
+        "inspection and runtime dependency-filtered names and hashes agree");
+    detail::prefill_identity_override() = saved_override;
+    for (const auto& [name, value] : saved_environment) {
+        if (value) setenv(name.c_str(), value->c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+}
+
 void serve_prefill_admission_tests(const ModelContract& model, const ModelManifest& manifest) {
     auto args=mtp_fixture();
     args.insert(args.begin()+5,13,"1");
@@ -339,6 +368,90 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& m) {
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
+    {
+        // qcq: an explicit host budget + strict L0 on the HTTP batch route resolves the solo suffix class (the
+        // scheduler the L0 gate below pins by env). No mode, capture, STRIX_BATCH_CACHE_SOLO=0, AUTO and the fixed
+        // route keep the incumbent scheduler. One resolver: the same options reach the bridge and the identity.
+        const Environment base{{"STRIX_BATCH_PROMPT_SMALL","0"}};
+        auto budget=args; budget.insert(budget.end(),{"--prefix-cache-host-bytes","4294967296"});
+        auto l0=budget; l0.insert(l0.end(),{"--prefix-batch-cert","l0"});
+        const auto solo=resolve({parse(l0),base},memory).options;
+        expect(solo.batch_cache_solo && solo.prefix_batch_cert==1 && solo.batch_cache_solo_reason=="l0-restore" &&
+            prefix_batch_cert_execution_mode(solo)==1,"qcq: explicit batch budget + L0 resolves the solo scheduler");
+        auto kept_env=requested_prefill_environment([](const char* name) -> const char* {
+            return std::string_view(name)=="STRIX_BATCH_CACHE_SOLO" || std::string_view(name)=="STRIX_BATCH_PROMPT_SMALL"
+                ? "0" : nullptr;
+        });
+        const auto kept=resolve({parse(l0),kept_env},memory).options;
+        expect(!kept.batch_cache_solo && kept.prefix_batch_cert==1 && kept.batch_cache_solo_reason=="STRIX_BATCH_CACHE_SOLO=0",
+            "qcq: STRIX_BATCH_CACHE_SOLO=0 keeps the incumbent scheduler");
+        auto capture=budget; capture.insert(capture.end(),{"--prefix-batch-cert","capture"});
+        const auto cap=resolve({parse(capture),base},memory).options;
+        expect(!cap.batch_cache_solo && cap.prefix_batch_cert==2 && cap.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: capture-only mode keeps the incumbent scheduler");
+        const auto none=resolve({parse(budget),base},memory).options;
+        expect(!none.batch_cache_solo && none.prefix_batch_cert==0 && none.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit budget without a mode is unchanged");
+        const auto explicit_rows=resolve(request,memory).options;
+        expect(!explicit_rows.cache_activation->automatic_path && !explicit_rows.batch_cache_solo &&
+            explicit_rows.batch_cache_solo_reason=="no-l0-restore",
+            "qcq: explicit checkpoint rows without budget or L0 keep the incumbent scheduler");
+        // Even a zero checkpoint-row override selects explicit cache configuration.
+        auto auto_args=args;
+        const auto rows=std::find(auto_args.begin(),auto_args.end(),"--prefix-cache-block-rows");
+        if(rows==auto_args.end()||rows+1==auto_args.end())
+            throw std::runtime_error("qcq: AUTO fixture lost its --prefix-cache-block-rows pair");
+        auto_args.erase(rows,rows+2);
+        const auto automatic=resolve({parse(auto_args),base},memory).options;
+        expect(automatic.cache_activation->automatic_path && !automatic.batch_cache_solo &&
+            automatic.batch_cache_solo_reason=="automatic-unqualified",
+            "qcq: AUTO batch stays declined (no qualified batch row)");
+        auto fixed=budget; *(std::find(fixed.begin(),fixed.end(),"--http-batch")+1)="1";
+        const auto single=resolve({parse(fixed),base},memory).options;
+        expect(!single.batch_cache_solo && single.batch_cache_solo_reason=="not-batch",
+            "qcq: the fixed route is unchanged");
+    }
+    {
+        // Server / CLI parity (strix/serve_cli_parity.hpp): the same request words through the ONE resolver, once as the
+        // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Compare the
+        // environment and the route fields projected below, with the listed field/family allowances. This is not
+        // complete effective-configuration or numerical-identity parity.
+        namespace sp = strix::parity;
+        std::vector<std::string> cli_args;
+        for(std::size_t i=0;i<args.size();++i) {
+            if(args[i]=="--http-serve") continue;
+            if(args[i]=="--http-batch" || args[i]=="--prefix-cache-block-rows") { ++i; continue; }
+            cli_args.push_back(args[i]);
+        }
+        const auto view=[](const EffectiveConfig& c) {
+            sp::Config v;
+            for(const auto& [k,value] : c.environment) v["env:"+k]=value;
+            v["known_prefix_prefill_rows"]=std::to_string(c.options.known_prefix_prefill_rows);
+            v["mtp"]=c.options.mtp.enabled?"1":"0";
+            v["admitted"]=c.admitted?"1":"0";
+            v["tile_fallback"]=c.tile_fallback;
+            v["arithmetic_fallback"]=c.arithmetic_fallback;
+            return v;
+        };
+        const auto served=resolve(request,ample_memory());
+        const auto cli=resolve(RequestedOptions{parse(cli_args),request.environment},ample_memory());
+        static constexpr sp::Allowed allowed[]={
+            // The server has no prompt at startup, so resolve_serve_prefill (apps/qwen_effective_config.hpp) admits the
+            // known-prefix tiled prefill and its organisation for the serving context then; the CLI resolves the same
+            // route from the prompt it is given (same block plan and kernels at 8K: wave4 SRVPAR receipts). Named here so
+            // that serving-only values outside these fields/families fail.
+            {"known_prefix_prefill_rows","serving admits the tiled prefill at startup; the CLI from its prompt"},
+            {"env:STRIX_QPF2K_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_QSA_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PIPE","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PLE_BATCH","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_INTPREFILL_DENSE_ROWS","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_DISPATCH_FUSE","serial-route dispatch fusion; the tiled serving route does not use it"},
+        };
+        const auto report=sp::compare(view(cli),view(served),allowed);
+        if(!report.ok()) std::cerr<<sp::text("qwen",report);
+        expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
+    }
     {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
         // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.
@@ -559,6 +672,20 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             startup.prefill_option_mask==*startup.options.resolved_prefill_option_mask &&
             startup.serve_prefill_notice.find("governed MTP")!=std::string::npos,
             "serve_prefill_production_mtp_ceilings: sidecar MTP takes automatic fp16 with the governed exclusions");
+        for (const char* name : {"STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
+            auto fast = request;
+            fast.environment[name] = "1";
+            fast.environment["STRIX_QPF2K_GDN_FP16_CHUNK"] = "3";
+            const auto excluded = resolve(fast, memory);
+            validate_effective_startup(excluded);
+            const auto candidates = prefill_option_bit(PrefillOption::ple_rows_f16) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16);
+            expect(excluded.options.prefill_profile_automatic &&
+                !(excluded.prefill_option_mask & (governed_excluded | candidates | kPrefillGdnChunkRev3)) &&
+                (excluded.options.prefill_disabled & candidates) == candidates,
+                "sidecar MTP excludes both explicitly requested FAST candidates");
+            expect_runtime_prefill_identity(excluded);
+        }
         // STRIX_SERVE_FP16_MTP=0 keeps the resolved arithmetic whatever the option mask already excludes.
         for (const bool already_excluded : {false,true}) {
             auto off=request; off.environment["STRIX_SERVE_FP16_MTP"]="0";
@@ -872,6 +999,21 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     geometric.context_tokens+=1024;
     expect(http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096).slot_host>mapped.slot_host,
         "native predictor pool follows context geometry");
+    {
+        auto ceiling=geometric;ceiling.context_tokens=131200;
+        ceiling.mtp.runtime_bytes=134217728;ceiling.mtp.runtime_automatic=false;
+        bool ceiling_refused=false;
+        try {(void)http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);}
+        catch(const std::runtime_error& e) {ceiling_refused=std::string_view(e.what()).find("runtime budget")!=std::string_view::npos;}
+        expect(ceiling_refused,"explicit 128 MiB ceiling refuses native long context before HTTP allocation");
+        ceiling.mtp.runtime_automatic=true;
+        const auto automatic=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        ceiling.mtp.runtime_automatic=false;
+        ceiling.mtp.runtime_bytes=mtp_payload::runtime(model,ceiling.context_tokens).retained;
+        const auto explicit_fit=http_mtp_memory(ceiling,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+        expect(automatic.slot_host==explicit_fit.slot_host && automatic.slot_device==explicit_fit.slot_device,
+            "automatic and sufficient explicit budgets charge the same shared runtime geometry");
+    }
     // Real native owner geometry, independent of the synthetic arena sizes.
     auto owners=startup.options;
     owners.known_prefix_tail_rows.clear();
@@ -2145,7 +2287,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_WMMA_PIN", "STRIX_QPF2K_HC_UPCOPY", "STRIX_PREFILL_ROUTER_SELECT", "STRIX_ROUTER_STAGE_ACT",
-                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16"}) {
+                "STRIX_QSA_WINDOW_ATTN_V2", "STRIX_PREFIX_CACHE", "STRIX_QPF2K_GDN_CHUNK16",
+                "STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
             auto off = request; off.environment[name] = "0";
             const auto admitted = resolve(off, memory);
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty() && admitted.admitted,
@@ -2157,6 +2300,14 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         }
         for (const char* name : {"STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_PREFILL_MOE_MERGE_VEC"})
             expect(yarn_environment_refusal({{name, "1"}}, 2).empty(), "YaRN admits the explicit default arm of code-default items");
+        for (const char* value : {"0", "1"}) {
+            auto low32 = request; low32.environment["STRIX_QPF2K_HC_LOW32"] = value;
+            const auto admitted = resolve(low32, memory);
+            expect(yarn_environment_refusal({{"STRIX_QPF2K_HC_LOW32", value}}, 2).empty() && admitted.admitted,
+                value[0] == '0' ? "YaRN admits default LOW32 omission" : "YaRN admits LOW32 rollback stores");
+            expect(admitted.environment.at("STRIX_QPF2K_HC_LOW32") == value, "YaRN preserves either explicit LOW32 arm");
+        }
+        expect(!yarn_environment_refusal({{"STRIX_QPF2K_HC_LOW32", "2"}}, 2).empty(), "LOW32 values stay bounded");
         for (const char* value : {"0", "1"}) {
             auto launch = request; launch.environment["STRIX_QPF2K_GDN_COOP_LAUNCH"] = value;
             const auto admitted = resolve(launch, memory);
@@ -3220,6 +3371,33 @@ void prefill_identity_plumbing_tests() {
     expect(bundled.prefill_option_mask == 0U &&
         (bundled.options.prefill_disabled & prefill_option_bit(PrefillOption::hc_output_wmma)),
         "automatic YaRN MTP bundle retains its qualified prefill arithmetic");
+    for (const char* name : {"STRIX_PREFILL_PLE_ROWS_F16", "STRIX_PREFILL_GDN_GATES_F16"}) {
+        for (const bool chunk_off : {false, true}) {
+            auto requested = plain_options;
+            Environment env{{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", chunk_off ? "3" : "0"}};
+            if (chunk_off) requested.prefill_disabled = prefill_option_bit(PrefillOption::gdn_fp16_chunk);
+            const auto inspected = resolved(requested, env);
+            expect(!(inspected.prefill_option_mask & (prefill_option_bit(PrefillOption::gdn_fp16_chunk) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16) | kPrefillGdnChunkRev3)),
+                "chunk OFF removes its dependent gate candidate and revision tag");
+            expect_runtime_prefill_identity(inspected);
+        }
+        for (const bool yarn : {false, true}) {
+            auto requested = bundled_mtp;
+            if (yarn) {
+                requested.mtp_bundle_path.clear();
+                requested.rotary = RotaryDescriptor::yarn(2U);
+            }
+            const auto inspected = initialize_prefill_config({requested,
+                {{name, "1"}, {"STRIX_QPF2K_GDN_FP16_CHUNK", "3"}}});
+            const auto candidates = prefill_option_bit(PrefillOption::ple_rows_f16) |
+                prefill_option_bit(PrefillOption::gdn_gates_f16);
+            expect(inspected.prefill_option_mask == 0U &&
+                (inspected.options.prefill_disabled & candidates) == candidates,
+                "bundle and automatic YaRN MTP exclude both FAST candidates");
+            expect_runtime_prefill_identity(inspected);
+        }
+    }
     auto split = plain_options;
     split.numerical_profile = dense_a8_profile;
     split.numerical_profile_explicit = true;
@@ -3285,14 +3463,14 @@ int main(int argc, char** arguments) {
     {
         EffectiveConfig c;
         const auto reported = [&] { return effective_config_json(c); };
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion is an opt-in and reports it off by default");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
+            "R1 decode fusion is a code default and reports it on");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "0";
-        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"opt-in-not-requested\"}") != std::string::npos,
-            "R1 decode fusion reports its OFF from the snapshot");
+        expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") != std::string::npos,
+            "R1 decode fusion reports its explicit OFF from the snapshot");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         expect(reported().find("\"STRIX_QWEN_DECODE_FUSE\":{\"enabled\":true,\"suppression\":null}") != std::string::npos,
-            "R1 decode fusion reports the opt-in ON");
+            "R1 decode fusion reports the explicit ON");
         c.environment["STRIX_QWEN_DECODE_FUSE"] = "1";
         for (const auto* name : {"STRIX_BASELINE", "STRIX_QPF2K_DEFAULTS"}) {
             c.environment[name] = std::string_view(name) == "STRIX_BASELINE" ? "1" : "0";
@@ -3836,6 +4014,105 @@ int main(int argc, char** arguments) {
             expect(kept.options.numerical_profile==sidecar.options.numerical_profile && !kept.options.prefill_profile_automatic &&
                 !kept.options.prefill_numerical_profile,
                 "sidecar MTP server with the FP16 off switch keeps its previous decode and prefill arithmetic");
+            // Issue 758: an explicit-sidecar server with the recipe's MTP windows must carry the window organization;
+            // each missing prerequisite is refused at resolution, naming its flags, instead of after the model load.
+            auto organized=sidecar_argv;
+            organized.insert(organized.end(),{"--deferred-moe-status","--virtual-q8-gdn-input","--prefetch-q8-gdn-input",
+                "--virtual-q8-gdn-output","--wave8-q8-gdn-input","--wave8-q8-gdn-output","--q4k-a8g32-gate-up",
+                "--grouped-exact-q51-down","--q51-slot-parallel-down","--context","33280"});
+            const auto served_without_hc=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(!served_without_hc.options.known_prefix_prefill_rows &&
+                served_without_hc.serve_prefill_notice.find("MTP window hyper-mix requires resolved --parallel-hyper-mix")!=std::string::npos,
+                "window hyper-mix without the HC organization is refused at resolution, naming the flags");
+            organized.insert(organized.end(),{"--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+                "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output"});
+            const auto served_without_head=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(!served_without_head.options.known_prefix_prefill_rows &&
+                served_without_head.serve_prefill_notice.find("MTP target windows require resolved --virtual-q8-lm-head")!=std::string::npos,
+                "greedy window rows without the virtual Q8 LM head are refused at resolution, naming the flags");
+            // With the virtual Q8 LM head the shared route adds its prefetch/wave8 pair; the explicit organization keeps
+            // the QSA input, shared-expert and lane-chain organizations off.
+            organized.emplace_back("--virtual-q8-lm-head");
+            const auto served_organized=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(served_organized.error.empty() && served_organized.options.known_prefix_prefill_rows==8192 &&
+                served_organized.options.automatic_prefill && mtp_tiled_prompt(served_organized.options) &&
+                served_organized.options.prefetch_q8_lm_head && served_organized.options.wave8_q8_lm_head &&
+                served_organized.options.wave8_q8_gdn_input,
+                "minimal MTP-window organization server admits automatic T8192");
+            validate_http_serve(served_organized.options);
+            {
+                // An explicit T keeps the user's organization (no shared prompt overlay): the window head also needs
+                // --prefetch-q8-lm-head, refused at resolution instead of after the model load (node: greedy rows).
+                auto explicit_t=organized;
+                explicit_t.insert(explicit_t.end(),{"--known-prefix-window","--known-prefix-full-rows",
+                    "--known-prefix-prefill-rows","8192","--known-prefix-workspace-budget-bytes","68719476736",
+                    "--known-prefix-host-metadata-budget-bytes","2147483648","--known-prefix-uma-budget-bytes","124889595904",
+                    "--known-prefix-host-headroom-bytes","4294967296"});
+                const auto outcome=[&](const std::vector<std::string>& case_argv) {
+                    try { const auto r=resolve(RequestedOptions{parse(case_argv),{}},memory);
+                        return std::pair<std::string,std::uint32_t>{r.error,r.options.known_prefix_prefill_rows};
+                    } catch (const std::exception& e) { return std::pair<std::string,std::uint32_t>{e.what(),0U}; }
+                };
+                const auto missing=outcome(explicit_t);
+                expect(missing.first.find("MTP target windows require resolved --virtual-q8-lm-head --prefetch-q8-lm-head")!=
+                    std::string::npos, "explicit-T server without LM-head prefetch is refused at resolution, naming the flag");
+                explicit_t.emplace_back("--prefetch-q8-lm-head");
+                const auto admitted=outcome(explicit_t);
+                expect(admitted.first.empty() && admitted.second==8192U,
+                    "explicit-T server with the virtual Q8 LM head and its prefetch admits T8192");
+            }
+            {
+                // The serving memory check registers the prompt compiler requests: their plans must follow the
+                // options, as in the decode builder ("... requires opt-in" otherwise).
+                auto organized_options=served_organized.options;
+                expect(!organized_options.prefetch_q8_qsa_input && !organized_options.prefetch_q8_shared_expert &&
+                    !organized_options.lane_chain_hyper_output,
+                    "minimal MTP-window organization keeps the QSA, shared-expert and lane-chain organizations off");
+                const auto req=prompt_compiler_requests(organized_options,model,manifest);
+                expect(req.binding.qsa_input_prefetch_layers.empty() && req.catalog.qsa_input_prefetch_layers.empty() &&
+                    req.binding.shared_expert_prefetch_layers.empty() && req.catalog.shared_expert_prefetch_layers.empty() &&
+                    req.binding.lane_chain_hyper_output_eligible_steps.empty(),
+                    "prompt compiler requests carry no layer/step lists for disabled organizations");
+                qsa_input_prefetch::validate_layers(model,req.binding.prefetch_q8_qsa_input,req.binding.qsa_input_prefetch_layers);
+                shared_expert_prefetch::validate_layers(model.hidden_layers,req.binding.prefetch_q8_shared_expert,
+                    req.binding.shared_expert_prefetch_layers);
+                organized_options.prefetch_q8_qsa_input=organized_options.prefetch_q8_shared_expert=true;
+                organized_options.lane_chain_hyper_output=true;
+                const auto enabled=prompt_compiler_requests(organized_options,model,manifest);
+                expect(!enabled.binding.qsa_input_prefetch_layers.empty() && !enabled.binding.shared_expert_prefetch_layers.empty() &&
+                    !enabled.binding.lane_chain_hyper_output_eligible_steps.empty(),
+                    "enabled organizations keep their layer and step plans");
+            }
+            {
+                // A server without target windows whose low-level organization keeps its decode profile (no virtual
+                // Q8 LM head) keeps its LM head: the shared route no longer adds the LM-head pair, which made every
+                // automatic tile fail "prefetch Q8 LM head requires resolved virtual Q8 LM head".
+                auto plain=mtp_fixture(); plain.insert(plain.begin()+5,13,"1");
+                plain.insert(plain.end(),{"--http-serve","--http-batch","0","--context","33280","--deferred-moe-status",
+                    "--virtual-q8-gdn-input","--prefetch-q8-gdn-input","--virtual-q8-gdn-output","--wave8-q8-gdn-input",
+                    "--wave8-q8-gdn-output","--q4k-a8g32-gate-up","--grouped-exact-q51-down","--q51-slot-parallel-down"});
+                const auto served_plain=resolve(RequestedOptions{parse(plain),{}},memory);
+                expect(served_plain.options.known_prefix_prefill_rows==8192 && !served_plain.options.virtual_q8_lm_head &&
+                    !served_plain.options.prefetch_q8_lm_head && !served_plain.options.wave8_q8_lm_head,
+                    "server without the virtual Q8 LM head admits automatic T8192 without the LM-head pair");
+            }
+            auto drafted=sidecar_argv;
+            drafted.insert(drafted.end(),{"--mtp-draft-chain","--mtp-spec-min-p","0.7","--mtp-draft-q4",
+                "--mtp-draft-vocab","auto:draft-vocab","--mtp-draft-context-vocab","4096","--context","33280"});
+            // Without that organization the server takes the decode profile, which is qualified at context 8192;
+            // any other explicit context needs --unqualified-context, the same rule as the single-request command.
+            const auto served_drafted=resolve(RequestedOptions{parse(drafted),{}},memory);
+            expect(!served_drafted.options.known_prefix_prefill_rows &&
+                served_drafted.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos &&
+                served_drafted.serve_prefill_notice.find("decode profile not adopted: context-not-qualified "
+                    "(context 33280 needs --unqualified-context)")!=std::string::npos,
+                "recipe server without organization flags at context 33280 names --unqualified-context in its notice");
+            drafted.emplace_back("--unqualified-context");
+            const auto served_unqualified=resolve(RequestedOptions{parse(drafted),{}},memory);
+            expect(served_unqualified.options.known_prefix_prefill_rows==8192 && served_unqualified.options.automatic_prefill &&
+                served_unqualified.options.numerical_profile==dense_a8_profile && served_unqualified.options.virtual_q8_lm_head &&
+                served_unqualified.options.prefetch_q8_lm_head,
+                "recipe server with --unqualified-context adopts the decode profile and admits automatic T8192");
         }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");
@@ -4952,6 +5229,29 @@ int main(int argc, char** arguments) {
             return effective_config_json(printed);
         };
         const auto has = [](const std::string& text, const char* field) { return text.find(field) != std::string::npos; };
+        // Split-load reporting preserves the request and reports every suppression.
+        for (const char* value : {"0", "1"}) {
+            ::setenv("STRIX_QSA_SCORE_SPLIT_LOADS", value, 1);
+            expect(requested_prefill_environment().at("STRIX_QSA_SCORE_SPLIT_LOADS") == value,
+                "requested environment retains the split-load switch");
+            expect(has(items(sized, false), value[0] == '0' ?
+                "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"explicit-off\"}" :
+                "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":true,\"suppression\":null}"),
+                "split-load reporting honors explicit OFF and ON");
+        }
+        ::setenv("STRIX_QPF2K_DEFAULTS", "0", 1);
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"STRIX_QPF2K_DEFAULTS=0\"}"),
+            "master OFF suppresses explicit split-load ON");
+        ::unsetenv("STRIX_QPF2K_DEFAULTS");
+        expect(has(items(sized, true), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"gsq\"}"),
+            "GSQ suppresses explicit split-load ON");
+        qpf2k::baseline = true;
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"baseline\"}"),
+            "baseline suppresses explicit split-load ON");
+        qpf2k::baseline = false;
+        ::unsetenv("STRIX_QSA_SCORE_SPLIT_LOADS");
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":true,\"suppression\":null}"),
+            "split loads report default ON");
         auto plain = items(sized, false);
         expect(has(plain, "\"STRIX_QSA_UNION_MERGE\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_SCORE_ROWS64\":{\"enabled\":true,\"suppression\":null}") &&

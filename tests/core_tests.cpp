@@ -201,6 +201,13 @@ int main() {
     expect(strix::gdn_matrix_state_bytes_per_layer(model) ==
                3ULL * 1024ULL * 1024ULL,
            "one GDN matrix layer is 3 MiB");
+    {
+        auto f16_model = model;
+        f16_model.recurrent_state = strix::RecurrentStateType::f16;
+        expect(strix::gdn_matrix_state_bytes_per_layer(f16_model) * 2 == strix::gdn_matrix_state_bytes_per_layer(model) &&
+                   strix::gdn_conv_state_bytes_per_layer(f16_model) == strix::gdn_conv_state_bytes_per_layer(model),
+               "f16 recurrent matrix is half of f32, convolution unchanged");
+    }
     expect(strix::gdn_conv_state_bytes_per_layer(model) ==
                80ULL * 1024ULL,
            "one GDN convolution layer is 80 KiB");

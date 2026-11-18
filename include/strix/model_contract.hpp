@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/hip_qwen_rotary_table.hpp"
+#include "strix/recurrent_state_type.hpp"
 #include <cstdint>
 #include <string>
 
@@ -80,6 +81,7 @@ struct ModelContract {
     bool gdn_conv_silu = true;
     std::uint64_t bytes_bf16 = 2;
     std::uint64_t bytes_fp32 = 4;
+    RecurrentStateType recurrent_state = RecurrentStateType::f32;  // GDN matrix storage; qwen38_flash_next() takes the policy
     AttentionKvStorage attention_kv_storage = AttentionKvStorage::bf16;
 
     [[nodiscard]] static ModelContract qwen38_flash_next();

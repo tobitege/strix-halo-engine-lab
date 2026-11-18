@@ -96,6 +96,14 @@ expert stripes on two drives DSpark wins at 24+32 (9.3 vs 7.8) and `auto` keeps 
 tok/s), so `auto` runs it without the drafter, and 32+32 on two drives (not measured there) also runs without it.
 `--drafter on` / `off` force it.
 
+<a id="deepseek-image-input"></a>
+
+## Image input
+
+The pair accepts images in OpenAI-style chat completions (`image_url` part). Start the server with
+`--vision <vision GGUF>` on rank 0 and `--prefill-path device`; without the flag nothing is loaded. Measured numbers,
+limits and the data path: [image input](../../engine/vision.md).
+
 <a id="how-fast"></a>
 
 ## Measured results: the pair
@@ -115,7 +123,13 @@ a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 
 | Device prefill | 2 nodes | 8K benchmark prompt, kind unspecified | 1 | TTFT **9.757 s** | median of 3; logits bit-identical on both ranks | `6a5604bf` |
 | Device prefill | 2 nodes | 16K | 1 | TTFT **20.40 s** (803 tok/s) | | `f9332f3e` |
 | Device prefill | 2 nodes | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 runs | | `43086d05` + prefill defaults |
+| Device prefill, exact | 2 nodes | real prompts of 2,952 / 8,192 / 11,594 / 32,768 tokens, engine, fresh process, warm | 1 | **893 / 1,165 / 1,203 / 1,285 tok/s** | 8K 7.02-7.05 s (3 runs), 32K 25.41-25.58 s (2 runs); hashes equal to earlier exact builds, both ranks equal | #584 |
+| Device prefill, FAST profile `STRIX_DS41_FAST_PREFILL=1` (opt-in) | 2 nodes | same prompts | 1 | **1,037 / 1,377 / 1,425 / 1,546 tok/s** | 8K 5.95 s, 32K 21.15-21.25 s; GPU clocks per token at 8K 1.89 M vs 2.17 M exact; passes the floor-relative gate below | #584 |
+| Device prefill, FAST profile (opt-in; passes the floor-relative gate below), with window drain + per-pass MoE window (default ON, bitwise) | 2 nodes | same prompts, warm run, strict ABAB 3 pairs | 1 | **1,064 / 1,422 / 1,512 / 1,648 tok/s** | vs 1,038 / 1,354 / 1,424 / 1,553 the same day without; -477.5 ms at 11,594; exact and FAST hashes unchanged, both ranks equal; the exact arm was not timed separately | #604 |
+| Served, whole run | 2 nodes | 8 short prompts (17-46 tokens), 256 tokens each, greedy | 8 | **97.7-101.3 tok/s** | full-cohort steady 104.3-108.0 tok/s; the gap is the 1.28-1.38 s admission of the 8 prompts; per-request text equal in every run | #587 |
+| Served, whole run, short prompts grouped (default `auto`) | 2 nodes | same 8 short prompts; also 4 | 8 / 4 | **103.29 tok/s** (102.61-103.59) at C8, 75.80 at C4 | strict ABAB, 3 tickets per arm, against 100.24 / 74.50 with `STRIX_SERVE_PREFILL_GROUP=0`: +3.0 % at C8; admission 1.35 s -> 0.68-0.94 s (2-4 device passes instead of 8); 57.5 -> 56.0 M GPU clocks per token; exact, per-request text equal | #591 |
 | Server, one client, chat | 2 nodes | chat prompt | 1 | **66.9 tok/s** (code) | 34.9 tok/s (prose) | release |
+| Served decode, exchanges on the shared device-waited Channel (default; `STRIX_DS41_DECODE_XPORT=communicator` rolls back) | 2 nodes | short prompt; 8K / 32K context, `--no-dspark`, strict ABAB (3 pairs at 1 / 8 chats, 1 pair at 8K / 32K) | 1 / 8 | **29.95 / 96.58 tok/s** (1 chat warm / 8 chats) vs 29.75 / 95.32; 8K 28.92 -> 29.10, 32K 28.67 -> 28.94 tok/s | ms per step 33.62 -> 33.40 (1 chat), 83.8 -> 82.8 (8 chats); GPU busy 93-95 -> 98-99 % at the same clock, so GPU clocks per token are not lower; prefill unchanged; text sha equal | #632 |
 | Server, 8 chats × 128 tokens | 2 nodes | chat prompts | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** aggregate | | release |
 | Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** aggregate | `cab238d6` |
 | Warmed server, 8-category short set | 2 nodes | same short set as above | 1 / 2 / 4 / 8 | **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | 64/64 IDs equal; C8 clean run (see below) | `6a5604bf` |
@@ -196,6 +210,14 @@ streams now hold only this rank's rows (80 KiB per row less, 1.25 GiB at 16384-r
 and generated ids. With both, server TTFT, one client, cache off: **7.94 / 27.73 / 38.61 s** (1,057 / 1,172 / 1,158
 tok/s) in `default` and 7.05 / 24.32 / 32.95 s (1,192 / 1,336 / 1,357 tok/s) under `--profile fast` in the same run
 (−11.3 / −12.3 / −14.7 %).
+
+**FAST prefill quality gate.** The gate compares the FAST profile with exact on 1,280 teacher-forced rows (20 prompts
+x 64 rows, true next-token labels, both ranks equal). A fixed dNLL limit of 0.01 cannot be met by anything at KL ~0.01 on
+this engine: three null arms that only move every stream value after layer 0 by one ulp score KL 0.0094-0.0105, top-1
+96.9-98.1 % and dNLL +0.011 to +0.014, failing it like the FAST arms. For labels drawn from a calibrated reference the
+expected dNLL equals the KL, so the dNLL limit is set relative to this null floor: mean + 2 sd of the three nulls on the
+same binary (+0.0155), with `strix-gate --dnll-rule floor` ([tools/strix-gate](../../../tools/strix-gate/README.md)).
+The full profile scores KL 0.0108, top-1 97.7 %, dNLL +0.0049 and passes; its three members alone also pass the floor rule.
 
 <a id="deepseek-rtx-pipeline"></a>
 

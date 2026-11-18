@@ -3,8 +3,8 @@
 // and at the model's shape; with STRIX_DS41_EXPERTS_GGUF also on the real expert tensors of a layer
 // (STRIX_DS41_LAYER, default 20), routed by STRIX_DS41_ROUTES (p8-routes format) when given.
 
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_moe.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_moe.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/gguf_reader.hpp"

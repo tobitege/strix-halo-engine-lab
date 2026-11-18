@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/serve/cache_budget_rule.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -56,12 +57,20 @@ struct CacheQualification {
     bool gpu_qualified=false, cost_qualified=false, resource_qualified=false;
     unsigned version=1;
     CacheFamilyIdentity identity{};
+    // Rows added as DATA for a node run: AUTO stays refused until the named receipt exists, even if the
+    // three flags are set. receipt = the node receipt id that measured gpu (restored == cold tokens and
+    // digests), cost (warm restore beats cold prefill) and resources (UMA/GTT peak fits, no slot/context cut).
+    bool receipt_required=false;
+    std::string_view receipt{};
     bool matches(CacheRunner r, std::uint32_t n, std::uint64_t context, std::uint32_t t,
                  const CacheFamilyIdentity& actual) const {
         return runner==r && n>=n_min && n<=n_max && context>=context_min && context<=context_max &&
             tile==t && identity.complete() && actual.complete() && identity==actual;
     }
-    bool qualified() const { return gpu_qualified && cost_qualified && resource_qualified && !evidence_id.empty(); }
+    bool qualified() const {
+        return gpu_qualified && cost_qualified && resource_qualified && !evidence_id.empty() &&
+            (!receipt_required || !receipt.empty());
+    }
 };
 // Candidate identity resolved from full asset bytes and the effective production
 // configuration. Qualification is a separate row switch; native equality, capacity
@@ -113,6 +122,14 @@ inline const CacheQualification automatic_prefix_auto_route_qualifications[] = {
     {"strict-l0-n1","http-mtp-batch-l0","QPC-B1-v1",CacheUse::prefix,CacheRunner::batch_mtp,1,1},
     {"strict-l0-n2","http-mtp-batch-l0","QPC-B2-v1",CacheUse::prefix,CacheRunner::batch_mtp,2,2},
     {"strict-l0-n4","http-mtp-batch-l0","QPC-B4-v1",CacheUse::prefix,CacheRunner::batch_mtp,4,4},
+    // Pending node receipts (16 chats x 17K at context 32,768): unqualified data rows, never a permission.
+    // Empty identities never match (CacheQualification::matches), so AUTO stays refused at every gate.
+    {"single-t2048-ctx32k","http-mtp-fixed","QPC-SINGLE-32K-v1",CacheUse::prefix,CacheRunner::single_mtp,1,1,16385,32768,2048,
+        false,false,false,1,{},true,{}}, // identity filled with the receipt (32K layout/signature)
+    {"strict-l0-n8","http-mtp-batch-l0","QPC-B8-v1",CacheUse::prefix,CacheRunner::batch_mtp,8,8,1,32768,2048,
+        false,false,false,1,{},true,{}},
+    {"strict-l0-n16","http-mtp-batch-l0","QPC-B16-v1",CacheUse::prefix,CacheRunner::batch_mtp,16,16,1,32768,2048,
+        false,false,false,1,{},true,{}},
     {"target","http-target","QPC-TARGET-v1",CacheUse::prefix,CacheRunner::target},
     {"cli-reuse","cli-target-tiled","QPC-CLI-v1",CacheUse::prefix,CacheRunner::cli}
 };
@@ -120,6 +137,10 @@ inline const CacheQualification automatic_prefix_batch_cert_route_qualifications
     {"strict-l0-n1","http-mtp-batch-certified-l0","QBC-B1-v1",CacheUse::batch_l0,CacheRunner::batch_mtp,1,1},
     {"strict-l0-n2","http-mtp-batch-certified-l0","QBC-B2-v1",CacheUse::batch_l0,CacheRunner::batch_mtp,2,2},
     {"strict-l0-n4","http-mtp-batch-certified-l0","QBC-B4-v1",CacheUse::batch_l0,CacheRunner::batch_mtp,4,4},
+    {"strict-l0-n8","http-mtp-batch-certified-l0","QBC-B8-v1",CacheUse::batch_l0,CacheRunner::batch_mtp,8,8,1,32768,2048,
+        false,false,false,1,{},true,{}},
+    {"strict-l0-n16","http-mtp-batch-certified-l0","QBC-B16-v1",CacheUse::batch_l0,CacheRunner::batch_mtp,16,16,1,32768,2048,
+        false,false,false,1,{},true,{}},
     {"ordinary-scheduler-decline","http-mtp-batch","QBC-DECLINE-v1",CacheUse::decline_compatibility,CacheRunner::batch_mtp,1,4},
     {"broader-l1","http-mtp-batch-certified-l1","QBC-L1-v1",CacheUse::batch_l1,CacheRunner::batch_mtp,1,4}
 };
@@ -144,6 +165,7 @@ struct CachePolicyActivation {
     std::optional<std::uint64_t> U,L,A,reserve,observation_age_ns;
     double pool_setup_ms=0;
     bool limits_consistent=false;
+    std::optional<serve::CacheBudgetPolicy> budget_policy; // populated when the automatic fit resolves it
     std::optional<std::uint64_t> B,S,H,F,E, context_off, slots_off, context_admitted, slots_admitted;
 };
 // One process-wide decline also reaches runtime Options copies. Numerical
@@ -178,6 +200,7 @@ struct CacheLateFit {
     std::uint64_t resident_payload=0, resident_staging=0; // live ledger backing, not reserved credits
     bool limits_consistent=false, aliasing_known=false;
     bool cgroup_ancestry_unproven=false;
+    serve::CacheBudgetPolicy budget_policy{}; // automatic budget rule; default = the incumbent legacy rule
 };
 inline void intersect_cache_capacity(CacheLateFit& fit, std::uint64_t configured) {
     if(!fit.U || !fit.L || !fit.A) return;
@@ -251,7 +274,7 @@ inline CacheFitResult fit_cache_late(const CacheLateFit& x) {
         return {0,"memory-arithmetic-overflow"};
     if (*x.A>*x.U || *x.L>*x.U) return {0,"post-residency-memory-unavailable"};
     if (*x.A<reserve) return {0,"insufficient-host-headroom"};
-    auto budget=x.explicit_budget.value_or(std::min({4*gib,*x.A/16,*x.A-reserve}));
+    auto budget=x.explicit_budget.value_or(serve::automatic_cache_budget(x.budget_policy,*x.A,reserve));
     if (!x.explicit_budget) budget-=budget%4096;
     auto total=*x.L;
     if (!add(total,reserve) || !add(total,budget-x.resident_payload)) return {0,"memory-arithmetic-overflow"};

@@ -2,7 +2,7 @@
 // split policy against the pair's own per-row outputs (a dump written on the AMD node by the engine's trellis adapter:
 // "TRLDUMP1", per record layer / which (0 gate, 1 up, 2 down) / K / I / N, x[8][I], then y[R][N] for R = 1..8).
 // Usage: strix-cuda-trellis-shexp-dump-check PACK_DIR DUMP.bin   (exit 0 when every value of every R is bitwise equal)
-#include "strix/cuda_trellis.hpp"
+#include "strix/cuda/trellis.hpp"
 
 #include <cstdint>
 #include <cstdio>

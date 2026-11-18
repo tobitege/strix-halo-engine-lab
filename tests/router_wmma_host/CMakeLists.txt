@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.24)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(strix-router-wmma-host LANGUAGES CXX)
+    enable_testing()
+endif()
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(NOT Python3_Interpreter_FOUND)
+    message(STATUS "Skipping router WMMA host tests: Python3 interpreter not found")
+    return()
+endif()
+get_filename_component(repo "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+set(ROUTER_SOURCE "${repo}" CACHE PATH "Production source tree to exercise")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/extract.py"
+    "${ROUTER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+add_executable(strix-router-wmma-host "${CMAKE_CURRENT_BINARY_DIR}/host.cpp")
+target_compile_features(strix-router-wmma-host PRIVATE cxx_std_20)
+target_include_directories(strix-router-wmma-host PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/stubs"
+    "${ROUTER_SOURCE}" "${ROUTER_SOURCE}/include" "${ROUTER_SOURCE}/src"
+    "${repo}" "${repo}/include" "${repo}/src" "${repo}/tests")
+if(MSVC)
+    target_compile_options(strix-router-wmma-host PRIVATE /W4 /WX)
+    target_compile_definitions(strix-router-wmma-host PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+else()
+    target_compile_options(strix-router-wmma-host PRIVATE -Wall -Wextra -Werror)
+endif()
+foreach(test IN ITEMS ownership gates)
+    add_test(NAME strix-router-wmma-${test} COMMAND strix-router-wmma-host ${test})
+endforeach()
+add_test(NAME strix-router-wmma-http-hello COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_LIST_DIR}/regressions.py" hello "$<TARGET_FILE:strix-router-wmma-host>")
+add_test(NAME strix-router-wmma-unit-wrapper COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_LIST_DIR}/regressions.py" wrapper "${ROUTER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}")

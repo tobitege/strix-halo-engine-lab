@@ -44,11 +44,15 @@ inline std::string without_prefix_reuse_policy(std::string text) {
 
 // Remove only additive reports; retain the frozen bytes of every incumbent field.
 inline std::string without_added_prefill_reports(std::string text) {
-    for (const char* key : {"prefill_identity", "prefill_identity_hash", "prefill_options_active",
+    for (const char* key : {"weight_plans", "prefill_identity", "prefill_identity_hash", "prefill_options_active",
             "compact_stage_images_requested", "hc_lowband_policy", "hc_lowband_route", "index_batch", "qwen_router_bf16",
             "early_setup", "eager_code_load", "hip_enable_deferred_loading", "t16k_policy", "profile", "prefill_moe_route_bf16",
             "prefill_storage_identity", "prefill_storage_identity_hash",
-            "prefill_moe_route_bf16_reason", "prefill_fast_components"}) {
+            "prefill_moe_route_bf16_reason", "prefill_fast_components",
+            // Reported for native weights too since the IU4 row-decode/reduction resolver report (additive).
+            "turbo_weights",
+            // Explicit-only QSA index band request report (default off; additive).
+            "qsa_index_band"}) {
         const auto needle = std::string("\"") + key + "\":";
         const auto start = text.find(needle);
         if (start == std::string::npos) continue;
@@ -78,7 +82,7 @@ inline std::string without_added_prefill_reports(std::string text) {
 // Long-context items added after the frozen table ({"enabled":..,"suppression":..} objects): each is
 // reported and tested on its own, so strip it from the frozen comparison.
 inline std::string without_added_long_context_items(std::string text) {
-    for(const char* key:{"STRIX_QSA_CACHE_ONLY","STRIX_PREFILL_FINAL_CONE","STRIX_QPF2K_GDN_CHUNK16","STRIX_QWEN_DECODE_FUSE"}) {
+    for(const char* key:{"STRIX_QSA_SCORE_SPLIT_LOADS","STRIX_QSA_CACHE_ONLY","STRIX_PREFILL_FINAL_CONE","STRIX_QPF2K_GDN_CHUNK16","STRIX_QWEN_DECODE_FUSE"}) {
         // Only inside "long_context_items" (the requested environment may carry the same name).
         const auto object=text.find("\"long_context_items\":{");
         if(object==std::string::npos) return text;

@@ -26,9 +26,14 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 7;  // paired prefix snapshot prepare / commit / restore / clear
+inline constexpr std::uint32_t kControlVersion = 8;  // v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
+// prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
+// kPrefillStart begins it over the plen tokens that follow at ppos; later calls carry no tokens.
+inline constexpr std::uint32_t kPrefillUnits = 32U;
+inline constexpr std::uint32_t kPrefillStart = 64U;
+inline constexpr std::uint32_t kPrefillPending = 0xFFFFFFFEU;  // a prefill units call that did not complete the prompt
 inline constexpr std::uint32_t kMaxMtpCycles = 64;
 inline constexpr std::uint32_t kPrefixReply = 8U;     // prefix_prepare pflags: reply-end snapshot (default: prompt-end)
 inline constexpr std::uint32_t kPrefixPressure = 16U; // prefix_evict pflags: eviction under memory pressure
@@ -131,7 +136,7 @@ struct Control {
     std::uint32_t echo_count = 0, echo_token = 0, echo_hash = 0, pad0 = 0;
     Hello hello{};
     std::uint32_t pflags = 0;            // prefill: kPrefillMtp
-    std::uint32_t budget = 0, cycles = 0, pad1 = 0;  // mtp_run
+    std::uint32_t budget = 0, cycles = 0, pad1 = 0;  // mtp_run; prefill units: budget = layer units of the call
     std::uint64_t ppos = 0;              // prefill: position of the chunk's first token (0: the slot is reset first)
     std::uint32_t sbudget[kMaxRows]{};   // spec_verify: per window
     std::uint32_t import_id = 0, import_status = 0;  // import_state / import_expect; replies: this rank's staging status
@@ -453,12 +458,30 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             return out;
         }
         case Cmd::prefill: {
+            if ((c.pflags & kPrefillUnits) != 0U && (c.pflags & kPrefillStart) == 0U) {  // resume / cancel: no tokens
+                if (c.pslot >= slots || (c.pflags & kPrefillMtp) == 0U || c.plen != 0)
+                    throw ProtocolError("control channel: prefill units resume out of range");
+                if constexpr (requires { eng.prefill_units(c.pslot, std::span<const std::uint32_t>{}, c.ppos, false, c.budget); })
+                    out.push_back(eng.prefill_units(c.pslot, std::span<const std::uint32_t>{}, c.ppos, false, c.budget));
+                else
+                    throw ProtocolError("control channel: this engine has no prefill units");
+                break;
+            }
             if (c.pslot >= slots || (c.ppos == 0 && ((c.resets >> c.pslot) & 1U) == 0))
                 throw ProtocolError("control channel: prefill without its slot reset");
             if (c.plen == 0 || c.ppos >= capacity || c.plen >= capacity - c.ppos)
                 throw ProtocolError("control channel: prompt chunk out of range");
             ch.tokens(prompt, c.plen, sender);
             const std::span<const std::uint32_t> p(prompt);
+            if ((c.pflags & kPrefillUnits) != 0U) {
+                if ((c.pflags & kPrefillMtp) == 0U || c.budget == 0)
+                    throw ProtocolError("control channel: prefill units start needs MTP and a unit budget");
+                if constexpr (requires { eng.prefill_units(c.pslot, p, c.ppos, true, c.budget); })
+                    out.push_back(eng.prefill_units(c.pslot, p, c.ppos, true, c.budget));
+                else
+                    throw ProtocolError("control channel: this engine has no prefill units");
+                break;
+            }
             out.push_back((c.pflags & kPrefillMtp) != 0 ? eng.prefill_mtp(c.pslot, p, c.ppos, (c.pflags & kPrefillLast) != 0)
                                                         : eng.prefill(c.pslot, p, c.ppos));
             break;

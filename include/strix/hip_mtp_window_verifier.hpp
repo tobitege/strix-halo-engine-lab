@@ -33,6 +33,9 @@ struct HipMtpVerifiedTargetRows {
     std::uint32_t verified_candidates=0,accepted_candidates=0;
     bool attempted_window=false,accepted_window=false,restored_checkpoint=false;
     std::uint32_t r2_dispatches=0,projection_launches_saved=0;
+    // Own window attempts and serial dispatches, including replay and selection failure.
+    // Shared cohort execution is counted once by the caller, not per member.
+    std::uint64_t target_forwards=0;
     std::uint32_t chosen_rows=1; // window owner rows, 1 = serial target steps
 };
 // Min-p controller cost samples per owner (rows 1 = serial, per emitted token); cycle_ms_ema is the current

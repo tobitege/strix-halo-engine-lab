@@ -713,14 +713,18 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
 // grid (kDnGroups, slots incl. shared). CTA = 4 waves x 4 columns (256 outputs) over the whole K: the 4 library splits
 // accumulate in ascending order in the CTA's fin rows; H32 + svh per 128-output block into yslot; the last CTA of the
 // 256-output group (over all active slots) runs R16 for every row.
-template <int MaxR, bool Pipe, bool I4 = false>
+// Part: 0 = all kDnGroups column groups (every default launch, code unchanged); 1 / 2 = the first / second half of the
+// groups (split-producer chunk frames): grid (kDnGroups / 2, slots), group cg = blockIdx.x (+ kDnGroups / 2 for part 2),
+// the partial goes to a.out in SplitLayout{rows, 4096, 2048} (part 1: out = the head part, part 2: out = the tail part,
+// row stride 2048 each) and publishes with kDnGroups / 2 arrivals. Every element's sum order is that of Part 0.
+template <int MaxR, bool Pipe, bool I4 = false, unsigned Part = 0>
 __global__ __launch_bounds__(128) void down_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kInter];
     __shared__ WideV4 rowbuf[4 * kRowbufStride<Pipe>];
     __shared__ float fin[MaxR * 256];
     __shared__ SlotInfo si;
     __shared__ std::uint32_t ids[kMaxRows * kTopE], mask[kMaskWords], pairs[kMaxRows * kTopE];
-    const unsigned slot = blockIdx.y, cg = blockIdx.x;
+    const unsigned slot = blockIdx.y, cg = Part == 2 ? blockIdx.x + kDnGroups / 2U : blockIdx.x;
     slot_info(a, slot, true, si, ids, mask);
     if (!si.active) return;
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
@@ -785,11 +789,12 @@ __global__ __launch_bounds__(128) void down_kernel(Args a) {
             float acc = 0.0F;
             for (unsigned k = 0; k < kTopE; ++k)
                 acc = __builtin_fmaf(a.weights[r * kTopE + k], load_agent(a.yslot(pairs[r * kTopE + k]) + o), acc);
-            a.out[static_cast<std::size_t>(r) * kHidden + o] = acc + load_agent(a.yslot(r) + o);
+            if constexpr (Part == 0) a.out[static_cast<std::size_t>(r) * kHidden + o] = acc + load_agent(a.yslot(r) + o);
+            else a.out[static_cast<std::size_t>(r) * (kHidden / 2U) + (Part == 2 ? o - kHidden / 2U : o)] = acc + load_agent(a.yslot(r) + o);
         }
     }
     // One R16 workgroup per 256-output group stores the partial: the last of the kDnGroups publishes it.
-    if (a.pub.on()) strix::pair::producer_publish(a.pub, kDnGroups);
+    if (a.pub.on()) strix::pair::producer_publish(a.pub, Part == 0 ? kDnGroups : kDnGroups / 2U);
 }
 
 // The core down path does not publish in-kernel: one thread raises the flag after it (same message, one more launch).
@@ -870,7 +875,7 @@ void check_launch(const char* what) {
 unsigned routed_slots(unsigned rows) { return rows * kTopE < kExperts ? rows * kTopE : kExperts; }
 
 template <int MaxR, unsigned SG, bool Pipe>
-void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
+void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks, const MoeSplit* sp) {
     const unsigned routed = routed_slots(a.rows);
     static const bool core_enabled = [] {
         const char* value = std::getenv("STRIX_GLM_MOE_CORE");
@@ -878,6 +883,7 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
     }();
     if constexpr (MaxR == 1) {
         if (core_enabled) {
+            if (sp != nullptr) throw std::invalid_argument("glm moe: split down is the default path only (not the core path)");
             if (router) {
                 core_router_shared_kernel<MaxR, SG, Pipe><<<kRouterCtas + kGuGroups * (kGateSplits / SG) * 2, 128, 0, stream>>>(a);
                 check_launch("router_shared");
@@ -907,8 +913,23 @@ void launch_rows_sg(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
     }
     check_launch("gate_up");
     if (marks != nullptr) (void)hipEventRecord(marks[router ? 1 : 0], stream);
-    down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
-    check_launch("down");
+    if (sp == nullptr) {
+        down_kernel<MaxR, Pipe><<<dim3(kDnGroups, routed + 1), 128, 0, stream>>>(a);
+        check_launch("down");
+    } else if constexpr (MaxR == 1 || Pipe) {
+        throw std::invalid_argument("glm moe: split down is the default path only (not the pipe path, rows >= 2)");
+    } else {
+        // Split-producer chunk frame: the down projection as two launches on the column-group halves; mid() (Channel::split_head)
+        // runs on the host between them.
+        down_kernel<MaxR, Pipe, false, 1><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(a);
+        check_launch("down head");
+        sp->mid(sp->mid_ctx);
+        Args t = a;
+        t.out = sp->tail_out;
+        t.pub = sp->tail;
+        down_kernel<MaxR, Pipe, false, 2><<<dim3(kDnGroups / 2, routed + 1), 128, 0, stream>>>(t);
+        check_launch("down tail");
+    }
 }
 // fast_i4 (MoeView::i4): the same three launches with the routed slots on the W4A16 core (no core / pipe variants).
 template <int MaxR, unsigned SG>
@@ -932,26 +953,29 @@ void launch_rows_i4(const Args& a, bool router, hipStream_t stream, hipEvent_t* 
     throw std::invalid_argument("glm moe: fast_i4 W4A16 core not built (shared stored INT4 core)");
 #endif
 }
-template <int MaxR, bool Pipe> void launch_rows(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks) {
+template <int MaxR, bool Pipe> void launch_rows(const Args& a, bool router, hipStream_t stream, hipEvent_t* marks, const MoeSplit* sp) {
     if (a.i4.on()) {
+        if (sp != nullptr) throw std::invalid_argument("glm moe: split down is not provided for fast_i4");
         if (split_group(static_cast<unsigned>(MaxR)) == 1) launch_rows_i4<MaxR, 1>(a, router, stream, marks);
         else launch_rows_i4<MaxR, 2>(a, router, stream, marks);
         return;
     }
     switch (split_group(static_cast<unsigned>(MaxR))) {
-    case 1: launch_rows_sg<MaxR, 1, Pipe>(a, router, stream, marks); break;
-    case 2: launch_rows_sg<MaxR, 2, Pipe>(a, router, stream, marks); break;
-    case 8: launch_rows_sg<MaxR, 8, Pipe>(a, router, stream, marks); break;
-    default: launch_rows_sg<MaxR, 4, Pipe>(a, router, stream, marks); break;
+    case 1: launch_rows_sg<MaxR, 1, Pipe>(a, router, stream, marks, sp); break;
+    case 2: launch_rows_sg<MaxR, 2, Pipe>(a, router, stream, marks, sp); break;
+    case 8: launch_rows_sg<MaxR, 8, Pipe>(a, router, stream, marks, sp); break;
+    default: launch_rows_sg<MaxR, 4, Pipe>(a, router, stream, marks, sp); break;
     }
 }
 template <bool Pipe>
-void launch(const MoeView& v, bool router, hipStream_t stream, hipEvent_t* marks) {
+void launch(const MoeView& v, bool router, hipStream_t stream, hipEvent_t* marks, const MoeSplit* sp = nullptr) {
     const Args a = make_args(v, router);
-    if (a.rows == 1) launch_rows<1, Pipe>(a, router, stream, marks);
-    else if (a.rows == 2) launch_rows<2, Pipe>(a, router, stream, marks);
-    else if (a.rows <= 4) launch_rows<4, Pipe>(a, router, stream, marks);
-    else launch_rows<8, Pipe>(a, router, stream, marks);
+    if (sp != nullptr && (a.rows < 2 || sp->mid == nullptr || !a.pub.on() || !sp->tail.on() || sp->tail_out == nullptr))
+        throw std::invalid_argument("glm moe: split down needs 2..8 rows, both publishers, the tail output and mid()");
+    if (a.rows == 1) launch_rows<1, Pipe>(a, router, stream, marks, sp);
+    else if (a.rows == 2) launch_rows<2, Pipe>(a, router, stream, marks, sp);
+    else if (a.rows <= 4) launch_rows<4, Pipe>(a, router, stream, marks, sp);
+    else launch_rows<8, Pipe>(a, router, stream, marks, sp);
 }
 
 }  // namespace
@@ -970,6 +994,9 @@ const std::uint16_t* moe_pair_down_input(const MoeWorkspace& ws, unsigned pair) 
 }
 void enqueue_moe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<false>(v, true, stream, marks); }
 void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<false>(v, false, stream, marks); }
+void enqueue_experts_split(const MoeView& v, hipStream_t stream, const MoeSplit& split) {
+    launch<false>(v, false, stream, nullptr, &split);
+}
 
 void enqueue_moe_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<true>(v, true, stream, marks); }
 void enqueue_experts_pipe(const MoeView& v, hipStream_t stream, hipEvent_t* marks) { launch<true>(v, false, stream, marks); }

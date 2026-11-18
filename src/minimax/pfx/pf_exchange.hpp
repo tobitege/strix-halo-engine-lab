@@ -89,6 +89,11 @@ public:
     void send_copy(const void* local, std::size_t bytes, const Tag& tag);
     // The message of `bytes` was written into tx() by work enqueued so far: publish it (1-block kernel) and send.
     void send(std::size_t bytes, const Tag& tag);
+    // STRIX_TP2_EXCHANGE_FMT=f16: rounds `elems` (multiple of 8) FP32 values of device memory `local` to binary16 into
+    // the next TX slot (one kernel; its last block publishes) and sends elems * 2 bytes. Never blocks the CPU.
+    void send_pack_f16(const float* local, std::size_t elems, const Tag& tag);
+    // Finite FP32 inputs of send_pack_f16 that rounded to an infinity since construction (nonzero: fail closed).
+    [[nodiscard]] std::uint64_t f16_overflows() const;
     // The stream waits for the oldest exchange not yet received; returns {local TX slot, peer RX slot} (device).
     struct View {
         const void* local = nullptr;
@@ -133,6 +138,7 @@ private:
     void run();
     void lane_run(Lane& lane, int cpu);
     void process(const Job& job);
+    void post_job(std::uint64_t s, std::size_t bytes, const Tag& tag);  // queue a launched copy / pack for the progress thread
     void post_lane(Lane& lane, const std::byte* data, std::size_t bytes, std::size_t ready);
     void wait_lane(Lane& lane, std::chrono::steady_clock::time_point deadline);
     [[noreturn]] void fail(const std::string& why);

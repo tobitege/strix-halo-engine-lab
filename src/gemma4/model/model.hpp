@@ -1,39 +1,17 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 
 #include "gemma4/contracts/g4_types.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/weight_archive.hpp"
 #include <filesystem>
 #include <map>
 
 namespace strix::gemma4 {
 
-class MappedFile {
-public:
-    explicit MappedFile(const std::filesystem::path& path);
-    ~MappedFile();
-    MappedFile(const MappedFile&) = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
-    [[nodiscard]] const std::uint8_t* data() const { return data_; }
-    [[nodiscard]] std::size_t size() const { return size_; }
-private:
-    const std::uint8_t* data_ = nullptr;
-    std::size_t size_ = 0;
-#ifdef _WIN32
-    void* file_ = nullptr;
-    void* mapping_ = nullptr;
-#else
-    int fd_ = -1;
-#endif
-};
-struct SafeTensor {
-    std::string name, dtype;
-    std::vector<std::uint64_t> shape;
-    std::uint64_t offset = 0, bytes = 0;
-};
-struct SafeFile {
-    std::shared_ptr<MappedFile> storage;
-    std::vector<SafeTensor> tensors;
-};
+using MappedFile = weights::MappedFile;
+using SafeTensor = weights::SafeTensor;
+using SafeFile = weights::SafeFile;
 [[nodiscard]] SafeFile read_safetensors(const std::filesystem::path& path);
 [[nodiscard]] ModelConfig parse_text_config(const std::filesystem::path& path);
 [[nodiscard]] std::map<std::string, std::vector<std::uint64_t>> required_tensors(const ModelConfig& config);

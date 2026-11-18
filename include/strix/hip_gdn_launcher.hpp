@@ -6,6 +6,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_contract.hpp"
+#include "strix/recurrent_state_type.hpp"
 
 #include <cstdint>
 #include <string>
@@ -32,6 +33,7 @@ struct HipGdnLauncherConfig {
     HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline;
     // Chosen with the session allocation/import; never converted per token.
     GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value;
+    // model.recurrent_state owns allocation, dispatch and identity together.
     // Dense A8 numerical profile (dense-a8-q80-v1): every Q8_0 projection of the
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
@@ -82,6 +84,9 @@ void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows
 // commit applies the pending rows and the caller then stores pending_rows = 0
 // before any serial GDN token. Every GDN layer of a round shares one control.
 inline constexpr std::uint32_t gdn_window_max_rows = 8;
+// Sessions of one GDN cohort call (kCohortWideMaxSessions). The fused part 2 table holds gdn_window_max_rows segments
+// (kernel argument budget), so a wider cohort launches it once per eight sessions; each block owns one session's state.
+inline constexpr std::uint32_t gdn_window_cohort_max_segments = 16;
 // Rows of one GDN cohort launch (the sessions of several 8-row chunks: 16 or 32).
 inline constexpr std::uint32_t gdn_window_cohort_max_rows = 32;
 struct GdnWindowControl { std::uint32_t pending_rows = 0, pending_slot = 0; };

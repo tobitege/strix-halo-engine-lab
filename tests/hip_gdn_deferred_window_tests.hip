@@ -1,22 +1,27 @@
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_setup_quiescence.hpp"
+#include "attn_core/recurrent_state.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
 using namespace strix;
+namespace rstate = strix::attn_core::rstate;
 constexpr std::uint32_t hidden = 2560, keys = 16, heads = 48, dim = 128, kernel = 4;
 constexpr std::uint32_t key_width = keys * dim, value_width = heads * dim, conv_width = 2U * key_width + value_width;
 constexpr std::size_t workspace_floats = conv_width + value_width + 2U * heads + value_width;
@@ -101,6 +106,26 @@ template <class T> std::vector<T> uniform(std::size_t count, float lo, float hi,
     }
     return result;
 }
+// Exact allocation-sized image: typed fixtures must not hide f32 reads or writes in an oversized tail.
+std::vector<std::byte> state_image(const std::vector<float>& values, RecurrentStateType type) {
+    std::vector<std::byte> image(static_cast<std::size_t>(recurrent_state_bytes(values.size(), type)), std::byte{0});
+    if (type == RecurrentStateType::f32) { std::memcpy(image.data(), values.data(), image.size()); return image; }
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const std::uint16_t half = type == RecurrentStateType::f16 ? rstate::f16_from_f32_host(values[i]) : rstate::bf16_from_f32(values[i]);
+        std::memcpy(image.data() + 2U * i, &half, 2U);
+    }
+    return image;
+}
+// Widening readback of such an image.
+std::vector<float> state_values(const std::vector<std::byte>& image, std::size_t count, RecurrentStateType type) {
+    std::vector<float> values(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (type == RecurrentStateType::f32) { std::memcpy(&values[i], image.data() + 4U * i, 4U); continue; }
+        std::uint16_t half = 0; std::memcpy(&half, image.data() + 2U * i, 2U);
+        values[i] = type == RecurrentStateType::f16 ? rstate::f32_from_f16_host(half) : rstate::f32_from_bf16(half);
+    }
+    return values;
+}
 struct Side { // One recurrent state with its rows.
     Buffer matrix, conv, retained;
     std::vector<Buffer> input, output, workspace;
@@ -112,8 +137,12 @@ struct Fixture {
     Buffer qkv, z, beta, alpha, out, conv_weights, dt, a, norm, control;
     Side window, serial;
     std::vector<float> state0; std::vector<std::uint16_t> history0;
-    Fixture(GdnRecurrentStorage storage, HipGdnRecurrentLayout layout, bool q8, bool bf16_weights, unsigned seed)
-        : q8_gates(q8), bf16_small(bf16_weights) {
+    RecurrentStateType state_type;
+    std::vector<std::byte> state_image0; // state0 as stored under state_type
+    Fixture(GdnRecurrentStorage storage, HipGdnRecurrentLayout layout, bool q8, bool bf16_weights, unsigned seed,
+        RecurrentStateType type = RecurrentStateType::f32)
+        : q8_gates(q8), bf16_small(bf16_weights), state_type(type) {
+        config.model.recurrent_state = type;
         config.virtual_q8_input_projections = config.prefetch_q8_input_projections = config.wave8_q8_input_projections = true;
         config.virtual_q8_output_projection = config.wave8_q8_output_projection = true;
         config.recurrent_storage = storage; config.recurrent_layout = layout;
@@ -136,9 +165,10 @@ struct Fixture {
         }
         control = owner.allocate(sizeof(GdnWindowControl));
         state0 = uniform<float>(state_floats, -0.2F, 0.2F, rng);
+        state_image0 = state_image(state0, type);
         history0 = uniform<std::uint16_t>(static_cast<std::size_t>(conv_width) * kernel, -1.0F, 1.0F, rng);
         for (auto* side : {&window, &serial}) {
-            side->matrix = owner.allocate(state_floats * sizeof(float));
+            side->matrix = owner.allocate(state_image0.size());
             side->conv = owner.allocate(history0.size() * sizeof(std::uint16_t));
             side->retained = owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(config.model)));
             for (unsigned row = 0; row < 16U; ++row) {
@@ -173,7 +203,7 @@ struct Fixture {
     }
     void reset() {
         for (auto* side : {&window, &serial}) {
-            write(side->matrix, state0); write(side->conv, history0);
+            write(side->matrix, state_image0); write(side->conv, history0);
             for (unsigned r = 0; r < 16U; ++r) {
                 check(hipMemset(side->output[r].address, 0x5a, side->output[r].bytes), "poison deferred GDN output");
                 check(hipMemset(side->workspace[r].address, 0x5a, side->workspace[r].bytes), "poison deferred GDN workspace");
@@ -229,18 +259,18 @@ struct Fixture {
             std::vector<std::byte> result(values.size() * sizeof(values[0]));
             std::memcpy(result.data(), values.data(), result.size()); return result;
         };
-        require(read(window.matrix) == bytes(state0) && read(window.conv) == bytes(history0),
+        require(read(window.matrix) == state_image0 && read(window.conv) == bytes(history0),
             label + ": window without pending rows wrote its state");
-        require(read(serial.matrix) != bytes(state0), label + ": serial reference did not advance");
+        require(read(serial.matrix) != state_image0, label + ": serial reference did not advance");
         // Rebuild the serial state at the committed prefix n.
-        write(serial.matrix, state0); write(serial.conv, history0);
+        write(serial.matrix, state_image0); write(serial.conv, history0);
         serial_rows(0U, n);
         set_control(n, 0U);
         window_rows(8U, u, capture);
         same_state(label + " after pending commit");
         serial_rows(8U, u);
         same_rows(8U, u, label + " window 2");
-        write(serial.matrix, state0); write(serial.conv, history0);
+        write(serial.matrix, state_image0); write(serial.conv, history0);
         serial_rows(0U, n); serial_rows(8U, m);
         set_control(m, 1U);
         commit();
@@ -253,16 +283,17 @@ struct Fixture {
 struct CohortSession {
     Side together, alone;
     Buffer control_together, control_alone;
-    std::vector<float> state; std::vector<std::uint16_t> history;
+    std::vector<float> state; std::vector<std::byte> image; std::vector<std::uint16_t> history;
 };
 void cohort_scenarios(Fixture& f, unsigned& cases) {
     std::vector<CohortSession> sessions(8);
     Rng rng{991U};
     for (auto& session : sessions) {
         session.state = uniform<float>(state_floats, -0.2F, 0.2F, rng);
+        session.image = state_image(session.state, f.state_type);
         session.history = uniform<std::uint16_t>(static_cast<std::size_t>(conv_width) * kernel, -1.0F, 1.0F, rng);
         for (auto* side : {&session.together, &session.alone}) {
-            side->matrix = f.owner.allocate(state_floats * sizeof(float));
+            side->matrix = f.owner.allocate(f.state_image0.size());
             side->conv = f.owner.allocate(session.history.size() * sizeof(std::uint16_t));
             side->retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
             for (unsigned row = 0; row < 16U; ++row) {
@@ -323,7 +354,7 @@ void cohort_scenarios(Fixture& f, unsigned& cases) {
             for (std::size_t k = 0; k < count; ++k) {
                 auto& session = sessions[k];
                 for (auto* side : {&session.together, &session.alone}) {
-                    write(side->matrix, session.state); write(side->conv, session.history);
+                    write(side->matrix, session.image); write(side->conv, session.history);
                     for (unsigned r = 0; r < 16U; ++r) {
                         check(hipMemset(side->output[r].address, 0x5a, side->output[r].bytes), "poison cohort GDN output");
                         check(hipMemset(side->workspace[r].address, 0x5a, side->workspace[r].bytes), "poison cohort GDN workspace");
@@ -494,9 +525,178 @@ void benchmark_gates() {
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
     check(hipFree(flush), "free MALL flush buffer");
 }
+// `bench-state warm|cold`: recurrent-state traffic of the decode recurrences (incumbent storage), for a kernel
+// trace. Cases run in order, 3 + 25 launches each, separated by a 60 ms host gap so a trace splits per case;
+// cold flushes the MALL (96 MiB memset) before every sample. Prints "case <name> <event median us>".
+void benchmark_state(bool cold, RecurrentStateType type = RecurrentStateType::f32) {
+    Fixture f(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, true, true, 5U, type);
+    f.reset();
+    void* flush = nullptr;
+    constexpr std::size_t flush_bytes = 96ULL << 20U;
+    check(hipMalloc(&flush, flush_bytes), "allocate MALL flush buffer");
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    unsigned sample = 0;
+    const auto run_case = [&](const std::string& name, auto&& run) {
+        f.owner.finish();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        for (unsigned i = 0; i < 3U; ++i) run();
+        std::vector<float> samples;
+        for (unsigned i = 0; i < 25U; ++i) {
+            if (cold) check(hipMemsetAsync(flush, static_cast<int>(++sample & 0xffU), flush_bytes, f.owner.stream), "MALL flush");
+            check(hipEventRecord(start, f.owner.stream), "record"); run(); check(hipEventRecord(stop, f.owner.stream), "record");
+            check(hipEventSynchronize(stop), "sync"); samples.push_back(elapsed(start, stop));
+        }
+        std::sort(samples.begin(), samples.end());
+        std::cout << "case " << name << " " << samples[samples.size() / 2U] * 1000.0F << " us\n";
+    };
+    const auto serial_layer = f.layer(f.serial), window_layer = f.layer(f.window);
+    const auto serial_row = f.rows(f.serial, 0U, 1U)[0];
+    run_case("r1", [&] { gdn_window_serial_row_probe(serial_layer, serial_row, f.config, f.owner.stream); });
+    for (const unsigned t : {1U, 2U, 8U})
+        for (const unsigned pending : {0U, t}) {
+            f.set_control(pending, 0U);
+            const auto views = f.rows(f.window, 0U, t);
+            run_case("w" + std::to_string(t) + "p" + std::to_string(pending),
+                [&] { gdn_window_enqueue(window_layer, views, f.device_control(), f.config, f.owner.stream); });
+        }
+    f.set_control(2U, 0U);
+    run_case("commit2", [&] { gdn_window_commit_enqueue(window_layer, f.device_control(), f.config, f.owner.stream); });
+    // Eight chats of one layer (C8 cohort): own state, conv history, retained rows and control each.
+    std::vector<Side> chats(8);
+    std::vector<Buffer> controls;
+    for (auto& chat : chats) {
+        chat.matrix = f.owner.allocate(f.state_image0.size()); write(chat.matrix, f.state_image0);
+        chat.conv = f.owner.allocate(f.history0.size() * sizeof(std::uint16_t)); write(chat.conv, f.history0);
+        chat.retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
+        for (unsigned row = 0; row < 2U; ++row) {
+            chat.input.push_back(f.window.input[row]);
+            chat.output.push_back(f.owner.allocate(hidden * sizeof(std::uint16_t)));
+            chat.workspace.push_back(f.owner.allocate(workspace_floats * sizeof(float)));
+        }
+        controls.push_back(f.owner.allocate(sizeof(GdnWindowControl)));
+        check(hipMemset(controls.back().address, 0, sizeof(GdnWindowControl)), "zero cohort control");
+    }
+    for (const unsigned rows : {1U, 2U}) {
+        std::vector<std::vector<GdnWindowRow>> views;
+        for (const auto& chat : chats) views.push_back(f.rows(chat, 0U, rows));
+        std::vector<GdnWindowCohortSegment> segments;
+        for (std::size_t k = 0; k < chats.size(); ++k)
+            segments.push_back({f.layer(chats[k]), views[k], reinterpret_cast<const GdnWindowControl*>(controls[k].address)});
+        // 8 chats x 2 rows = 16 rows: the wide cohort forms need dense A8 (restored after the case).
+        const bool dense_before = f.config.dense_a8_projections;
+        if (rows == 2U) f.config.dense_a8_projections = true;
+        run_case("c8r" + std::to_string(rows), [&] { gdn_window_cohort_enqueue(segments, f.config, f.owner.stream); });
+        f.config.dense_a8_projections = dense_before;
+    }
+    f.owner.finish();
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    check(hipFree(flush), "free MALL flush buffer");
+}
+// "state16 codec": the device store / load of rstate::Codec<f16|bf16> against the host reference, bit for bit,
+// over a sweep of float bit patterns (every upper half x lower halves around the rounding ties, NaN, inf, subnormals).
+template <RecurrentStateType T>
+__global__ void state16_codec_kernel(const float* in, std::uint16_t* narrowed, float* widened, std::size_t count) {
+    const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto half = rstate::Codec<T>::store(in[i]);
+    narrowed[i] = half; widened[i] = rstate::Codec<T>::load(half);
+}
+template <RecurrentStateType T> void state16_codec_case(Owner& owner, const std::vector<float>& values) {
+    const auto count = values.size();
+    auto in = owner.allocate(count * 4U), narrowed = owner.allocate(count * 2U), widened = owner.allocate(count * 4U);
+    write(in, values);
+    hipLaunchKernelGGL(state16_codec_kernel<T>, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0, owner.stream,
+        reinterpret_cast<const float*>(in.address), reinterpret_cast<std::uint16_t*>(narrowed.address),
+        reinterpret_cast<float*>(widened.address), count);
+    check(hipGetLastError(), "state16 codec launch"); owner.finish();
+    const auto n = read(narrowed), w = read(widened);
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint16_t got = 0; float wide = 0;
+        std::memcpy(&got, n.data() + 2U * i, 2U); std::memcpy(&wide, w.data() + 4U * i, 4U);
+        const std::uint16_t want = T == RecurrentStateType::f16 ? rstate::f16_from_f32_host(values[i]) : rstate::bf16_from_f32(values[i]);
+        const float want_wide = T == RecurrentStateType::f16 ? rstate::f32_from_f16_host(want) : rstate::f32_from_bf16(want);
+        if (got != want || std::bit_cast<std::uint32_t>(wide) != std::bit_cast<std::uint32_t>(want_wide)) {
+            if (bad++ < 4U)
+                std::cerr << "state16 codec " << recurrent_state_type_name(T) << " mismatch for 0x" << std::hex << std::bit_cast<std::uint32_t>(values[i])
+                          << " device 0x" << got << " host 0x" << want << std::dec << '\n';
+        }
+    }
+    require(bad == 0U, std::string("state16 codec ") + recurrent_state_type_name(T) + ": device differs from the host codec");
+}
+void state16_codec_tests(unsigned& cases) {
+    std::vector<float> values;
+    const std::uint32_t lows[] = {0x0000U, 0x0001U, 0x0fffU, 0x1000U, 0x1001U, 0x1fffU, 0x2000U, 0x3000U, 0x5555U, 0x7fffU, 0x8000U,
+        0x8001U, 0xa000U, 0xaaaaU, 0xe000U, 0xffffU};
+    for (std::uint32_t high = 0; high < 65536U; ++high)
+        for (const auto low : lows) values.push_back(std::bit_cast<float>((high << 16U) | low));
+    Rng rng{4242U};
+    for (std::size_t i = 0; i < 65536U * 8U; ++i) values.push_back(std::bit_cast<float>(rng.next() ^ (rng.next() << 16U)));
+    Owner owner;
+    state16_codec_case<RecurrentStateType::f16>(owner, values);
+    state16_codec_case<RecurrentStateType::bf16>(owner, values);
+    owner.guards();
+    std::cout << "state16 codec: " << values.size() << " patterns x {f16, bf16} bit-identical to the host codec\n";
+    ++cases;
+}
+// Report only: 16 serial rows from the same inputs, 16-bit storage against FP32.
+void state16_drift(RecurrentStateType type) {
+    Fixture f32(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, false, false, 9U);
+    Fixture f16(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, false, false, 9U, type);
+    f32.reset(); f16.reset();
+    f32.serial_rows(0U, 16U); f16.serial_rows(0U, 16U);
+    const auto outputs = [](const Fixture& f) {
+        std::vector<float> values;
+        for (unsigned r = 0; r < 16U; ++r) {
+            const auto bytes = read(f.serial.output[r]);
+            for (std::size_t i = 0; i < hidden; ++i) {
+                std::uint16_t half = 0; std::memcpy(&half, bytes.data() + 2U * i, 2U);
+                values.push_back(std::bit_cast<float>(static_cast<std::uint32_t>(half) << 16U));
+            }
+        }
+        return values;
+    };
+    const auto drift = [](const std::vector<float>& reference, const std::vector<float>& value) {
+        double sum = 0, worst = 0;
+        for (std::size_t i = 0; i < reference.size(); ++i) {
+            sum += static_cast<double>(reference[i]) * reference[i];
+            worst = std::max(worst, std::abs(static_cast<double>(value[i]) - reference[i]));
+        }
+        const double rms = std::sqrt(sum / static_cast<double>(reference.size()));
+        return rms > 0 ? worst / rms : 0.0;
+    };
+    const auto state32 = state_values(read(f32.serial.matrix), state_floats, RecurrentStateType::f32);
+    const auto state16 = state_values(read(f16.serial.matrix), state_floats, type);
+    std::cout << "state16 drift " << recurrent_state_type_name(type) << " out " << drift(outputs(f32), outputs(f16))
+              << " state " << drift(state32, state16) << '\n';
+}
+// 16-bit state is typed only on the baseline key-value organization: the others must refuse, not run FP32 code on 16-bit data.
+void state16_refusals(unsigned& cases) {
+    for (const auto type : {RecurrentStateType::f16, RecurrentStateType::bf16})
+        for (const auto [storage, layout] : {std::pair{GdnRecurrentStorage::value_key, HipGdnRecurrentLayout::baseline},
+                                             std::pair{GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::transposed}}) {
+            Fixture f(storage, layout, false, false, 11U, type);
+            f.reset(); f.set_control(0U, 1U);
+            bool thrown = false;
+            try { f.window_rows(0U, 2U, false); } catch (const std::invalid_argument&) { thrown = true; }
+            require(thrown, std::string("state16 ") + recurrent_state_type_name(type) + ": unsupported organization was not refused");
+            ++cases;
+        }
+}
+RecurrentStateType parse_state_type(std::string_view name) {
+    if (name == "f32") return RecurrentStateType::f32;
+    if (name == "f16") return RecurrentStateType::f16;
+    if (name == "bf16") return RecurrentStateType::bf16;
+    throw std::invalid_argument("state type must be f32, f16 or bf16");
+}
 } // namespace
 int main(int argc, char** argv) {
     try {
+        if (argc > 3 && std::string_view(argv[1]) == "bench-state16") {
+            benchmark_state(std::string_view(argv[3]) == "cold", parse_state_type(argv[2])); return 0;
+        }
+        if (argc > 2 && std::string_view(argv[1]) == "bench-state") { benchmark_state(std::string_view(argv[2]) == "cold"); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench") { benchmark(); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench-cold") { benchmark_cold(); return 0; }
         if (argc > 1 && std::string_view(argv[1]) == "bench-gates") { benchmark_gates(); return 0; }
@@ -515,6 +715,21 @@ int main(int argc, char** argv) {
             // Several sessions in one cohort window, each against its own window.
             cohort_scenarios(fixture, cases);
         }
+        // 16-bit recurrent state (FAST storage): the same window-vs-serial and cohort-vs-alone bitwise equalities
+        // under each type (the bits differ from the f32 run, the routes agree with each other), codec pins, drift.
+        state16_codec_tests(cases);
+        for (const auto type : {RecurrentStateType::f16, RecurrentStateType::bf16}) {
+            for (const auto [q8, bf16_small] : {std::pair{false, false}, std::pair{true, true}}) {
+                Fixture fixture(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, q8, bf16_small, cases + 1U, type);
+                for (const unsigned t : {1U, 2U, 3U, 4U, 8U})
+                    for (unsigned n = 0; n <= t; ++n) { fixture.scenario(t, n, (t - n + 1U) % (t + 1U), n == 1U); ++cases; }
+                for (const auto [t, u] : {std::pair{2U, 4U}, std::pair{4U, 2U}, std::pair{8U, 2U}, std::pair{2U, 8U}, std::pair{4U, 8U}, std::pair{8U, 4U}})
+                    for (unsigned n = 0; n <= t; ++n) { fixture.scenario(t, n, (n + 1U) % (u + 1U), n == 2U, u); ++cases; }
+                cohort_scenarios(fixture, cases);
+            }
+            state16_drift(type);
+        }
+        state16_refusals(cases);
         std::cout << "deferred GDN window: " << cases << " scenarios bit-exact (outputs, workspaces, matrix, conv history)\n";
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

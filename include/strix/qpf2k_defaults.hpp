@@ -98,12 +98,14 @@ inline bool long_context_item_enabled(const char* name, bool gsq = gsq_model) no
 }
 // R1 GDN launch organization. Share the resolver's immutable environment view
 // with the launcher policy; a false result always restores the original sequence.
+// Code default ON (same tokens, one launch instead of three per GDN layer: plain one-row decode
+// 41.60 -> 41.37 ms per step in a strict ABAB of 3 pairs); STRIX_QWEN_DECODE_FUSE=0 restores the sequence.
 template<class Get>
 inline const char* decode_fuse_suppression(Get get, bool base, bool gsq) noexcept {
     if (base || (get("STRIX_BASELINE") && std::string_view(get("STRIX_BASELINE")) == "1")) return "baseline";
     if (gsq) return "gsq";
     if (const char* v = get("STRIX_QPF2K_DEFAULTS"); v && v[0] == '0') return "STRIX_QPF2K_DEFAULTS=0";
-    if (const char* v = get("STRIX_QWEN_DECODE_FUSE"); !(v && v[0] == '1' && !v[1])) return "opt-in-not-requested";
+    if (const char* v = get("STRIX_QWEN_DECODE_FUSE"); v && v[0] == '0' && !v[1]) return "explicit-off";
     return nullptr;
 }
 inline bool decode_fuse_enabled() noexcept {

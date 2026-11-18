@@ -3,8 +3,10 @@
 #include <array>
 #include <exception>
 #include "xport/channel.hpp"
+#include "xport/split_frame.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
+#include "glm/rtxpf/import/glm_state_layout.hpp"
 // GLM-5.3-Flash engine (see include/strix/glm/engine.hpp, design notes).
 //
 // Skeleton v1: correctness first. Per layer: mHC pre (Tier A) -> RMSNorm -> attention seam -> TP reduction -> mHC
@@ -15,14 +17,17 @@
 // Weights: O_DIRECT reads through one pinned staging buffer (MiniMax DirectLoader pattern), rank slices per
 // tools/glm/split_plan.py (H128-aligned EXL3 slices, plain tensors by rows).
 #include "strix/glm/engine.hpp"
+#include "strix/session/prefill_session.hpp"
 
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
+#include "core/host_free_memory.hpp"
 #include "core/iu4.hpp"
 #include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "glm/prefill/glm_pf_router_wmma.hpp"
 #include "glm/engine/glm_lib.hpp"
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
@@ -603,9 +608,32 @@ struct Engine::Impl {
     unsigned null_elem = 0;
     float *X = nullptr, *X2 = nullptr, *F = nullptr, *mix = nullptr, *xc = nullptr, *xn = nullptr, *part = nullptr;
     float *logits = nullptr, *rlog = nullptr, *wts = nullptr, *hfin = nullptr, *hidden = nullptr, *amv = nullptr;
+    std::uint32_t* rflags = nullptr;  // guard flags of the FAST prefill router (glm-pf-router-wmma-v1), RW rows, zero
     float *dg = nullptr, *du = nullptr, *da = nullptr;
     std::uint32_t *ids = nullptr, *tok_d = nullptr, *ami = nullptr, *slot_d = nullptr;
     std::uint64_t* pos_d = nullptr;
+    // ---- Prefill units (serving: a long prompt under load paused at layer boundaries, Options::prefill_units)
+    // The row buffers a forward writes, as one set. While a piece is paused the engine's members point at the decode
+    // window (rows [unit_rows, unit_rows + 8) of the same buffers) and the piece's own set waits in `units.saved`.
+    struct RowSet {
+        float *X, *X2, *F, *hz, *hrr, *mix, *xc, *xn, *part, *hfin, *hidden, *rlog, *wts;
+        std::uint32_t *ids, *tok_d, *slot_d;
+        std::uint64_t* pos_d;
+    };
+    std::size_t unit_rows = 0;               // RC: the prefill rows of every row buffer (the window starts here)
+    std::array<bool, 2> seqpar_normed{};     // seqpar fused-norm carry between the layer ranges of one piece
+    struct UnitSession {
+        bool active = false, paused = false;
+        std::uint32_t slot = 0;
+        std::uint64_t pos0 = 0;
+        std::vector<std::uint32_t> tokens;
+        std::uint32_t done = 0, total = 0;   // layer units of the whole prompt
+        unsigned layer = 0;                  // next layer of the current piece (0: the piece has not started)
+        std::size_t c0 = 0;                  // first prompt row of the current piece
+        std::vector<Row> rows;               // the current piece
+        unsigned last = 0, interior_flag = 0;
+        RowSet saved{};
+    } units;
     unsigned* flag = nullptr;
     hipStream_t stream = nullptr;
     Profile prof;
@@ -655,6 +683,23 @@ struct Engine::Impl {
         return forced < 0 ? xb_publish_env : forced != 0;
     }
     std::uint64_t xb_publish_count = 0;
+    // Split-producer chunk frames (Options::split_frame_*, resolved once by apps/glm_rank_defaults.hpp): a decode step of R rows
+    // exchanges attn_sum / ffn_sum as head (columns [0, 2048)) + tail parts when the policy says so for R. Both ranks run the
+    // same R, so the decision is identical on both. The head width is the half of the 4096 columns (16 Tier B blocks / 8 down groups).
+    static constexpr unsigned kSplitHead = kHidden / 2;
+    int split_override = -1;  // Engine::set_split_frame (benches): -1 resolved policy, 0 off, 1 on (R >= 2 only: no 1-row split down form)
+    [[nodiscard]] xport::SplitFramePolicy split_policy() const {
+        if (split_override >= 0) return {split_override == 1 ? xport::SplitFramePolicy::Mode::on : xport::SplitFramePolicy::Mode::off, 0};
+        return {static_cast<xport::SplitFramePolicy::Mode>(opt.split_frame_mode), opt.split_frame_crossover};
+    }
+    struct SplitMid {
+        Exchange* x;
+        unsigned rows, cols;
+    };
+    static void split_mid(void* p) {
+        const auto* m = static_cast<const SplitMid*>(p);
+        m->x->split_head(m->rows, m->cols);
+    }
     // MoE kernels (TP2 rank slices, I = 1024): default for world 2; STRIX_GLM_MOE=ref = DefaultMoe.
     const bool moe_fast = opt.world == 2 && !(std::getenv("STRIX_GLM_MOE") != nullptr && std::string(std::getenv("STRIX_GLM_MOE")) == "ref");
     // STRIX_GLM_MODEL_FORMAT=exl3 (default) | fast_i4. fast_i4 (lossy FAST identity glm-fast-i4): at load the routed
@@ -1500,6 +1545,15 @@ struct Engine::Impl {
             rep.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
             return rep;
         }
+        // Free the RAM the load takes before the first device allocation (shared step, core/host_free_memory.hpp): a node
+        // whose page cache holds that memory would otherwise reclaim and migrate pages under the load and the first
+        // forward, and the driver suspends this process's queues at every migrated locked page (the "slow rank" of a pair).
+        // Opt-in (STRIX_HOST_FREE_PREPARE=1). The request is what a load was measured to take from MemFree: the physical
+        // plan plus a fifth.
+        {
+            const auto prep = strix::core::prepare_free_memory(phys + phys / 5);
+            std::fprintf(stderr, "mem: rank %u %s\n", opt.rank, strix::core::describe(prep).c_str());
+        }
         lib.reserve_staging();
         base = probe.read();
         const bool load_limit = base.dev_counters() && mem::Watchdog::from_env().max_gtt_used == 0;
@@ -1697,24 +1751,29 @@ struct Engine::Impl {
     void alloc() {
         const std::size_t R = 8;  // decode rows per call
         const std::size_t RC = std::max<std::size_t>(R, opt.max_rows);  // chunked prefill rows (PrefillPath)
-        X = lib.buffer<float>(RC * kHc * kHidden);
-        X2 = lib.buffer<float>(RC * kHc * kHidden);
-        F = lib.buffer<float>(RC * kHc * kHidden);
-        hz = lib.buffer<float>(RC * kHcMix);
-        hrr = lib.buffer<float>(RC);
-        mix = lib.buffer<float>(RC * kHcMix);
-        xc = lib.buffer<float>(RC * kHidden);
-        xn = lib.buffer<float>(RC * kHidden);
-        part = lib.buffer<float>(RC * kHidden);
-        hfin = lib.buffer<float>(RC * kHidden);
-        hidden = lib.buffer<float>(RC * kHidden);
+        // Options::prefill_units: R decode rows reserved above the RC prefill rows in every row buffer a forward
+        // writes (the window decode runs in while a prefill piece is paused at a layer boundary; ~280 KB per row).
+        unit_rows = RC;
+        const std::size_t RW = RC + (opt.prefill_units ? R : 0);
+        X = lib.buffer<float>(RW * kHc * kHidden);
+        X2 = lib.buffer<float>(RW * kHc * kHidden);
+        F = lib.buffer<float>(RW * kHc * kHidden);
+        hz = lib.buffer<float>(RW * kHcMix);
+        hrr = lib.buffer<float>(RW);
+        mix = lib.buffer<float>(RW * kHcMix);
+        xc = lib.buffer<float>(RW * kHidden);
+        xn = lib.buffer<float>(RW * kHidden);
+        part = lib.buffer<float>(RW * kHidden);
+        hfin = lib.buffer<float>(RW * kHidden);
+        hidden = lib.buffer<float>(RW * kHidden);
         logits = lib.buffer<float>(R * std::max<std::size_t>(vocab_n, kExperts));
-        rlog = lib.buffer<float>(RC * kExperts);
-        wts = lib.buffer<float>(RC * kTopE);
-        ids = lib.buffer<std::uint32_t>(RC * kTopE);
-        tok_d = lib.buffer<std::uint32_t>(RC);
-        slot_d = lib.buffer<std::uint32_t>(RC);
-        pos_d = lib.buffer<std::uint64_t>(RC);
+        rlog = lib.buffer<float>(RW * kExperts);
+        if (glm::pf::router_wmma::enabled()) rflags = lib.state<std::uint32_t>(RW);  // zeroed; FAST router only
+        wts = lib.buffer<float>(RW * kTopE);
+        ids = lib.buffer<std::uint32_t>(RW * kTopE);
+        tok_d = lib.buffer<std::uint32_t>(RW);
+        slot_d = lib.buffer<std::uint32_t>(RW);
+        pos_d = lib.buffer<std::uint64_t>(RW);
         amv = lib.buffer<float>(R);
         ami = lib.buffer<std::uint32_t>(R);
         flag = lib.state<unsigned>(1);
@@ -1806,6 +1865,14 @@ struct Engine::Impl {
         router_route_impl(x, w, R);
         if (route_log && route_log_d != nullptr && cur_layer < kLayers + 1)
             hip_ok(hipMemcpyAsync(route_log_d + static_cast<std::size_t>(cur_layer) * kTopE, ids, kTopE * 4, hipMemcpyDeviceToDevice, stream), "route log");
+    }
+    // Prefill router logits of `rows` rows starting at engine row `row0`: the exact R1 chains (dense_rows), or the FAST
+    // product on the shared WMMA core (glm-pf-router-wmma-v1, opt-in; D::route after it is unchanged).
+    void pf_router(const float* x, const MoeLayerWeights& w, float* log, unsigned rows, std::size_t row0, hipStream_t s) {
+        if (rflags != nullptr && glm::pf::router_wmma::supported(rows))
+            glm::pf::router_wmma::logits(x, w.router, log, rows, rflags + row0, s);
+        else
+            glm::pf::dense_rows(x, w.router, D::WType::F16, kHidden, 0, kExperts, log, rows, s);
     }
     void router_route_impl(const float* x, const MoeLayerWeights& w, unsigned R) {
         if (r1b) {  // default generated identity: blocked router logits; selection / weights (R5 / R14) unchanged
@@ -1903,7 +1970,7 @@ struct Engine::Impl {
                 float* log = rlog + q * kExperts;
                 std::uint32_t* id = ids + q * kTopE;
                 float* wt = wts + q * kTopE;
-                glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, h.count, stream);
+                pf_router(x, w.moew, log, h.count, q, stream);
                 D::route(log, w.moew.bias, id, wt, h.count, stream);
                 if (pf->moe_by_row()) {
                     const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -1992,7 +2059,11 @@ struct Engine::Impl {
     // TP2 SP island: residual/mHC/norm are owner-local, column/head/K-half work
     // still consumes every row. Pipeline halves each contain both owners, so
     // their independently queued RS/AG can overlap the other half's column work.
-    void layers_forward_seqpar(std::span<const Row> rows, unsigned n_layers) {
+    // [l0, l1): a layer range of the piece (prefill units). Every range drains tile B's deferred reduce-scatter
+    // before it returns (no collective in flight) and starts as layer 0 does; the fused-norm carry (normed, hrr) and
+    // the residual X persist between ranges; the last row's residual is materialized after the piece's last layer.
+    // Same kernels on the same rows in the same per-tile order as the unbroken pass: bits independent of the cut.
+    void layers_forward_seqpar(std::span<const Row> rows, unsigned n_layers, unsigned l0, unsigned l1) {
         const unsigned R = static_cast<unsigned>(rows.size());
         const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
         const unsigned block = opt.pf_pipeline == 2 ? R / 2U : R;
@@ -2007,7 +2078,8 @@ struct Engine::Impl {
         const bool fuse = opt.pf_pipeline == 2 && glm::pf::hc_expand_norm_enabled();
         float* const sp_xn = seqpar_xch->normalized(); // coherent direct AG consumer
         const bool mixnorm = glm::pf::hc_mix_norm_enabled();
-        std::array<bool, 2> normed{};
+        std::array<bool, 2>& normed = seqpar_normed;
+        if (l0 == 0) normed = {};
         auto pre = [&](unsigned i, const HcSite& site, const std::uint16_t* norm) {
             const auto half_stream = seqpar_xch->compute(i);
             const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
@@ -2072,7 +2144,7 @@ struct Engine::Impl {
                     auto* wt = wts + std::size_t{first} * kTopE;
                     auto* log = rlog + std::size_t{first} * kExperts;
                     // Router and matrix-specific MoE input transforms stay replicated.
-                    glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, count, half_stream);
+                    pf_router(x, w.moew, log, count, first, half_stream);
                     D::route(log, w.moew.bias, id, wt, count, half_stream);
                     if (pf->moe_by_row()) {
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2098,7 +2170,7 @@ struct Engine::Impl {
             seqpar_xch->start_reduce_scatter(part, xfer::seqpar_tile(R, opt.pf_pipeline, i), i, seqpar_xch->compute(i));
         };
         try {
-            for (unsigned li = 0; li < n_layers; ++li) {
+            for (unsigned li = l0; li < l1; ++li) {
                 LayerW& w = layers[li];
                 cur_layer = li;
                 if (pf_streams == 1) {
@@ -2136,10 +2208,10 @@ struct Engine::Impl {
                     post(0);
                     continue;
                 }
-                if (li == 0) pre(1, w.hc_attn, w.in_norm);
+                if (li == l0) pre(1, w.hc_attn, w.in_norm);  // a range starts as layer 0: nothing of B is pending
                 else start_rs(1); // previous FFN B; AG A precedes it on the wire
                 consume_column(0, w, false);
-                if (li != 0) {
+                if (li != l0) {
                     post(1);
                     pre(1, w.hc_attn, w.in_norm);
                 }
@@ -2157,12 +2229,12 @@ struct Engine::Impl {
                 // Defer B's RS until AFTER next-layer AG A, so that a side
                 // stream RX wait cannot sit in front of A's next column call.
             }
-            if (pf_streams == 2 && tiles == 2 && n_layers != 0) {
+            if (pf_streams == 2 && tiles == 2 && l1 != l0) {  // drain B's deferred RS: nothing in flight on return
                 start_rs(1);
                 post(1);
             }
             seqpar_xch->join();
-            seqpar_xch->materialize_last(X, R);
+            if (l1 == n_layers) seqpar_xch->materialize_last(X, R);
             seqpar_xch->complete();
             hip_ok(hipStreamSynchronize(stream), "seqpar exit");
         } catch (...) {
@@ -2179,11 +2251,21 @@ struct Engine::Impl {
     // sp != nullptr: speculative verify rows (one slot): checkpoints go to sp->row_flag[r], nothing throws here.
     // pfc: a chunk of a chunked prefill (rows of one slot, any count <= max_rows): attention, MoE and the dense FFN go
     // through the PrefillPath seam; the row-batched Tier A sites use pf::hc_pre_rows / pf::dense_rows (== decode bits).
-    void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr) {
+    // [l0, l1) (prefill units): one layer range of a prefill piece; the residual X and the rows' slot / position
+    // arrays stay in the piece's row buffers between ranges (embedding only at l0 == 0). Default: all n_layers.
+    void layers_forward(std::span<const Row> rows, unsigned n_layers, ForwardKind kind, const SpecRows* sp = nullptr,
+                        unsigned l0 = 0, unsigned l1 = ~0U) {
         const bool pfc = kind == ForwardKind::Prefill;
         const auto R = static_cast<unsigned>(rows.size());
         const bool seqpar = pfc && pf_seqpar && xfer::seqpar_admits(R);
-        if (pfc && pf_seqpar && !seqpar)
+        l1 = std::min(l1, n_layers);
+        if (l0 != 0 || l1 != n_layers) {
+            if (!pfc || !unit_pausable(R) || sp != nullptr || layer_dump != nullptr || null_layer >= 0 || l0 >= l1)
+                throw std::logic_error("layers_forward: a layer range needs a pausable prefill piece");
+        }
+        if (units.paused && R > 8)
+            throw std::logic_error("layers_forward: a prefill piece is paused; only the decode row window (1..8 rows) is free");
+        if (pfc && pf_seqpar && !seqpar && l0 == 0)
             std::fprintf(stderr, "glm prefill seqpar: rows=%u declined (requires even rows >= 2); legacy path\n", R);
         if (pfc && opt.pf_pipeline == 2) {
             if (sp != nullptr || layer_dump != nullptr || null_layer >= 0)
@@ -2214,7 +2296,9 @@ struct Engine::Impl {
         hip_ok(hipMemcpyAsync(pos_d, ps.data(), R * 8, hipMemcpyHostToDevice, stream), "pos");
         seg_n = 0;  // only step() collects; a verify / gate forward's marks are dropped here
         mark(segStart);
-        if (seqpar) {
+        if (l0 != 0) {
+            // a resumed range: the piece's residual is already in X
+        } else if (seqpar) {
             for (unsigned i = 0; i < xfer::seqpar_tiles(R, opt.pf_pipeline); ++i) {
                 const auto embed_rows = xfer::seqpar_owner(xfer::seqpar_tile(R, opt.pf_pipeline, i), opt.rank);
                 embed4_kernel<<<dim3(kHidden / 256, embed_rows.count), 256, 0, stream>>>(
@@ -2230,7 +2314,7 @@ struct Engine::Impl {
         if (pfc && r1b) throw std::logic_error("r1b-all needs the reference prefill; the chunked prefill implements R1 prompts");
         select_exchange(kind, R);
         if (seqpar) {
-            layers_forward_seqpar(rows, n_layers);
+            layers_forward_seqpar(rows, n_layers, l0, l1);
             return;
         }
         if (pfc && opt.pf_pipeline == 2) {
@@ -2241,7 +2325,13 @@ struct Engine::Impl {
         unsigned* const c1 = sp ? sp->row_flag : flag;  // C1 per row in spec mode
         const unsigned c1_stride = sp ? 1U : 0U;
         const bool mixnorm = pfc && glm::pf::hc_mix_norm_enabled();
-        for (unsigned li = 0; li < n_layers; ++li) {
+        // Split frames only on the default producers (Tier B o projection, FastMoe down_kernel) and the kernel-wait consumer; any
+        // other combination (comm exchange, pipe / core / fast_i4 MoE, prepared o) stays unsplit: the seams' splits_o /
+        // publishes_split and Exchange::producer_slot_split decide it per layer, identically on both ranks.
+        // R >= 2: the 1-row MoE launch (launch_rows_sg MaxR 1) has no split down form.
+        const bool split_on = !pfc && boundary_fused && xb_publish_on() && decode_xch != nullptr && R >= 2 && split_policy().on(R);
+        SplitMid split_ctx{xch.get(), R, kSplitHead};
+        for (unsigned li = l0; li < l1; ++li) {
             LayerW& w = layers[li];
             cur_layer = li;
             const float* attn_produced = nullptr;  // the attention partial when its producer wrote the TX slot
@@ -2264,7 +2354,20 @@ struct Engine::Impl {
                 CallCtx ca = c;
                 float* out = part;
                 if (boundary_fused && xb_publish_on() && attn->publishes()) {  // the o projection writes and publishes the TX slot
-                    const auto slot = xch->producer_slot(R, stream);
+                    if (split_on && (w.kda ? attn->splits_o(w.kdaw) : attn->splits_o(w.dsaw))) {  // head + tail parts, two launches
+                        const auto split_slot = xch->producer_slot_split(R, kSplitHead, stream);
+                        if (split_slot.data != nullptr) {
+                            ca.publish = split_slot.head;
+                            ca.publish_tail = split_slot.tail;
+                            ca.split_cols = kSplitHead;
+                            ca.split_mid = &split_mid;
+                            ca.split_mid_ctx = &split_ctx;
+                            out = split_slot.data;
+                            attn_produced = split_slot.data;
+                            ++xb_publish_count;
+                        }
+                    }
+                    const auto slot = attn_produced == nullptr ? xch->producer_slot(R, stream) : Exchange::ProducerSlot{};
                     if (slot.data != nullptr) {
                         ca.publish = slot.publish;
                         out = slot.data;
@@ -2291,7 +2394,7 @@ struct Engine::Impl {
             const float* produced = nullptr;  // the FFN partial when its producer wrote the TX slot
             if (w.moe) {
                 if (pfc) {  // chunk rows: the row-tiled router chain (== decode bits) + R14 route
-                    glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
+                    pf_router(xn, w.moew, rlog, R, 0, stream);
                     D::route(rlog, w.moew.bias, ids, wts, R, stream);
                     if (pf->moe_by_row()) {  // the engine's MoE seam, blocks of <= 8 rows: the decode identity (batch invariant)
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2307,7 +2410,21 @@ struct Engine::Impl {
                     router_route(xn, w.moew, R);
                     if (boundary_fused && xb_publish_on() && moe->publishes()) {
                         // The down kernel writes the partial into the TX slot and publishes it (pair/producer_publish).
-                        const auto slot = xch->producer_slot(R, stream);
+                        if (split_on && moe->publishes_split(w.moew)) {  // head + tail parts, down_kernel on the group halves
+                            const auto split_slot = xch->producer_slot_split(R, kSplitHead, stream);
+                            if (split_slot.data != nullptr) {
+                                CallCtx cp = c;
+                                cp.publish = split_slot.head;
+                                cp.publish_tail = split_slot.tail;
+                                cp.split_cols = kSplitHead;
+                                cp.split_mid = &split_mid;
+                                cp.split_mid_ctx = &split_ctx;
+                                moe->forward(w.moew, cp, xn, ids, wts, split_slot.data);
+                                produced = split_slot.data;
+                                ++xb_publish_count;
+                            }
+                        }
+                        const auto slot = produced == nullptr ? xch->producer_slot(R, stream) : Exchange::ProducerSlot{};
                         if (slot.data != nullptr) {
                             CallCtx cp = c;
                             cp.publish = slot.publish;
@@ -2496,8 +2613,48 @@ struct Engine::Impl {
         return out;
     }
 
-    Engine::MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
-                                     std::uint64_t pos0, Exchange::MergeCtl& ctl) {
+    // ---- Prefill units (Options::prefill_units; PFFIX spec (b)): prefill_mtp as a session that pauses at layer
+    // boundaries of its current piece. Same pieces (max_rows), same kernels, same order per row as the whole call.
+    // A piece is pausable when its forward takes a layer range: the seqpar schedule or the plain chunked loop (the
+    // half-row pipeline without seqpar and the kvshard prefill run a piece whole).
+    bool unit_pausable(unsigned R) const {
+        if (pf_seqpar && xfer::seqpar_admits(R)) return true;
+        return opt.pf_pipeline != 2 && !kv_shard;
+    }
+    bool prefill_units_admit(std::uint64_t rows) const {
+        const strix::session::LayerUnits lu{rows, static_cast<std::uint32_t>(std::max<std::size_t>(1, opt.max_rows)), opt.layers};
+        return opt.prefill_units && lu.all_pieces_pausable([this](std::uint32_t r) { return unit_pausable(r); });
+    }
+    RowSet row_set() const { return {X, X2, F, hz, hrr, mix, xc, xn, part, hfin, hidden, rlog, wts, ids, tok_d, slot_d, pos_d}; }
+    void set_rows(const RowSet& s) {
+        X = s.X, X2 = s.X2, F = s.F, hz = s.hz, hrr = s.hrr, mix = s.mix, xc = s.xc, xn = s.xn, part = s.part;
+        hfin = s.hfin, hidden = s.hidden, rlog = s.rlog, wts = s.wts, ids = s.ids, tok_d = s.tok_d, slot_d = s.slot_d, pos_d = s.pos_d;
+    }
+    RowSet window_of(const RowSet& s) const {
+        const std::size_t r = unit_rows;
+        return {s.X + r * kHc * kHidden, s.X2 + r * kHc * kHidden, s.F + r * kHc * kHidden, s.hz + r * kHcMix, s.hrr + r,
+                s.mix + r * kHcMix, s.xc + r * kHidden, s.xn + r * kHidden, s.part + r * kHidden, s.hfin + r * kHidden,
+                s.hidden + r * kHidden, s.rlog + r * kExperts, s.wts + r * kTopE, s.ids + r * kTopE, s.tok_d + r,
+                s.slot_d + r, s.pos_d + r};
+    }
+    void unit_pause() {
+        xch->complete(stream);  // nothing of the piece in flight when decode takes the exchange
+        hip_ok(hipStreamSynchronize(stream), "prefill unit pause");
+        units.saved = row_set();
+        set_rows(window_of(units.saved));
+        units.paused = true;
+    }
+    void unit_resume() {
+        if (!units.paused) return;
+        set_rows(units.saved);
+        units.paused = false;
+    }
+    void prefill_mtp_cancel() {
+        unit_resume();
+        units = UnitSession{};  // the slot stays poisoned (no_mtp) until its next prefill resets it
+    }
+    void prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+        if (units.active) throw std::logic_error("prefill_mtp: another prompt's prefill units are in progress");
         if (load_test) throw std::logic_error("STRIX_GLM_LOAD_TEST: load only");
         if (!opt.mtp || layers.empty() || !layers.back().mtp || opt.layers != kLayers || final_norm == nullptr)
             throw std::logic_error("prefill_mtp needs all 45 trunk layers and MTP");
@@ -2510,76 +2667,127 @@ struct Engine::Impl {
             if (t >= kVocab) throw std::out_of_range("token id");
         if (opt.spec && pending.at(slot) > 0) flush(slot);
         no_mtp.at(slot) = 1;  // stays poisoned until the final single-row seed also succeeds
-        const std::size_t C = std::max<std::size_t>(1, opt.max_rows);
-        std::vector<Row> rows;
-        unsigned last = 0, interior_flag = 0;
-        for (std::size_t c0 = 0; c0 < tokens.size(); c0 += C) {
-            const auto R = static_cast<unsigned>(std::min(C, tokens.size() - c0));
-            rows.resize(R);
-            for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
-            layers_forward(rows, opt.layers, ForwardKind::Prefill);
-            if (pf_seqpar && xfer::seqpar_admits(R)) {
-                if (!seqpar_xch) throw std::logic_error("glm seqpar: channel must be admitted before final gather");
-                // MTP teacher forcing consumes all trunk hidden rows. Residual
-                // streams remain local; gather only the final normalized hidden.
-                float* const gathered = seqpar_xch->normalized();
-                const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
-                for (unsigned i = 0; i < tiles; ++i) {
-                    const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
-                    const auto own = xfer::seqpar_owner(tile, opt.rank);
-                    D::hc_final(X + own.elements(kHc * kHidden), hfin + own.elements(), own.count, stream);
-                    D::GlmNorm::run(hfin + own.elements(), final_norm, D::WType::BF16, kHidden, kEps,
-                                   gathered + own.elements(), own.count, stream);
-                    seqpar_xch->start_gather(gathered, tile, i, stream);
+        units = UnitSession{};
+        units.active = true;
+        units.slot = slot;
+        units.pos0 = pos0;
+        units.tokens.assign(tokens.begin(), tokens.end());
+        const strix::session::LayerUnits lu{tokens.size(), static_cast<std::uint32_t>(std::max<std::size_t>(1, opt.max_rows)), opt.layers};
+        units.total = static_cast<std::uint32_t>(lu.total());
+    }
+    // At most `n` layer units (~0U: the rest). true: the prompt is complete, `out` as prefill_mtp's (`ctl` is used
+    // only by that call); false: paused at a layer boundary (decode rows then run in the reserved window) or between
+    // pieces. Returns with no collective in flight.
+    bool prefill_mtp_advance(std::uint32_t n, Exchange::MergeCtl& ctl, Engine::MtpPrefillOut& out) {
+        if (!units.active) throw std::logic_error("prefill_mtp_advance: no prefill in progress");
+        if (n == 0) throw std::invalid_argument("prefill_mtp_advance: zero units");
+        if (n < units.total - units.done && !opt.prefill_units)
+            throw std::logic_error("prefill units need Options::prefill_units (the reserved decode row window)");
+        if (n < units.total - units.done && !prefill_units_admit(units.tokens.size()))
+            throw std::logic_error("prefill units need pausable geometry for every piece");
+        unit_resume();
+        try {
+            const std::span<const std::uint32_t> tokens(units.tokens);
+            const std::uint32_t slot = units.slot;
+            const std::uint64_t pos0 = units.pos0;
+            unsigned& interior_flag = units.interior_flag;
+            const std::size_t C = std::max<std::size_t>(1, opt.max_rows);
+            std::uint32_t budget = n;
+            while (budget != 0 && units.c0 < tokens.size()) {
+                const std::size_t c0 = units.c0;
+                const auto R = static_cast<unsigned>(std::min(C, tokens.size() - c0));
+                std::vector<Row>& rows = units.rows;
+                if (units.layer == 0) {
+                    rows.resize(R);
+                    for (unsigned j = 0; j < R; ++j) rows[j] = Row{slot, tokens[c0 + j], pos0 + c0 + j};
                 }
-                for (unsigned i = 0; i < tiles; ++i) seqpar_xch->finish(i, stream);
-                seqpar_xch->complete();
-                // One chunk-boundary handoff into the existing MTP buffer;
-                // per-sublayer AG has no staging/copy kernel.
-                hip_ok(hipMemcpyAsync(hidden, gathered, xfer::GlmSchedule::row_bytes(R), hipMemcpyDeviceToDevice, stream),
-                       "seqpar MTP hidden copy");
-                hip_ok(hipStreamSynchronize(stream), "seqpar MTP hidden handoff");
-            } else {
-                D::hc_final(X, hfin, R, stream);
-                D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+                const unsigned l0 = units.layer;
+                const unsigned l1 = unit_pausable(R) ? l0 + std::min<std::uint32_t>(budget, opt.layers - l0) : opt.layers;
+                layers_forward(rows, opt.layers, ForwardKind::Prefill, nullptr, l0, l1);
+                units.done += l1 - l0;
+                units.layer = l1;
+                budget = l1 - l0 >= budget ? 0U : budget - (l1 - l0);
+                if (units.layer < opt.layers) break;  // paused inside the piece
+                if (pf_seqpar && xfer::seqpar_admits(R)) {
+                    if (!seqpar_xch) throw std::logic_error("glm seqpar: channel must be admitted before final gather");
+                    // MTP teacher forcing consumes all trunk hidden rows. Residual
+                    // streams remain local; gather only the final normalized hidden.
+                    float* const gathered = seqpar_xch->normalized();
+                    const unsigned tiles = xfer::seqpar_tiles(R, opt.pf_pipeline);
+                    for (unsigned i = 0; i < tiles; ++i) {
+                        const auto tile = xfer::seqpar_tile(R, opt.pf_pipeline, i);
+                        const auto own = xfer::seqpar_owner(tile, opt.rank);
+                        D::hc_final(X + own.elements(kHc * kHidden), hfin + own.elements(), own.count, stream);
+                        D::GlmNorm::run(hfin + own.elements(), final_norm, D::WType::BF16, kHidden, kEps,
+                                       gathered + own.elements(), own.count, stream);
+                        seqpar_xch->start_gather(gathered, tile, i, stream);
+                    }
+                    for (unsigned i = 0; i < tiles; ++i) seqpar_xch->finish(i, stream);
+                    seqpar_xch->complete();
+                    // One chunk-boundary handoff into the existing MTP buffer;
+                    // per-sublayer AG has no staging/copy kernel.
+                    hip_ok(hipMemcpyAsync(hidden, gathered, xfer::GlmSchedule::row_bytes(R), hipMemcpyDeviceToDevice, stream),
+                           "seqpar MTP hidden copy");
+                    hip_ok(hipStreamSynchronize(stream), "seqpar MTP hidden handoff");
+                } else {
+                    D::hc_final(X, hfin, R, stream);
+                    D::GlmNorm::run(hfin, final_norm, D::WType::BF16, kHidden, kEps, hidden, R, stream);
+                }
+                // Like the plain chunked prefill, interior rows run no vocabulary head (trunk or MTP): their ids are
+                // discarded and drafts are always verified, so only the final row's head (y0) and the seed drafter
+                // below need logits. Per-row vocabulary heads cost ~15 % of the prefill at 8K/32K.
+                // Look ahead in the full prompt: a chunk's last hidden pairs with the next chunk's first token.
+                // Only the final prompt row waits for the trunk head's y0.
+                const auto pairs = static_cast<unsigned>(std::min<std::size_t>(R, tokens.size() - c0 - 1));
+                if (pairs != 0) {
+                    mtp_cache(slot, hidden, tokens.subspan(c0 + 1, pairs), pos0 + c0, true);
+                    unsigned f = 0;
+                    hip_ok(hipGetLastError(), "MTP prefill kernels");
+                    hip_ok(hipMemcpyAsync(&f, mtp_flag, 4, hipMemcpyDeviceToHost, stream), "MTP prefill flag");
+                    hip_ok(hipStreamSynchronize(stream), "MTP prefill sync");
+                    xch->complete(stream);
+                    interior_flag |= f;  // propagated through the final seed merge on both ranks
+                }
+                units.last = R - 1;
+                units.c0 += R;
+                units.layer = 0;
             }
-            // Like the plain chunked prefill, interior rows run no vocabulary head (trunk or MTP): their ids are
-            // discarded and drafts are always verified, so only the final row's head (y0) and the seed drafter
-            // below need logits. Per-row vocabulary heads cost ~15 % of the prefill at 8K/32K.
-            // Look ahead in the full prompt: a chunk's last hidden pairs with the next chunk's first token.
-            // Only the final prompt row waits for the trunk head's y0.
-            const auto pairs = static_cast<unsigned>(std::min<std::size_t>(R, tokens.size() - c0 - 1));
-            if (pairs != 0) {
-                mtp_cache(slot, hidden, tokens.subspan(c0 + 1, pairs), pos0 + c0, true);
-                unsigned f = 0;
-                hip_ok(hipGetLastError(), "MTP prefill kernels");
-                hip_ok(hipMemcpyAsync(&f, mtp_flag, 4, hipMemcpyDeviceToHost, stream), "MTP prefill flag");
-                hip_ok(hipStreamSynchronize(stream), "MTP prefill sync");
-                xch->complete(stream);
-                interior_flag |= f;  // propagated through the final seed merge on both ranks
+            if (units.c0 < tokens.size()) {
+                if (units.layer != 0) unit_pause();
+                return false;
             }
-            last = R - 1;
+            const unsigned last = units.last;
+            // Preserve last_hidden()'s single final-row contract before the existing head and MTP seed paths.
+            if (last != 0)
+                hip_ok(hipMemcpyAsync(hidden, hidden + static_cast<std::size_t>(last) * kHidden, kHidden * 4,
+                                      hipMemcpyDeviceToDevice, stream), "MTP prefill last hidden");
+            lib.run(head, hidden, logits, 1, stream);
+            D::argmax(logits, vocab_n, vocab0, amv, ami, flag, 1, stream);
+            check_flag("head");
+            xch->argmax(amv, ami, 1, stream);
+            hip_ok(hipMemcpyAsync(&out.y0, ami, 4, hipMemcpyDeviceToHost, stream), "MTP prefill y0");
+            hip_ok(hipStreamSynchronize(stream), "MTP prefill head sync");
+            hip_ok(hipMemcpyAsync(trunk_logits, logits, std::size_t{vocab_n} * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream), "save trunk logits");
+            out.mtp = mtp(slot, hidden, {&out.y0, 1}, pos0 + tokens.size() - 1, ctl, true, interior_flag);
+            hip_ok(hipMemcpyAsync(logits, trunk_logits, std::size_t{vocab_n} * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream), "restore trunk logits");
+            hip_ok(hipStreamSynchronize(stream), "trunk logits sync");
+            out.hp = m_h;
+            no_mtp.at(slot) = 0;
+            ++prof.calls;
+            units = UnitSession{};
+            return true;
+        } catch (...) {
+            prefill_mtp_cancel();
+            throw;
         }
-        // Preserve last_hidden()'s single final-row contract before the existing head and MTP seed paths.
-        if (last != 0)
-            hip_ok(hipMemcpyAsync(hidden, hidden + static_cast<std::size_t>(last) * kHidden, kHidden * 4,
-                                  hipMemcpyDeviceToDevice, stream), "MTP prefill last hidden");
-        lib.run(head, hidden, logits, 1, stream);
-        D::argmax(logits, vocab_n, vocab0, amv, ami, flag, 1, stream);
-        check_flag("head");
-        xch->argmax(amv, ami, 1, stream);
+    }
+    Engine::MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
+                                     std::uint64_t pos0, Exchange::MergeCtl& ctl) {
+        prefill_mtp_begin(slot, tokens, pos0);
         Engine::MtpPrefillOut out;
-        hip_ok(hipMemcpyAsync(&out.y0, ami, 4, hipMemcpyDeviceToHost, stream), "MTP prefill y0");
-        hip_ok(hipStreamSynchronize(stream), "MTP prefill head sync");
-        hip_ok(hipMemcpyAsync(trunk_logits, logits, std::size_t{vocab_n} * sizeof(float),
-                              hipMemcpyDeviceToDevice, stream), "save trunk logits");
-        out.mtp = mtp(slot, hidden, {&out.y0, 1}, pos0 + tokens.size() - 1, ctl, true, interior_flag);
-        hip_ok(hipMemcpyAsync(logits, trunk_logits, std::size_t{vocab_n} * sizeof(float),
-                              hipMemcpyDeviceToDevice, stream), "restore trunk logits");
-        hip_ok(hipStreamSynchronize(stream), "trunk logits sync");
-        out.hp = m_h;
-        no_mtp.at(slot) = 0;
-        ++prof.calls;
+        if (!prefill_mtp_advance(~0U, ctl, out)) throw std::logic_error("prefill_mtp: the whole call stopped early");
         return out;
     }
 
@@ -2645,7 +2853,7 @@ struct Engine::Impl {
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n);  // r = z + attn
         D::GlmNorm::run(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
         if (pfc) {
-            glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
+            pf_router(xn, w.moew, rlog, R, 0, stream);
             D::route(rlog, w.moew.bias, ids, wts, R, stream);
             if (pf->moe_by_row()) {
                 const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2817,7 +3025,12 @@ struct Engine::Impl {
     }
 
     // Device regions of one slot's snapshot, in serialization order (frontier caps the DSA prefix).
-    template <typename F> void for_each_state_region(std::uint32_t slot, std::uint64_t frontier, F&& f) const {
+    template <typename F>
+    void for_each_state_region(std::uint32_t slot, std::uint64_t frontier, F&& f,
+                               strix::state::RawRows index_rows = strix::state::RawRows::full) const {
+        if (index_rows != strix::state::RawRows::full && kv_shard)
+            throw std::invalid_argument("state layout: the DSA index tail form needs the unsharded DSA (a kv-sharded slot "
+                                        "serializes its owned prefix, kvshard::owned_prefix)");
         for (const LayerW& w : layers) {
             if (w.kda) {
                 const std::size_t s = static_cast<std::size_t>(kda_heads) * kKdaDim * kKdaDim, c = 3ULL * kda_heads * kKdaDim * 3;
@@ -2828,16 +3041,19 @@ struct Engine::Impl {
                 const auto global_n = std::min<std::uint64_t>(w.dst.cap, frontier);
                 const std::size_t n = static_cast<std::size_t>(w.dst.shard ? kvshard::owned_prefix(global_n, opt.rank) : global_n);
                 f(w.dst.latent + slot * cap * kKvLora, n * kKvLora * 2);
-                f(w.dst.ikey + slot * cap * kIdxDim, n * kIdxDim * 2);
-                f(w.dst.igate + slot * cap * kIdxDim, n * kIdxDim * 2);
+                // index key / gate: the window of the form (full: [0, n); open_tail: the open pool block only)
+                const auto index = strix::glm::state_layout::index_rows(index_rows, n);
+                f(w.dst.ikey + (slot * cap + index.first) * kIdxDim, index.rows * kIdxDim * 2);
+                f(w.dst.igate + (slot * cap + index.first) * kIdxDim, index.rows * kIdxDim * 2);
                 f(w.dst.pooled + slot * (cap / kKpool) * kIdxDim, (n / kKpool) * kIdxDim * 4);
             }
         }
     }
 
-    std::size_t state_payload_bytes(std::uint32_t slot, std::uint64_t frontier) const {
+    std::size_t state_payload_bytes(std::uint32_t slot, std::uint64_t frontier,
+                                    strix::state::RawRows index_rows = strix::state::RawRows::full) const {
         std::size_t total = 0;
-        for_each_state_region(slot, frontier, [&](const void*, std::size_t bytes) { total += bytes; });
+        for_each_state_region(slot, frontier, [&](const void*, std::size_t bytes) { total += bytes; }, index_rows);
         return total;
     }
 
@@ -2859,22 +3075,23 @@ struct Engine::Impl {
         return out;
     }
 
-    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier) {
+    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> in, std::uint64_t frontier,
+                       strix::state::RawRows index_rows = strix::state::RawRows::full) {
         if (slot >= opt.slots) throw std::out_of_range("restore_state: slot");
         const std::size_t key_bytes = kv_shard ? sizeof(kvshard::SnapshotKey) : 0;
-        const std::size_t payload = state_payload_bytes(slot, frontier);
+        const std::size_t payload = state_payload_bytes(slot, frontier, index_rows);
         if (kv_shard)
             kvshard::validate_snapshot(in.data(), in.size(), true,
                                        kvshard::snapshot_key(opt.capacity, opt.rank, std::min(opt.capacity, frontier), payload));
         else kvshard::validate_snapshot(in.data(), in.size(), false);
         if (in.size() < key_bytes + payload) throw std::invalid_argument("restore_state: state shorter than this engine's layout");
         if (in.size() > key_bytes + payload) throw std::invalid_argument("restore_state: state longer than this engine's layout");
-        reset(slot);  // memsets on the stream; the copies below are queued after them
+        reset(slot);  // memsets on the stream; the copies below are queued after them (index tail: the holes keep them)
         std::size_t o = key_bytes;
         for_each_state_region(slot, frontier, [&](const void* p, std::size_t bytes) {
             if (bytes) hip_ok(hipMemcpyAsync(const_cast<void*>(p), in.data() + o, bytes, hipMemcpyHostToDevice, stream), "restore");
             o += bytes;
-        });
+        }, index_rows);
         hip_ok(hipStreamSynchronize(stream), "restore sync");
     }
 };
@@ -2928,10 +3145,11 @@ std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t>
     }
     return next;
 }
-Engine::MtpPrefillOut Engine::prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
-                                        std::uint64_t pos0, Exchange::MergeCtl& ctl) {
-    if (impl_->identity == IdentityMode::kR1bAll)
-        throw std::logic_error("prefill_mtp requires R1 prompts (r1 or r1b)");
+namespace {
+// prefill_mtp runs R1 prompts: the generated identity (r1b) is off for the call and restored on every exit.
+template <class Impl, class F>
+decltype(auto) with_r1_prompt(Impl& impl, F&& f) {
+    if (impl.identity == IdentityMode::kR1bAll) throw std::logic_error("prefill_mtp requires R1 prompts (r1 or r1b)");
     struct Scope {
         Impl& impl;
         bool saved, active;
@@ -2943,9 +3161,26 @@ Engine::MtpPrefillOut Engine::prefill_mtp(std::uint32_t slot, std::span<const st
             impl.r1b = saved;
             strix::glm::r1b::set_active(active);
         }
-    } scope(*impl_);
-    return impl_->prefill_mtp(slot, tokens, pos0, ctl);
+    } scope(impl);
+    return f();
 }
+}  // namespace
+Engine::MtpPrefillOut Engine::prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens,
+                                        std::uint64_t pos0, Exchange::MergeCtl& ctl) {
+    return with_r1_prompt(*impl_, [&] { return impl_->prefill_mtp(slot, tokens, pos0, ctl); });
+}
+void Engine::prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+    if (impl_->identity == IdentityMode::kR1bAll) throw std::logic_error("prefill_mtp requires R1 prompts (r1 or r1b)");
+    impl_->prefill_mtp_begin(slot, tokens, pos0);
+}
+bool Engine::prefill_mtp_advance(std::uint32_t units, Exchange::MergeCtl& ctl, MtpPrefillOut& out) {
+    return with_r1_prompt(*impl_, [&] { return impl_->prefill_mtp_advance(units, ctl, out); });
+}
+void Engine::prefill_mtp_cancel() { impl_->prefill_mtp_cancel(); }
+std::uint32_t Engine::prefill_units_done() const { return impl_->units.done; }
+bool Engine::prefill_units_admit(std::uint64_t rows) const { return impl_->prefill_units_admit(rows); }
+std::uint32_t Engine::prefill_units_total() const { return impl_->units.total; }
+bool Engine::prefill_units_active() const { return impl_->units.active; }
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }
 void Engine::reset(std::uint32_t slot) { impl_->reset(slot); }
 void Engine::set_attn(std::shared_ptr<AttnPath> p) {
@@ -3037,6 +3272,10 @@ std::vector<std::uint8_t> Engine::state_bytes_upto(std::uint32_t slot, std::uint
 void Engine::restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier) {
     impl_->restore_state(slot, bytes, frontier);
 }
+void Engine::restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier,
+                           strix::state::RawRows index_rows) {
+    impl_->restore_state(slot, bytes, frontier, index_rows);
+}
 Engine::MtpOut Engine::mtp(std::uint32_t slot, const float* h, std::span<const std::uint32_t> tokens, std::uint64_t mtp_pos0,
                            Exchange::MergeCtl& ctl) {
     return impl_->mtp(slot, h, tokens, mtp_pos0, ctl);
@@ -3053,6 +3292,8 @@ std::vector<float> Engine::gate_residual(std::span<const std::uint32_t> tokens, 
 }
 std::vector<std::uint8_t> Engine::state_bytes(std::uint32_t slot) const { return impl_->state_bytes(slot); }
 void Engine::set_profiling(bool on) { impl_->profiling = on; }
+void Engine::set_split_frame(int mode) { impl_->split_override = mode < 0 ? -1 : mode ? 1 : 0; }
+int Engine::split_frame() const { return impl_->split_override; }
 const Profile& Engine::profile() const { return impl_->prof; }
 std::uint32_t Engine::rank() const { return impl_->opt.rank; }
 

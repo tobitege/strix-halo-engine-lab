@@ -27,6 +27,7 @@
 // Self-contained format headers (STRIX_GGML_KINDS_GSQ, hip_ggml, gsq_a8) are needed with the A8 runtime OFF too.
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/gsq_a8_groups.hpp"
+#include "hip/weight/gsq_plan.hpp"
 #include <array>
 #include <functional>
 #include <algorithm>
@@ -1437,11 +1438,10 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
     // All admission is complete before even the initial clear is submitted.
     moe_q4k_a8::validate(request,bindings);
     const auto down_type = tensors.down.manifest->ggml_type;
-    const bool integer_down = (config.a8_down_q51 && down_type == 7U) ||
-        (config.a8_down_q80 && down_type == 8U) ||
-        (config.a8_down_q80 && gsq_a8::down_type(down_type) && moe_q4k_a8::q20_a8_enabled());
-    if (gsq_a8::gate_type(gate_type) && !integer_down)
-        throw std::invalid_argument("Q2_0 A8 gate/up requires the A8 down profile");
+    const bool integer_down = weight::hip::gsq_integer_down(down_type, config.a8_down_q51, config.a8_down_q80,
+        moe_q4k_a8::q20_a8_enabled());
+    if (const auto gsq_plan = weight::hip::gsq_gate_needs_integer_down(gate_type, integer_down); !gsq_plan)
+        throw std::invalid_argument(gsq_plan.reason);
     const bool grouped_q51=config.grouped_exact_q51_down && down_type==7U && !integer_down;
     const bool slot_parallel_q51=grouped_q51 && config.q51_slot_parallel_down;
     if(grouped_q51) {
@@ -1793,18 +1793,7 @@ PreparedMoeExperts prepare_moe_experts(
         "routed down");
 
     if (config.a8_down_q51 || config.a8_down_q80) {
-        const auto layer = *context.layer;
-        const bool q80_layer = layer == 2U || layer == 4U || layer == 30U || layer == 46U || layer == 47U;
-        const auto gate_type = layer == 2U ? 13U : 12U;
-        const bool q20_layer = moe_q4k_a8::q20_a8_enabled() && !tensors.fused_gate_up &&
-            gsq_a8::gate_type(tensors.gate.manifest->ggml_type) &&
-            tensors.up.manifest->ggml_type == tensors.gate.manifest->ggml_type &&
-            (gsq_a8::down_type(tensors.down.manifest->ggml_type) || tensors.down.manifest->ggml_type == 7U ||
-             tensors.down.manifest->ggml_type == 8U);
-        if (!q20_layer && (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != gate_type ||
-            tensors.up.manifest->ggml_type != gate_type ||
-            tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U)))
-            throw std::invalid_argument("A8 down layer types differ from canonical fallback census");
+        weight::hip::gsq_prepare_a8_down(tensors, *context.layer, moe_q4k_a8::q20_a8_enabled());
     }
 
     if (config.deferred_moe_status) {
@@ -1834,7 +1823,7 @@ PreparedMoeExperts prepare_moe_experts(
 #endif
     if (config.q4k_a8g32_gate_up) {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
-        const bool q20 = gsq_a8::gate_type(tensors.gate.manifest->ggml_type) && moe_q4k_a8::q20_a8_enabled();
+        const bool q20 = weight::hip::gsq_q20_gate(tensors.gate.manifest->ggml_type, moe_q4k_a8::q20_a8_enabled());
         if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
             (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13 && !q20))
             throw std::invalid_argument("Q4K A8 runtime requires separate paired Q4K or Q5K gate/up");
@@ -2648,7 +2637,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         // Q4K (or Q5K) gate/up + the serial Q5_1/Q8_0 A8G32 down request.
         if (!p.quantized || p.tensors.fused_gate_up || p.tensors.up.manifest->ggml_type != gate_type ||
             (a8 ? !p.quantized->a8_down_request || p.quantized->a8_down_request->weight_type != down_type ||
-                  (gate_type != 12U && !(gate_type == 13U && config.q5k_a8g32_gate_up) && !(gsq_a8::gate_type(gate_type) && moe_q4k_a8::q20_a8_enabled())) :
+                  !weight::hip::gsq_rows_gate_ok(gate_type, config.q5k_a8g32_gate_up, moe_q4k_a8::q20_a8_enabled()) :
                   !p.quantized->slot_parallel_q51 || gate_type != 12U || down_type != 7U) ||
             gate_type != out.rows[0].tensors.gate.manifest->ggml_type || down_type != out.rows[0].tensors.down.manifest->ggml_type)
             throw std::invalid_argument("known-window routed rows require the serial Q4K/Q5K A8 gate/up and down formats");
@@ -3170,7 +3159,7 @@ static void known_moe_route_census(std::uint32_t count, const HipMoeExpertsLaunc
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();
     known_moe_route_census(count, config, p, stream);
-    const bool gsq = qpf2k::gsq_model || gsq_a8::gate_type(p.request.gate_type);
+    const bool gsq = qpf2k::gsq_model || weight::hip::gsq_type_plan(p.request.gate_type).gate;
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
     bool committed = false;
     auto rows = p.rows;
@@ -3294,7 +3283,7 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         using Form = moe_q4k_a8::known_rows::PrefillKernelForm;
         const auto form = moe_q4k_a8::known_rows::prefill_kernel_form(p.request, p.down_type, config.prefill_f16wmma ? 3 : -1);
         if (form == Form::f16_wmma) stats.prefill_f16wmma_submissions.fetch_add(count, std::memory_order_relaxed);
-        if (gsq_a8::gate_type(p.request.gate_type)) {
+        if (weight::hip::gsq_type_plan(p.request.gate_type).gate) {
             (form == Form::f16_wmma ? stats.prefill_gsq_f16wmma_submissions : form == Form::iu8_wmma ? stats.prefill_gsq_iu8_submissions
                 : stats.prefill_gsq_dot4_submissions).fetch_add(count, std::memory_order_relaxed);
             const bool batch128 = form == Form::f16_wmma && (moe_q4k_a8::known_rows::prefill_effective_tune(p.request, count, p.down_type, 3) &

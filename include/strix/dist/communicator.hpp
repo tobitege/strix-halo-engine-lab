@@ -176,7 +176,7 @@ struct Tag {
     std::uint32_t layer = 0;
     std::uint64_t request = 0;
 };
-enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4 };
+enum class TagKind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4, engram_rows = 5 };
 
 struct CommunicatorStats {
     std::uint64_t exchanges = 0;
@@ -255,6 +255,14 @@ public:
     // same as exchange()'s, so a peer may use either call for the same collective. The calling thread does the transfer;
     // not between start() and finish().
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
+    // Agree before an optional collective changes the pair's protocol. Both ranks
+    // call this even when locally disabled; either refusal selects the old path.
+    [[nodiscard]] bool agree_exchange(bool requested, std::size_t bytes, std::size_t scratch_bytes, const Tag& tag) {
+        const std::byte local{static_cast<unsigned char>(requested && bytes != 0U && bytes <= scratch_bytes && bytes <= max_bytes())};
+        std::byte peer{};
+        exchange_host({&local, 1U}, {&peer, 1U}, tag);
+        return local == std::byte{1} && peer == std::byte{1};
+    }
     // Per-communicator opt-in, without changing other engines/process environment.
     void enable_async_start() { async_start_ = true; }
     // Enable before the first collective. Per-communicator scheduling policy for messages above GPU ring capacity:
@@ -284,6 +292,23 @@ public:
     // views in place and call publish_staged_block. No HIP calls in start/finish/
     // release on this path. prepare returns {} for routes/sizes not admitted.
     [[nodiscard]] ProducerStage prepare_staged_ready(hipStream_t stream, std::size_t bytes);
+    // The largest payload one ready view takes (0: no ready views); callers split larger exchanges into chunks.
+    [[nodiscard]] std::size_t staged_ready_capacity() const noexcept { return staged_ready_bytes_ < max_bytes_ ? staged_ready_bytes_ : max_bytes_; }
+    // Preflight all distinct sizes before preparing a view (prepare reserves it).
+    // Capacity alone does not admit a size: trace and direct routes refuse views.
+    // Keep these route guards consistent with prepare_staged_ready.
+    [[nodiscard]] std::uint32_t staged_ready_chunk_rows(std::uint32_t rows, std::size_t row_bytes) const {
+        if (!rows || !row_bytes || trace_) return 0U;
+        const auto limit = staged_ready_capacity() / row_bytes;
+        if (!limit) return 0U;
+        auto chunk = limit < rows ? static_cast<std::uint32_t>(limit) : rows;
+        const auto chunks = 1U + (rows - 1U) / chunk;
+        chunk = 1U + (rows - 1U) / chunks;
+        const auto tail = rows % chunk;
+        if (direct_ && (route(std::size_t{chunk} * row_bytes).direct ||
+                       (tail && route(std::size_t{tail} * row_bytes).direct))) return 0U;
+        return chunk;
+    }
     void start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag);
     [[nodiscard]] ConsumerStage finish_staged_ready();
     void release_staged_ready(hipStream_t stream);
@@ -297,6 +322,19 @@ public:
     [[nodiscard]] const void* finish_staged(hipStream_t stream);
     void release_staged(hipStream_t stream);
     [[nodiscard]] const CommunicatorStats& stats() const noexcept { return stats_; }
+    // A borrower calls this only after draining its progress thread, with
+    // deltas since its previous snapshot. Seconds are progress-thread elapsed
+    // time (producer wait + wire + check), overlapping device execution; they
+    // are not additional step wall time. The wait is also included in stage.
+    void account_borrowed_transport(std::uint64_t exchanges, std::uint64_t bytes,
+                                    double producer_wait, double wire, double check) noexcept {
+        stats_.exchanges += exchanges;
+        stats_.bytes_sent += bytes;
+        stats_.seconds += producer_wait + wire + check;
+        stats_.stage += producer_wait;
+        stats_.wire += wire;
+        stats_.check += check;
+    }
     [[nodiscard]] const Group& group() const noexcept { return group_; }
     [[nodiscard]] std::string transport_name() const;
     // The transport, for a module that borrows it between this communicator's exchanges (both ranks at the same point,

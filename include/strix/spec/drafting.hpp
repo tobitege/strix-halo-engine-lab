@@ -81,6 +81,7 @@ struct ArbiterConfig {
     std::uint32_t probe_every = 32;     // passes: re-probe a barred / unused learned drafter (at its deepest k)
     std::uint32_t retreat_misses = 2;   // consecutive first-row misses that bar a source (lookup: until new evidence;
                                         // never a black-box drafter: its measured rate already prices its misses)
+    double retreat_confidence = 0.01;   // learned drafter: bar only a miss streak at most this probable under its rate
     double min_lookup_evidence = 4.0;   // observations a lookup bucket needs before lookup may run (fresh buckets:
                                         // depth 1; resumed copy buckets: one hazard per emitted position)
     std::uint32_t min_model_passes = 3; // the learned drafter runs this often before it is compared
@@ -167,6 +168,12 @@ private:
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;
+    std::array<Decision, source_count> arms_{};  // best option per source of the last decide() (trace)
+    std::array<double, source_count> arm_scores_{};
+
+public:
+    [[nodiscard]] const std::array<Decision, source_count>& last_arms() const { return arms_; }
+    [[nodiscard]] const std::array<double, source_count>& last_arm_scores() const { return arm_scores_; }
 };
 
 // One counters object per stream (or summed over a run) and THE line every engine prints at the end of a run:

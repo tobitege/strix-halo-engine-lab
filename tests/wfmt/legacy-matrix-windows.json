@@ -1,0 +1,310 @@
+{
+  "schema": "wfmt.matrix@1",
+  "cases": [
+    {
+      "file": "ds41-a.weight.wfmt",
+      "case": "ds41-a.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        2
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 68
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "ds41-b.weight.wfmt",
+      "case": "ds41-b.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 55
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "ds41-aux.wfmt",
+      "case": "ds41-aux",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 59
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "ds41-codes.wfmt",
+      "case": "ds41-codes",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        4
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 54
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "ds41-missing.wfmt",
+      "case": "ds41-missing",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [],
+      "required_sections": {
+        "source": 272,
+        "output": 40
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "h3-a.weight.wfmt",
+      "case": "h3-a.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        2
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 68
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "h3-b.weight.wfmt",
+      "case": "h3-b.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 55
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "h3-aux.wfmt",
+      "case": "h3-aux",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 59
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "h3-codes.wfmt",
+      "case": "h3-codes",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        4
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 54
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "h3-missing.wfmt",
+      "case": "h3-missing",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [],
+      "required_sections": {
+        "source": 272,
+        "output": 40
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "gemma-a.weight.wfmt",
+      "case": "gemma-a.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        2
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 68
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "gemma-b.weight.wfmt",
+      "case": "gemma-b.weight",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 55
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "gemma-aux.wfmt",
+      "case": "gemma-aux",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        1
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 59
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "gemma-codes.wfmt",
+      "case": "gemma-codes",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        4
+      ],
+      "required_sections": {
+        "source": 272,
+        "output": 54
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "gemma-missing.wfmt",
+      "case": "gemma-missing",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [],
+      "required_sections": {
+        "source": 272,
+        "output": 40
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "vision-0.wfmt",
+      "case": "vision-0",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        32
+      ],
+      "required_sections": {
+        "source": 804,
+        "output": 318
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "vision-1.wfmt",
+      "case": "vision-1",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        32
+      ],
+      "required_sections": {
+        "source": 804,
+        "output": 190
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "vision-30.wfmt",
+      "case": "vision-30",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        32
+      ],
+      "required_sections": {
+        "source": 804,
+        "output": 191
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    },
+    {
+      "file": "vision-8.wfmt",
+      "case": "vision-8",
+      "format": "legacy-wrapper",
+      "arithmetic": "legacy-host-decode@1",
+      "shape": [
+        2,
+        32
+      ],
+      "required_sections": {
+        "source": 804,
+        "output": 62
+      },
+      "optional_sections": {
+        "sidecars": 0
+      }
+    }
+  ]
+}

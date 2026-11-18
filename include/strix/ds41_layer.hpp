@@ -232,8 +232,9 @@ struct VocabSlice { std::uint32_t first = 0, count = 0; };
 //   rh = 1 / sqrt(chunked_dot(h, h) / hidden + eps), rk likewise for key, inv_sqrt_hidden = float(1 / sqrt(hidden))
 //   evaluated in double; gate = engram_gate_of(dot); h[i] = h[i] + gate * value[i].
 void engram_rows_to_bf16(std::span<const std::uint8_t> rows, std::span<float> out);
+// gate_off: an image position (upstream token_mask false): every gate is 0, so h[i] = h[i] + 0 * value[i].
 void engram_inject(std::span<float> stream, std::span<const float> kv, std::span<const float> q_norm,
-                   std::span<const float> k_norm, float eps);
+                   std::span<const float> k_norm, float eps, bool gate_off = false);
 // The per-copy gates of engram_inject (for tests).
 [[nodiscard]] std::array<float, hc_copies> engram_gates(std::span<const float> stream, std::span<const float> kv,
                                                         std::span<const float> q_norm, std::span<const float> k_norm,

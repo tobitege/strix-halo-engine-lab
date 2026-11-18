@@ -1,7 +1,7 @@
-// Bit-exact tests of the CUDA Qwen PLE step and MTP cache rows (src/cuda/qwen_plemtp.cu) against literal host
+// Bit-exact tests of the CUDA Qwen PLE step and MTP cache rows (src/cuda/models/qwen/qwen_plemtp.cu) against literal host
 // references of the HIP kernels and, for the host PLE code, against the engine's own C++ (src/ple_lookup.cpp).
 //   qwen_plemtp_tests [--tables DIR] [--gguf PATH] [--fixture DIR]
-// Build: tests\cuda\build_qwen_test.bat <wt> qwen_plemtp_tests <out> <wt>\src\cuda\qwen_plemtp.cu <wt>\src\ple_lookup.cpp
+// Build: tests\cuda\build_qwen_test.bat <wt> qwen_plemtp_tests <out> <wt>\src\cuda\models\qwen\qwen_plemtp.cu <wt>\src\ple_lookup.cpp
 //        <wt>\src\model_contract.cpp <wt>\src\iq4_nl.cpp <wt>\src\model_runtime_binding.cpp
 //        <wt>\tests\cuda\qwen_ple_lookup_link_stubs.cpp
 #include <cuda_runtime.h>
@@ -17,12 +17,12 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_plemtp.hpp"
+#include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/iq4_nl.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/ple_lookup.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 
@@ -464,7 +464,7 @@ static void test_ple_tail(const std::string& gguf_path) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------------------------------------
-// MTP cache rows: literal host references of every HIP kernel of one primed row (see src/cuda/qwen_plemtp.cu).
+// MTP cache rows: literal host references of every HIP kernel of one primed row (see src/cuda/models/qwen/qwen_plemtp.cu).
 static std::uint16_t f2bf_quiet(float x) {
     const auto b = fbits(x);
     if ((b & 0x7f800000U) == 0x7f800000U && (b & 0x007fffffU)) return static_cast<std::uint16_t>((b >> 16U) | 0x0040U);
@@ -840,6 +840,77 @@ static std::vector<std::uint8_t> read_file(const std::string& p) {
     std::fclose(f);
     return v;
 }
+// FAST form (Config::forms.mtp_mma): fused projection on FP16 tensor cores vs the exact kernel on the same random Q4 weights
+// and FP32 activations. Not bit-exact by design: reports max abs, rel L2 and the spread of per-row / per-column-tile rel L2
+// (uniform = no edge / last-tile / row bug), standalone timing exact vs mma with the SM clock.
+static void test_mtp_mma_form() {
+    const std::uint32_t K5 = 2560 * 2 / 32, W = 12800, O = 10240;
+    std::mt19937_64 rng(1234);
+    std::vector<std::uint8_t> q4(static_cast<size_t>(2560) * K5 * 18);
+    for (size_t b = 0; b < static_cast<size_t>(2560) * K5; ++b) {
+        const float d = (static_cast<float>(rng() % 2000) / 2000.0F - 0.5F) * 0.05F;
+        const auto h = host_f2h(d);
+        q4[b * 18] = static_cast<std::uint8_t>(h & 255U); q4[b * 18 + 1] = static_cast<std::uint8_t>(h >> 8U);
+        for (int j = 0; j < 16; ++j) q4[b * 18 + 2 + j] = static_cast<std::uint8_t>(rng());
+    }
+    auto* dq = dev(q4);
+    const std::uint32_t maxrows = 8192;
+    std::vector<float> x(static_cast<size_t>(maxrows) * W);
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    for (std::uint32_t r = 0; r < maxrows; ++r)
+        for (std::uint32_t c = 0; c < W; ++c) {
+            float v = nd(rng) * (1.0F + 0.02F * static_cast<float>(c % 97));   // gains up to ~3
+            if ((rng() & 0x3ffU) == 0) v *= 20.0F;                              // outliers
+            x[static_cast<size_t>(r) * W + c] = v;
+        }
+    auto* dx = dev(x);
+    std::uint16_t *de = nullptr, *dm = nullptr;
+    CK(cudaMalloc(&de, static_cast<size_t>(maxrows) * O * 2)); CK(cudaMalloc(&dm, static_cast<size_t>(maxrows) * O * 2));
+    pm::MtpRounding ex{}, mm{}; mm.mma = true;
+    for (std::uint32_t rows : {1U, 15U, 16U, 17U, 129U, 1000U, 8192U}) {
+        CK(cudaMemset(de, 0, static_cast<size_t>(rows) * O * 2)); CK(cudaMemset(dm, 0, static_cast<size_t>(rows) * O * 2));
+        pm::launch_mtp_fused_projection(dx, dq, rows, de, ex, nullptr);
+        pm::launch_mtp_fused_projection(dx, dq, rows, dm, mm, nullptr);
+        CK(cudaDeviceSynchronize());
+        const auto a = host(de, static_cast<size_t>(rows) * O), b = host(dm, static_cast<size_t>(rows) * O);
+        double dd = 0, rr = 0, mx = 0, mxref = 0;
+        std::vector<double> rd(rows, 0.0), rn(rows, 0.0), cd(O / 128, 0.0), cn(O / 128, 0.0);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t o = 0; o < O; ++o) {
+                const double u = bf(a[static_cast<size_t>(r) * O + o]), v = bf(b[static_cast<size_t>(r) * O + o]);
+                const double e = v - u;
+                dd += e * e; rr += u * u; mx = std::max(mx, std::fabs(e)); mxref = std::max(mxref, std::fabs(u));
+                rd[r] += e * e; rn[r] += u * u; cd[o / 128] += e * e; cn[o / 128] += u * u;
+            }
+        double rmin = 1e9, rmax = 0, cmin = 1e9, cmax = 0;
+        for (std::uint32_t r = 0; r < rows; ++r) { const double q = std::sqrt(rd[r] / std::max(rn[r], 1e-30)); rmin = std::min(rmin, q); rmax = std::max(rmax, q); }
+        for (size_t c = 0; c < cd.size(); ++c) { const double q = std::sqrt(cd[c] / std::max(cn[c], 1e-30)); cmin = std::min(cmin, q); cmax = std::max(cmax, q); }
+        const double rel = std::sqrt(dd / std::max(rr, 1e-30));
+        char buf[300];
+        std::snprintf(buf, sizeof(buf), "rows %u: maxabs %.4g (max|ref| %.4g) relL2 %.3e; per-row relL2 [%.2e, %.2e] per-128-col-tile [%.2e, %.2e]",
+            rows, mx, mxref, rel, rmin, rmax, cmin, cmax);
+        report(rel < 2e-3 && rmax < 5.0 * std::max(rel, 1e-9) + 1e-4 && cmax < 3.0 * std::max(rel, 1e-9) + 1e-4, "mtp_mma vs exact", buf);
+    }
+    for (std::uint32_t rows : {8192U, 1024U}) {
+        cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        for (int form = 0; form < 2; ++form) {
+            const pm::MtpRounding& rd = form ? mm : ex;
+            for (int i = 0; i < 3; ++i) pm::launch_mtp_fused_projection(dx, dq, rows, de, rd, nullptr);
+            CK(cudaDeviceSynchronize());
+            CK(cudaEventRecord(e0));
+            for (int i = 0; i < 20; ++i) pm::launch_mtp_fused_projection(dx, dq, rows, de, rd, nullptr);
+            CK(cudaEventRecord(e1));
+            for (int i = 0; i < 100; ++i) pm::launch_mtp_fused_projection(dx, dq, rows, de, rd, nullptr);  // keep the clock up
+            std::printf("  SM clock under load: "); std::fflush(stdout);
+            std::system("nvidia-smi -i 0 --query-gpu=clocks.sm --format=csv,noheader");
+            CK(cudaDeviceSynchronize());
+            float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+            std::printf("  timing rows %u %s: %.3f ms/call (20 reps) = %.1f TFLOPS\n", rows, form ? "mma  " : "exact", ms / 20.0F,
+                537.0 * rows / 8192.0 / (ms / 20.0F));
+        }
+    }
+}
+
 static void test_fixture(const std::string& dir, const std::string& gguf_path) {
     const std::string path = dir + "\\d64.dump";
     FILE* probe = std::fopen(path.c_str(), "rb");
@@ -963,12 +1034,18 @@ int main(int argc, char** argv) {
         if (k == "--tables") tables = argv[i + 1]; else if (k == "--gguf") gguf = argv[i + 1]; else if (k == "--fixture") fixture = argv[i + 1]; else if (k == "--sidecar") sidecar = argv[i + 1];
     }
     CK(cudaSetDevice(0));
+    if (argc > 1 && std::string(argv[1]) == "--mma-only") {
+        test_mtp_mma_form();
+        std::printf("qwen_plemtp_tests (mma only): %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
     test_ple_hash();
     test_ple_gather(gguf);
     test_ple_project(gguf);
     g_tables = am::load_tables(tables);
     test_ple_tail(gguf);
     test_mtp(gguf, sidecar);
+    test_mtp_mma_form();
     test_fixture(fixture, gguf);
     am::free_tables(g_tables);
     std::printf("qwen_plemtp_tests: %d passed, %d failed\n", g_pass, g_fail);

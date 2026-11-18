@@ -15,7 +15,7 @@
 #ifndef _WIN32
 extern char** environ;
 #else
-extern char** _environ;
+#include <stdlib.h>  // declares _environ with the CRT linkage
 #endif
 
 namespace strix {

@@ -314,6 +314,88 @@ void test_route(const std::string& cases, std::mt19937& g) {
     fr(dbias);
 }
 
+// Oracle for the wave-parallel route_kernel: the former lane-0 serial selection, verbatim.
+__global__ void route_serial_oracle(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
+    __shared__ float sg[kExperts];
+    __shared__ std::uint32_t key[kExperts];
+    __shared__ bool taken[kExperts];
+    if (threadIdx.x != 0) return;
+    const unsigned r = blockIdx.x;
+    const float* lg = logits + static_cast<std::size_t>(r) * kExperts;
+    for (unsigned e = 0; e < kExperts; ++e) {
+        sg[e] = sigmoid(lg[e]);
+        key[e] = ordered_key(sg[e] + bias[e]);
+    }
+    for (unsigned e = 0; e < kExperts; ++e) taken[e] = false;
+    std::uint32_t pick[kTopE];
+    for (unsigned k = 0; k < kTopE; ++k) {
+        unsigned best = kExperts;
+        for (unsigned e = 0; e < kExperts; ++e)
+            if (!taken[e] && (best == kExperts || key[e] > key[best])) best = e;
+        taken[best] = true;
+        pick[k] = best;
+    }
+    for (unsigned a = 1; a < kTopE; ++a)
+        for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
+            const std::uint32_t t = pick[b];
+            pick[b] = pick[b - 1];
+            pick[b - 1] = t;
+        }
+    float den = 0.0F;
+    for (unsigned k = 0; k < kTopE; ++k) den = den + sg[pick[k]];
+    den = den + kRouteDenEps;
+    for (unsigned k = 0; k < kTopE; ++k) {
+        ids[static_cast<std::size_t>(r) * kTopE + k] = pick[k];
+        w[static_cast<std::size_t>(r) * kTopE + k] = (sg[pick[k]] / den) * kRouteScale;
+    }
+}
+
+// Device stress set: 4096 rows of random, quantized (mass ties), signed-zero, infinite, NaN and saturated logits with
+// random / zero / -0 / tie-making biases; the wave route must equal the serial oracle bit for bit (ids and weights).
+void test_route_stress(std::mt19937& g) {
+    constexpr unsigned R = 4096;
+    std::vector<float> lg(static_cast<std::size_t>(R) * kExperts);
+    std::normal_distribution<float> n(0.0F, 3.0F);
+    std::uniform_int_distribution<int> q(-4, 4), pick(0, kExperts - 1);
+    for (unsigned r = 0; r < R; ++r) {
+        float* row = lg.data() + static_cast<std::size_t>(r) * kExperts;
+        const unsigned kind = r % 8;
+        for (unsigned e = 0; e < kExperts; ++e) {
+            float v = n(g);
+            if (kind == 1) v = 0.5F * static_cast<float>(q(g));      // few distinct values: ties across lanes and slots
+            if (kind == 2) v = (e % 2) ? 0.0F : -0.0F;               // signed zeros only
+            if (kind == 3) v = n(g) * 40.0F;                         // saturated sigmoids (1 and +0)
+            if (kind == 4 && e % 37 == 5) v = INFINITY;
+            if (kind == 4 && e % 41 == 7) v = -INFINITY;
+            if (kind == 5) v = 1.0F;                                 // all equal
+            row[e] = v;
+        }
+        if (kind == 6) row[pick(g)] = NAN;
+        if (kind == 7) { row[pick(g)] = NAN; row[pick(g)] = -NAN; row[pick(g)] = INFINITY; }
+    }
+    for (unsigned variant = 0; variant < 3; ++variant) {
+        std::vector<float> bias(kExperts);
+        for (unsigned e = 0; e < kExperts; ++e)
+            bias[e] = variant == 0 ? 0.01F * n(g) : variant == 1 ? ((e % 3) ? 0.0F : -0.0F) : 0.25F * static_cast<float>(q(g));
+        float *dl = up(lg), *db = up(bias);
+        float *dw = up(std::vector<float>(static_cast<std::size_t>(R) * kTopE)), *dwo = up(std::vector<float>(static_cast<std::size_t>(R) * kTopE));
+        std::uint32_t* di = up(std::vector<std::uint32_t>(static_cast<std::size_t>(R) * kTopE));
+        std::uint32_t* dio = up(std::vector<std::uint32_t>(static_cast<std::size_t>(R) * kTopE));
+        for (unsigned rows : {1U, 7U, 32U, R}) {
+            D::route(dl, db, di, dw, rows, nullptr);
+            route_serial_oracle<<<rows, 32>>>(dl, db, dio, dwo);
+            hok(hipGetLastError(), "oracle");
+            const std::size_t m = static_cast<std::size_t>(rows) * kTopE;
+            check(same(down(di, m), down(dio, m)) && same(down(dw, m), down(dwo, m)),
+                  "P3 wave route == serial oracle (ids + weights bitwise), bias variant " + std::to_string(variant) +
+                      ", rows " + std::to_string(rows));
+        }
+        for (float* p : {dl, db, dw, dwo}) fr(p);
+        fr(di);
+        fr(dio);
+    }
+}
+
 void test_small(std::mt19937& g) {
     for (unsigned R : {1U, 8U}) {  // combine
         const auto w = rnd(R * kTopE, g, 0.5F), eo = rnd(static_cast<std::size_t>(R) * kTopE * kHidden, g, 1.0F), sh = rnd(static_cast<std::size_t>(R) * kHidden, g, 1.0F);
@@ -386,6 +468,7 @@ int main(int argc, char** argv) {
     test_hc(argv[1], g);
     test_kda(argv[1], g);
     test_route(argv[1], g);
+    test_route_stress(g);
     test_small(g);
     std::printf("checks: %d failures: %d\n", checks, failures);
     return failures ? 1 : 0;

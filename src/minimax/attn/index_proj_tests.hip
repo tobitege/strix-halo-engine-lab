@@ -2,16 +2,28 @@
 // equal to the gate's dense_t (FP32 transposed weights) and to the engine's dense_t16 (both copied below verbatim from
 // src/minimax/engine/mm_kernels.hpp at minimax/engine f2f84f43), decode rows 1..8 x ring 8/16/32 and the tiled
 // prefill kernel at ragged token counts. STRIX_MMATTN_BENCH=1 adds ABA x3 timings with the weights of 60 layers
-// rotated (cold, like the real layer loop).
+// rotated (cold, like the real layer loop). FAST minimax-index-proj-wmma-v1: contract / drift / same-bits checks
+// always; STRIX_MMATTN_BENCH=wmma its strict ABAB bench (STRIX_MMATTN_WMMA_SERIES = x16 | diag | orders).
+// Build (gfx1151): clang++ -x hip --offload-arch=gfx1151 -mno-wavefrontsize64 --rocm-path=<rocm> -O3 -std=c++20
+//   -Isrc -Iinclude --hip-link src/minimax/attn/index_proj.hip src/minimax/attn/index_proj_tests.hip -o index-proj-tests
 #include "index_proj.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
+#if defined(__linux__)
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
+#endif
 
 namespace ma = strix::minimax::attn;
 
@@ -135,7 +147,7 @@ void engine_t16(const float* x, const Weights& w, float* iq, float* ik, unsigned
 
 void tests(std::mt19937& rng) {
     Weights w = make_weights(rng, true);
-    const unsigned maxT = 1100;
+    const unsigned maxT = 2050;  // one guard row even for the largest boundary case
     std::normal_distribution<float> n(0.0F, 1.0F);
     std::vector<float> xh(std::size_t(maxT) * kHidden);
     for (auto& v : xh) v = n(rng);
@@ -157,7 +169,7 @@ void tests(std::mt19937& rng) {
         hip_ok(hipMemset(iq, 0xFF, std::size_t(maxT) * ma::kProjQ * 4), "memset");
         hip_ok(hipMemset(ik, 0xFF, std::size_t(maxT) * ma::kProjK * 4), "memset");
     };
-    for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 17U, 63U, 64U, 65U, 300U, 1100U}) {
+    for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 17U, 63U, 64U, 65U, 300U, 1100U, 2047U, 2048U, 2049U}) {
         hipLaunchKernelGGL(dense_t_kernel, dim3(rows, ma::kProjQ / 128), dim3(128), 0, nullptr, x, w.tq, rq, kHidden, ma::kProjQ);
         hipLaunchKernelGGL(dense_t_kernel, dim3(rows, 1), dim3(128), 0, nullptr, x, w.tk, rk, kHidden, ma::kProjK);
         engine_t16(x, w, iq, ik, rows, nullptr);
@@ -187,6 +199,239 @@ void tests(std::mt19937& rng) {
     for (void* p : {static_cast<void*>(x), static_cast<void*>(rq), static_cast<void*>(rk), static_cast<void*>(iq), static_cast<void*>(ik)})
         (void)hipFree(p);
     free_weights(w);
+}
+
+// Check bytes rather than floating-point values: the sentinel is an all-ones NaN.
+template <class T> bool ff_tail(const std::vector<T>& values, std::size_t live) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+    for (std::size_t i = live * sizeof(T); i < values.size() * sizeof(T); ++i)
+        if (bytes[i] != 0xFFU) return false;
+    return true;
+}
+
+// FAST minimax-index-proj-wmma-v1 contract: (a) against dense_t on x rounded to FP16 (the same products in an FP32
+// chain: only the accumulation order differs), (b) drift against the exact chains on x (the FP16 rounding of x),
+// (c) tc 4 / 2 / 1 bit for bit equal, (d) finite outputs and rows past `rows` untouched. x carries a few outlier
+// channels (x 24) like a norm output.
+void wmma_tests(std::mt19937& rng) {
+    Weights w = make_weights(rng, true);
+    const unsigned maxT = 2050;  // one guard row even for the largest boundary case
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> xh(std::size_t(maxT) * kHidden), x16h(xh.size());
+    for (std::size_t i = 0; i < xh.size(); ++i) {
+        xh[i] = n(rng) * (i % kHidden % 997U == 5U ? 24.0F : 1.0F);
+        x16h[i] = static_cast<float>(static_cast<_Float16>(xh[i]));
+    }
+    float *x = dev(xh), *x16 = dev(x16h);
+    const std::size_t nq = std::size_t(maxT) * ma::kProjQ, nk = std::size_t(maxT) * ma::kProjK;
+    float *eq = dev(std::vector<float>(nq)), *ek = dev(std::vector<float>(nk)), *cq = dev(std::vector<float>(nq)),
+          *ck = dev(std::vector<float>(nk)), *iq = dev(std::vector<float>(nq)), *ik = dev(std::vector<float>(nk));
+    _Float16* xt = dev(std::vector<_Float16>(std::size_t(maxT + 1) * kHidden));  // prefix and suffix guards
+    auto rel_l2 = [](const std::vector<float>& a, const std::vector<float>& b, double& max_rel) {
+        double num = 0, den = 0, mx = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const double d = double(a[i]) - double(b[i]);
+            num += d * d;
+            den += double(b[i]) * double(b[i]);
+            mx = std::max(mx, std::abs(d));
+        }
+        max_rel = mx / std::sqrt(den / double(std::max<std::size_t>(1, b.size())));
+        return std::sqrt(num / std::max(den, 1e-300));
+    };
+    for (unsigned rows : {1U, 15U, 16U, 127U, 128U, 129U, 300U, 1100U, 2047U, 2048U, 2049U}) {
+        for (auto [xin, q, k] : {std::tuple{x, eq, ek}, std::tuple{x16, cq, ck}}) {
+            hipLaunchKernelGGL(dense_t_kernel, dim3(rows, ma::kProjQ / 128), dim3(128), 0, nullptr, xin, w.tq, q, kHidden, ma::kProjQ);
+            hipLaunchKernelGGL(dense_t_kernel, dim3(rows, 1), dim3(128), 0, nullptr, xin, w.tk, k, kHidden, ma::kProjK);
+        }
+        std::vector<float> first_q, first_k;
+        for (const auto& [tc, rows_fast] : {std::pair{4U, false}, std::pair{2U, false}, std::pair{1U, false}, std::pair{4U, true}}) {
+            hip_ok(hipMemset(iq, 0xFF, nq * 4), "memset");
+            hip_ok(hipMemset(ik, 0xFF, nk * 4), "memset");
+            ma::enqueue_index_proj_wmma({x, w.packed, iq, ik, rows}, nullptr, tc, rows_fast);
+            hip_ok(hipDeviceSynchronize(), "sync");
+            const auto aq = host(iq, std::size_t(rows + (rows < maxT ? 1 : 0)) * ma::kProjQ);
+            const auto ak = host(ik, std::size_t(rows + (rows < maxT ? 1 : 0)) * ma::kProjK);
+            bool guard = true, finite = true;
+            auto scan = [&](const std::vector<float>& a, std::size_t live) {  // [0, live) finite, the rest still 0xFF
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    if (i < live) finite = finite && std::isfinite(a[i]);
+                    else guard = guard && std::bit_cast<std::uint32_t>(a[i]) == 0xFFFFFFFFU;
+                }
+            };
+            scan(aq, std::size_t(rows) * ma::kProjQ);
+            scan(ak, std::size_t(rows) * ma::kProjK);
+            std::vector<float> lq(aq.begin(), aq.begin() + std::size_t(rows) * ma::kProjQ), lk(ak.begin(), ak.begin() + std::size_t(rows) * ma::kProjK);
+            if (tc == 4 && !rows_fast) {
+                double mq = 0, mk = 0, dq = 0, dk = 0;
+                const double cq_l2 = rel_l2(lq, host(cq, lq.size()), mq), ck_l2 = rel_l2(lk, host(ck, lk.size()), mk);
+                const double eq_l2 = rel_l2(lq, host(eq, lq.size()), dq), ek_l2 = rel_l2(lk, host(ek, lk.size()), dk);
+                std::printf("wmma rows %u: contract rel-l2 iq %.2e ik %.2e | drift vs exact rel-l2 iq %.2e ik %.2e, max |err|/rms iq %.2e ik %.2e\n",
+                            rows, cq_l2, ck_l2, eq_l2, ek_l2, dq, dk);
+                // contract: accumulation order only, measured 1.9-2.0e-5 at every row count 1..1100 (uniform: the WMMA's
+                // internal accumulation, 6144 terms); drift (x rounded to FP16): measured 1.8-2.2e-4.
+                if (!(cq_l2 < 4e-5 && ck_l2 < 4e-5 && eq_l2 < 2e-3 && ek_l2 < 2e-3)) {
+                    ++g_fail;
+                    std::fprintf(stderr, "FAIL: wmma rows %u contract / drift bound\n", rows);
+                }
+                first_q = std::move(lq);
+                first_k = std::move(lk);
+            } else if (std::memcmp(lq.data(), first_q.data(), lq.size() * 4) != 0 || std::memcmp(lk.data(), first_k.data(), lk.size() * 4) != 0) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u tc %u rows_fast %d differs from tc 4\n", rows, tc, int(rows_fast));
+            }
+            if (!guard || !finite) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u tc %u rows_fast %d guard %d finite %d\n", rows, tc, int(rows_fast), int(guard), int(finite));
+            }
+        }
+        for (int form = 0; form < 3; ++form) {  // the 192-VGPR form, the x16 tiles form and the FAST entry: same bits as tc 4
+            hip_ok(hipMemset(iq, 0xFF, nq * 4), "memset");
+            hip_ok(hipMemset(ik, 0xFF, nk * 4), "memset");
+            hip_ok(hipMemset(xt, 0xFF, std::size_t(maxT + 1) * kHidden * sizeof(*xt)), "scratch memset");
+            if (form == 0) ma::enqueue_index_proj_wmma_diag({x, w.packed, iq, ik, rows}, 2, nullptr);
+            else if (form == 1) ma::enqueue_index_proj_wmma_x16({x, w.packed, iq, ik, rows}, xt + kHidden, nullptr);
+            else ma::enqueue_index_proj_fast({x, w.packed, iq, ik, rows}, xt + kHidden, nullptr);
+            hip_ok(hipDeviceSynchronize(), "sync");
+            const auto aq = host(iq, std::size_t(rows + 1) * ma::kProjQ);
+            const auto ak = host(ik, std::size_t(rows + 1) * ma::kProjK);
+            const bool guard = ff_tail(aq, first_q.size()) && ff_tail(ak, first_k.size()) &&
+                               ff_tail(host(xt, kHidden), 0) &&
+                               ff_tail(host(xt + std::size_t(rows + 1) * kHidden, kHidden), 0);
+            if (!guard || std::memcmp(aq.data(), first_q.data(), first_q.size() * sizeof(float)) != 0 ||
+                std::memcmp(ak.data(), first_k.data(), first_k.size() * sizeof(float)) != 0) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: wmma rows %u %s form differs from tc 4 or corrupts guards\n", rows, form == 0 ? "192-VGPR" : form == 1 ? "x16" : "fast entry");
+            }
+        }
+    }
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(x16), static_cast<void*>(eq), static_cast<void*>(ek), static_cast<void*>(cq),
+                    static_cast<void*>(ck), static_cast<void*>(iq), static_cast<void*>(ik), static_cast<void*>(xt)})
+        (void)hipFree(p);
+    free_weights(w);
+}
+
+#if defined(__linux__)
+// Sum of evicted_ms over this process's KFD stats entries (0 when absent).
+long kfd_evicted_ms() {
+    long total = 0;
+    std::error_code ec;
+    const std::string dir = "/sys/class/kfd/kfd/proc/" + std::to_string(::getpid());
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().filename().string().rfind("stats_", 0) != 0) continue;
+        std::ifstream f(e.path() / "evicted_ms");
+        long v = 0;
+        if (f >> v) total += v;
+    }
+    return total;
+}
+#else
+long kfd_evicted_ms() { return 0; }
+#endif
+
+// STRIX_MMATTN_BENCH=wmma: strict A B A B A B (3 pairs), fixed first 12/30 of 60 weight sets. Series 1: A = slab
+// (exact default), B = wmma tc 4; series 2: A = wmma tc 4 rows-fast CTA order, B = tc 4 (column-fast); series 3:
+// A = tc 4, B = tc 2. Cold = the first call of each arm in the process (code object load excluded by one 8-row call
+// of every kernel first), warm = the medians. First run (rows-fast only, 18:05 11-15): 4096 rows slab 2740 tc4 4290
+// tc2 6878 tc1 14687 us; 1024 rows 673 / 209 / 326 / 602 us.
+void bench_wmma(std::mt19937& rng) {
+    const unsigned L = 60;
+    std::vector<Weights> ws;
+    for (unsigned l = 0; l < L; ++l) ws.push_back(make_weights(rng, false));
+    const unsigned maxT = 8192;
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> xh(std::size_t(maxT) * kHidden);
+    for (auto& v : xh) v = n(rng);
+    float* x = dev(xh);
+    float *iq = dev(std::vector<float>(std::size_t(maxT) * ma::kProjQ)), *ik = dev(std::vector<float>(std::size_t(maxT) * ma::kProjK));
+    _Float16* xt = dev(std::vector<_Float16>(std::size_t(maxT) * kHidden));  // x16 tiles (arm 8 times the WMMA on them alone)
+    hipStream_t st;
+    hip_ok(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
+    hipEvent_t e0, e1;
+    hip_ok(hipEventCreate(&e0), "event");
+    hip_ok(hipEventCreate(&e1), "event");
+    auto launch = [&](int arm, unsigned l, unsigned rows) {
+        const ma::IndexProjView v{x, ws[l].packed, iq, ik, rows};
+        if (arm == 0) ma::enqueue_index_proj_slab(v, st);
+        else if (arm >= 7) ma::enqueue_index_proj_wmma_x16(v, xt, st, arm == 7);
+        else if (arm >= 4) ma::enqueue_index_proj_wmma_diag(v, arm - 3, st);
+        else ma::enqueue_index_proj_wmma(v, st, arm == 3 ? 2U : 4U, arm == 2);
+    };
+    auto timed = [&](int arm, unsigned rows, unsigned layers, bool warm) {
+        // The packed stride includes rows. Repack on this stream, outside the events,
+        // even when a preceding case happened to use the same shape.
+        if (arm == 8) launch(7, 0, rows);
+        if (warm) launch(arm, 0, rows);
+        hip_ok(hipEventRecord(e0, st), "rec");
+        for (unsigned l = 0; l < layers; ++l) launch(arm, l, rows);
+        hip_ok(hipEventRecord(e1, st), "rec");
+        hip_ok(hipEventSynchronize(e1), "sync");
+        float ms = 0;
+        hip_ok(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        return 1000.0 * ms / layers;
+    };
+    auto validate_x16 = [&](unsigned rows, unsigned layers) {
+        launch(7, 0, rows);  // prepare the current shape on st before any conversion-free use
+        for (unsigned l = 0; l < layers; ++l) {
+            launch(1, l, rows);
+            hip_ok(hipStreamSynchronize(st), "reference sync");
+            const auto rq = host(iq, std::size_t(rows) * ma::kProjQ);
+            const auto rk = host(ik, std::size_t(rows) * ma::kProjK);
+            launch(8, l, rows);
+            hip_ok(hipStreamSynchronize(st), "x16 sync");
+            const auto aq = host(iq, rq.size()), ak = host(ik, rk.size());
+            if (std::memcmp(aq.data(), rq.data(), rq.size() * sizeof(float)) != 0 ||
+                std::memcmp(ak.data(), rk.data(), rk.size() * sizeof(float)) != 0) {
+                ++g_fail;
+                std::fprintf(stderr, "FAIL: x16-only rows %u layer %u differs from direct WMMA; timings rejected\n", rows, l);
+                return false;
+            }
+        }
+        return true;
+    };
+    for (int arm = 0; arm < 9; ++arm) launch(arm, 0, 8);  // code objects loaded, not timed
+    hip_ok(hipStreamSynchronize(st), "sync");
+    const double cold_a = timed(0, 4096, 1, false), cold_b = timed(1, 4096, 1, false);
+    std::printf("wmma bench cold (first 4096-row call, layer 0) us: slab %.0f wmma-tc4 %.0f\n", cold_a, cold_b);
+    // Run 2 (18:25 11-15, column-fast): 4096 rows tc4-rowsfast 4426 vs tc4 1715; tc2 1.21-1.74x of tc4 at 1024..8192.
+    // Run 3 (18:47 11-15, gfxclk busy median 2401 MHz): 4096 rows tc4 1705 vs x-cached 599 us, vs 192-VGPR 3366 us.
+    // Run 4 (19:05): one column block alone (x read once) 4096 rows 1079 us, 2048 431, 1024 100: x stream ~93-114 GB/s.
+    const char* names[9] = {"slab",           "wmma-tc4",       "wmma-tc4-rowsfast", "wmma-tc2", "diag-xcached", "wmma-tc4-vgpr192",
+                            "diag-1colblock", "wmma-x16(conv+wmma)", "wmma-x16-only"};
+    // "x16" (default): slab|tc4, tc4|x16, tc4|x16-only, slab|x16; "diag": slab|tc4, tc4|x-cached, tc4|one column block;
+    // "orders": slab|tc4, rowsfast|tc4, tc4|tc2, tc4|vgpr192
+    const int series = strix::envcfg::choice("STRIX_MMATTN_WMMA_SERIES", {"x16", "diag", "orders"}, 0);
+    const std::vector<std::pair<int, int>> pairs =
+        series == 2 ? std::vector<std::pair<int, int>>{{0, 1}, {2, 1}, {1, 3}, {1, 5}}
+        : series == 1 ? std::vector<std::pair<int, int>>{{0, 1}, {1, 4}, {1, 6}}
+                      : std::vector<std::pair<int, int>>{{0, 1}, {1, 7}, {1, 8}, {0, 7}};
+    for (const auto& [a, b] : pairs)
+        for (unsigned rows : {4096U, 1024U, 2048U, 8192U}) {
+            const unsigned layers = rows > 2048 ? 12 : 30;
+            if ((a == 8 || b == 8) && !validate_x16(rows, layers)) continue;
+            std::vector<double> ta, tb, ratio;
+            std::string runs;
+            for (int pair = 0; pair < 3; ++pair) {
+                const double x1 = timed(a, rows, layers, true), y1 = timed(b, rows, layers, true);
+                ta.push_back(x1);
+                tb.push_back(y1);
+                ratio.push_back(y1 / x1);
+                char buf[64];
+                std::snprintf(buf, sizeof buf, " [%.0f %.0f]", x1, y1);
+                runs += buf;
+            }
+            std::printf("wmma bench T %u sampled layers [0,%u) of %u us/call: A %s %.0f B %s %.0f (B/A median %.3f, worst %.3f, last pair %.3f) ABAB:%s\n", rows, layers, L,
+                        names[a], median(ta), names[b], median(tb), median(ratio), *std::max_element(ratio.begin(), ratio.end()),
+                        ratio.back(), runs.c_str());
+        }
+    std::printf("wmma bench kfd evicted_ms %ld\n", kfd_evicted_ms());
+    (void)hipEventDestroy(e0);
+    (void)hipEventDestroy(e1);
+    (void)hipStreamDestroy(st);
+    for (auto& w : ws) free_weights(w);
+    (void)hipFree(x);
+    (void)hipFree(iq);
+    (void)hipFree(ik);
+    (void)hipFree(xt);
 }
 
 // slab_only (STRIX_MMATTN_BENCH=slab): only the prefill slab gate.
@@ -340,6 +585,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::mt19937 rng(20261024);
     tests(rng);
+    wmma_tests(rng);
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
         return 1;
@@ -347,5 +593,7 @@ int main() {
     std::printf("strix-mmattn-index-proj-tests: all passed\n");
     if (const char* b = std::getenv("STRIX_MMATTN_BENCH"); b != nullptr && (std::strcmp(b, "1") == 0 || std::strcmp(b, "slab") == 0))
         bench(rng, std::strcmp(b, "slab") == 0);
-    return 0;
+    else if (b != nullptr && std::strcmp(b, "wmma") == 0)
+        bench_wmma(rng);
+    return g_fail == 0 ? 0 : 1;
 }

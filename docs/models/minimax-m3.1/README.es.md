@@ -27,6 +27,11 @@ los ranks coinciden. [Contrato de implementación](../../minimax-grouped-prefill
 
 ## Ejecución
 
+**Pesos:** [hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (réplica de
+`Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw`, usada tal cual se publica; nuestros packs de draft EXL3 de 4 bits en
+`minimax-drafts/`) y [hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) (origen del draft). Ficheros y revisiones:
+[reproducir](../../reproduce.md#models-and-provenance).
+
 Ejecute una vez por nodo con `R` establecido en 0 o 1 y assets EXL3 coincidentes:
 
 ```sh
@@ -96,6 +101,9 @@ un tiempo de prefill un 2.3–2.6% menor con IDs de token completos idénticos; 
 
 | Modo | Prompt / contexto | Resultado medido | Build / exactitud |
 |---|---|---|---|
+| Prefill combinado | 8K, valores por defecto (exacto), segunda sesión en caliente en el proceso, 3 ejecuciones | **12.24-12.25 s = 669 tok/s** (primera ejecución 13.30 s); 3.40 M ciclos de GPU por token por GPU. Medido antes de #626; cifras de proceso nuevo con los valores por defecto actuales en las filas siguientes | main `ae06f9466`; hashes de estado iguales en ambos ranks en cada ejecución |
+| Prefill, valores exactos por defecto, proceso nuevo (en frío): filas de cola del MoE en el kernel segmentado (por defecto; `STRIX_MMX_PREFILL_PIPE_TAIL=0` lo desactiva, mismos bits) | 8K / 32K, par, primer prefill de un proceso nuevo, solo ejecuciones válidas | **12,47 s = 657 tok/s / 50,91 s = 644 tok/s** frente a 12,68 / 51,81 s sin las filas de cola (-213 / -901 ms) | #626; logits idénticos con y sin (768 filas en 8K, 256 en 32K), digests de estado iguales en ambos ranks |
+| Prefill, perfil FAST `STRIX_MM_FAST_PREFILL=1` (opcional; atención flash BF16 en las capas 40-59, `msa-flash-bf16-l40-v1`) | 8K / 32K, mismo método, 1-2 ejecuciones válidas | **11,92 s = 687 tok/s / 48,06 s = 682 tok/s** (-6,0 / -7,2 % frente a exacto) | #626; puerta superada en 8K (KL 0,0012, top-1 99,7 %) y 32K (KL 0,0029, top-1 99,6 %); las capas 30-59 pasan solo en 8K (fallan en 32K), solo explícitas |
 | Decode greedy | prompts de benchmark de 1K / 8K, en frío | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s); 44.57 / 46.10 ms/token en `8cc30ac0` (256 tokens) | árbol público del PR #59; los ranks coinciden, IDs de referencia iguales |
 | Prefill combinado | prompt de benchmark de 8K | **14.04 s**, 583 tok/s (brazos alternos en un proceso, 13.85–14.29 s); **45–50 %** del suelo de kernel calculado de 6.3–7.0 s; 17.731 s en `e0bad3d1` (línea base 21.874 s) | #334 `c225cdaa2`; estado y filas finales de ambos ranks iguales a las referencias |
 | Prefill combinado nuevo | prompt de benchmark de 32K | **63.48 s**, 516 tok/s (tres ejecuciones por brazo, en ambos órdenes); **41–46 %** del suelo de kernel calculado de 26–29 s; 91.508 s en `e0bad3d1` | #334 `c225cdaa2`; hash de resultado igual en las seis ejecuciones, los ranks coinciden |

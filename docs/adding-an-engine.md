@@ -277,8 +277,6 @@ on refusal. CMake continues to call `--check`, never `--grandfather`.
 | `STRIX_BATCH_NEST_RATIO` | `apps/hip_mtp_decode_bridge.hpp` | Qwen HTTP scheduling | to be governed |
 | `STRIX_GLM_PF_DENSE_FORM` | `src/glm/prefill/glm_prefill.hip` | GLM prefill | to be governed |
 | `STRIX_HOST_WAIT` | `src/device/hip_gate.cpp`, `src/device/hip_gate_none.cpp` | Shared device host-wait policy | to be governed |
-| `STRIX_MM_PF_MSA_FLASH` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
-| `STRIX_MM_PF_MSA_FLASH_LAYERS` | `src/minimax/engine/engine.hip` | MiniMax prefill | to be governed |
 | `STRIX_MSA_TEST_FLASH` | `src/minimax/attn/msa_fused_tests.hip` | MiniMax attention qualification | to be governed |
 | `STRIX_PREFILL_FINAL_CONE` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |
 | `STRIX_PREFILL_FINAL_CONE_ROWS` | `src/known_prefix_prefill_runtime.cpp` | Shared known-prefix prefill | to be governed |

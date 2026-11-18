@@ -697,7 +697,7 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_order_kernel(const
 }
 // Occ-only copy: keep attend_body and the non-occ kernels unchanged. Floating-point
 // statements are identical; the query-fragment fence below bounds load live ranges.
-template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8>
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8, bool Share = false>
 __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std::uint16_t* kv, std::uint32_t kv_heads,
     std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug, unsigned tile, unsigned yb) {
     constexpr unsigned HPW = 16U / TR, HG = G * HPW, Loaders = 128U, Compute = 2U * G;
@@ -854,6 +854,7 @@ __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std:
                     raw[k] = meta_at(chunk(step + 1U + 2U * D));
                     lds_barrier();
                     lds_barrier();
+                    if constexpr (Share) lds_barrier(); // ShareSoftmax: the probability hand-off barrier
                 }
             }
         }
@@ -901,12 +902,12 @@ __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std:
     if (c0 < c1) lds_barrier();
     for (unsigned c = c0; c < c1; ++c) {
         const unsigned buf = (c - c0) & 1U;
-        if (debug & 2U) { lds_barrier(); lds_barrier(); continue; }
+        if (debug & 2U) { lds_barrier(); lds_barrier(); if constexpr (Share) lds_barrier(); continue; }
         uint2 meta[4];
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) meta[i] = meta_lds[buf][i];
-        strix::attn_core::selected_flash_step(qf, acc, k_lds[buf], v_lds[buf], xch[grp], col, half, fh, lane,
-            m_run, l_run, SelectedFlashPolicy<Int8>{meta, bit, visible, weights, half, score_scale, scale_lds[Int8 ? buf : 0U]});
+        strix::attn_core::selected_flash_step<SelectedFlashPolicy<Int8>, Share>(qf, acc, k_lds[buf], v_lds[buf], xch[grp], col, half,
+            fh, lane, m_run, l_run, SelectedFlashPolicy<Int8>{meta, bit, visible, weights, half, score_scale, scale_lds[Int8 ? buf : 0U]});
     }
     if (splits == 1U) {
         // One slice: combine_kernel's arithmetic for one split, in place.
@@ -934,13 +935,14 @@ __device__ __forceinline__ void attend_occ_body(const Views<Rows>& v, const std:
 // STRIX_QPF2K_QSA bit 13 (0x2000, with bit 6): attend_order_kernel with a register budget of eight waves per SIMD, so a
 // WGP can hold three 10-wave workgroups (3 x 39,936 B LDS fits) instead of two. Register allocation only: the same body
 // and grid, with an occ-only query load fence; every workgroup runs the same floating-point statements.
-template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U>
+// Share (STRIX_QSA_ATTEND_SHARED_SOFTMAX): one softmax per wave pair (attn_core::selected_flash_step ShareSoftmax), bitwise.
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U, bool Share = false>
 __global__ __launch_bounds__((2U * G + 4U) * 32U) __attribute__((amdgpu_waves_per_eu(8))) void attend_order_occ_kernel(
     const Views<Rows>* groups, const std::uint16_t* kv, std::uint32_t kv_heads, std::uint32_t heads, std::uint32_t union_at,
     std::uint32_t ys) {
     constexpr unsigned tiles = Rows / TR;
     const unsigned bx = blockIdx.x, tile = bx % tiles, y = (bx / tiles) % ys, g = bx / (tiles * ys);
-    attend_occ_body<Rows, TR, G, D, false>(groups[g], kv, kv_heads, heads, union_at, 1U, 0U, tile, y);
+    attend_occ_body<Rows, TR, G, D, false, Share>(groups[g], kv, kv_heads, heads, union_at, 1U, 0U, tile, y);
 }
 
 template <unsigned Rows>

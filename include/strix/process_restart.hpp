@@ -12,19 +12,20 @@
 #endif
 
 // Running the program again from its start, with the environment as it is now (a value the runtime reads
-// while the image loads takes effect only this way).
+// while the image loads takes effect only this way). strix/device/eager_code_load.hpp restarts through it.
 namespace strix::process_restart {
 
-// Replaces this process by a fresh run of its own program and returns only when that failed, with the reason.
-// Linux: execv of the program with the given arguments (terminated by a null pointer); the process keeps its
+// Replaces this process by a fresh run of its own program and returns only when that failed, with a non-zero
+// error: errno under Linux, the Windows error code under Windows (failure_text names either).
+// Linux: execv of /proc/self/exe with the given arguments (terminated by a null pointer); the process keeps its
 // identity. Windows has no exec: the program runs again with the process's own command line (the arguments
 // are not used) as a child that shares the console, the standard handles and the environment. The child is in
 // a job that ends it when this process ends, however that happens, and this process waits and ends with the
 // child's exit code. While it waits it leaves Ctrl+C and Ctrl+Break to the child.
-[[nodiscard]] inline std::string run_again(char* const* arguments) {
+[[nodiscard]] inline int run_again(char* const* arguments) {
 #if defined(_WIN32)
     static_cast<void>(arguments);
-    const auto failure = [] { return "Windows error " + std::to_string(GetLastError()); };
+    const auto failure = [] { const DWORD code = GetLastError(); return code ? static_cast<int>(code) : ERROR_GEN_FAILURE; };
     std::wstring program(32768U, L'\0');
     program.resize(GetModuleFileNameW(nullptr, program.data(), static_cast<DWORD>(program.size())));
     if (program.empty()) return failure();
@@ -67,7 +68,16 @@ namespace strix::process_restart {
     std::_Exit(static_cast<int>(code)); // closes the job with this process
 #else
     ::execv("/proc/self/exe", arguments);
-    return std::strerror(errno);
+    return errno ? errno : EIO;
+#endif
+}
+
+// The text of an error run_again returned.
+[[nodiscard]] inline std::string failure_text(int error) {
+#if defined(_WIN32)
+    return "Windows error " + std::to_string(error);
+#else
+    return std::strerror(error);
 #endif
 }
 

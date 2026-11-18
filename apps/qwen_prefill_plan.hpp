@@ -219,6 +219,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     // runtime_payload participates in every UMA admission formula; device_base
     // participates in every GTT formula. Split named owners without charging twice.
     account_qwen_router_bf16(result, manifest, options.qwen_router_bf16, full_owners);
+    account_qwen_onfly_i4(result, manifest, options.turbo, full_owners);
     if(mtp_prompt_phase_separation(options)) result.organization.emplace("mtp_prompt_phase_separation",1U);
     if (registered_mtp) result.registered_plan=registered;
     if(mtp_pool) result.organization.emplace("qsa_mtp_pool_bytes",mtp_pool);

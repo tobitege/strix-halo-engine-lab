@@ -1,6 +1,6 @@
 #define STRIX_HASH_AUTHORITY_TESTING
-#include "glm/rtxpf/producer/verified_manifest.hpp"
-#include "glm/rtxpf/producer/shards.hpp"
+#include "cuda/models/glm/producer/verified_manifest.hpp"
+#include "cuda/models/glm/producer/shards.hpp"
 #include <iostream>
 #include <memory>
 #include <future>

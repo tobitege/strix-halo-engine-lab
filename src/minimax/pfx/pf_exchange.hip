@@ -1,7 +1,9 @@
 // MiniMax M3.1 TP2 prefill exchange module: the engine (see pf_exchange.hpp).
 #include "pf_exchange.hpp"
 #include "minimax/xfer/minimax_xfer_device.hpp"
+#include "xport/exchange_format_hip.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -45,6 +47,17 @@ __global__ __launch_bounds__(kCopyThreads) void copy_publish_kernel(std::byte* d
         for (std::size_t i = vec * 16 + threadIdx.x; i < bytes; i += kCopyThreads) dst[i] = src[i];
     xfer::mmx_publish(target, gridDim.x);
 }
+
+// STRIX_TP2_EXCHANGE_FMT=f16 (xport/exchange_format.hpp): the copy kernel's pack form. Each block rounds its share of
+// the FP32 partial to binary16 into the TX slot (half the bytes), counts finite inputs that round to an infinity in
+// the host-coherent overflow word, and the last block publishes, as copy_publish_kernel does.
+__global__ __launch_bounds__(kCopyThreads) void pack_f16_publish_kernel(void* dst, const float* src, std::size_t elems,
+                                                                        unsigned* overflow, xfer::ProducerTarget target) {
+    if (strix::xport::hip::pack_f16_grid(dst, src, elems))
+        __hip_atomic_fetch_add(overflow, 1U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    xfer::mmx_publish(target, gridDim.x);
+}
+constexpr std::size_t kOverflowWord = 16;  // u64 index in the flags page: its own 64-byte line
 
 void pin(std::thread& t, int cpu) {
     if (cpu < 0) return;
@@ -102,10 +115,10 @@ Exchanger::Exchanger(dist::Transport& borrowed, Options options)
         hip_check(hipExtMallocWithFlags(reinterpret_cast<void**>(&tx_dev_), total, hipDeviceMallocUncached), "uncached TX slots");
         tx_host_ = tx_dev_;
     } else {
-        hip_check(hipHostMalloc(reinterpret_cast<void**>(&tx_host_), total, flags), "TX slots");
+        hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&tx_host_), total, flags), "TX slots");
         hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&tx_dev_), tx_host_, 0), "TX slots");
     }
-    hip_check(hipHostMalloc(reinterpret_cast<void**>(&rx_host_), total, flags), "RX slots");
+    hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&rx_host_), total, flags), "RX slots");
     hip_check(hipHostMalloc(reinterpret_cast<void**>(&flags_host_), 4096, flags), "flags");
     hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&rx_dev_), rx_host_, 0), "RX slots");
     hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&flags_dev_), flags_host_, 0), "flags");
@@ -146,9 +159,9 @@ Exchanger::~Exchanger() {
     }
     (void)hipFree(counter_dev_);
     (void)hipHostFree(flags_host_);
-    (void)hipHostFree(rx_host_);
+    (void)strix::host_pin::release(rx_host_);
     if (options_.tx_uncached) (void)hipFree(tx_dev_);
-    else (void)hipHostFree(tx_host_);
+    else (void)strix::host_pin::release(tx_host_);
 }
 
 std::byte* Exchanger::tx_slot(std::uint64_t sequence) const { return tx_host_ + ((sequence - 1) % options_.depth) * stride_; }
@@ -171,15 +184,15 @@ bool Exchanger::set_tx_uncached(bool on) {
         }
         host = dev;
     } else {
-        hip_check(hipHostMalloc(reinterpret_cast<void**>(&host), total, hipHostMallocMapped | hipHostMallocCoherent), "TX slots");
+        hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&host), total, hipHostMallocMapped | hipHostMallocCoherent), "TX slots");
         const hipError_t status = hipHostGetDevicePointer(reinterpret_cast<void**>(&dev), host, 0);
         if (status != hipSuccess) {
-            (void)hipHostFree(host);
+            (void)strix::host_pin::release(host);
             hip_check(status, "TX slots");
         }
     }
     if (options_.tx_uncached) (void)hipFree(tx_dev_);
-    else (void)hipHostFree(tx_host_);
+    else (void)strix::host_pin::release(tx_host_);
     tx_host_ = host;
     tx_dev_ = dev;
     options_.tx_uncached = on;
@@ -230,6 +243,29 @@ void Exchanger::send_copy(const void* local, std::size_t bytes, const Tag& tag) 
     hipLaunchKernelGGL(copy_publish_kernel, dim3(blocks), dim3(kCopyThreads), 0, options_.stream, dst, static_cast<const std::byte*>(local),
                        bytes, xfer::ProducerTarget{flags_dev_ + kTxFlag, counter_dev_, s});
     hip_check(hipGetLastError(), "copy kernel");
+    post_job(s, bytes, tag);
+}
+
+void Exchanger::send_pack_f16(const float* local, std::size_t elems, const Tag& tag) {
+    check();
+    const std::size_t bytes = elems * 2;
+    if (bytes == 0 || bytes > options_.capacity || elems % 8 != 0)
+        throw std::invalid_argument("mmpfx: f16 message size outside 1..capacity or not a multiple of 8 elements");
+    void* dst = tx();
+    const std::uint64_t s = next_ + 1;
+    const unsigned blocks =
+        static_cast<unsigned>(std::clamp<std::size_t>((elems / 8 + kCopyThreads - 1) / kCopyThreads, 1, kCopyMaxBlocks));
+    hipLaunchKernelGGL(pack_f16_publish_kernel, dim3(blocks), dim3(kCopyThreads), 0, options_.stream, dst, local, elems,
+                       reinterpret_cast<unsigned*>(flags_dev_ + kOverflowWord), xfer::ProducerTarget{flags_dev_ + kTxFlag, counter_dev_, s});
+    hip_check(hipGetLastError(), "f16 pack kernel");
+    post_job(s, bytes, tag);
+}
+
+std::uint64_t Exchanger::f16_overflows() const {
+    return __atomic_load_n(reinterpret_cast<const unsigned*>(flags_host_ + kOverflowWord), __ATOMIC_ACQUIRE);
+}
+
+void Exchanger::post_job(std::uint64_t s, std::size_t bytes, const Tag& tag) {
     slot_wait_.block_while(static_cast<std::uint32_t>(tag.kind), [&] {
         return posted_.load(std::memory_order_relaxed) - done_.load(std::memory_order_acquire) >= kQueue;
     }, [&] {

@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/model_input.hpp"
 #include "strix/ds41_native_fp8.hpp"
@@ -163,32 +164,21 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path& dir, b
 }
 
 void SafetensorsCheckpoint::load_header(const std::filesystem::path& file) {
-    const auto size = std::filesystem::file_size(file);
-    const auto head = read_bytes(file, 0, 8);
-    std::uint64_t n = 0;
-    for (int k = 7; k >= 0; --k) n = (n << 8U) | static_cast<std::uint8_t>(head[static_cast<std::size_t>(k)]);
-    if (n == 0U || n > size - 8U || n > (256ULL << 20U)) throw std::runtime_error("ds41 native fp8: bad safetensors header in " + file.string());
-    const auto root = serve::parse_json(read_bytes(file, 8, n));
-    if (!root.is_object()) throw std::runtime_error("ds41 native fp8: safetensors header is not an object in " + file.string());
-    for (const auto& [name, v] : root.as_object()) {
-        if (name == "__metadata__") continue;
-        const auto* dtype = v.find("dtype");
-        const auto* shape = v.find("shape");
-        const auto* offsets = v.find("data_offsets");
-        if (dtype == nullptr || shape == nullptr || offsets == nullptr || offsets->size() != 2U)
-            throw std::runtime_error("ds41 native fp8: malformed entry " + name + " in " + file.string());
-        Tensor t;
-        t.file = file;
-        t.dtype = dtype->as_string();
-        for (const auto& d : shape->as_array()) t.shape.push_back(static_cast<std::uint64_t>(d.as_int()));
-        const auto a = static_cast<std::uint64_t>(offsets->as_array()[0].as_int()), b = static_cast<std::uint64_t>(offsets->as_array()[1].as_int());
-        if (b < a || 8U + n + b > size) throw std::runtime_error("ds41 native fp8: " + name + " outside " + file.string());
-        t.offset = 8U + n + a;
-        t.bytes = b - a;
-        if (reject_duplicate_names_ && tensors_.contains(name))
-            throw std::runtime_error("session cache: duplicate tensor name '" + name + "' across consumed shards");
-        tensors_[name] = std::move(t);
-        shard_of_.emplace(name, file.filename().string());
+    std::shared_ptr<const weight::Source> source;
+    auto status = weight::open_source(file.string(), source, std::filesystem::absolute(file).lexically_relative(std::filesystem::absolute(dir_)).generic_string());
+    weight::TensorIndex index;
+    if (status) status = weight::index_safetensors(source, index);
+    if (!status) throw std::runtime_error("ds41 native fp8: " + status.detail);
+    index_.container = index.container; index_.schema = index.schema;
+    for (const auto& raw : index.tensors) {
+        Tensor t; t.file = file; t.dtype = raw.wire_dtype;
+        t.shape = raw.extents;
+        t.offset = raw.payload.range.offset; t.bytes = raw.payload.range.bytes; t.source = raw.payload;
+        if (reject_duplicate_names_ && tensors_.contains(raw.name))
+            throw std::runtime_error("session cache: duplicate tensor name '" + raw.name + "' across consumed shards");
+        index_.tensors.push_back(raw);
+        tensors_[raw.name] = std::move(t);
+        shard_of_.emplace(raw.name, file.filename().string());
     }
     loaded_[file.filename().string()] = true;
 }
@@ -207,26 +197,15 @@ const SafetensorsCheckpoint::Tensor* SafetensorsCheckpoint::find(const std::stri
 }
 
 void SafetensorsCheckpoint::read(const Tensor& t, std::uint8_t* out) const {
-#if defined(_WIN32)
-    const auto bytes = read_bytes(t.file, t.offset, t.bytes);
-    std::copy(bytes.begin(), bytes.end(), out);
-#else
-    const int fd = ::open(t.file.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) throw std::runtime_error("ds41 native fp8: cannot open " + t.file.string());
-    strix::LoaderCapture::record(t.file, fd);
-    std::uint64_t done = 0;
-    while (done < t.bytes) {
-        const auto n = ::pread(fd, out + done, static_cast<std::size_t>(std::min<std::uint64_t>(t.bytes - done, 1ULL << 30U)),
-                               static_cast<off_t>(t.offset + done));
-        if (n <= 0) {
-            ::close(fd);
-            throw std::runtime_error("ds41 native fp8: short read of " + t.file.string());
-        }
-        done += static_cast<std::uint64_t>(n);
+    auto slice = t.source;
+    if (!slice.source) {
+        auto status = weight::open_source(t.file.string(), slice.source);
+        if (!status) throw std::runtime_error("ds41 native fp8: " + status.detail);
+        slice.range = {t.offset, t.bytes};
     }
-    (void)::posix_fadvise(fd, static_cast<off_t>(t.offset), static_cast<off_t>(t.bytes), POSIX_FADV_DONTNEED);
-    ::close(fd);
-#endif
+    auto status = weight::read_slice(slice, {reinterpret_cast<weight::Byte*>(out), static_cast<std::size_t>(t.bytes)});
+    if (!status) throw std::runtime_error("ds41 native fp8: " + status.detail);
+    slice.source->discard(slice.range);
 }
 
 Fp8Tensor read_fp8_tensor(SafetensorsCheckpoint& checkpoint, const std::string& original, std::size_t rows, std::size_t width) {

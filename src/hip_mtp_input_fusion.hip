@@ -1,3 +1,5 @@
+#include "strix/hip_mtp_prime_rows.hpp"
+#include <type_traits>
 #include "strix/hip_check.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -15,6 +17,7 @@
 
 namespace strix {
 namespace {
+static_assert(sizeof(HipMtpInputFusionRequest)+sizeof(HipMtpInputFusionPrimeRows)+32U<4096U);
 std::uint64_t multiply(std::uint64_t a,std::uint64_t b) {
     if(b && a>UINT64_MAX/b) throw std::overflow_error("MTP input fusion byte overflow");return a*b;
 }
@@ -36,18 +39,18 @@ bool overlaps(HipMtpInputFusionView a,HipMtpInputFusionView b) {
     return a.address<b.address+b.bytes && b.address<a.address+a.bytes;
 }
 using strix::hip_check;
-__device__ float load_value(std::uintptr_t p,unsigned i,HipMtpInputStorage storage) {
+__device__ __forceinline__ float load_value(std::uintptr_t p,unsigned i,HipMtpInputStorage storage) {
     return storage==HipMtpInputStorage::bf16?
         __uint_as_float(static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(p)[i])<<16U):
         reinterpret_cast<const float*>(p)[i];
 }
-__device__ std::uint16_t to_bf16(float x) {
+__device__ __forceinline__ std::uint16_t to_bf16(float x) {
     const unsigned bits=__float_as_uint(x);
     if((bits&0x7f800000U)==0x7f800000U && (bits&0x007fffffU))
         return static_cast<std::uint16_t>((bits>>16U)|0x0040U);
     return static_cast<std::uint16_t>((bits+0x7fffU+((bits>>16U)&1U))>>16U);
 }
-__device__ float rounded(float v,HipMtpInputRounding rounding) {
+__device__ __forceinline__ float rounded(float v,HipMtpInputRounding rounding) {
     return rounding==HipMtpInputRounding::bf16_rne?__uint_as_float(static_cast<unsigned>(to_bf16(v))<<16U):v;
 }
 // Threads >= 256 (when launched wider) only join the element-wise output pass: the sum and
@@ -80,8 +83,8 @@ __device__ __forceinline__ void mtp_input_norms_body(const HipMtpInputFusionRequ
 template<unsigned Threads=256U>
 __global__ __launch_bounds__(Threads) void mtp_input_norms(HipMtpInputFusionRequest r) {mtp_input_norms_body<Threads>(r);}
 // Draft batch: token blockIdx.y runs the one-token norms on its own views (same body, same bits).
-template<unsigned Threads=256U>
-__global__ __launch_bounds__(Threads) void mtp_input_norms_rows(HipMtpInputFusionRequest r,HipMtpInputFusionRows rows) {
+template<unsigned Threads=256U,class Rows=HipMtpInputFusionRows>
+__global__ __launch_bounds__(Threads) void mtp_input_norms_rows(HipMtpInputFusionRequest r,Rows rows) {
     auto q=r;
     q.embedding.address=rows.embedding[blockIdx.y];q.wide_hidden.address=rows.wide_hidden[blockIdx.y];
     q.normalized_scratch.address=rows.normalized[blockIdx.y];
@@ -227,8 +230,8 @@ __global__ __launch_bounds__(256) void mtp_input_projections_wave_rows(HipMtpInp
 // rounding/output casts). Rows per wave only regroup independent rows, so R=1 here matches any R there.
 // Tokens come in groups of Count per block (blockIdx.y = group, `total` tokens): 40 accumulators per token, so a
 // group of 8 spilled (t3 trace: 1.9 ms at 8 tokens against 42 us for one); groups only regroup independent tokens.
-template<bool Q4,unsigned Count>
-__global__ __launch_bounds__(256) void mtp_input_projections_batch(HipMtpInputFusionRequest r,HipMtpInputFusionRows all,
+template<bool Q4,unsigned Count,class Rows=HipMtpInputFusionRows>
+__global__ __launch_bounds__(256) void mtp_input_projections_batch(HipMtpInputFusionRequest r,Rows all,
     const unsigned char* weights,unsigned total) {
     constexpr unsigned block=Q4?18U:34U,hc=4U;
     const unsigned lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U,h=r.hidden_size;
@@ -382,10 +385,12 @@ void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* r
     else hipLaunchKernelGGL(mtp_input_projections_wave<false>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q8);
     hip_check(hipGetLastError(),"MTP draft fused projection launch");
 }
-void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest> requests,void* raw_stream) {
-    if(requests.empty() || requests.size()>8U || !raw_stream)throw std::invalid_argument("MTP input fusion batch size/stream is invalid");
+namespace {
+template<class Rows> void launch_mtp_input_fusion_rows(std::span<const HipMtpInputFusionRequest> requests,void* raw_stream) {
+    constexpr auto capacity=std::is_same_v<Rows,HipMtpInputFusionRows>?8U:hip_mtp_prime_rows_max;
+    if(requests.empty() || requests.size()>capacity || !raw_stream)throw std::invalid_argument("MTP input fusion batch size/stream is invalid");
     const auto& r=requests.front();
-    HipMtpInputFusionRows rows{};
+    Rows rows{};
     for(std::size_t t=0;t<requests.size();++t) {
         const auto& q=requests[t];
         preflight_hip_mtp_input_fusion(q);
@@ -396,8 +401,18 @@ void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionReq
            q.embedding.bytes!=r.embedding.bytes || q.wide_hidden.bytes!=r.wide_hidden.bytes ||
            q.normalized_scratch.bytes!=r.normalized_scratch.bytes || q.output.bytes!=r.output.bytes)
             throw std::invalid_argument("MTP input fusion batch requests differ beyond their per-session views");
-        rows.embedding[t]=q.embedding.address;rows.wide_hidden[t]=q.wide_hidden.address;
-        rows.normalized[t]=q.normalized_scratch.address;rows.output[t]=q.output.address;
+        rows.wide_hidden[t]=q.wide_hidden.address;
+        if constexpr (std::is_same_v<Rows,HipMtpInputFusionRows>) {
+            rows.embedding[t]=q.embedding.address;rows.normalized[t]=q.normalized_scratch.address;rows.output[t]=q.output.address;
+        } else {
+            if(!t) {
+                const auto stride=requests.size()>1U?requests[1].embedding.address-r.embedding.address:0U;
+                rows.embedding={r.embedding.address,stride};rows.normalized={r.normalized_scratch.address,stride};
+                rows.output={r.output.address,stride};
+            }
+            if(rows.embedding[t]!=q.embedding.address || rows.normalized[t]!=q.normalized_scratch.address || rows.output[t]!=q.output.address)
+                throw std::invalid_argument("MTP input fusion prime scratch is not strided");
+        }
     }
     const auto* q8=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
     const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8));
@@ -405,16 +420,24 @@ void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionReq
     if(!q4 || r.hc_count!=4U)throw std::invalid_argument("MTP input fusion batch needs the Q4 copy and four HC streams");
     const auto stream=static_cast<hipStream_t>(raw_stream);
     const auto n=static_cast<unsigned>(requests.size());
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms_rows<1024U>),dim3(2U,n),dim3(1024U),0U,stream,r,rows);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms_rows<1024U,Rows>),dim3(2U,n),dim3(1024U),0U,stream,r,rows);
     hip_check(hipGetLastError(),"MTP input norms batch launch");
     // STRIX_MTP_DRAFT_BATCH_PROJ_GROUP=1|2|4: tokens per block (default 2).
     static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_PROJ_GROUP");
         const unsigned g=v?static_cast<unsigned>(std::atoi(v)):2U;return g==1U||g==4U?g:2U;}();
     const auto g=std::min(group,n);
     const dim3 grid((r.hidden_size+7U)/8U,(n+g-1U)/g);
-    if(g==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,1U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
-    else if(g==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,2U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,4U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    if(g==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,1U,Rows>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    else if(g==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,2U,Rows>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,4U,Rows>),grid,dim3(256U),0U,stream,r,rows,q4,n);
     hip_check(hipGetLastError(),"MTP draft fused projection batch launch");
 }
+}
+void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest> requests,void* stream) {
+    launch_mtp_input_fusion_rows<HipMtpInputFusionRows>(requests,stream);
+}
+void launch_hip_mtp_input_fusion_prime_rows(std::span<const HipMtpInputFusionRequest> requests,void* stream) {
+    launch_mtp_input_fusion_rows<HipMtpInputFusionPrimeRows>(requests,stream);
+}
+
 } // namespace strix

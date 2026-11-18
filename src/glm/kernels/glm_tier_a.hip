@@ -3,7 +3,10 @@
 // separate multiply/add elsewhere. Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm_norm.hpp"
 #include "strix/hip_argmax_core.hpp"
+#include "strix/hip_qwen_dpp_reduce.hpp"
+#include "moe_core/route.hpp"
 #include "../../ops/norm/norm_device.hpp"
+#include "../../core/ordered_reduce.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -27,18 +30,10 @@ __device__ __forceinline__ void flag_if(unsigned* flag, float v) {
     if (flag && !is_finite(v)) atomicOr(flag, 1U);
 }
 
-// R2 tree in LDS over L lanes (s has L entries; lane l holds its partial). Returns s[0] to every lane.
+// R2 tree over L lanes (s has L entries; lane l holds its partial). Returns s[0] to every lane. The halving order
+// s[l] + s[l + h] is the host tree_sum's; levels 16..1 run in wave 0 registers (core/ordered_reduce.hpp, same bits).
 template <unsigned L> __device__ __forceinline__ float lds_tree(float* s, float part) {
-    const unsigned l = threadIdx.x;
-    s[l] = part;
-    __syncthreads();
-    for (unsigned h = L / 2; h > 0; h >>= 1U) {
-        if (l < h) s[l] = s[l] + s[l + h];
-        __syncthreads();
-    }
-    const float r = s[0];
-    __syncthreads();
-    return r;
+    return ::strix::core::ordered_reduce::tree_broadcast<L>(s, part, threadIdx.x);
 }
 
 // ---------------------------------------------------------------- R1 dense chain
@@ -218,26 +213,45 @@ __global__ __launch_bounds__(128) void kda_out_kernel(KdaDev k, const float* o, 
 }
 
 // ---------------------------------------------------------------- router, combine, swiglu, argmax
+// One wave per row (P3): each lane owns experts lane + 32 i (288 = 9 x 32). The sigmoid and the biased key are the same
+// expressions per expert as the former lane-0 loop; the k-pass selection is the shared moe_core::route_wave_topk XOR tree on
+// the 32-bit ordered keys (carried as float bits; the exchanges move bits only), largest key first, ties -> lower index, so
+// the 8 picks equal the serial scan's. Sorting, the ascending denominator sum and the weights stay on lane 0, unchanged.
+struct GlmRouteWavePolicy {
+    static constexpr std::uint32_t candidates = kExperts / 32, wave = 32;
+    static_assert(kExperts % 32 == 0 && candidates <= 32, "route_kernel: experts must fill the wave candidate mask");
+    std::uint32_t lane;
+    std::uint32_t* pick;
+    template <class T>
+    __device__ static T xor32(T value, int mask) { return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask)); }
+    __device__ static bool better(float a, std::uint32_t ai, float b, std::uint32_t bi) {
+        const std::uint32_t ka = __builtin_bit_cast(std::uint32_t, a), kb = __builtin_bit_cast(std::uint32_t, b);
+        return ka > kb || (ka == kb && ai < bi);
+    }
+    __device__ void record(std::uint32_t slot, bool, float, std::uint32_t index) const {
+        if (lane == 0) pick[slot] = index;  // every slot has a candidate: 288 experts, 8 passes
+    }
+};
+
 __global__ void route_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
-    __shared__ float sg[kExperts];  // LDS, not private scratch (one lane uses it)
-    __shared__ std::uint32_t key[kExperts];
-    __shared__ bool taken[kExperts];
-    if (threadIdx.x != 0) return;
-    const unsigned r = blockIdx.x;
+    __shared__ float sg[kExperts];
+    __shared__ std::uint32_t pick_s[kTopE];
+    const unsigned r = blockIdx.x, lane = threadIdx.x;
     const float* lg = logits + static_cast<std::size_t>(r) * kExperts;
-    for (unsigned e = 0; e < kExperts; ++e) {
-        sg[e] = sigmoid(lg[e]);
-        key[e] = ordered_key(sg[e] + bias[e]);
+    float key[GlmRouteWavePolicy::candidates];
+#pragma unroll
+    for (unsigned i = 0; i < GlmRouteWavePolicy::candidates; ++i) {
+        const unsigned e = lane + 32 * i;
+        const float v = sigmoid(lg[e]);
+        sg[e] = v;
+        key[i] = __builtin_bit_cast(float, ordered_key(v + bias[e]));
     }
-    for (unsigned e = 0; e < kExperts; ++e) taken[e] = false;
+    strix::moe_core::route_wave_topk(key, (1U << GlmRouteWavePolicy::candidates) - 1U, kExperts, kTopE, lane,
+                                     GlmRouteWavePolicy{lane, pick_s});
+    __syncthreads();
+    if (lane != 0) return;
     std::uint32_t pick[kTopE];
-    for (unsigned k = 0; k < kTopE; ++k) {  // largest key, ties -> lower index (== the host stable sort's first 8)
-        unsigned best = kExperts;
-        for (unsigned e = 0; e < kExperts; ++e)
-            if (!taken[e] && (best == kExperts || key[e] > key[best])) best = e;
-        taken[best] = true;
-        pick[k] = best;
-    }
+    for (unsigned k = 0; k < kTopE; ++k) pick[k] = pick_s[k];
     for (unsigned a = 1; a < kTopE; ++a)  // ascending id
         for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
             const std::uint32_t t = pick[b];

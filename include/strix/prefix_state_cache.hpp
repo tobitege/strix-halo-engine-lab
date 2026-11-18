@@ -288,6 +288,10 @@ struct PrefixStateCacheStats {
     std::array<std::uint64_t,prefix_certificate_decline_names.size()> certificate_declines{};
     std::uint64_t capture_skips_tripwire=0,capture_skips_batch_config=0;
     std::uint64_t snapshot_preparations=0, capture_skipped_no_slot=0, pool_bytes=0, pool_budget_bytes=0, pool_metadata_reserved=0, pool_free_bytes=0, pool_staging_bytes=0;
+    // Queue protection (protect_longest): taken, refused by the byte cap, found nothing; live gauges;
+    // protected entries erased anyway (explicit removal or invalid entry; eviction never erases them).
+    std::uint64_t queue_protections=0, queue_protection_cap_skips=0, queue_protection_misses=0;
+    std::uint64_t queue_protected_entries=0, queue_protected_bytes=0, queue_protected_erased=0;
     double disk_read_ms = 0.0, disk_write_ms = 0.0;
 };
 
@@ -376,10 +380,39 @@ public:
     // the stored tokens exactly, and loads a disk checkpoint (payload read, budget credits, certificate
     // check) itself. Prepared disk metadata is used only while this cache has not published or removed a
     // checkpoint file since it was read; otherwise the lookup probes the files as the one-step form does.
+    // probe_disk=false is owned, host-only preparation: hashes/copies only, with no filesystem work.
     [[nodiscard]] PrefixLookupTicket prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
-        std::uint32_t block_rows, std::uint64_t limit) const;
+        std::uint32_t block_rows, std::uint64_t limit, bool probe_disk = true) const;
     [[nodiscard]] std::shared_ptr<const PrefixCacheCheckpoint> find_longest(const PrefixLookupTicket& ticket, bool promote = true,
         std::string_view conversation = {}, const std::function<bool(const PrefixCacheCheckpoint&)>& eligible = {});
+    // Queue protection. A request still WAITING for a slot takes a reference on the longest host-tier
+    // checkpoint compatible with its prompt, so a capture made meanwhile cannot evict the state its later
+    // restore needs. Host tier only: no disk probe, promotion, touch or hit accounting; one lock
+    // acquisition and at most ticket.digests.size() probes. Every eviction path (fair ranking, LRU,
+    // entry pressure, scoped reclaim) skips a protected entry; explicit removal still erases it. The
+    // handle releases on destruction (restore, cancellation, failure, timeout) and may outlive the store.
+    // max_bytes caps the payload bytes held protected across all handles (0: the host byte budget);
+    // a protection that would exceed it is refused (empty handle), never forced.
+    class QueueProtection {
+        friend class PrefixStateCache;
+        struct Anchor;
+        std::shared_ptr<Anchor> anchor_;
+        std::weak_ptr<const PrefixCacheCheckpoint> entry_;
+        ModelContentIdentity digest_{};
+        std::uint64_t position_ = 0;
+    public:
+        QueueProtection() = default;
+        QueueProtection(const QueueProtection&) = delete;
+        QueueProtection& operator=(const QueueProtection&) = delete;
+        QueueProtection(QueueProtection&& o) noexcept { *this = std::move(o); }
+        QueueProtection& operator=(QueueProtection&& o) noexcept;
+        ~QueueProtection() { release(); }
+        void release() noexcept;
+        explicit operator bool() const noexcept { return bool(anchor_); }
+        // Restorable prompt rows the protected checkpoint covers (0 when empty).
+        [[nodiscard]] std::uint64_t position() const noexcept { return anchor_ ? position_ : 0; }
+    };
+    [[nodiscard]] QueueProtection protect_longest(const PrefixLookupTicket& ticket, std::uint64_t max_bytes = 0);
     [[nodiscard]] bool contains(const ModelContentIdentity& digest);
     // A retained segment with this digest (host tier only), or null.
     [[nodiscard]] std::shared_ptr<const PrefixCacheSegment> find_segment(const ModelContentIdentity& digest);
@@ -436,7 +469,12 @@ private:
         std::uint64_t epoch = 0, reuse = 0;
         std::set<std::string> conversations;
         bool protected_entry = false;
+        std::uint32_t queue_refs = 0;      // live QueueProtection handles; eviction skips while nonzero
+        std::uint64_t queue_bytes = 0;     // payload bytes charged to the queue-protection cap
     };
+    std::shared_ptr<QueueProtection::Anchor> queue_anchor_;
+    std::uint64_t queue_protected_bytes_ = 0;
+    void queue_release_locked(const QueueProtection&) noexcept;
     struct DigestLess {
         bool operator()(const ModelContentIdentity& a, const ModelContentIdentity& b) const noexcept {
             return a.bytes < b.bytes;

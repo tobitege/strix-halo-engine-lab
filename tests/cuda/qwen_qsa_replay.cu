@@ -1,7 +1,7 @@
 // Replay of the HIP indexed_attention step (op 6) of the d64 fixture for all 12 QSA layers: dense A8 q/k/v projection
 // (dense family, qwen_dense.cu) -> qwen_qsa layer_core -> dense A8 o projection, compared byte for byte with the step's
 // write records and with the final KV / raw-index state (positions 0..63) of d64-state.
-// Build: build_qwen_test.bat <wt> qwen_qsa_replay <out> <wt>\src\cuda\qwen_qsa.cu <dense wt>\src\cuda\qwen_dense.cu -I<dense wt>\include
+// Build: build_qwen_test.bat <wt> qwen_qsa_replay <out> <wt>\src\cuda\models\qwen\qwen_qsa.cu <dense wt>\src\cuda\models\qwen\qwen_dense.cu -I<dense wt>\include
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -12,9 +12,9 @@
 
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
-#include "qwen_amd_math_tables.hpp"
-#include "strix/cuda_qwen_dense.hpp"
-#include "strix/cuda_qwen_qsa.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
+#include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/qwen_qsa.hpp"
 
 namespace q = strix::cuda::qwen_qsa;
 namespace qd = strix::cuda::qwen_dense;

@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
+#include "stats.hpp"
 
 namespace strix::xport {
 // Adapt a borrowed Channel to the Communicator byte interface. Framing, wire
@@ -25,8 +27,10 @@ class ChannelCommunicator {
     std::uint64_t held_ = 0;
     bool submitted_ = false;
     bool drained_ = false;
+    Stats accounted_{};
 
     void before_send(Stream producer) {
+        drained_ = false;
         runtime_.order(producer, channel_->options().stream);
         auto& event = consumers_[static_cast<std::size_t>(channel_->sent() % consumers_.size())];
         if (event) runtime_.wait(event, channel_->options().stream);
@@ -55,6 +59,19 @@ public:
     }
     bool active() const { return channel_ != nullptr; }
     void drain() { if (channel_) { channel_->drain(); drained_ = true; } }
+    // Sample only after drain's acquire of progress completion: Channel::stats
+    // is otherwise mutable on the worker. The sink receives cumulative deltas
+    // exactly once, including when drain is repeated between leases.
+    template<class Account>
+    void drain_and_account(Account&& account) {
+        if (!channel_) return;
+        drain();
+        const auto now = channel_->stats();
+        account(now.exchanges - accounted_.exchanges, now.bytes - accounted_.bytes,
+                now.producer_wait - accounted_.producer_wait, now.wire - accounted_.wire,
+                now.check - accounted_.check);
+        accounted_ = now;
+    }
     void* send_staging(std::size_t bytes) {
         if (!channel_) return legacy_->send_staging(bytes);
         if (!bytes || bytes > channel_->options().capacity) return nullptr;
@@ -75,8 +92,26 @@ public:
         auto& event = consumers_[static_cast<std::size_t>((held_ - 1U) % consumers_.size())];
         runtime_.record(event, stream);
     }
+    // Device-local producer output (e.g. a GEMV plan that cannot write host-coherent memory): one Channel kernel copies
+    // it into the TX slot and publishes; the consumer then takes the zero-copy view of finish_staged() and retires it
+    // with release_staged(). Channel route only (the legacy route has its own staged-ready producers).
+    void start_staged_copy(Stream stream, const void* local, std::size_t bytes, const Tag& tag) {
+        if (!channel_ || !bytes || bytes > channel_->options().capacity)
+            throw std::logic_error("xport: start_staged_copy needs the Channel route and bytes within its capacity");
+        before_send(stream);
+        channel_->send_copy(local, bytes, Runtime::tag(tag));
+    }
     // Ready-view vocabulary is required by the existing DS41 facade's type
-    // contract. Those calls remain on the legacy decode route.
+    // contract. Those calls remain on the legacy decode route; on the Channel
+    // route no ready view is offered, so callers take their staged / copy paths.
+    auto prepare_staged_ready(Stream stream, std::size_t bytes) {
+        if (!channel_) return legacy_->prepare_staged_ready(stream, bytes);
+        return decltype(legacy_->prepare_staged_ready(stream, bytes)){};
+    }
+    std::uint32_t staged_ready_chunk_rows(std::uint32_t rows, std::size_t row_bytes) const {
+        return channel_ ? 0U : legacy_->staged_ready_chunk_rows(rows, row_bytes);
+    }
+    std::size_t capacity() const { return channel_ ? channel_->options().capacity : 0U; }
     auto finish_staged_ready() { return legacy_->finish_staged_ready(); }
     void start_staged_ready(Stream stream, std::size_t bytes, const Tag& tag) {
         legacy_->start_staged_ready(stream, bytes, tag);

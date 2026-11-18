@@ -1,0 +1,12 @@
+# Two RTX 5090 over PCIe 5 x16 (no NVLink), 128 GiB of host RAM: a planned shape, sized by strix-device-plan.
+schema = "strix-devices-v1"
+
+[devices.pair]
+profile = "rtx-5090-32"
+count = 2
+interconnect = "pcie5x16"
+roles = ["replica"]
+
+[devices.host]
+kind = "cpu"
+memory_gib = 128

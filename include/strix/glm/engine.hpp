@@ -15,6 +15,7 @@
 // calls; the engine owns weights and state, seams own only their scratch.
 #include "glm/spec/glm_spec_merge.hpp"
 #include "strix/pair/producer_publish.hpp"
+#include "strix/block_summary_state.hpp"
 
 #include <array>
 #include <cstddef>
@@ -186,6 +187,15 @@ struct CallCtx {
     // Set by the engine when y is the exchange's TX slot (Exchange::producer_slot): the seam's last kernel publishes
     // the partial itself. Only passed to a seam whose publishes() is true.
     strix::pair::ProducerPublish publish{};
+    // Split-producer chunk frame (xport/split_frame.hpp, SplitLayout{rows, 4096, split_cols}); split_cols != 0 only when
+    // the engine called Exchange::producer_slot_split and the seam's splits_o / publishes_split said yes. y is then the
+    // TX slot: the head part (rows x split_cols, stride split_cols) is written first and published through `publish`,
+    // then split_mid(split_mid_ctx) runs on the host (Channel::split_head), then the tail part (the next
+    // rows x (4096 - split_cols) floats of the slot) is written and published through `publish_tail`.
+    unsigned split_cols = 0;
+    strix::pair::ProducerPublish publish_tail{};
+    void (*split_mid)(void*) = nullptr;
+    void* split_mid_ctx = nullptr;
 };
 
 // ---------------------------------------------------------------- seams
@@ -200,6 +210,9 @@ public:
     virtual bool supports_multi_slot_verify() const { return false; }
     // True when kda() / dsa() honour CallCtx::publish (y is the exchange TX slot; the partial is published by the seam).
     virtual bool publishes() const { return false; }
+    // True when kda() / dsa() of these weights honour CallCtx::split_cols (the o projection as two column-half launches).
+    virtual bool splits_o(const KdaLayerWeights&) const { return false; }
+    virtual bool splits_o(const DsaLayerWeights&) const { return false; }
 };
 // FFN of one MoE layer: x = normed [R][4096]; route ids [R][8] ascending + weights [R][8] (computed by the engine,
 // R5/R14) -> y = sum over the row's experts in ascending id of fmaf(w, expert(x)) + shared(x), this rank's partial.
@@ -218,6 +231,8 @@ public:
     virtual void warm(const MoeLayerWeights& w) { (void)w; }
     // True when forward() honours CallCtx::publish (the partial is published by the seam's last kernel).
     virtual bool publishes() const { return false; }
+    // True when forward() of these weights honours CallCtx::split_cols (the down projection as two column-half launches).
+    virtual bool publishes_split(const MoeLayerWeights&) const { return false; }
 };
 // TP reduction: p [R][4096] in place -> p0 + p1 (rank order) on both ranks; head argmax merge. world = 1: identity.
 class Exchange {
@@ -249,6 +264,16 @@ public:
         strix::pair::ProducerPublish publish{};
     };
     virtual ProducerSlot producer_slot(unsigned /*rows*/, hipStream_t /*s*/) { return {}; }
+    // Split-producer chunk frame: producer_slot for a message produced in two column parts (head: rows x head_cols,
+    // published through `publish`; tail: the rest, published through `publish_tail`); the next fused_boundary_rows reads the
+    // payload through SplitLayout{rows, 4096, head_cols}. data == nullptr = not provided (unsplit path). The producer
+    // calls split_head(rows, head_cols) on the host between the two parts.
+    struct SplitSlot {
+        float* data = nullptr;
+        strix::pair::ProducerPublish head{}, tail{};
+    };
+    virtual SplitSlot producer_slot_split(unsigned /*rows*/, unsigned /*head_cols*/, hipStream_t /*s*/) { return {}; }
+    virtual void split_head(unsigned /*rows*/, unsigned /*head_cols*/) {}
     // Row-aware hook: existing seams retain the single-flag contract.
     virtual bool fused_boundary_rows(const float* part, const float* X, const float* mix, float* Xout,
                                      unsigned* flags, unsigned rows, unsigned flag_stride, hipStream_t s) {
@@ -316,6 +341,9 @@ struct Options {
     bool auto_rows = false;             // recheck admission after communication growth, before weights
     unsigned exchange_rows = 0;         // 0 uses max_rows; startup may grow Comm buffers after selection
     std::uint32_t max_rows = 1024;       // rows per forward call (prefill chunk)
+    // Prefill units (serving under load): reserve 8 decode rows above max_rows in every row buffer a forward writes,
+    // so a prefill piece can pause at a layer boundary while decode runs (prefill_mtp_begin / _advance); ~2.2 MiB.
+    bool prefill_units = false;
     std::uint32_t layers = 45;           // first `layers` main layers only (G3 uses 6); the head needs all 45
     bool mtp = true;                     // load layer 45 (MTP) + its DSA state
     bool raw_linears = false;            // keep raw EXL3 copies of every linear (fused seams need them)
@@ -324,6 +352,9 @@ struct Options {
     // STRIX_GLM_IDENTITY=r1|r1b|r1b-all overrides this option at construction.
     bool external_exchange = false;      // world 2 without a Communicator: the caller installs its Exchange
                                          // (set_exchange) before the first forward (e.g. XferExchange)
+    // Split-producer chunk frames of the decode exchanges (xport::SplitFramePolicy, resolved once by apps/glm_rank_defaults.hpp
+    // for CLI and serve): mode 0 automatic (rows >= split_frame_crossover), 1 off (default), 2 on.
+    unsigned split_frame_mode = 1, split_frame_crossover = 4;
     bool decode_xfer = true;             // TP2: Plain/Verify/MTP with 1..8 rows can borrow its transport.
                                          // STRIX_GLM_DECODE_XCH=comm|xfer overrides this option on both ranks.
                                          // STRIX_GLM_SPEC_XCH=comm keeps Verify/MTP on Comm (default xfer).
@@ -464,6 +495,21 @@ public:
     };
     MtpPrefillOut prefill_mtp(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
                              Exchange::MergeCtl& ctl);
+    // prefill_mtp as a session of layer units (strix/session/prefill_session.hpp LayerUnits: pieces of max_rows rows,
+    // `layers` units each). begin takes the prompt (no device work); each advance runs at most `units` layer units of
+    // the current piece onward (a piece's MTP cache after its last layer) and returns with no collective in flight;
+    // the call that completes the prompt runs the head and the drafter seed (`ctl` is used only then) and returns true
+    // with `out` as prefill_mtp's. Pausing inside a piece needs Options::prefill_units: while paused, calls of other
+    // slots (<= 8 rows) run in the reserved decode window. prefill_mtp == begin + advance(~0U): same bits.
+    // Partial advances require prefill_units_admit(tokens.size()); otherwise use whole calls/token chunks.
+    void prefill_mtp_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    bool prefill_mtp_advance(std::uint32_t units, Exchange::MergeCtl& ctl, MtpPrefillOut& out);
+    void prefill_mtp_cancel();
+    // True only when every piece can honor an exact layer-unit budget.
+    [[nodiscard]] bool prefill_units_admit(std::uint64_t rows) const;
+    [[nodiscard]] std::uint32_t prefill_units_done() const;
+    [[nodiscard]] std::uint32_t prefill_units_total() const;
+    [[nodiscard]] bool prefill_units_active() const;
 
     // ---- gates (G3 / G4 / replay)
     // Teacher-forced run of the first `layers` layers over `tokens` (slot 0, positions 0..): returns the 4-stream
@@ -478,7 +524,15 @@ public:
     // Inverse of state_bytes_upto (same capacity / layers / mtp): reset(slot), then every segment written back, so the
     // slot continues at `frontier` as if it had run there (G4 runs across turns; gate SR). Throws on a size mismatch.
     void restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier);
+    // The same with the DSA index key / gate in `index_rows` form: open_tail carries only the open pool block's rows
+    // [frontier - frontier % 4, frontier) (hand-off v3/v4); the closed blocks' rows stay at their reset value, never read
+    // (strix/block_summary_state.hpp contract). Refused on kv-sharded DSA.
+    void restore_state(std::uint32_t slot, std::span<const std::uint8_t> bytes, std::uint64_t frontier, strix::state::RawRows index_rows);
 
+    // Bench-only override of the split-producer chunk frames: -1 resolved policy (default), 0 off, 1 on (rows >= 2, the
+    // supported splits). Both ranks must flip at the same step.
+    void set_split_frame(int mode);
+    [[nodiscard]] int split_frame() const;
     void set_profiling(bool on);
     [[nodiscard]] const Profile& profile() const;
     [[nodiscard]] std::uint32_t rank() const;

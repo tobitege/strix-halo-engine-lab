@@ -3,7 +3,7 @@
 // against xrpc::combine_host with answers planned by xrpc::plan_response for one or two servers (FOLD and RAW items,
 // row subsets), and against enqueue_moe_combine on the one-device raw vectors.
 
-#include "strix/cuda_ds41_parts_host.hpp"
+#include "strix/cuda/ds41_parts_host.hpp"
 #include "strix/ds41_expert_rpc.hpp"
 
 #include <cuda_runtime.h>

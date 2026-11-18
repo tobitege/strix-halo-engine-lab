@@ -13,11 +13,13 @@
 //
 // Host only (no GPU header): the HIP part is hip_weight_uploader.hpp, tests use a host uploader.
 #include "byte_budget.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -140,11 +142,15 @@ struct WeightLoadOptions {
     std::uint64_t staging_budget_bytes = std::uint64_t{1} << 30;  // resident staging, free pool included
     ByteBudget* rate = nullptr;                                   // host bytes/s governor for the reads (may be null)
     bool hash = false;                                            // content hash per ticket (identity gates)
+    // Budget full and no pooled buffer of the ticket's class: use an idle larger one instead of free + allocate.
+    // STRIX_WEIGHT_STAGING_REUSE_LARGER=0 restores free + allocate (bitwise either way).
+    bool reuse_larger_staging = strix::envcfg::flag("STRIX_WEIGHT_STAGING_REUSE_LARGER", true);
 };
 
 struct WeightLoadStats {
     std::uint64_t tickets = 0, read_bytes = 0, upload_bytes = 0, held_bytes = 0;
     std::uint64_t peak_staging_bytes = 0, staging_allocations = 0, upload_events = 0;
+    std::uint64_t staging_reused_larger = 0;  // tickets served by an idle larger pooled buffer (budget full)
     double read_seconds = 0;     // summed over workers (reads overlap: can exceed the wall time)
     double convert_seconds = 0;  // summed over workers
     double admit_wait_seconds = 0;  // workers waiting for staging inside the budget
@@ -380,6 +386,22 @@ private:
                 lock.lock();
                 if (waited) stats_.admit_wait_seconds += std::chrono::duration<double>(Clock::now() - t0).count();
                 return b;
+            }
+            // Budget full: an idle pooled buffer that is merely larger than this ticket's class serves it as is.
+            // Releasing it to allocate the exact class cost a hipHostFree + hipHostMalloc pair (a KFD userptr BO torn
+            // down and built again, its pages zeroed) per ticket: 922 staging allocations in one MiniMax rank load with
+            // a 2 GiB budget and 4..80 MB tickets. Same staging bytes and copies either way (bitwise).
+            if (opt_.reuse_larger_staging) {
+                std::size_t larger = free_.size();
+                for (std::size_t i = 0; i < free_.size(); ++i)
+                    if (free_[i].cap >= cap && (larger == free_.size() || free_[i].cap < free_[larger].cap)) larger = i;
+                if (larger != free_.size()) {
+                    const Buffer b = free_[larger];
+                    free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(larger));
+                    ++stats_.staging_reused_larger;
+                    if (waited) stats_.admit_wait_seconds += std::chrono::duration<double>(Clock::now() - t0).count();
+                    return b;
+                }
             }
             if (!free_.empty()) {  // a pooled buffer of another size class makes room
                 const Buffer b = free_.back();

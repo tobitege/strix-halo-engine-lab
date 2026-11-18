@@ -11,6 +11,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -195,6 +196,102 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
     check(outs, "R13 absorbed MLA, 32 rank heads, real L3 kv_b rows: outputs bitwise at all positions (n up to 2051)");
 }
 
+// Hand-off index tail (wire v3/v4, strix/block_summary_state.hpp): a slot restored at frontier P with only the open pool
+// block's index key / gate rows [P - P % 4, P) continues bitwise like the full state. The closed blocks' rows are
+// poisoned with BF16 NaN (0xFFFF): any read would turn a pooled key non-finite (flag) or change a list / output.
+void test_index_tail(const std::string& cases, std::mt19937& g) {
+    CaseDir c(cases + "/mla_l3_r0");
+    const auto wk = c.v<std::uint16_t>("indexer.wk"), gate = c.v<std::uint16_t>("indexer.index_kpool_compress_gate");
+    const auto wp = c.v<std::uint16_t>("indexer.weights_proj"), knw = c.v<std::uint16_t>("indexer.k_norm");
+    const auto knb = c.v<std::uint16_t>("indexer.k_norm.bias");
+    const auto ape = c.v<float>("indexer.index_kpool_compress_ape");
+    const auto kvb_all = c.v<std::uint16_t>("kv_b_proj");
+    constexpr unsigned Hh = 32, P0 = 2996, K = 13, cap = 3072;
+    const std::vector<std::uint16_t> kvb(kvb_all.begin(), kvb_all.begin() + static_cast<std::size_t>(Hh) * 2 * kMlaDim * kKvLora);
+    const D::IndexerDev dw{up(wk), up(gate), up(wp), up(knw), up(knb), up(ape)};
+    auto slot_alloc = [&] {
+        return D::DsaSlot{zalloc<std::uint16_t>(static_cast<std::size_t>(cap) * kKvLora), zalloc<std::uint16_t>(static_cast<std::size_t>(cap) * kIdxDim),
+                          zalloc<std::uint16_t>(static_cast<std::size_t>(cap) * kIdxDim), zalloc<float>(static_cast<std::size_t>(cap / kKpool) * kIdxDim), cap};
+    };
+    const std::size_t lat_b = static_cast<std::size_t>(cap) * kKvLora * 2, idx_b = static_cast<std::size_t>(cap) * kIdxDim * 2,
+                      pool_b = static_cast<std::size_t>(cap / kKpool) * kIdxDim * 4;
+    auto copy = [&](const D::DsaSlot& to, const D::DsaSlot& from) {
+        hok(hipMemcpy(to.latent, from.latent, lat_b, hipMemcpyDeviceToDevice), "c");
+        hok(hipMemcpy(to.ikey, from.ikey, idx_b, hipMemcpyDeviceToDevice), "c");
+        hok(hipMemcpy(to.igate, from.igate, idx_b, hipMemcpyDeviceToDevice), "c");
+        hok(hipMemcpy(to.pooled, from.pooled, pool_b, hipMemcpyDeviceToDevice), "c");
+    };
+    const D::DsaSlot a = slot_alloc(), full = slot_alloc(), tail = slot_alloc();
+    D::DsaSlot *da = up(std::vector<D::DsaSlot>{a}), *dfull = up(std::vector<D::DsaSlot>{full}), *dtail = up(std::vector<D::DsaSlot>{tail});
+    unsigned *dt = zalloc<unsigned>(1), *flag = zalloc<unsigned>(1), *flag_full = zalloc<unsigned>(1), *flag_tail = zalloc<unsigned>(1);
+    float *dks = zalloc<float>(kIdxDim), *dgs = zalloc<float>(kIdxDim), *dx = zalloc<float>(kHidden), *dl = zalloc<float>(kKvLora);
+    float *dwh = zalloc<float>(kIdxHeads), *dsc = zalloc<float>(cap / kKpool), *dq = zalloc<float>(Hh * kMlaDim);
+    float *dqt = zalloc<float>(Hh * kKvLora), *dqI = zalloc<float>(kIdxHeads * kIdxDim), *dout = zalloc<float>(Hh * kMlaDim);
+    std::uint32_t *dwork = zalloc<std::uint32_t>(cap), *dtok = zalloc<std::uint32_t>(kIdxTopk + 3), *dn = zalloc<std::uint32_t>(1);
+    std::uint16_t* dkvb = up(kvb);
+    auto append = [&](D::DsaSlot* s, unsigned* f, unsigned t, const std::vector<float>& x, const std::vector<float>& lat) {
+        hok(hipMemcpy(dt, &t, 4, hipMemcpyHostToDevice), "t");
+        hok(hipMemcpy(dx, x.data(), kHidden * 4, hipMemcpyHostToDevice), "x");
+        hok(hipMemcpy(dl, lat.data(), kKvLora * 4, hipMemcpyHostToDevice), "l");
+        D::dsa_append(s, dt, dl, dx, dw, dks, dgs, f, 1, nullptr);
+    };
+    // One step's outputs: the selected tokens, then the MLA output bits.
+    auto query = [&](const D::DsaSlot& s, unsigned t, const std::vector<float>& x, const std::vector<float>& qI, const std::vector<float>& q) {
+        hok(hipMemcpy(dx, x.data(), kHidden * 4, hipMemcpyHostToDevice), "x");
+        hok(hipMemcpy(dqI, qI.data(), qI.size() * 4, hipMemcpyHostToDevice), "q");
+        hok(hipMemcpy(dq, q.data(), q.size() * 4, hipMemcpyHostToDevice), "q");
+        D::indexer_select(s, t, dqI, dx, dw, dwh, dsc, dwork, dtok, dn, nullptr);
+        const auto n = down(dn, 1)[0];
+        auto tok = down(dtok, n);
+        D::mla_attention(s, dtok, dn, dq, dkvb, Hh, dqt, dout, nullptr);
+        const auto o = down(dout, Hh * kMlaDim);
+        std::vector<std::uint32_t> bits(o.size());
+        std::memcpy(bits.data(), o.data(), o.size() * 4);
+        tok.insert(tok.end(), bits.begin(), bits.end());
+        return tok;
+    };
+    for (unsigned t = 0; t < P0; ++t) append(da, flag, t, rnd(kHidden, g, 0.5F), rnd(kKvLora, g, 1.0F));
+    bool steps = true, caches = true, holes = true, flags = true;
+    unsigned compared = 0;
+    for (unsigned P = P0; P < P0 + 4; ++P) {  // P % 4 = 0, 1, 2, 3
+        copy(full, a);
+        copy(tail, a);
+        const unsigned first = P - P % kKpool;  // the open pool block's first row
+        const std::vector<std::uint16_t> poison(static_cast<std::size_t>(first) * kIdxDim, 0xFFFFU);
+        hok(hipMemcpy(tail.ikey, poison.data(), poison.size() * 2, hipMemcpyHostToDevice), "p");
+        hok(hipMemcpy(tail.igate, poison.data(), poison.size() * 2, hipMemcpyHostToDevice), "p");
+        hok(hipMemset(flag_full, 0, 4), "f");
+        hok(hipMemset(flag_tail, 0, 4), "f");
+        for (unsigned t = P; t < P + K; ++t) {  // continue: crosses 3..4 block closes
+            const auto x = rnd(kHidden, g, 0.5F), lat = rnd(kKvLora, g, 1.0F);
+            append(dfull, flag_full, t, x, lat);
+            append(dtail, flag_tail, t, x, lat);
+            for (int mode = 0; mode < 2; ++mode) {  // 0: real-scale qI, 1: qI = 0 (all scores tie)
+                const auto qI = mode == 0 ? rnd(kIdxHeads * kIdxDim, g, 1.0F) : std::vector<float>(kIdxHeads * kIdxDim, 0.0F);
+                const auto q = rnd(Hh * kMlaDim, g, 1.0F);
+                steps &= query(full, t, x, qI, q) == query(tail, t, x, qI, q);
+                ++compared;
+            }
+        }
+        const unsigned end = P + K;
+        caches &= down(full.latent, static_cast<std::size_t>(end) * kKvLora) == down(tail.latent, static_cast<std::size_t>(end) * kKvLora);
+        const auto pooled_full = down(full.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim);
+        const auto pooled_tail = down(tail.pooled, static_cast<std::size_t>(end / kKpool) * kIdxDim);
+        caches &= std::memcmp(pooled_full.data(), pooled_tail.data(), pooled_full.size() * sizeof(float)) == 0;
+        const auto kf = down(full.ikey, static_cast<std::size_t>(end) * kIdxDim), kt = down(tail.ikey, static_cast<std::size_t>(end) * kIdxDim);
+        const auto gf = down(full.igate, static_cast<std::size_t>(end) * kIdxDim), gt = down(tail.igate, static_cast<std::size_t>(end) * kIdxDim);
+        const auto f0 = static_cast<std::ptrdiff_t>(static_cast<std::size_t>(first) * kIdxDim);
+        caches &= std::equal(kf.begin() + f0, kf.end(), kt.begin() + f0) && std::equal(gf.begin() + f0, gf.end(), gt.begin() + f0);
+        holes &= std::all_of(kt.begin(), kt.begin() + f0, [](std::uint16_t v) { return v == 0xFFFFU; }) &&
+                 std::all_of(gt.begin(), gt.begin() + f0, [](std::uint16_t v) { return v == 0xFFFFU; });
+        flags &= down(flag_full, 1)[0] == 0 && down(flag_tail, 1)[0] == 0;
+        append(da, flag, P, rnd(kHidden, g, 0.5F), rnd(kKvLora, g, 1.0F));  // the next frontier
+    }
+    check(steps && compared == 4 * K * 2, "index tail: token lists + MLA outputs bitwise vs the full state, P % 4 = 0..3, 13 steps each");
+    check(caches, "index tail: latent, pooled and the open-block index rows bitwise after the continuation");
+    check(holes && flags, "index tail: NaN-poisoned closed-block index rows never read (untouched, no non-finite flag)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -205,6 +302,7 @@ int main(int argc, char** argv) {
     std::mt19937 g(20261024);
     test_topk_alone(g);
     test_dsa(argv[1], g);
+    test_index_tail(argv[1], g);
     std::printf("checks: %d failures: %d\n", checks, failures);
     return failures ? 1 : 0;
 }

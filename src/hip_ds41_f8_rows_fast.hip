@@ -1,6 +1,7 @@
 // F8 rows with 16-byte weight loads, one output row per wave; arithmetic of f16_rows (see hip_ds41_f8_rows_fast.hpp).
 #include "strix/env_flags.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
+#include "strix/lever_cache.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -425,17 +426,17 @@ namespace {
 // 0 = off (lanes row kernel). STRIX_DS41_ENGRAM_RN=1: the RN kernels at 2..8 rows (default off). Read once.
 // Internal mode: 0 off, 1 round-1 kernel, 2 compact kernel.
 unsigned fast_mode() noexcept {
-    static const unsigned m = [] {
+    static strix::lever_cache<unsigned> m{[] {
         const char* e = std::getenv("STRIX_DS41_ENGRAM_FAST");
         // default 2 (compact kernel) since P15 (approved after P14: R1 -0.6 ms, same bits); =1 the round-1 kernel
         return e && e[0] == '0' ? 0U : e && e[0] == '1' ? 1U : 2U;
-    }();
-    return m;
+    }};
+    return m.get();
 }
 bool rn_on() noexcept {
     // on by default since P15 (P14: R6 -1.1 ms, same bits); STRIX_DS41_ENGRAM_RN=0 off
-    static const bool on = strix::envcfg::flag("STRIX_DS41_ENGRAM_RN", true);
-    return on;
+    static strix::lever_cache<bool> on{[] { return strix::envcfg::flag("STRIX_DS41_ENGRAM_RN", true); }};
+    return on.get();
 }
 }  // namespace
 

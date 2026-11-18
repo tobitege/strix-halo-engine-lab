@@ -64,7 +64,7 @@ inline float project_one(const std::uint8_t* wrow, std::uint32_t width, const st
     return acc != acc ? bits_float(kNan) : acc;
 }
 
-// v_mul_f32 with RDNA3 NaN propagation (src0 first, quieted) [assumption, see src/cuda/qwen_dense.cu amd_mul].
+// v_mul_f32 with RDNA3 NaN propagation (src0 first, quieted) [assumption, see src/cuda/models/qwen/qwen_dense.cu amd_mul].
 inline float amd_mul(float a, float b) {
     if (a != a) return bits_float(float_bits(a) | 0x00400000U);
     if (b != b) return bits_float(float_bits(b) | 0x00400000U);

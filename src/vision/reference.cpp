@@ -2,7 +2,9 @@
 // reference tower (the fixture oracle; slow by design: double accumulation, no approximation anywhere).
 #include "strix/vision/encoder.hpp"
 
+#include "../attn_core/two_term_model.hpp"
 #include "encoder_layout.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,29 +21,7 @@ namespace {
 
 [[noreturn]] void bad(const std::string& what) { throw std::invalid_argument("vision encoder: " + what); }
 
-float half_to_float(std::uint16_t h) {
-    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
-    std::uint32_t exp = (h >> 10U) & 0x1FU, man = h & 0x3FFU, bits;
-    if (exp == 0U) {
-        if (man == 0U) {
-            bits = sign;
-        } else {
-            unsigned shift = 0;
-            while ((man & 0x400U) == 0U) {
-                man <<= 1U;
-                ++shift;
-            }
-            bits = sign | ((113U - shift) << 23U) | ((man & 0x3FFU) << 13U);
-        }
-    } else if (exp == 31U) {
-        bits = sign | 0x7F800000U | (man << 13U);
-    } else {
-        bits = sign | ((exp + 112U) << 23U) | (man << 13U);
-    }
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
+using attn_core::model::half_to_float;
 
 // fn(begin, end) over [0, n) on the host threads; small jobs run inline.
 void parallel_for(std::size_t n, std::size_t work_per_item, const std::function<void(std::size_t, std::size_t)>& fn) {
@@ -63,6 +43,16 @@ void check(const Tensor& t, std::size_t rows, std::size_t cols, const char* name
         return;
     }
     if (t.rows != rows || t.cols != cols) bad(std::string("shape of ") + name);
+}
+
+void linear_ref(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y);
+
+// linear_ref on FP16-rounded inputs when the rounding model asks for it (the default path is linear_ref unchanged).
+void linear_model(const ReferenceRounding& m, const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) {
+    if (!m.linear_inputs_f16) return linear_ref(w, bias, x, rows, y);
+    std::vector<float> xr(x, x + rows * w.cols);
+    for (float& v : xr) v = round_to_f16(v);
+    linear_ref(w, bias, xr.data(), rows, y);
 }
 
 void linear_ref(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) {
@@ -295,21 +285,50 @@ EncoderPlan plan(const EncoderConfig& c, unsigned rows, unsigned tiles, const En
     return p;
 }
 
+unsigned attention_terms_from_env() {
+    // Default 1: the main rows. Two terms change the tower bits and the served answer of one fixture, cost +14 % per
+    // encode, and the device gate re-check still fails on preprocessing; 2 stays opt-in until that gate passes.
+    static const unsigned terms = envcfg::number<unsigned>("STRIX_VISION_ATTN_TERMS", 1U, 1U, 2U);
+    return terms;
+}
+
 bool resident_from_env() {
     const char* v = std::getenv("STRIX_VISION_RESIDENT");
     return !v || !*v || std::strcmp(v, "0") != 0;
 }
 
-ReferenceEncoder::ReferenceEncoder(EncoderConfig c, const EncoderWeights& w) : cfg_(std::move(c)), weights_(&w) { validate(cfg_, w); }
-EncoderOutput ReferenceEncoder::encode(const PatchGrid& g, const PositionInputs& p) { return reference_encode(cfg_, *weights_, g, p); }
-void ReferenceEncoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) { linear_ref(w, bias, x, rows, y); }
+void layout::parallel_ranges(std::size_t n, std::size_t work_per_item, const std::function<void(std::size_t, std::size_t)>& fn) {
+    parallel_for(n, work_per_item, fn);
+}
 
-EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g, const PositionInputs& p) {
+float round_to_f16(float f) { return attn_core::model::round_to_f16(f); }
+
+float round_f16_terms(float f, unsigned terms) {
+    if (terms == 0U) return f;
+    const float hi = round_to_f16(f);
+    if (terms == 1U || !std::isfinite(hi)) return hi;
+    return hi + round_to_f16(f - hi);  // f - hi is exact in FP32 (Sterbenz); the sum is exact unless lo rounds
+}
+
+ReferenceEncoder::ReferenceEncoder(EncoderConfig c, const EncoderWeights& w, ReferenceRounding r)
+    : cfg_(std::move(c)), weights_(&w), rounding_(r) {
+    validate(cfg_, w);
+}
+EncoderOutput ReferenceEncoder::encode(const PatchGrid& g, const PositionInputs& p) { return reference_encode(cfg_, *weights_, g, p, rounding_); }
+void ReferenceEncoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) {
+    linear_model(rounding_, w, bias, x, rows, y);
+}
+
+EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, const PatchGrid& g, const PositionInputs& p,
+                               const ReferenceRounding& m) {
     validate(c, w);
     validate(c, g, p);
     const std::size_t N = g.rows, W = c.width, H = c.heads, D = c.head_dim(), M = c.mlp_width, M1 = c.mlp_out();
     std::vector<float> x(N * W), n(N * W), qkv(N * 3U * W), att(N * W), o(N * W), mid(N * M1), act(N * M);
-    linear_ref(w.patch_w, w.patch_b, g.data.data(), N, x.data());
+    const auto lin = [&m](const Tensor& wt, const Tensor& bias, const float* in, std::size_t rows, float* y) {
+        linear_model(m, wt, bias, in, rows, y);
+    };
+    lin(w.patch_w, w.patch_b, g.data.data(), N, x.data());
     for (std::size_t i = 0; i < p.addend.size(); ++i) x[i] += p.addend[i];
     std::vector<unsigned> tiles = g.tile_end;
     if (tiles.empty()) tiles.push_back(g.rows);
@@ -321,13 +340,23 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
     for (unsigned l = 0; l < c.layers; ++l) {
         const auto& b = w.blocks[l];
         norm_ref(c, b.norm1_w, b.norm1_b, x.data(), N, n.data());
-        linear_ref(b.qkv_w, b.qkv_b, n.data(), N, qkv.data());
+        lin(b.qkv_w, b.qkv_b, n.data(), N, qkv.data());
         if (c.has_rope())
             for (std::size_t r = 0; r < N; ++r)
                 for (std::size_t h = 0; h < H; ++h) {
                     rotate(c, &qkv[r * 3U * W + h * D], &p.angles[r * (D / 2U)]);
                     rotate(c, &qkv[r * 3U * W + W + h * D], &p.angles[r * (D / 2U)]);
                 }
+        if (m.any_attention() && !m.attn_order)  // the flash core's Q, K, V operands (qkv is read by the attention only)
+            for (std::size_t r = 0; r < N; ++r)
+                for (std::size_t i = 0; i < 3U * W; ++i) {
+                    float& v = qkv[r * 3U * W + i];
+                    v = round_f16_terms(v, i < W ? m.attn_q : i < 2U * W ? m.attn_k : m.attn_v);
+                }
+        // The core's constant: FP32 1/sqrt(D) times FP32 log2(e), rounded once more (the policy's kScaleLog2).
+        const float scale_log2 = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))) * 1.44269504088896341F;
+        std::vector<attn_core::model::Terms> qkv_terms(m.attn_order ? qkv.size() : 0U);
+        for (std::size_t i = 0; i < qkv_terms.size(); ++i) qkv_terms[i] = attn_core::model::split(qkv[i], attn_core::model::Format::f16, m.attn_q);
         std::size_t begin = 0;
         for (const unsigned end : tiles) {
             const std::size_t nk = end - begin;
@@ -336,6 +365,13 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                 for (std::size_t r = begin + r0; r < begin + r1; ++r)
                     for (std::size_t h = 0; h < H; ++h) {
                         const float* q = &qkv[r * 3U * W + h * D];
+                        if (m.attn_order) {  // the dense core's three products and their order (two_term_model.hpp)
+                            const auto at = [&](std::size_t j, std::size_t part) { return &qkv_terms[(begin + j) * 3U * W + part * W + h * D]; };
+                            attn_core::model::dense_row(
+                                &qkv_terms[r * 3U * W + h * D], static_cast<unsigned>(nk), [&](unsigned j) { return at(j, 1U); }, [&](unsigned j) { return at(j, 2U); },
+                                static_cast<unsigned>(D), scale_log2, m.attn_q, attn_core::model::Format::f16, &att[r * W + h * D]);
+                            continue;
+                        }
                         double top = -std::numeric_limits<double>::infinity();
                         for (std::size_t j = 0; j < nk; ++j) {
                             const float* k = &qkv[(begin + j) * 3U * W + W + h * D];
@@ -346,21 +382,36 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
                         }
                         double sum = 0.0;
                         std::fill(acc.begin(), acc.end(), 0.0);
-                        for (std::size_t j = 0; j < nk; ++j) {
-                            const double pj = std::exp(s[j] - top);
-                            sum += pj;
-                            const float* v = &qkv[(begin + j) * 3U * W + 2U * W + h * D];
-                            for (std::size_t d = 0; d < D; ++d) acc[d] += pj * static_cast<double>(v[d]);
+                        const std::size_t step = m.attn_p ? 16U : nk;
+                        if (m.attn_p) top = -std::numeric_limits<double>::infinity();
+                        for (std::size_t j0 = 0; j0 < nk; j0 += step) {
+                            const std::size_t j1 = std::min(j0 + step, nk);
+                            if (m.attn_p) {
+                                double next = top;
+                                for (std::size_t j = j0; j < j1; ++j) next = std::max(next, s[j]);
+                                const double alpha = std::exp(top - next);
+                                sum *= alpha;
+                                for (double& v : acc) v *= alpha;
+                                top = next;
+                            }
+                            for (std::size_t j = j0; j < j1; ++j) {
+                                // Round at this online step's maximum; earlier contributions are only rescaled.
+                                const double e = std::exp(s[j] - top);
+                                const double pj = m.attn_p ? static_cast<double>(round_f16_terms(static_cast<float>(e), m.attn_p)) : e;
+                                sum += pj;
+                                const float* v = &qkv[(begin + j) * 3U * W + 2U * W + h * D];
+                                for (std::size_t d = 0; d < D; ++d) acc[d] += pj * static_cast<double>(v[d]);
+                            }
                         }
                         for (std::size_t d = 0; d < D; ++d) att[r * W + h * D + d] = static_cast<float>(acc[d] / sum);
                     }
             });
             begin = end;
         }
-        linear_ref(b.out_w, b.out_b, att.data(), N, o.data());
+        lin(b.out_w, b.out_b, att.data(), N, o.data());
         for (std::size_t i = 0; i < N * W; ++i) x[i] += o[i];
         norm_ref(c, b.norm2_w, b.norm2_b, x.data(), N, n.data());
-        linear_ref(b.mlp1_w, b.mlp1_b, n.data(), N, mid.data());
+        lin(b.mlp1_w, b.mlp1_b, n.data(), N, mid.data());
         if (c.mlp == EncoderConfig::Mlp::swiglu) {
             const double lim = static_cast<double>(c.swiglu_limit);
             for (std::size_t r = 0; r < N; ++r)
@@ -376,7 +427,7 @@ EncoderOutput reference_encode(const EncoderConfig& c, const EncoderWeights& w, 
         } else {
             for (std::size_t i = 0; i < N * M; ++i) act[i] = static_cast<float>(activation(c, static_cast<double>(mid[i])));
         }
-        linear_ref(b.mlp2_w, b.mlp2_b, act.data(), N, o.data());
+        lin(b.mlp2_w, b.mlp2_b, act.data(), N, o.data());
         for (std::size_t i = 0; i < N * W; ++i) x[i] += o[i];
         if (tap < c.deepstack_taps.size() && c.deepstack_taps[tap] == l) {
             out.taps.push_back(x);

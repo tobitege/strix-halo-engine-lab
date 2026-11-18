@@ -1,0 +1,12 @@
+{
+  "schema": "wfmt.matrix@1",
+  "cases": [
+    {
+      "file": "protocol.wfmt",
+      "case": "protocol-fixture",
+      "arithmetic": "legacy-fixture@1",
+      "shape": [4],
+      "required_sections": {"activation_codes": 4, "output": 4, "source": 4}
+    }
+  ]
+}

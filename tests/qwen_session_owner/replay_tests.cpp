@@ -71,6 +71,8 @@ struct MtpBatchRunner {
     std::size_t slots_capacity=3;
     std::mutex mutex;
     std::mutex* session_mutex=&mutex;
+    // No prefix store in the replay: the queue protection binding is empty (owner protection inert).
+    strix::serve::QueuedPrefixProtection::Binding queue_protection_binding() { return {}; }
     bool session_run=true, memory_refusal=false, check_mutex=false, completed=true, empty_error=false, unknown_error=false;
     bool stop_when_empty=true;
     int fault=0;
@@ -488,9 +490,62 @@ static void owner_failure_texts() {
 }
 #endif
 }
+#ifndef QWEN_ENTRY
+// The actual owner, eight occupied slots, and no native nested-pump calls.
+static void queue_protection_without_nesting() {
+    namespace serve = strix::serve;
+    using Owner = strix::qwen::HttpSessionOwner;
+    serve::GenerationQueue queue;
+    std::vector<std::shared_ptr<serve::GenerationTicket>> tickets;
+    for (std::uint32_t i = 0; i < 10; ++i) {
+        serve::GenerationJob job; job.prompt = {i + 1}; job.max_tokens = 1;
+        tickets.push_back(queue.submit(std::move(job)));
+        CHECK(tickets.back());
+    }
+    std::size_t held = 0, completed = 0, steps = 0;
+    std::vector<Owner::Callbacks> active;
+    Owner::Native native;
+    native.queue_protection.prepare = [](auto prompt) -> serve::QueuedPrefixProtection::Prepared {
+        return std::make_shared<const std::uint32_t>(prompt.front());
+    };
+    native.queue_protection.protect = [&](const auto&) -> serve::QueuedPrefixProtection::Handle {
+        ++held;
+        return std::shared_ptr<void>(new int(0), [&](void* p) { delete static_cast<int*>(p); --held; });
+    };
+    native.add_slot = [](bool) {};
+    native.has_free_slot = [&] { return active.size() < 8; };
+    native.active = [&] { return active.size(); };
+    native.submit = [&](const auto&, Owner::Callbacks cb) { active.push_back(std::move(cb)); };
+    // STRIX_BATCH_NEST_ROWS=0: the runner never invokes this pump.
+    native.service_admission = [](auto, auto) {};
+    native.step = [&] {
+        ++steps;
+        if (steps == 1) {
+            CHECK(active.size() == 8 && held == 10);
+            tickets.back()->cancel();
+            const std::uint32_t token = 1;
+            for (auto& cb : active) CHECK(cb.tokens(std::span(&token, 1)));
+            CHECK(held == 2); // only the two waiting jobs still hold references
+            return;
+        }
+        CHECK(held == 1); // cancelled waiting job was released by a normal turn
+        for (auto& cb : active) { cb.finish({}, {}); ++completed; }
+        active.clear();
+        if (completed == 9) queue.shutdown();
+    };
+    native.fail_requests = [](const auto&) {};
+    native.abandon = [&] { active.clear(); };
+    Owner owner(queue, 64, 8, std::move(native));
+    owner.run();
+    CHECK(steps == 3 && held == 0 && completed == 9);
+    CHECK(owner.queue_protection_stats().released_left == 1);
+    CHECK(owner.queue_protection_stats().handed_over == 9);
+}
+#endif
 int main(int argc,char** argv) try {
     if(argc==2 && std::string(argv[1])=="--failure-probe") {CHECK(argc==0);}
 #ifndef QWEN_ENTRY
+    if(argc==2 && std::string(argv[1])=="--queue-protection") {queue_protection_without_nesting();return 0;}
     if(argc==2 && std::string(argv[1])=="--readiness-phases") {
         for(unsigned mode=0;mode<3;++mode)(void)strix::decode_cli::http_scenario(mode);
         std::cout<<"Qwen idle, completion, pre-admission disconnect and teardown phases passed\n";return 0;

@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/types.hpp"
 
 #include "g4_identity.hpp"
 #include <array>
@@ -45,6 +46,7 @@ struct ModelConfig {
     std::vector<LayerConfig> layer;
 };
 struct ModelManifest {
+    weight::WeightMap weights;
     std::string identity = arithmetic_id, model_hash, rope_hash, cache_dtype = "F32";
     ModelConfig config;
     std::vector<TensorRecord> tensors;

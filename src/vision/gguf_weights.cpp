@@ -69,16 +69,17 @@ gguf::FileInfo parse(const std::vector<std::byte>& bytes, const gguf::Limits& li
 }  // namespace
 
 GgufWeights::GgufWeights(const std::filesystem::path& path, const gguf::Limits& limits, const HostBudget& budget)
-    : bytes_(read_all(path, limits, budget)) {
-    info_ = parse(bytes_, limits);
+    : bytes_(std::make_shared<const std::vector<std::byte>>(read_all(path, limits, budget))) {
+    info_ = parse(*bytes_, limits);
     index();
 }
 
-GgufWeights::GgufWeights(gguf::FileInfo info, std::vector<std::byte> bytes) : info_(std::move(info)), bytes_(std::move(bytes)) {
+GgufWeights::GgufWeights(gguf::FileInfo info, std::vector<std::byte> bytes) : info_(std::move(info)), bytes_(std::make_shared<const std::vector<std::byte>>(std::move(bytes))) {
     index();
 }
 
 void GgufWeights::index() {
+    owner_ = weight::view_source(*bytes_,bytes_);
     for (std::size_t i = 0; i < info_.tensors.size(); ++i)
         if (!by_name_.emplace(info_.tensors[i].name, i).second)
             throw std::invalid_argument("vision weights: duplicate tensor " + info_.tensors[i].name);
@@ -98,7 +99,7 @@ Tensor GgufWeights::tensor(std::string_view name) {
         case 30: out.type = Tensor::Type::bf16; element = 2; break;
         default: throw std::invalid_argument("vision weights: tensor " + t.name + " has an unsupported storage type");
     }
-    if (t.dimensions.empty()) throw std::invalid_argument("vision weights: tensor " + t.name + " has no dimensions");
+    if (t.dimensions.empty() || t.dimensions.size() > 4) throw std::invalid_argument("vision weights: tensor " + t.name + " has unsupported rank");
     std::uint64_t rows = t.dimensions.back(), cols = 1;
     if (t.dimensions.size() == 1) {
         cols = 1;
@@ -110,10 +111,21 @@ Tensor GgufWeights::tensor(std::string_view name) {
         }
     }
     if (rows == 0 || cols == 0 || rows > std::numeric_limits<std::uint64_t>::max() / cols / element ||
-        rows * cols * element != t.byte_size || t.absolute_offset > bytes_.size() ||
-        t.byte_size > bytes_.size() - t.absolute_offset || t.absolute_offset % element != 0)
+        rows * cols * element != t.byte_size || t.absolute_offset > bytes_->size() ||
+        t.byte_size > bytes_->size() - t.absolute_offset || t.absolute_offset % element != 0)
         throw std::invalid_argument("vision weights: tensor " + t.name + " does not fit the file");
-    out.data = bytes_.data() + t.absolute_offset;
+    const auto& owner = owner_;
+    weight::TensorIndex index; index.container = weight::Container::gguf; index.owner = owner;
+    weight::RawTensor raw; raw.id = weight::tensor_id(*owner,t.name); raw.name = t.name; raw.wire_type = t.ggml_type;
+    raw.shape.rank = static_cast<std::uint8_t>(t.dimensions.size());
+    std::reverse_copy(t.dimensions.begin(), t.dimensions.end(), raw.shape.dims.begin()); raw.extents.assign(t.dimensions.rbegin(), t.dimensions.rend());
+    raw.payload = {owner,{t.absolute_offset,t.byte_size}}; index.tensors.push_back(raw);
+    weight::WeightMap admitted;
+    auto status = weight::bind_vision(index,admitted);
+    if (!status) throw std::invalid_argument("vision weight admission: " + status.detail);
+    if (std::none_of(weights_.begin(),weights_.end(),[&](const auto& e){ return e.binding.tensor == raw.id; }))
+        weights_.insert(weights_.end(),admitted.begin(),admitted.end());
+    out.data = bytes_->data() + t.absolute_offset;
     out.rows = static_cast<std::size_t>(rows);
     out.cols = static_cast<std::size_t>(cols);
     return out;

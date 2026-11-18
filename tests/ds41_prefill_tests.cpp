@@ -1,5 +1,5 @@
 #include "strix/ds41_prefill.hpp"
-#include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda/ds41_replay.hpp"
 #include "strix/ds41_memory_budget.hpp"
 #include "strix/ds41_state_transfer.hpp"
 
@@ -221,16 +221,135 @@ void test_state_transfer_framing() {
         if (mutation == 1U) bad.push_back(0);
         if (mutation == 2U) bad[0] ^= 1U;
         if (mutation == 3U) bad[12] = 2U;
-        if (mutation == 4U) std::fill_n(bad.begin() + 29, 8, 255U);  // vector length UINT64_MAX
+        if (mutation == 4U) std::fill_n(bad.begin() + 29, 8, std::uint8_t{255});  // vector length UINT64_MAX
         try { (void)plan_state_transfer_v1(bad); }
         catch (const std::invalid_argument&) { ++rejected; }
     }
     expect(rejected == 5U, "v2 framing rejects truncation, trailing bytes, history mismatch and overflowing lengths");
 }
 
+void test_moe_growth() {
+    using strix::ds41::try_grow_moe_scratch;
+    using strix::ds41::bounded_moe_window_rows;
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 0) == 6144,
+           "automatic pass growth remains enabled");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, false, 0) == 4096,
+           "explicit window (including default value) or S4 off forbids growth");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 2048) == 2048,
+           "scheduled slice caps scratch below base window");
+    expect(bounded_moe_window_rows(4096, 1024, 5800, 8192, true, 5000) == 5000,
+           "scheduled slice caps growth without rounding above executed rows");
+    struct Scratch {
+        std::uint32_t rows;
+        std::uint64_t bytes;
+        std::uint64_t& used;
+        Scratch(std::uint32_t r, std::uint64_t b, std::uint64_t& u)
+            : rows(r), bytes(b), used(u) { used += bytes; }
+        ~Scratch() { used -= bytes; }
+    };
+    const auto size = [](std::uint32_t rows) {
+        return strix::ds41::prefill_moe_layout(rows, 8, 128, 7168, 2048, 2048).bytes;
+    };
+    std::uint64_t used = 0;
+    auto scratch = std::make_unique<Scratch>(4096, size(4096), used);
+    const auto* original = scratch.get();
+    auto budget = used + size(6144) - 1U;
+    unsigned attempts = 0;
+    const auto allocate = [&] {
+        ++attempts;
+        if (size(6144) > budget - used) throw std::bad_alloc();
+        return std::make_unique<Scratch>(6144, size(6144), used);
+    };
+    expect(!try_grow_moe_scratch(scratch, size(6144), budget - used, allocate),
+           "growth refuses insufficient simultaneous headroom");
+    expect(attempts == 0 && scratch.get() == original && used == size(4096),
+           "refusal preserves old allocation without calling allocator");
+    // Headroom can disappear after the query; the allocator enforces the actual budget.
+    expect(!try_grow_moe_scratch(scratch, size(6144), size(6144), allocate),
+           "growth catches allocation failure after admission");
+    expect(attempts == 1 && scratch.get() == original && scratch->rows == 4096 && used == size(4096),
+           "allocation failure retains usable old window and scratch");
+    expect((5800U + scratch->rows - 1U) / scratch->rows == 2U,
+           "fallback still executes two windows");
+    budget = used + size(6144);
+    expect(try_grow_moe_scratch(scratch, size(6144), budget - used, allocate),
+           "growth succeeds with room for both allocations");
+    expect(attempts == 2 && scratch->rows == 6144 && used == size(6144),
+           "successful growth releases old allocation only after replacement");
+}
+
+void test_moe_schedule() {
+    using strix::ds41::moe_joint_layer;
+    using strix::ds41::moe_window_rows;
+    // 11,594 rows split 5,795 / 5,800: one window of 6,144 rows instead of two of 4,096; never below the configured window
+    expect(moe_window_rows(4096, 1024, 5800, 8192) == 6144U, "moe window: the pass rows in whole chunks");
+    expect(moe_window_rows(4096, 1024, 1476, 8192) == 4096U, "moe window: at least the configured window");
+    expect(moe_window_rows(4096, 1024, 0, 8192) == 4096U, "moe window: no rows keeps the configured window");
+    expect(moe_window_rows(4096, 1024, 16384, 8192) == 8192U, "moe window: at most the cap");
+    expect(moe_window_rows(4096, 1024, 16384, 1000) == 4096U, "moe window: a cap below the window keeps the window");
+    expect(moe_window_rows(4096, 1024, 9000, 9500) == 9216U, "moe window: the cap in whole chunks");
+    bool rejected = false;
+    try { (void)moe_window_rows(0, 1024, 10, 8192); } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "moe window rejects a zero window");
+    // joint by the layer's rows: symmetric in (peer, own), so both ranks take the same form
+    expect(moe_joint_layer(512, 512, 1024) && moe_joint_layer(700, 324, 1024) && moe_joint_layer(324, 700, 1024),
+           "joint layer: at most max_rows rows");
+    expect(!moe_joint_layer(606, 605, 1024) && !moe_joint_layer(0, 0, 0), "joint layer: above max_rows, or max_rows 0, never");
+}
+
+void test_bounded_plan() {
+    using strix::ds41::plan_bounded_replay;
+    const strix::ds41::SuffixReplayGeometry g;  // 40 layers, first decoder 20, window 128, draft 128 rows x 3 layers
+    for (const std::uint32_t R : {128U, 256U, 512U, 1024U}) {
+        for (const std::uint64_t T : {2952ULL, 11594ULL, 32768ULL}) {
+            const auto p = plan_bounded_replay(g, 0, T, R);
+            bool ok = p.layers.size() == 40U && p.encoder_output_begin == 0U && p.ring_rows == 0U;
+            for (const auto& l : p.layers) {
+                const std::uint64_t want = l.layer < 20U ? 0U : (T - R) / 256U * 256U;
+                ok = ok && l.out_begin == want && l.kv_begin == want;
+            }
+            ok = ok && p.replay_row_layers == T * 20U + (T - (T - R) / 256U * 256U) * 20U && p.full_row_layers == T * 40U;
+            expect(ok, "bounded plan: encoder every row, every decoder layer its fixed-floor suffix (R " + std::to_string(R) + ", T " + std::to_string(T) + ")");
+        }
+    }
+    // a prompt shorter than the bound: every row everywhere (the full prefill's rows, keys floored at 0)
+    const auto shortp = plan_bounded_replay(g, 0, 100, 128);
+    expect(shortp.layers[39].out_begin == 0U && shortp.layers[20].kv_begin == 0U, "bounded plan: a prompt within the bound runs every row");
+    strix::ds41::SuffixReplayGeometry gd = g;
+    gd.draft_rows = 512;
+    bool draft_rejected = false;
+    try { (void)plan_bounded_replay(gd, 0, 8192, 256); }
+    catch (const std::invalid_argument& e) {
+        const std::string message = e.what();
+        draft_rejected = message.find("draft_rows = 512") != std::string::npos && message.find("R = 256") != std::string::npos;
+    }
+    expect(draft_rejected, "bounded plan refuses oversized draft with both values");
+    for (const auto draft : {0U, 128U, 256U}) {
+        gd.draft_rows = draft;
+        const auto pd = plan_bounded_replay(gd, 0, 1001, 256);
+        for (const auto window_rows : {8U, 16U}) {
+            const auto floor = strix::ds41::bounded_replay_key_floor(1001, 256);
+            expect(floor == 512U && pd.layers[20].out_begin / window_rows * window_rows == floor &&
+                   pd.layers[39].kv_begin == floor && pd.layers[19].out_begin == 0U,
+                   "bounded plan accepts draft <= R with identical fixed floor for windows 8 and 16");
+        }
+    }
+    const auto p8 = plan_bounded_replay(g, 0, 8192, 128);
+    expect(p8.replay_row_layers - 8192U * 20U == 5'120U, "bounded 8K plan: fixed floor covers 256 rows per decoder");
+    std::uint32_t rejected = 0;
+    for (const std::uint32_t R : {0U, 100U, 200U}) {
+        try { (void)plan_bounded_replay(g, 0, 8192, R); } catch (const std::invalid_argument&) { ++rejected; }
+    }
+    try { (void)plan_bounded_replay(g, 8192, 8192, 128); } catch (const std::invalid_argument&) { ++rejected; }
+    expect(rejected == 4U, "bounded plan rejects a bound that is not a positive multiple of the window, and no new row");
+}
+
 int main() {
     test_routes();
     test_plan();
+    test_moe_schedule();
+    test_moe_growth();
+    test_bounded_plan();
     // Bounded replay must leave complete final rings, all requested head rows,
     // and the encoder/source-cache inputs. Exercise unaligned prompt lengths
     // and call sizes, as well as the 8K/32K qualification shapes.

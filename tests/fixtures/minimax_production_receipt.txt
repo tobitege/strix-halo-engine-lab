@@ -12,11 +12,14 @@
 # STRIX_MM_ATTEND_DIET, STRIX_MM_ATTEND4_DECODE.
 # Prefill items added with their own PAIR ABA receipts (fresh process per arm, state/final rows/tokens identical):
 # STRIX_MMX_PREFILL_GATHER_TOK, STRIX_MM_PF_DENSE_QKV, STRIX_MM_PF_ROUTER_ROWS, STRIX_MM_PF_MSA_SCRATCH_MB,
-# STRIX_MM_PF_DENSE_O, STRIX_MMX_PREFILL_TAIL_STREAM, STRIX_MMX_PREFILL_PIPE_PAIR.
+# STRIX_MM_PF_DENSE_O, STRIX_MMX_PREFILL_TAIL_STREAM, STRIX_MMX_PREFILL_PIPE_PAIR, STRIX_MMX_PREFILL_PIPE_TAIL.
 # Decode items added with their own PAIR ABA receipts (in-process matched replay, logits bitwise across rows/verify):
 # STRIX_MM_XB_WARM_O, STRIX_MMX_MOE_TIGHT_GRID, STRIX_MMX_MOE_PIPE, STRIX_MM_SELECT_ONCE (fresh process per arm at 32K).
 # Draft pack: dspark-exl3-K4fc-sh (scaled-Hessian requant of dspark-exl3-K4fc, same layout and keys); paired A B B A
 # against the previous pack: spec ids == plain greedy in 32/32 sessions, acceptance equal, tok/s within +-2 %.
+# Prefill order item with its own quality gate (6 x 32K units vs L0 nulls, task check; gate32b): STRIX_MMX_PF_ORDER.
+# Explicit-only row-group flash (mode 3) rows item STRIX_MM_PF_MSA_RG_ROWS=auto: inert here (flash modes 0/1/2 never read it);
+# listed so the plain invocation stays fully covered, not a measured receipt of mode 3.
 receipt rank
 argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc-sh --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
 plain $M 0 usb4-auto $OUT
@@ -47,15 +50,21 @@ env STRIX_MM_MARKOV_C=4096
 env STRIX_MM_MARKOV_H=8192
 env STRIX_MM_MARKOV_TOPC=v2
 env STRIX_MM_PF_MSA_BATCH=1
+env STRIX_MM_PF_FLASH_KEYS=2
+env STRIX_MM_PF_MSA_RG_ROWS=auto
+env STRIX_MM_PF_DENSE_MLP=1
+env STRIX_MM_PF_HEADLESS=1
 env STRIX_MM_PF_ATTEND4=1
 env STRIX_MM_PF_ROUTER_BATCH=1
 env STRIX_MMX_PREFILL_MTFIT=1
+env STRIX_MM_PF_MSA_Q16=1
 env STRIX_MM_PF_MSA_REWORK=10
 env STRIX_MM_PF_IDX_TILE=1
 env STRIX_MM_PF_IDX_ROWS=64
 env STRIX_MMX_PREFILL_PIPE=1
 env STRIX_MMX_PREFILL_GATHER_TOK=1
 env STRIX_MMX_PREFILL_TAIL_STREAM=1
+env STRIX_MMX_PREFILL_PIPE_TAIL=1
 env STRIX_MMX_PREFILL_PIPE_PAIR=auto
 env STRIX_MM_PF_DENSE_QKV=1
 env STRIX_MM_PF_ROUTER_ROWS=32
@@ -63,6 +72,7 @@ env STRIX_MM_PF_MSA_SCRATCH_MB=1152
 env STRIX_MM_PF_DENSE_O=1
 env STRIX_MM_PF_KV_TILE=auto
 env STRIX_MM_PF_TX_UNCACHED=1
+env STRIX_MMX_PF_ORDER=invariant
 env STRIX_DIST_CRC_PARALLEL=1
 env STRIX_DIST_HOST_CRC_OVERLAP=1
 env STRIX_DIST_HOST_CHUNK_BYTES=1048576
@@ -98,15 +108,21 @@ env STRIX_MM_MARKOV_C=4096
 env STRIX_MM_MARKOV_H=8192
 env STRIX_MM_MARKOV_TOPC=v2
 env STRIX_MM_PF_MSA_BATCH=1
+env STRIX_MM_PF_FLASH_KEYS=2
+env STRIX_MM_PF_MSA_RG_ROWS=auto
+env STRIX_MM_PF_DENSE_MLP=1
+env STRIX_MM_PF_HEADLESS=1
 env STRIX_MM_PF_ATTEND4=1
 env STRIX_MM_PF_ROUTER_BATCH=1
 env STRIX_MMX_PREFILL_MTFIT=1
+env STRIX_MM_PF_MSA_Q16=1
 env STRIX_MM_PF_MSA_REWORK=10
 env STRIX_MM_PF_IDX_TILE=1
 env STRIX_MM_PF_IDX_ROWS=64
 env STRIX_MMX_PREFILL_PIPE=1
 env STRIX_MMX_PREFILL_GATHER_TOK=1
 env STRIX_MMX_PREFILL_TAIL_STREAM=1
+env STRIX_MMX_PREFILL_PIPE_TAIL=1
 env STRIX_MMX_PREFILL_PIPE_PAIR=auto
 env STRIX_MM_PF_DENSE_QKV=1
 env STRIX_MM_PF_ROUTER_ROWS=32
@@ -114,6 +130,7 @@ env STRIX_MM_PF_MSA_SCRATCH_MB=1152
 env STRIX_MM_PF_DENSE_O=1
 env STRIX_MM_PF_KV_TILE=auto
 env STRIX_MM_PF_TX_UNCACHED=1
+env STRIX_MMX_PF_ORDER=invariant
 env STRIX_DIST_CRC_PARALLEL=1
 env STRIX_DIST_HOST_CRC_OVERLAP=1
 env STRIX_DIST_HOST_CHUNK_BYTES=1048576

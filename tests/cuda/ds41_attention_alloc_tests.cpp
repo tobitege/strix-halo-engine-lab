@@ -1,5 +1,5 @@
 // CPU-only allocation and ring-capacity contracts; no CUDA runtime or device needed.
-#include "strix/cuda_ds41_attention_alloc.hpp"
+#include "strix/cuda/ds41_attention_alloc.hpp"
 #include "strix/ds41_prefill.hpp"
 
 #include <cmath>

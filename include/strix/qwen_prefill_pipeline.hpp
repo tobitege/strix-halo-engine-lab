@@ -57,4 +57,17 @@ inline LayerRange parse_range(const char* value, std::uint32_t layers) {
         throw std::invalid_argument("STRIX_QWEN_PF_LAYER_RANGE is outside the model");
     return range;
 }
+// Interleaved virtual stages (PR-3, option C): the running (stage, chunk) step and its layers, set by the driver
+// around each cursor advance. Inactive: the process range (STRIX_QWEN_PF_LAYER_RANGE, the two-stage pair path).
+struct PipeStep {
+    bool active = false;
+    std::uint32_t stage = 0;
+    std::uint32_t stages = 0;
+    std::uint64_t chunk = 0;
+    LayerRange range;
+};
+inline PipeStep pipe_step;
+inline LayerRange step_or_process_range(const char* process_text, std::uint32_t layers) {
+    return pipe_step.active ? pipe_step.range : parse_range(process_text, layers);
+}
 } // namespace strix::qwen_pp

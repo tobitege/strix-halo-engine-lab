@@ -23,6 +23,15 @@ template <Operand O> __device__ __forceinline__ Frag frag_from_f32(const float* 
     __builtin_memcpy(reinterpret_cast<char*>(&f) + 16U, &hi, 16U);
     return f;
 }
+// The lo terms (to_operand2) of the same 16 FP32 values: frag_from_f32 + frag_lo_from_f32 = the two-term operand.
+template <Operand O> __device__ __forceinline__ Frag frag_lo_from_f32(const float* p) {
+    const float4* q = reinterpret_cast<const float4*>(p);
+    const U4 lo = pack8_lo<O>(q[0], q[1]), hi = pack8_lo<O>(q[2], q[3]);
+    Frag f;
+    __builtin_memcpy(&f, &lo, 16U);
+    __builtin_memcpy(reinterpret_cast<char*>(&f) + 16U, &hi, 16U);
+    return f;
+}
 // XOR-swizzled row-major tile of `pieces` 16-B pieces per row (idx-wmma's 128 x 128 key tile): row r's piece c at
 // r * pieces + (c ^ (r & 15)); a fragment read (16 rows, one piece each) and a row-per-lane write hit distinct banks.
 __host__ __device__ constexpr unsigned piece_slot(unsigned row, unsigned piece, unsigned pieces) { return row * pieces + (piece ^ (row & 15U)); }

@@ -59,3 +59,22 @@ PerfOpt on/off only on the same kernel.
   [USB4 controller recovery](engine/transport/usb4-controller-recovery.md).
 - DeepSeek transport and prefill exchange defaults: [production defaults](models/deepseek-v4.1/production-defaults.md),
   [long contexts on two nodes](models/deepseek-v4.1/long-context.md).
+
+## Prompt-state hand-off: one copy per owner
+
+When a prefill host hands a prompt's state to the pair, every family declares its state pieces once
+(`include/strix/pair/state_decls.hpp`: per-rank slices, shared bytes, stage-owned layers, replicated metadata) and the
+shared planner (`include/strix/pair/state_owners.hpp`) decides what crosses which link: shared pieces go once to rank 0,
+which relays them to rank 1 over the pair link with a hash check (`include/strix/pair/state_relay.hpp`). The prefill
+host's NIC is shared by both destinations, so a second copy costs its full wire time. At 32K on 1 GbE (measured with
+`scripts/bench/handoff/owners_probe.py`, ABAB, warm): GLM DSA once 12.38 -> 6.90 s (default), MiniMax index keys once
+5,033 -> 4,530 MB (`--ik-once` on the producer, opt-in; 8K 11.14 -> 10.04 s). The planner's prefix-first mode
+(`STRIX_HANDOFF_PREFIX_FIRST`, off) ships only the rows the ranks do not already hold, once a family has the
+prompt-length row invariance receipt. Switches: `STRIX_HANDOFF_SHARED_ONCE` / the family's flag, recorded by
+`--print-effective-config`.
+
+Planner times are optimistic wire bounds assuming perfect host/relay overlap; GLM currently stages the host payload
+before relaying. They are not completion latency or native model/state qualification. Live family transfer layouts
+are not yet driven by the declarations, and prefix transfer is unbound; no shipped family declares row invariance.
+DS41's declaration estimates tensor/token capacity; `ds41_serialized_bytes` uses the actual vectors and serializer
+layout for traffic, including framing and short or absent top-k data.

@@ -1,0 +1,64 @@
+Here is weather.py. Rename the function `summarise` to `summarise_by_station` everywhere, make `mean` raise ValueError on an empty input instead of returning 0.0, and return the complete updated file in one code block, with no other text.
+
+```python
+import csv
+import sys
+from dataclasses import dataclass
+
+
+@dataclass
+class Reading:
+    station: str
+    day: str
+    temp_c: float
+    rain_mm: float
+
+
+def load_readings(path):
+    readings = []
+    with open(path, newline="") as handle:
+        for row in csv.DictReader(handle):
+            readings.append(Reading(row["station"], row["day"], float(row["temp_c"]), float(row["rain_mm"])))
+    return readings
+
+
+def mean(values):
+    values = list(values)
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def summarise(readings):
+    by_station = {}
+    for reading in readings:
+        by_station.setdefault(reading.station, []).append(reading)
+    summary = {}
+    for station, items in sorted(by_station.items()):
+        summary[station] = {
+            "days": len(items),
+            "mean_temp_c": round(mean(item.temp_c for item in items), 2),
+            "total_rain_mm": round(sum(item.rain_mm for item in items), 1),
+            "wettest_day": max(items, key=lambda item: item.rain_mm).day,
+        }
+    return summary
+
+
+def print_report(summary, out=sys.stdout):
+    for station, stats in summary.items():
+        out.write("%-12s days=%3d mean=%6.2f C rain=%7.1f mm wettest=%s
+" % (
+            station, stats["days"], stats["mean_temp_c"], stats["total_rain_mm"], stats["wettest_day"]))
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: weather.py FILE.csv", file=sys.stderr)
+        return 2
+    print_report(summarise(load_readings(argv[1])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+```

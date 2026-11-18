@@ -148,6 +148,10 @@ bool GenerationTicket::publish(std::span<const std::uint32_t> tokens) {
     {
         const std::lock_guard lock(mutex_);
         if (!tokens.empty() && progress_.phase == GenerationPhase::prefill) progress_.phase = GenerationPhase::decode;
+        if (trace_emissions_ && !tokens.empty()) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now().time_since_epoch()).count();
+            token_emissions_.push_back({ns, static_cast<std::uint64_t>(tokens.size())});
+        }
         pending_.insert(pending_.end(), tokens.begin(), tokens.end());
         changed_.notify_all();
     }
@@ -156,6 +160,8 @@ bool GenerationTicket::publish(std::span<const std::uint32_t> tokens) {
 
 void GenerationTicket::finish(GenerationStats stats, std::string error) {
     const std::lock_guard lock(mutex_);
+    stats.emission_trace = trace_emissions_;
+    stats.token_emissions = std::move(token_emissions_);
     stats_ = std::move(stats);
     error_ = std::move(error);
     done_ = true;
@@ -167,6 +173,7 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     const std::lock_guard lock(mutex_);
     if (stopping_ || draining_ || entries_.size() >= max_queued_) return nullptr;
     ticket->output_ = job.output;
+    ticket->trace_emissions_ = job.trace_emissions;
     ticket->submitted_queue_position_ = entries_.size();
     ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
@@ -530,6 +537,16 @@ bool GenerationQueue::has_waiting(const std::function<bool(const GenerationJob&,
 #endif
         return !e.ticket->cancelled() && eligible(e.job, e.submitted);
     });
+}
+void GenerationQueue::visit_waiting(std::size_t max,
+    const std::function<bool(const GenerationJob&, const std::shared_ptr<GenerationTicket>&)>& visit) const {
+    std::lock_guard lock(mutex_);
+    for (const auto& e : entries_) {
+        if (!max) return;
+        if (e.ticket->cancelled()) continue;
+        --max;
+        if (!visit(e.job, e.ticket)) return;
+    }
 }
 
 bool GenerationQueue::has_queued_work() const {

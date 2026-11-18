@@ -5,6 +5,7 @@
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/lookup/index.hpp"
+#include "strix/spec/drafting.hpp"
 
 #include <array>
 #include <chrono>
@@ -78,7 +79,7 @@ struct BatchSpecStats {
     double lookup_seconds = 0.0;  // host time of the lookup indexes, queries and scoring
     double draft_seconds = 0.0, step_seconds = 0.0, finish_seconds = 0.0, plan_seconds = 0.0;
     double decode_seconds = 0.0;  // wall of the decode-only steps (plan + drafts + step + finish)
-    std::array<std::uint64_t, ds41::dspark::block_size + 2U> window_rows{};  // windows by rows (1 = plain row)
+    std::array<std::uint64_t, BatchForward::max_rows + 1U> window_rows{};  // windows by rows (1 = plain row; lookup copy windows up to 8)
     std::array<std::uint64_t, ds41::dspark::block_size> reached{}, hit{};    // per depth: verified after j correct, correct
 };
 
@@ -257,6 +258,9 @@ private:
     // estimated rate (posterior-mean survival; tokens per priced step time, rows only) beats the mean rate of the request's alternative
     // (its DSpark windows, once measured, or a plain row) by STRIX_DS41_LOOKUP_MARGIN
     static constexpr std::uint32_t lookup_buckets = 5;
+    // lookup (copy) windows may verify more drafts than the DSpark block: STRIX_DS41_COPY_ROWS = 6 (today) | 8 rows (one
+    // request's maximum segment, BatchForward::max_rows); DSpark windows stay at block_size + 1
+    static constexpr std::uint32_t max_copy_drafts = BatchForward::max_rows - 1U;
     struct Moments {  // decayed tokens and rows per window (priced at the current costs when compared)
         double n = 0.0, sum = 0.0, rows = 0.0;
         void add(double tokens, double window_rows);
@@ -269,13 +273,18 @@ private:
         std::uint64_t next_position = 0;              // stream position of the next committed token
         struct Pending {
             std::uint64_t first = 0;
-            std::array<std::uint32_t, ds41::dspark::block_size> token{};
+            std::array<std::uint32_t, max_copy_drafts> token{};
             std::uint32_t count = 0, done = 0, bucket = 0;
         };
         std::vector<Pending> pending;
-        std::array<std::array<double, ds41::dspark::block_size>, lookup_buckets> eligible{}, accepted{};
+        std::array<std::array<double, max_copy_drafts>, lookup_buckets> eligible{}, accepted{};
         std::array<double, lookup_buckets> evidence{};
         Moments dspark;  // the request's DSpark windows
+        // STRIX_DS41_SPEC_ARBITER=1, one decoding request: the shared source arbiter (src/spec/drafting.cpp) over a copy
+        // cursor proposer prices lookup against the request's measured DSpark rate instead of the per-depth rate above
+        std::unique_ptr<strix::spec::ContextProposer> proposer;
+        std::unique_ptr<strix::spec::Arbiter> arbiter;
+        strix::spec::Proposal proposal;  // this plan's proposal (token storage reused)
     };
     bool lookup_on_ = false;
     double lookup_margin_ = 1.0;
@@ -284,13 +293,20 @@ private:
     std::vector<bool> lookup_;  // per owner (index into seqs): its window came from prompt lookup
     std::vector<std::uint32_t> lookup_cap_;  // per owner: the drafts of its lookup window (executed as chosen)
     std::uint32_t lookup_mask_ = 0, lookup_mask_follow_ = 0;  // see lookup_window_slots()
+    std::uint32_t copy_drafts_ = ds41::dspark::block_size;  // lookup drafts per window (STRIX_DS41_COPY_ROWS - 1)
+    bool arbiter_on_ = false;                               // STRIX_DS41_SPEC_ARBITER
+    // per owner: the arbiter's decision this plan (arbiter_used_: decided by the arbiter; observed in finish())
+    std::vector<bool> arbiter_used_;
+    std::vector<strix::spec::Decision> arbiter_decision_;
+    double planned_draft_ms_ = 0.0;  // a lone decoding request's draft wall this plan (ms)
+    std::vector<std::array<std::uint32_t, max_copy_drafts + 1U>> looked_tokens_;  // per owner: a lookup window's row tokens
     // STRIX_DS41_LOOKUP_LOG=1 (diagnostic, rank 0): per decoding request and step, the lookup candidate, its predicted
     // rate against the alternative and what ran (stderr "dspark lookup:" lines), for calibration and agreement studies
     struct LookupTrace {
         bool candidate = false;
         std::uint32_t length = 0, bucket = 0, available = 0, cap = 0;
         double rate = 0.0, alternative = 0.0;
-        std::array<std::uint32_t, ds41::dspark::block_size> token{};
+        std::array<std::uint32_t, max_copy_drafts> token{};
     };
     bool lookup_log_ = false;
     std::vector<LookupTrace> lookup_trace_;  // per owner

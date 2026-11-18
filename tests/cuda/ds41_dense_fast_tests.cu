@@ -3,10 +3,10 @@
 // mixes, norm with the collapse and A8), on synthetic data with model-like scales.
 // With --bench: device ms of the sites at 2K / 8K / 32K rows (exact vs fast).
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_dense_fast.hpp"
-#include "strix/cuda_ds41_prefill_q8.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_dense_fast.hpp"
+#include "strix/cuda/ds41_prefill_q8.hpp"
 
 #include <algorithm>
 #include <cmath>

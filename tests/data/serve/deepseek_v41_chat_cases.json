@@ -372,5 +372,205 @@
   "reasoning_effort": null,
   "preserve_thinking": false,
   "expected": "<｜begin▁of▁sentence｜><｜User｜>part one\n\npart two<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "第一张图"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "有什么内容？"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜User｜>第一张图\n\n<｜deepseek_image｜>\n\n有什么内容？<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "第一张图"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "有什么内容？"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": true,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>第一张图\n\n<｜deepseek_image｜>\n\n有什么内容？<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Describe this image."
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜User｜>Describe this image.\n\n<｜deepseek_image｜><｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Describe this image."
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": true,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Describe this image.\n\n<｜deepseek_image｜><｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "Describe this image."
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nDescribe this image.<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "Describe this image."
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": true,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜><｜deepseek_image｜>\n\nDescribe this image.<｜Assistant｜><think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Compare"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "which one is brighter?"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜User｜>Compare\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜>\n\nwhich one is brighter?<｜Assistant｜></think>"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Compare"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "<｜deepseek_image｜>"
+     },
+     {
+      "type": "text",
+      "text": "which one is brighter?"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": true,
+  "reasoning_effort": null,
+  "preserve_thinking": false,
+  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Compare\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜>\n\nwhich one is brighter?<｜Assistant｜><think>"
  }
 ]

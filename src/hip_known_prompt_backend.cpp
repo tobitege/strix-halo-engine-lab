@@ -203,7 +203,8 @@ struct HipKnownPromptBackend::Impl {
                 session.committed_tokens != committed_before + rows || result.logits.size()!=result.logit_row_indices.size())
                 throw std::logic_error("known prompt native window did not commit its configured causal rows");
             // pair prefill stage A (rank 0, layers 0-23) has no LM head: no logits and no output mapping to check
-            const bool pp_stage_a=qwen_pp::pipe_context.pipe&&qwen_pp::pipe_context.rank==0U;
+            const bool pp_stage_a=(qwen_pp::pipe_context.pipe&&qwen_pp::pipe_context.rank==0U)||
+                (qwen_pp::pipe_step.active&&qwen_pp::pipe_step.stage+1U<qwen_pp::pipe_step.stages); // PR-3: any stage before the last
             std::size_t outputs=0U;
             for(std::uint32_t r=0;r<rows&&!headless&&!pp_stage_a;++r)if(known_window_produces_logits(policy,r,rows)) {
                 if(outputs>=result.logit_row_indices.size()||result.logit_row_indices[outputs]!=r)

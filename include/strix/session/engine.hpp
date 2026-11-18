@@ -139,6 +139,9 @@ struct Capabilities {
     bool pair = false;
     bool prefix_cache = false;
     bool batch_prefill = false;
+    // A prompt's prefill can pause at a layer boundary of its current piece (session/prefill_session.hpp LayerUnits):
+    // a long prompt under load is cut by layers instead of by token chunks.
+    bool prefill_units = false;
     bool batch_decode = false;
     bool speculative = false;
     bool temperature = false;

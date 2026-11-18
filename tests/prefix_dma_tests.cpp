@@ -8,6 +8,11 @@
 #include <deque>
 #include <map>
 #include <iostream>
+#ifdef _WIN32
+#include <stdlib.h>
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char* name) { return _putenv_s(name, ""); }
+#endif
 
 extern thread_local bool prefix_test_fail_host_allocations;
 

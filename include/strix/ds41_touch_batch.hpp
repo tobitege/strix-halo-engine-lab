@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/lever_cache.hpp"
+
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -17,11 +19,11 @@ inline void set_touch_batch(int mode) { touch_batch_override().store(mode, std::
 inline bool touch_batch() {
     const int mode = touch_batch_override().load(std::memory_order_relaxed);
     if (mode >= 0) return mode != 0;
-    static const bool env = [] {
+    static ::strix::lever_cache<bool> env{[] {
         const char* v = std::getenv("STRIX_DS41_TOUCH_BATCH");
         return !(v != nullptr && std::strcmp(v, "0") == 0);
-    }();
-    return env;
+    }};
+    return env.get();
 }
 
 }  // namespace strix::ds41

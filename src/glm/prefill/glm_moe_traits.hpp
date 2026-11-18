@@ -26,6 +26,7 @@ struct MoeTraits : MoePolicy {
     static constexpr unsigned kE = kMoeExperts, kTop = kMoeTop, kH = kMoeHidden, kI = kMoeInter;
     static constexpr unsigned kHB = kH / 128, kIB = kI / 128;
     template <int Bits> using WeightDecode = strix::moe_core::Exl3Trellis<Bits>;
+    template <int Bits> using WeightSource = strix::weight::hip::LegacyMul1Source<static_cast<unsigned>(Bits)>;
     template <int Bits> using Norm = typename WeightDecode<Bits>::Norm;
     template <typename T> using Glob = const __attribute__((address_space(1))) T*;
 // One grouped work item: one expert matrix over its group's rows.
@@ -61,6 +62,9 @@ static __device__ __forceinline__ void finish_block(const float* row, unsigned b
     hadamard128(v, lane);
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] = v[j] * half_bits(svh[b * 128 + lane + 32U * static_cast<unsigned>(j)]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+    for (int j = 0; j < 4; ++j) strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisFinish, v[j]);
+#endif
 }
 static __device__ __forceinline__ float swiglu_r15(float g, float u) {
     const float gg = g > kClamp ? kClamp : g;

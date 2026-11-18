@@ -6,18 +6,30 @@
 #include <thread>
 
 namespace {
-struct Receipt { std::uint64_t hash, tokens; };
+struct Receipt { std::uint64_t hash, tokens; StepProfile profile; };
 
 // Same threading arrangement as --transport emulate: rank 1 on a peer thread,
 // rank 0 on the caller. Each invocation owns its checksum and publishes a copy.
 Receipt run_rank(std::barrier<>& round, bool divergent) {
     StepTokenDigest step_tokens;
+    StepProfile step_profile;
+    strix::deepseek41::BatchStepStats stats;
+    stats.rows = divergent ? 16U : 7U;
+    stats.seconds = divergent ? 2.0 : 1.0;
+    stats.exchange_seconds = 0.5;
+    stats.engram_seconds = 0.25;
+    stats.engram_wait_seconds = 0.125;
+    stats.union_experts = {2U, 3U};
+    stats.expert_bytes = divergent ? 512U : 256U;
     for (unsigned i = 0; i < 1000U; ++i) {
         round.arrive_and_wait();
         if (divergent) step_tokens.add(std::array<std::uint32_t, 3>{7U, 8U, 9U});
         else step_tokens.add(std::array<std::uint32_t, 2>{1U, 2U});
+        step_profile.add(stats);
     }
-    return {step_tokens.hash, step_tokens.tokens};
+    stats.rows = 17U;  // outside the extended bin range
+    step_profile.add(stats);
+    return {step_tokens.hash, step_tokens.tokens, step_profile};
 }
 
 bool pair(bool divergent) {
@@ -32,7 +44,18 @@ bool pair(bool divergent) {
         if (divergent) expected1.add(std::array<std::uint32_t, 3>{7U, 8U, 9U});
         else expected1.add(std::array<std::uint32_t, 2>{1U, 2U});
     }
-    return caller.tokens == 2000U && peer.tokens == (divergent ? 3000U : 2000U) &&
+    const auto valid_profile = [](const StepProfile& profile, bool different) {
+        for (std::size_t r = 0; r < profile.bins.size(); ++r) {
+            const auto& b = profile.bins[r];
+            if (r != (different ? 16U : 7U)) { if (b.steps != 0U) return false; continue; }
+            if (b.steps != 1000U || b.seconds != (different ? 2000.0 : 1000.0) ||
+                b.exchange != 500.0 || b.engram_read != 250.0 || b.engram_wait != 125.0 ||
+                b.unions != 5000U || b.layers != 2000U || b.expert_bytes != (different ? 512000U : 256000U)) return false;
+        }
+        return true;
+    };
+    return valid_profile(caller.profile, false) && valid_profile(peer.profile, divergent) &&
+           caller.tokens == 2000U && peer.tokens == (divergent ? 3000U : 2000U) &&
            caller.hash == expected0.hash && peer.hash == expected1.hash &&
            ((caller.hash != peer.hash) == divergent);
 }

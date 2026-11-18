@@ -8,6 +8,7 @@
 #include "xport/borrowed_transport.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "strix/minimax/session_startup.hpp"
+#include "strix/serve/startup_phases.hpp"
 #include <csignal>
 #include <cstring>
 #include <cstdio>
@@ -27,7 +28,6 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // Signal storage outlives every Lead and transport; no monitor thread.
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
-void default_env(const char* name, const char* value) { (void)::setenv(name,value,0); }
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, std::string& receipt,
     std::unique_ptr<strix::dist::DeviceExchange>& gpu_direct) {
     // transport_capabilities 0 preserves the serving capability contract.
@@ -61,6 +61,7 @@ class NativeAssets final : public ServiceAssets {
 public:
     explicit NativeAssets(const ServePreparation& p) : settings(p) {
         try {
+        sv::StartupPhases phases;
         mm::Options opt{p.opt.model_dir,p.opt.rank,p.opt.slots,p.opt.capacity,p.opt.max_rows};
         const auto& transport_spec=p.transport_spec;
         const auto& dspark_dir=p.dspark_dir; const auto& dspark_exl3=p.dspark_exl3;
@@ -82,12 +83,7 @@ public:
         strix::minimax::defaults::Cli cli;cli.app="serve";cli.transport=transport_spec;
         cli.slots=opt.slots;cli.capacity=opt.capacity;cli.max_rows=opt.max_rows;
         strix::minimax::defaults::SessionConfig session_config;
-        default_env("STRIX_DIST_USB4_TIMEOUT_MS","60000");
-        default_env("STRIX_DIST_WAIT_TIMEOUT_MS","60000");
-        default_env("STRIX_DIST_CRC_PARALLEL","1");
-        default_env("STRIX_DIST_HOST_CRC_OVERLAP","1");
-        default_env("STRIX_DIST_HOST_CHUNK_BYTES","1048576");
-        default_env("STRIX_MMX_CRC","deferred");
+        strix::minimax::defaults::apply_host_defaults("serve");  // the one host-path table, serving column
         g_stop.store(false);
         std::signal(SIGINT,on_signal); std::signal(SIGTERM,on_signal);
         std::string receipt;
@@ -126,10 +122,17 @@ public:
         if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
         std::printf("connected: rank %u transport %s\n", opt.rank, comm.transport_name().c_str());
         std::fflush(stdout);
+        phases.mark("transport");
+        // The drafter file is host-only and independent of the target weights: read it beside the weight load.
+        const bool draft_overlap = !dspark_dir.empty() && sv::startup_overlap_enabled();
+        auto draft_read = sv::startup_overlap([&]() -> std::unique_ptr<ds::DraftFile> {
+            return dspark_dir.empty() ? nullptr : ds::DraftFile::open(dspark_dir, dspark_exl3.empty());
+        }, draft_overlap);
         engine_owner = std::make_unique<mm::Engine>(opt, comm);
         auto& eng = *engine_owner;
         if (exchanger) eng.set_exchanger(exchanger.get(), true);
         const auto lr = eng.load();
+        phases.mark("weights");
         const std::uint32_t dspark_config = 0x4d4d0400U | (static_cast<std::uint32_t>(dspark_prior) << 7) | (static_cast<std::uint32_t>(dspark_mode) << 5) |
                                             (dspark_dir.empty() ? 0U : 16U) | dspark_inflight;
         if (eng.peer(dspark_config) != dspark_config) {
@@ -141,14 +144,19 @@ public:
             const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
             std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
         } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
+        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
+            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
         std::printf("rank %u: load %.1f s, device used %.1f GiB\n", opt.rank, lr.seconds, lr.device_gib);
         std::fflush(stdout);
+        phases.mark("peer-agree");
         // DSpark drafter on both ranks (both run every draft command; the target's residual taps are replicated)
         runner_owner = std::make_unique<Runner>(eng, comm);
         auto& run = *runner_owner;
         if (!dspark_dir.empty()) {
             const auto t0 = Clock::now();
-            draft_file = ds::DraftFile::open(dspark_dir, dspark_exl3.empty());
+            draft_file = draft_read.get();
+            phases.mark(draft_overlap ? "drafter-read-join" : "drafter-read");
             ds::DeviceDrafter::Options dopt;
             dopt.slots = opt.slots;
             dopt.capacity = opt.capacity;
@@ -163,6 +171,7 @@ public:
                         static_cast<double>(drafter->weight_bytes()) / 1e9, static_cast<double>(drafter->ring_bytes()) / 1e6, opt.slots);
             std::fflush(stdout);
         }
+        phases.mark("drafter-device");
         (void)eng.reserve_nested(drafter != nullptr);
         // A protocol/capacity handshake before any check or READY, independent of rank-1 environment policy.
         const auto peer_capacity = eng.peer(eng.nested_rows());
@@ -170,6 +179,7 @@ public:
             eng.abort("nested capacity mismatch");
             throw std::runtime_error("nested capacity mismatch");
         }
+        phases.mark("nested+peer");
         const bool session_cli = !session_options.prompt.empty() || !session_options.load.empty();
         try { session_config = strix::minimax::defaults::session_policy(cli, lookup, session_cli); }
         catch (const std::exception& e) { session_config.enabled = false; session_config.reason = e.what(); }
@@ -243,6 +253,7 @@ public:
         } else {
             std::fprintf(stderr, "session cache: off (%s)\n", session_config.reason.c_str());
         }
+        phases.mark("session");
         if (session_runtime && session_cli) {
             strix::minimax::session::run_cli(*session_runtime,session_options); exit_code = 0; return;
         }
@@ -261,6 +272,8 @@ public:
         const bool dspark_on = drafter != nullptr && dspark_mode == ds::Mode::on;
         if (drafter != nullptr) eng.set_taps(dspark_on);
         if (opt.rank != 0) {
+            std::printf("%s\n", phases.line("rank 1").c_str());
+            std::fflush(stdout);
             return;
         }
         {
@@ -318,6 +331,9 @@ public:
         lead_owner=make_lead<mm::Engine,Runner>(eng,run,opt.max_rows,dspark_on,g_stop,
             [tok](const std::vector<std::uint32_t>& ids){return tok->decode(ids,true);},
             session_runtime ? &sessions : nullptr);
+        phases.mark("tokenizer+lead");
+        std::printf("%s\n", phases.line("rank 0").c_str());
+        std::fflush(stdout);
         } catch (...) { fail(); throw; }
     }
     ~NativeAssets() override { close(); }

@@ -36,6 +36,8 @@ public:
         for (auto& [k, p] : experts_) (void)hipFree(p);
     }
     bool publishes() const override { return true; }
+    // Split-producer chunk frames: the default down_kernel only (not the pipe path, not stored INT4, not the R1 core path).
+    bool publishes_split(const MoeLayerWeights& w) const override { return !w.i4.on() && !M::pipe_enabled(); }
     void forward(const MoeLayerWeights& w, const CallCtx& c, const float* x, const std::uint32_t* ids, const float* wts,
                  float* y) override {
         const auto R = static_cast<unsigned>(c.rows.size());
@@ -50,6 +52,12 @@ public:
         v.out = y;
         v.ws = ws_;
         v.publish = c.publish;
+        if (c.split_cols != 0) {  // SplitLayout{R, 4096, split_cols}: the down projection in two column-group halves
+            if (c.split_cols != M::kHidden / 2 || !publishes_split(w)) throw std::logic_error("fast MoE: split down on a path that cannot split");
+            const M::MoeSplit sp{c.publish_tail, y + static_cast<std::size_t>(R) * c.split_cols, c.split_mid, c.split_mid_ctx};
+            M::enqueue_experts_split(v, c.stream, sp);
+            return;
+        }
         if (w.i4.on()) {  // stored routed INT4: W4A16 for every row regime
             for (unsigned m = 0; m < 3; ++m) {
                 v.i4.wq[m] = w.i4.wq[m];

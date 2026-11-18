@@ -45,7 +45,10 @@ model/state assets, profile and rank/transport arguments:
 `--deploy auto` searches the provider's supported choices. `--deploy FILE` constrains
 that search with a TOML file. `--deploy-check` prints the plan and exits before
 weight payload loading, device-owner construction or pair connection; metadata
-must still be readable. Pair inspection therefore needs measured peer inventory.
+must still be readable. The startup device gate still admits and binds a device;
+`--devices` / `--device-id` retain their normal admission checks. Device-free
+inspection requires integration with the validated engine parser's launch mode.
+Pair inspection therefore needs measured peer inventory.
 Inspect `refused`, `refusal`, candidate reasons, `requested`, `chosen` and each
 rank's budget. A refused plan must not be launched. Remove `--deploy-check` to
 execute an admitted configuration, keeping the same launch arguments.
@@ -201,7 +204,10 @@ prefill = "exl3"
 
 Use the transport spelling accepted by the selected engine. Keep one process per
 rank for TP2 and retain the engine's normal peer/transport launch configuration.
-For offline inspection, append one `[[devices]]` table per node. Supply all six
+For measured inspection inventory, add the root key `devices = [{...}, {...}]`
+before the first table header (`[hardware]` in these examples), never after
+`[format]`. Use one inline table per node in rank order (the parser's TOML subset
+has no `[[devices]]` array tables). Supply all six
 fields: `gfx_target` (string), `cu_count` (integer), `mem_total_bytes` and
 `mem_free_bytes` (integers), `unified` (boolean), and `source` (nonempty string
 describing measurement provenance). Copy actual observations; do not duplicate
@@ -267,3 +273,42 @@ describe executed API policies; deployment describes placement and budgets.
 For individual controls and off switches, see [toggles](toggles.md). Keep model,
 profile, context, slots and numerical identity fixed when validating a change;
 compare complete token IDs and logits/state, then measure the complete workload.
+
+## Placing one prefill across devices
+
+The device declaration states what connects the units. One line per device sets the link model:
+
+```toml
+[devices.node-a]
+vendor = "amd"
+pci = "0000:c3:00.0"
+roles = ["pair", "decode", "prefill"]
+attach = { kind = "remote", link = "2.5gbe" }   # classes: 1gbe 2.5gbe 5gbe 10gbe 25gbe usb4 usb4-gen2
+                                                #          pcie3x4 pcie4x4 oculink4x4 pcie4x16 pcie5x16
+[links.pair]                                    # a cable between two declared devices
+between = ["node-a", "node-b"]
+class = "usb4"
+```
+
+A class gives nominal rates with a wide uncertainty; `gbps_measured` (useful Gbit/s) and `rtt_us_measured` replace
+them. Remote devices of one machine share its network port (`port`) unless declared otherwise. A role that needs a
+measured rate (`prefill` on a remote device) is still refused until the probe is declared.
+
+`strix::deploy::plan_route` (include/strix/deploy/route.hpp) is an unbound shared host planner; production CLI/server
+callers and model adapters have not been added. From the
+declaration, its link graph and measured stage costs (`strix-stage-costs-v1`: unit, arithmetic identity, prompt
+length, block size, total and fixed ms, optional per-layer work, spread, warm/cold, receipt) it lists every route
+the model announces: prefill where it decodes, prefill elsewhere and hand the state off, or a layer split in blocks
+with the cuts balanced from the measured rates. Each option carries its stages and layer ranges, block size, bytes
+per link, identity, predicted time with uncertainty, rate, memory per rank (through the model's FootprintProvider)
+and the reason it was refused. Unknown memory, an unmeasured import cost, a link without rate or class, or a route
+without a gate receipt is reported and never selected. The objective is `ttft` or `throughput`; a pin forces one
+option or fails with its reason. `contrast()` compares the prediction with receipts and flags misses above 30 %.
+
+Warm-receipt preference, borrowed layer work, extrapolation and pipeline throughput are modelling assumptions.
+Synthetic host tests and a nonempty gate string do not qualify native performance or numerical execution.
+Before production binding, adapters must define the mapping from protocol/cost arithmetic identities to footprint
+formats; choosing the first matching advertised format is currently only a synthetic planning convention.
+Search limits refuse the whole plan: 100,000 search steps, 4,096 layers/cost entries, 256 devices, 128 protocols,
+and 64 stages/chunks per protocol. An off-chain decoder is recorded as a zero-prefill-range stage with full-model
+rank budgets. Overlapping units have no shared-ownership contract and cannot form a handoff.

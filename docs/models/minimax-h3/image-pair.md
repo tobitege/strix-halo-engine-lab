@@ -6,6 +6,9 @@ compilation, fidelity, deterministic replay and performance qualification are pe
 
 ## Select a regime
 
+Weights are not published by us: `--model` takes the [`Comfy-Org/MiniMax-H3-Image@0bb149f5`](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/0bb149f51e3156ed4b90dd45d5620346bfe1df8f) layout
+(`diffusion_models/`, `vae/`); its licence grants use only outside the EU, UK, Republic of Korea and USA.
+
 Run one process per node, with identical binary, model assets, prompt, references,
 seed and numerical flags. Use separate output directories on shared storage.
 

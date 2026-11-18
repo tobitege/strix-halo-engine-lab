@@ -1,4 +1,5 @@
 #include "xport/transport_backend.hpp"
+#include "strix/pinned_host.hpp"
 // The GLM exchange module behind the engine's Exchange seam (see glm_xfer_exchange.hpp).
 #include "glm_xfer_exchange.hpp"
 #include "glm_post_exchange.hpp"
@@ -90,11 +91,11 @@ SeqparExchange::Side::Side(unsigned max_rows, unsigned compute_streams) : stream
         ok(hipEventCreateWithFlags(&column, hipEventDisableTiming), "seqpar column handoff");
         // The transport writes peer rows straight into this consumer buffer.
         // Ordinary hipMalloc storage is not assumed host-coherent or CPU writable.
-        ok(hipHostMalloc(reinterpret_cast<void**>(&normalized_host), GlmSchedule::row_bytes(max_rows),
+        ok(strix::host_pin::allocate(reinterpret_cast<void**>(&normalized_host), GlmSchedule::row_bytes(max_rows),
                          hipHostMallocMapped | hipHostMallocCoherent), "seqpar normalized buffer");
         ok(hipHostGetDevicePointer(reinterpret_cast<void**>(&normalized_dev), normalized_host, 0), "seqpar normalized alias");
     } catch (...) {
-        if (normalized_host) (void)hipHostFree(normalized_host);
+        if (normalized_host) (void)strix::host_pin::release(normalized_host);
         if (column) (void)hipEventDestroy(column);
         for (auto e : consumed) if (e) (void)hipEventDestroy(e);
         for (auto e : ready) if (e) (void)hipEventDestroy(e);
@@ -110,7 +111,7 @@ SeqparExchange::Side::~Side() {
     // normal execution joins and synchronizes the compute queues before exit.
     for (auto s : compute) if (s) (void)hipStreamSynchronize(s);
     if (stream) (void)hipStreamSynchronize(stream);
-    if (normalized_host) (void)hipHostFree(normalized_host);
+    if (normalized_host) (void)strix::host_pin::release(normalized_host);
     if (column) (void)hipEventDestroy(column);
     for (auto e : consumed) if (e) (void)hipEventDestroy(e);
     for (auto e : ready) if (e) (void)hipEventDestroy(e);
@@ -299,6 +300,24 @@ XferExchange::ProducerSlot XferExchange::producer_slot(unsigned rows, hipStream_
     return {data, {t.flag, t.counter, t.sequence}};
 }
 
+XferExchange::SplitSlot XferExchange::producer_slot_split(unsigned rows, unsigned head_cols, hipStream_t s) {
+    if (rows < 2 || rows > max_rows_ || head_cols == 0 || head_cols >= 4096U || !kwait_ || use_bracket_) return {};
+    Exchanger& x = ensure(s);
+    const auto h = x.head_target();
+    const auto t = x.producer_target();
+    auto* data = static_cast<float*>(x.tx());
+    produced_ = data;
+    split_cols_ = head_cols;
+    return {data, {h.flag, h.counter, h.sequence}, {t.flag, t.counter, t.sequence}};
+}
+
+// Host call between the head producer's launch and the tail producer's launch: the head (rows x head_cols floats) is
+// published by its producer's last block; the progress thread moves it while the tail is computed.
+void XferExchange::split_head(unsigned rows, unsigned head_cols) {
+    if (xf_ == nullptr || split_cols_ != head_cols) throw std::logic_error("glm xfer exchange: split_head without producer_slot_split");
+    xf_->split_head(std::size_t{rows} * head_cols * sizeof(float), Publish::producer);
+}
+
 void XferExchange::boundary_rows(const float* part, const float* X, const float* mix, float* Xout, unsigned* flag,
                                   unsigned rows, unsigned flag_stride, hipStream_t s) {
     if (rows == 0 || rows > max_rows_) throw std::invalid_argument("glm xfer exchange: rows");
@@ -310,6 +329,9 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
     const bool produced = produced_ != nullptr && part == produced_;
     if (produced_ != nullptr && !produced) throw std::logic_error("glm xfer exchange: producer slot taken but not used by the next boundary");
     produced_ = nullptr;
+    const bool split = split_cols_ != 0;
+    if (split && !produced) throw std::logic_error("glm xfer exchange: split slot taken but not used by the next boundary");
+    split_cols_ = 0;
     // STRIX_GLMX_FOLD=N (xport row fold): boundaries of at most N rows have their pair sum (R17, rank 0's partial
     // first) computed by the exchange progress thread; post_expand then reads one folded slot. Same bits.
     if (fold_enabled_.load(std::memory_order_relaxed) && x.can_fold(bytes)) x.fold_next(strix::xport::RowFold::sum_f32);
@@ -328,8 +350,10 @@ void XferExchange::boundary_rows(const float* part, const float* X, const float*
             local = nullptr;
         }
         if (use_bracket_) post_expand_bracket(bracket_, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
+        else if (split) post_expand_split(X, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
         else post_expand(X, mix, local, nullptr, v, rank_, Xout, flag, rows, s, flag_stride);
     } else {
+        if (split) throw std::logic_error("glm xfer exchange: split payload needs the kernel-wait form");
         const auto* peer = static_cast<const float*>(backend.wait(ticket, s).remote);
         const float* local = part;
         if (const void* folded = x.last_folded()) {

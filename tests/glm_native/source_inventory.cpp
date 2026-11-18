@@ -1,6 +1,6 @@
 // CPU-only synthetic source inventory probe. No schema bypass in the service.
 #define STRIX_HASH_AUTHORITY_TESTING
-#include "glm/rtxpf/producer/shards.hpp"
+#include "cuda/models/glm/producer/shards.hpp"
 #include <iostream>
 using namespace strix::glm::rtxpf::producer;
 int main(int argc,char** argv){try{

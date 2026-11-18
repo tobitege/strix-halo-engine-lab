@@ -209,7 +209,7 @@ std::vector<std::uint8_t> canonical_attention_state_bytes(const AttentionState& 
             if (layer.ring.size() != live.size() * attn::kWindowEntryBytes)
                 throw std::invalid_argument("canonical attention state: invalid ring size");
             for (std::size_t i = 0; i < live.size(); ++i)
-                if (!live[i]) std::fill_n(layer.ring.begin() + i * attn::kWindowEntryBytes, attn::kWindowEntryBytes, 0);
+                if (!live[i]) std::fill_n(layer.ring.begin() + i * attn::kWindowEntryBytes, attn::kWindowEntryBytes, std::uint8_t{0});
         }
         layer.topk.clear();
         layer.topk_known = false;

@@ -45,6 +45,9 @@ public:
     // Split activations: on images with flat areas this tower forms a few rows of very large norm in its middle
     // blocks, and which rows those are flips under single-FP16 operand rounding (measured on the real file).
     vision::EncoderOptions device_options() const override;
+    std::vector<std::pair<vision::Tensor, vision::Tensor>> projector_linears() const override;  // aligner w1, w2 after bind()
+    unsigned max_encoder_rows() const override;  // max_image_tokens merged rows of downsample_ratio^2 tower rows
+    bool device_resident_hidden() const override { return true; }
 
     // Canvas of the image, the rule of the checkpoint's reference processor: an image under min_pixels is scaled up,
     // each side is rounded up to a multiple of the patch (not of the 3x3 cell), and a canvas whose whole span would

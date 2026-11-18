@@ -1,0 +1,9 @@
+{
+ "class": "prose",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Tell a short story about a lighthouse keeper who finds a message in a bottle. About 600 words."
+  }
+ ]
+}

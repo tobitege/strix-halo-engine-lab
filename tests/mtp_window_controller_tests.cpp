@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/mtp_cohort_partition.hpp"
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
@@ -68,7 +69,123 @@ double share(const Run& r,std::uint32_t rows) {
 } // namespace
 
 int main() {
-    for (const std::size_t count : {0U, 1U, 2U, 8U, 9U, 16U, 19U}) {
+    {
+        // budget-measured: synthetic topology costs (policy behaviour, not device measurements).
+        using C=strix::MtpBatchWindowController;
+        const auto rule=C::parse_rule("budget-measured");
+        expect(rule.budget && rule.measured_lanes==0x1FEU,"measured policy is explicit");
+        expect(C::parse_rule("budget-fit").measured_lanes==0U && C::parse_rule("measured").measured_lanes==0U,
+            "budget-fit is the affine rule and measured needs the budget rule");
+        // One resolver: the serving default (no STRIX_MTP_JOINT_PLAN) is the plain budget rule with the auto lane table,
+        // the same value the CLI cohort path resolves.
+        expect(C::parse_rule("budget").measured_lanes==strix::mtp_serve_row_measured_lanes(),"plain budget takes the lane table");
+        expect(strix::mtp_serve_row_measured_lane_list("7,8")==((1U<<7U)|(1U<<8U)) && strix::mtp_serve_row_measured_lane_list("7")==(1U<<7U)
+            && strix::mtp_serve_row_measured_lane_list("9")==0U && strix::mtp_serve_row_measured_lane_list("7,x")==0U,"lane list override");
+        if(!std::getenv("STRIX_SERVE_ROW_MEASURED") && !std::getenv("STRIX_MTP_JOINT_PLAN") && !std::getenv("STRIX_SERVE_ROW_BUDGET"))
+            expect(C::rule_from_env(false).measured_lanes==strix::kMtpRowMeasuredAutoLanes,"serve and CLI default = auto table");
+        const std::array<float,7> p{1,1,1,1,1,1,1};
+        std::vector<C::Request> q;
+        for(std::uint32_t i=0;i<8U;++i) q.push_back({i,8U,p});
+        const std::vector<std::uint32_t> r2(8,2U),r4(8,4U),a2(8,1U),a4(8,3U);
+        C measured(8,rule);
+        expect(measured.choose(q,32)==r2,"unmeasured C8 keeps the fixed two rows");
+        for(int i=0;i<3;++i) measured.observe(q,r2,a2,8.0,150.0,8U);
+        measured.observe(q,r4,a4,24.0,180.0,24U);
+        expect(measured.choose(q,32)==r2,"a provisional topology does not price");
+        for(int i=0;i<2;++i) measured.observe(q,r4,a4,24.0,180.0,24U);
+        expect(measured.choose(q,32)==r4,"measured C8 buys productive R4 owners");
+        C expensive(8,rule);
+        for(int i=0;i<3;++i) {expensive.observe(q,r2,a2,8.0,150.0,8U);expensive.observe(q,r4,a4,24.0,450.0,24U);}
+        expect(expensive.choose(q,32)==r2,"a measured expensive R4 topology loses to R2");
+        // A C8 table never prices a C4 topology: the same state under the budget rule plans the same.
+        const std::span<const C::Request> four(q.data(),4);
+        C budget_copy=measured;budget_copy.set_rule(C::parse_rule("budget-fit"));
+        expect(measured.choose(four,32)==budget_copy.choose(four,32),"an unmeasured lane count keeps the budget plan");
+        for(auto& request:q) request.limit=2U;
+        expect(measured.choose(q,32)==r2,"context limits bound the owners");
+        for(auto& request:q) request.limit=8U;
+        expect(measured.choose(q,16)==r2,"the row budget bounds the owners");
+        // Bounded exploration through C8 (above the budget's lane bound), then the measured plan.
+        bool deep=false;
+        for(int i=0;i<10;++i) {
+            const auto rows=measured.plan(q,32);
+            std::uint32_t sum=0;
+            for(auto r:rows) {expect(r==0U || r==2U || r==4U || r==8U,"valid physical owner");sum+=r?r:2U;deep=deep || r>2U;}
+            expect(sum<=32U,"measured exploration stays in the row budget");
+            if(i==9) expect(rows==r4,"measured exploitation follows the probes");
+        }
+        expect(deep,"measured probes explore deeper owners at eight lanes");
+        C budget_only(8,C::parse_rule("budget-fit"));
+        for(int i=0;i<10;++i) expect(budget_only.plan(q,32)==r2,"the budget rule keeps C8 at two rows");
+        measured.save_shared();
+        const auto before=measured.choose(q,32);
+        for(int i=0;i<8;++i) measured.observe(q,r4,a4,24.0,900.0,24U);
+        expect(measured.choose(q,32)==r2,"a slower measured topology is dropped");
+        expect(measured.restore_shared() && measured.choose(q,32)==before,"A/B restore restores topology costs");
+        // Per-lane placement: deep owners go to the lanes that accept.
+        const std::array<float,7> none{0,0,0,0,0,0,0};
+        std::vector<C::Request> mixed;
+        for(std::uint32_t i=0;i<8U;++i) mixed.push_back({i,8U,i<4U?std::span<const float>(p):std::span<const float>(none)});
+        C placed(8,rule);
+        const std::vector<std::uint32_t> half{4,4,4,4,2,2,2,2},zero(8,0U);
+        for(int i=0;i<3;++i) {
+            placed.observe(mixed,r2,zero,0.0,150.0,0U);placed.observe(mixed,half,zero,0.0,170.0,0U);
+            placed.observe(mixed,r4,zero,0.0,180.0,0U);
+        }
+        for(std::uint32_t i=0;i<8U;++i) placed.reset(i);
+        expect(placed.choose(mixed,32)==half,"measured plan places R4 on the accepting lanes");
+        // Audit case (yield calibration vs context candidates): seven lanes, one certain predictor draft and two
+        // certain context drafts each (external_first=1), all accepted in R4. R2 100 ms delivers its 14 tokens, R4
+        // 250 ms delivers 28 = what the complete candidates predict: 14/100 > 28/250, so R2 stays. A predictor-only
+        // expectation (14 for R4) against 28 delivered would inflate R4 to 51.5 tokens and buy it.
+        const std::array<float,3> ext{1,1,1};
+        std::vector<C::Request> seven;
+        for(std::uint32_t i=0;i<7U;++i) {seven.push_back({i,8U,ext});seven.back().external_first=1U;}
+        const std::vector<std::uint32_t> s2(7,2U),s4(7,4U),s1(7,1U),s3(7,3U),s0(7,0U);
+        C context(7,rule);
+        for(int i=0;i<3;++i) {context.observe(seven,s2,s1,0.0,100.0,0U);context.observe(seven,s4,s3,0.0,250.0,0U);}
+        expect(context.choose(seven,32)==s2,"context candidates do not inflate the R4 yield");
+        // The reported failure, reproduced with the old runtime call shape (observe() fed the predictor prefix only).
+        std::vector<C::Request> seven_prefix=seven;
+        for(auto& r:seven_prefix) {r.probabilities=std::span<const float>(ext).first(1);r.external_first=SIZE_MAX;}
+        C truncated(7,rule);
+        for(int i=0;i<3;++i) {truncated.observe(seven_prefix,s2,s1,0.0,100.0,0U);truncated.observe(seven_prefix,s4,s3,0.0,250.0,0U);}
+        expect(truncated.choose(seven,32)==s4,"a predictor-only expectation over-buys R4 (the runtime passes complete candidates)");
+        C context_fast(7,rule);
+        for(int i=0;i<3;++i) {context_fast.observe(seven,s2,s1,0.0,100.0,0U);context_fast.observe(seven,s4,s3,0.0,180.0,0U);}
+        expect(context_fast.choose(seven,32)==s4,"a faster measured R4 with context candidates still wins");
+        // Predictor histories ignore context candidates: observing the complete candidates or the predictor prefix
+        // leaves the same histories (same affine-fit plan for a later predictor-only request).
+        C full(4,C::parse_rule("calibrated")),prefix(4,C::parse_rule("calibrated"));
+        const std::array<float,3> mix{0.9F,0.2F,0.2F};
+        std::vector<C::Request> fq,pq;
+        for(std::uint32_t i=0;i<4U;++i) {
+            fq.push_back({i,8U,mix});fq.back().external_first=1U;
+            pq.push_back({i,8U,std::span<const float>(mix).first(1)});
+        }
+        const std::vector<std::uint32_t> f4(4,4U),f3(4,3U),f1(4,1U);
+        for(int i=0;i<6;++i) {
+            full.observe(fq,f4,f3,1.0,120.0,4U);prefix.observe(pq,f4,f3,1.0,120.0,4U);
+        }
+        // Low-confidence predictor drafts: context candidates counted as accepted 0.2-confidence predictor drafts
+        // would make them look certain and buy deep rows.
+        const std::array<float,7> later{0.2F,0.2F,0.2F,0.2F,0.2F,0.2F,0.2F};
+        std::vector<C::Request> lq;
+        for(std::uint32_t i=0;i<4U;++i) lq.push_back({i,8U,later});
+        expect(full.choose(lq,32)==prefix.choose(lq,32),"context candidates leave predictor histories unchanged");
+        // Estimator lifetime: forty R4 cycles that deliver one token per lane, then the workload changes and R4
+        // delivers its four; the aged calibration follows within sixteen cycles (the whole-history ratio would stay
+        // at ~0.47 and keep R2 at 14/100 against 28*0.47/160).
+        std::vector<C::Request> ctx7;
+        for(std::uint32_t i=0;i<7U;++i) {ctx7.push_back({i,8U,ext});ctx7.back().external_first=0U;}
+        C aged(7,rule);
+        for(int i=0;i<3;++i) aged.observe(ctx7,s2,s1,0.0,100.0,0U);
+        for(int i=0;i<40;++i) aged.observe(ctx7,s4,s0,0.0,160.0,0U);
+        expect(aged.choose(ctx7,32)==s2,"an R4 topology that under-delivers is not bought");
+        for(int i=0;i<16;++i) aged.observe(ctx7,s4,s3,0.0,160.0,0U);
+        expect(aged.choose(ctx7,32)==s4,"the yield calibration ages with the workload");
+    }
+    for (const std::size_t count : {0U, 1U, 2U, 6U, 7U, 8U, 9U, 16U, 19U, 24U}) {
         for (std::size_t round = 0; round < count + 2U; ++round) {
             std::vector<unsigned> seen(count, 0U);
             strix::MtpBatchWindowController controller(count);
@@ -83,6 +200,36 @@ int main() {
                 expect(plan.size() == group.size(), "controller accepts partition with stable global slot IDs");
             }
             expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "round covers every live slot once");
+        }
+        // Budget rule above the lane bound: fixed two rows per request, so one group (one logical target
+        // execution) takes up to 16 requests = 32 rows; at or below the bound, and for searching rules, 8.
+        for (std::size_t round = 0; round < count + 2U; ++round) {
+            strix::MtpBatchWindowController budget(count, strix::MtpBatchWindowController::parse_rule("budget"));
+            strix::MtpBatchWindowController search(count);
+            // The cap under test: 16 (the default; STRIX_SERVE_JOINT_GROUP_LANES=8 is the old form) above the bound.
+            const auto cap = count > strix::mtp_serve_row_budget_max_lanes() ? std::size_t{strix::kMtpJointGroupLanesMax} : std::size_t{8U};
+            expect(search.max_group_lanes(count, round) == 8U, "searching rule keeps eight requests per group");
+            expect(budget.max_group_lanes(count, round) == (count > strix::mtp_serve_row_budget_max_lanes() ?
+                strix::mtp_serve_joint_group_lanes(round) : 8U), "budget rule cap follows the switch above the lane bound");
+            expect(strix::mtp_serve_joint_group_lanes(round) == strix::kMtpJointGroupLanesMax,
+                "default: one forward per sixteen requests above the lane bound");
+            expect(strix::kMtpJointGroupLanesMax <= strix::kCohortWideMaxSessions, "a group fits one wide cohort step");
+            std::vector<unsigned> seen(count, 0U);
+            const auto groups = strix::mtp_cohort_partition(count, round, cap);
+            expect(groups.size() == (count + cap - 1U) / cap, "fewest groups for the cap");
+            for (const auto& group : groups) {
+                expect(!group.empty() && group.size() <= cap, "group within the cap");
+                std::vector<strix::MtpBatchWindowController::Request> requests;
+                for (const auto slot : group) {
+                    ++seen.at(slot);
+                    requests.push_back({static_cast<std::uint32_t>(slot), 2U, {}});
+                }
+                const auto plan = budget.plan(requests, std::max<std::uint32_t>(32U, 2U * static_cast<std::uint32_t>(group.size())));
+                expect(plan.size() == group.size(), "budget plan covers the group");
+                if (group.size() > strix::mtp_serve_row_budget_max_lanes())
+                    expect(std::all_of(plan.begin(), plan.end(), [](std::uint32_t r) { return r == 2U; }), "fixed two rows above the bound");
+            }
+            expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "wide round covers every live slot once");
         }
     }
 

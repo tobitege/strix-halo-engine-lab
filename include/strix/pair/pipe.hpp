@@ -4,7 +4,8 @@
 // pinned staging, per-piece and whole-frame CRC32C and a consumption ACK per chunk. Engines supply only
 // the seam header validation (their own geometry and identity words) and the device staging.
 // Frame header words owned here: [1] sequence (producer), [40] whole CRC, [41] chunk count (producer),
-// [42] wire version 3. All other words belong to the engine's validator.
+// [42] wire version (3; 4 for interleaved virtual stages, which also own [43] boundary index and [44] StageMap
+// FNV, see stage_map.hpp). All other words belong to the engine's validator.
 #include <array>
 #include <algorithm>
 #include <charconv>
@@ -153,6 +154,12 @@ struct PipeOptions {
     std::function<std::size_t(const PipeHeader&, std::uint64_t sequence)> validate;
     std::string profile_label = "pair-profile"; // stderr prefix of the per-chunk transfer profile line
     bool profile = false;
+    std::uint64_t wire_version = 3U;            // header word [42] the producer writes (StagePipes: 4 when v > 1)
+    // Sender: recompute each host piece's CRC after it went on the wire. A difference means the staged bytes
+    // changed while they were being sent (a late copy into the slot), which the receiver reports as a piece
+    // CRC mismatch; with this on the sender names it instead. Costs one CPU CRC pass per frame on the
+    // progress thread.
+    bool recheck_sent = false;
     // Optional STRIX_PAIR_TIMING spans: the engine owns the timeline and its column names and maps the
     // pipe's own waits onto its columns (step = chunk sequence).
     dist::PipelineTimeline* timeline = nullptr;
@@ -234,6 +241,17 @@ private:
         SeamCrc checksum; checksum.update(bytes); return checksum.value();
     }
     void rethrow() { if (error_) std::rethrow_exception(error_); }
+    // Names the failing piece: a single bad piece inside a frame points at one corrupted transfer, piece 0 of
+    // a frame whose header validated points at the payload, not at stream framing.
+    static std::string piece_error(const char* route, std::uint64_t sequence, std::size_t offset, std::size_t frame_bytes,
+        std::uint32_t expected, std::uint32_t got) {
+        char text[256];
+        std::snprintf(text, sizeof text, "pair prefill seam piece CRC mismatch (%s): sequence %llu piece %zu of %zu "
+            "(offset %zu of %zu bytes) crc expected %08x got %08x", route, static_cast<unsigned long long>(sequence),
+            offset / seam_piece_bytes, (frame_bytes + seam_piece_bytes - 1U) / seam_piece_bytes, offset, frame_bytes,
+            expected, got);
+        return text;
+    }
     void stop() {
         { std::lock_guard lock(mutex_); if (stopping_) return; stopping_ = true; cv_.notify_all(); }
         abort_();
@@ -277,6 +295,12 @@ private:
                     if (device && !moved) throw std::logic_error("pair prefill device-checked piece was not moved by the transport");
                     if (!moved) send_(piece);
                 });
+                if (options_.recheck_sent && !device) {
+                    const auto again = piece_crc(piece);
+                    if (again != crc)
+                        throw std::runtime_error(piece_error("staged bytes changed while sent", sequence, offset,
+                            frame.payload.size(), crc, again));
+                }
             } else {
                 const bool routed = timed(sequence, column.wire, [&] {
                     receive_(std::as_writable_bytes(std::span(&crc, 1)));
@@ -285,9 +309,11 @@ private:
                     return routed_piece;
                 });
                 if (device && !routed) throw std::logic_error("pair prefill device-checked piece was not moved by the transport");
-                if (crc != timed(sequence, column.crc, [&] {
-                        return device ? frame.staging->device_crc(offset, piece.size(), true) : piece_crc(piece); }))
-                    throw std::runtime_error("pair prefill seam piece CRC mismatch");
+                const auto got = timed(sequence, column.crc, [&] {
+                    return device ? frame.staging->device_crc(offset, piece.size(), true) : piece_crc(piece); });
+                if (crc != got)
+                    throw std::runtime_error(piece_error(device ? "device-routed" : "host-routed", sequence, offset,
+                        frame.payload.size(), crc, got));
                 whole.append(crc, piece.size());
                 if (frame.staging && !routed)
                     timed(sequence, column.h2d_wait, [&] { frame.staging->received_piece(offset, piece.size()); });
@@ -316,7 +342,7 @@ private:
                 auto transfer_start = options_.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (rank_ == 0U) {
                     if (!frame.staging) frame.payload = frame.bytes;
-                    frame.header[42] = 3U;
+                    frame.header[42] = options_.wire_version;
                     timed(sequence, options_.timing.wire, [&] { send_(std::as_bytes(std::span(frame.header))); });
                 } else {
                     timed(sequence, options_.timing.header_wait, [&] { receive_(std::as_writable_bytes(std::span(frame.header))); });

@@ -230,14 +230,17 @@ __global__ void hyper_expand_kernel(
 
 // Rows of a tiled prefill block in one launch (STRIX_PREFILL_PIPE bit 16): blockIdx.y selects the row, whose input
 // and output start one pitch after the previous row's; each element is hyper_expand_kernel's for one row.
+// One thread per feature: the source value is loaded once and stored to the hc_count copies from the register (the
+// per-element form read each source row hc_count times). Same load_activation / store_activation per copy: same bits.
 template <typename Storage>
 __global__ void hyper_expand_pitched_rows_kernel(const Storage* input, std::uint64_t input_pitch, Storage* output,
     std::uint64_t output_pitch, std::uint32_t hidden_size, std::uint32_t hc_count) {
-    const auto within = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (within >= static_cast<std::uint64_t>(hidden_size) * hc_count) return;
+    const auto feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (feature >= hidden_size) return;
     const auto row = static_cast<std::uint64_t>(blockIdx.y);
-    store_activation(&output[row * output_pitch + within],
-        load_activation(&input[row * input_pitch + within % static_cast<std::uint64_t>(hidden_size)]));
+    const auto value = load_activation(&input[row * input_pitch + feature]);
+    Storage* out = output + row * output_pitch + feature;
+    for (std::uint32_t s = 0; s < hc_count; ++s) store_activation(out + static_cast<std::uint64_t>(s) * hidden_size, value);
 }
 
 template <typename Storage>
@@ -529,7 +532,7 @@ bool launch_hyper_expand_rows(std::span<const ExecutionDispatchContext> rows, vo
             row.input.address != first.input.address + r * input_pitch || row.output.address != first.output.address + r * output_pitch)
             return false;
     }
-    const auto blocks = prepare_1d_blocks(expanded);
+    const auto blocks = prepare_1d_blocks(first.config.hidden_size);
     const auto count = static_cast<std::uint32_t>(rows.size());
     switch (first.config.activation) {
     case HipActivationStorage::bf16:

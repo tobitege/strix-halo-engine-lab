@@ -2,7 +2,9 @@
 
 // Host-only verdicts shared by the dense-core and vision device fixtures.
 #include <charconv>
+#include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <istream>
@@ -45,12 +47,24 @@ inline std::vector<float> exact_reference(std::span<const float> x, std::span<co
 inline void check_dense(std::span<const float> got, std::span<const float> want,
                         unsigned rows, unsigned n, unsigned pad, float guard) {
     require(got.size() == std::size_t{rows + 1U} * (n + pad), "dense output size");
+    require(want.size() == got.size(), "dense reference size");
     for (unsigned r = 0; r < rows; ++r)
         for (unsigned c = 0; c < n; ++c) {
             const float v = got[std::size_t{r} * (n + pad) + c];
             require(v != guard && std::isfinite(v), "dense live output was not written or is nonfinite");
         }
-    require(same_bytes(got, want), "dense reference or padding mismatch");
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const auto actual = std::bit_cast<std::uint32_t>(got[i]), expected = std::bit_cast<std::uint32_t>(want[i]);
+        if (actual == expected) continue;
+        const auto row = i / (n + pad), col = i % (n + pad);
+        char message[240];
+        std::snprintf(message, sizeof(message),
+                      "dense reference or padding mismatch: row %zu col %zu (%s), got %a [%08x], expected %a [%08x]",
+                      row, col, row == rows ? "guard row" : col >= n ? "padding" : "live",
+                      static_cast<double>(got[i]), static_cast<unsigned>(actual),
+                      static_cast<double>(want[i]), static_cast<unsigned>(expected));
+        throw std::runtime_error(message);
+    }
 }
 
 template <class Call> void require_numeric_failure(Call call) {

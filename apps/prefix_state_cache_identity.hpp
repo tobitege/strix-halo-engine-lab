@@ -4,6 +4,7 @@
 #include "strix/moe_route_bf16.hpp"
 #include "strix/session_state_cache.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/turbo.hpp"
 #include <span>
 #include <string>
 #include <stdexcept>
@@ -31,6 +32,8 @@ inline ModelContentIdentity prefix_effective_execution_signature(std::string_vie
     const bool route_bf16 = !baseline && !qpf2k::baseline && !gsq && moe_route_bf16_environment_requested(
         std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16"), std::getenv("STRIX_BASELINE"), std::getenv("STRIX_QPF2K_DEFAULTS"));
     long_context += std::string(";STRIX_QPF2K_MOE_ROUTE_BF16=") + (route_bf16 ? "1" : "0");
+    // TURBO namespace (qwen-turbo-v1 + effective levers + weight identity); absent outside turbo.
+    if (const auto turbo = ::strix::profile::turbo::exported_namespace(); !turbo.empty()) long_context += ";" + turbo;
     std::vector<std::string> executed;
     if (const char* v = std::getenv("STRIX_QPF2K_SCHED")) {
         const auto raw = static_cast<std::uint64_t>(std::strtoull(v, nullptr, 0));

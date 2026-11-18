@@ -1,0 +1,12 @@
+# qwen-turbo-v1 lever manifest (data for the shared `--profile turbo` column; opt-in, defaults unchanged).
+# id | group | env (space separated NAME=VALUE) | CLI args | identity tag | state (main|pending) | note
+# group: lever ids sharing a group are alternatives (one value each); ALL takes the first listed of each group.
+index_proj|index_proj|STRIX_PREFILL_INDEX_PROJ_WMMA=1||idxproj16|main|BF16 indexer projections|STRIX_PREFILL_INDEX_PROJ_WMMA=0
+index_score|index_score|STRIX_PREFILL_INDEX_SCORE_WMMA=1||idxscore16|main|BF16 index scores|STRIX_PREFILL_INDEX_SCORE_WMMA=0
+ple_rows|ple_rows|STRIX_PREFILL_PLE_ROWS_F16=1||plef16|main|PLE rows on the FP16 dense core|STRIX_PREFILL_PLE_ROWS_F16=0
+gdn_gates|gdn_gates|STRIX_PREFILL_GDN_GATES_F16=1||gatef16|main|GDN gates on FP16 dense core (needs gdn_chunk)|STRIX_PREFILL_GDN_GATES_F16=0
+gdn_chunk|gdn|STRIX_QPF2K_GDN_FP16_CHUNK=1||gdnchunk16-rev2|main|chunked GDN FP16 WMMA rev 2|STRIX_QPF2K_GDN_FP16_CHUNK=0
+gdn_chunk_r3|gdn|STRIX_QPF2K_GDN_FP16_CHUNK=3||gdnchunk16-rev3|main|rev 3 (alternative to rev 2)|STRIX_QPF2K_GDN_FP16_CHUNK=0
+route_bf16|moe|STRIX_QPF2K_MOE_ROUTE_BF16=1||route-bf16|main|BF16 MoE route storage|STRIX_QPF2K_MOE_ROUTE_BF16=0
+qsa_budget|qsa|STRIX_QPF2K_QSA_BUDGET=1536||qsa1536|main|ranked-block budget|STRIX_QPF2K_QSA_BUDGET=0
+route_prune|prune|STRIX_QPF2K_MOE_ROUTE_PRUNE=rel0.02||prune-rel0.02|pending|calibrated route prune (value swept)|STRIX_QPF2K_MOE_ROUTE_PRUNE=0

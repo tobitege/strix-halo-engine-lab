@@ -8,8 +8,9 @@
 // Keys/values are used as stored (bf16 caches).
 // Split = true (two-term operands): queries and probabilities are carried as hi + lo, each rounded to the operand
 // type (lo = the rounding remainder of hi), and both products run once per term (32 WMMA per tile instead of 16).
-// The operand rounding error drops from 2^-9 to about 2^-17 relative; the result is still not the exact kernel's
-// bytes (summation order, exp2).
+// bf16 operand error max(2^-8 |x|, h) -> max(2^-16 |x|, h) (bf16 keeps FP32's range, so h is negligible): about
+// 2^-7 -> 3 x 2^-16 |ab| per product (two_term_model.hpp); the result is still not the exact kernel's bytes
+// (summation order, exp2), and cancellation in a score is not covered by either form.
 //
 // Shape: one work-group = one query row (16 query heads) = 4 waves. The row's key list is cut into 16-key tiles and
 // wave w owns tiles w, w + 4, ...: a complete flash step per tile inside the wave, no barrier in the key loop.
@@ -44,6 +45,14 @@
 //                                                 called by a whole wave: lane owns dims 4 lane .. 4 lane + 3 (FP32,
 //                                                 final values; the policy may use wave shuffles, e.g. a norm)
 //   static __device__ float* out(const Args&, const Row&)                                     FP32 [H][D]
+// Optional (a policy without it compiles to the code above):
+//   static __device__ const std::uint16_t* query_op(const Args&, const Row&)
+//                                 replaces query(): the row's H heads already in the operand type, [H][D], 16-B aligned,
+//                                 loaded as fragments with no conversion and no staging. Same bits as query() when the
+//                                 producer stored tile::to_operand<kOp>(x) of query()'s values (MiniMax: the q
+//                                 projection finish, mmx_prefill.hip). Split also needs
+//   static __device__ const std::uint16_t* query_op_lo(const Args&, const Row&)
+//                                 the lo terms to_operand(x - operand_value(to_operand(x))), [H][D], 8-B aligned
 // Launch: flash_rows_keysplit_kernel<P, Split><<<work_groups, KeySplit<P::kHeads, P::kDim>::kThreads, 0, stream>>>(args).
 #include "attn_core/flash_tile.hpp"
 
@@ -81,7 +90,17 @@ template <unsigned H, unsigned D> struct KeySplit {
     }
 };
 
-template <class P, bool Split = false>
+template <class P>
+concept RowQueryOp = requires(const typename P::Args& a, const typename P::Row& r, const std::uint16_t*& p) { p = P::query_op(a, r); };
+
+// Opt (source load schedule only; same operands and WMMA order):
+//   0             incumbent: each key fragment is loaded immediately before its QK operation.
+//   kKsKeysFirst  all key fragments precede the value loads and a scheduling barrier.
+//   kKsKeysHalves key loads are grouped in two halves around the value loads, both before QK.
+// Register liveness, waits and overlap require compiler/ISA evidence for each instantiation;
+// source ordering alone establishes neither reduced register pressure nor native bitwise equality.
+inline constexpr unsigned kKsKeysFirst = 1U, kKsKeysHalves = 2U;
+template <class P, bool Split = false, unsigned Opt = 0U>
 __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flash_rows_keysplit_kernel(typename P::Args a) {
     using G = KeySplit<P::kHeads, P::kDim>;
     static_assert(G::merge_slots_cover(), "merge buffer layout");
@@ -96,25 +115,40 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
     typename P::Row row;
     if (!P::begin(a, blockIdx.x, row)) return;
     const unsigned tid = threadIdx.x, w = tid >> 5U, lane = tid & 31U, ln = lane & 15U, hf = lane >> 4U;
-    // Queries: wave w prepares heads w, w + 4, ... (lane = 4 dims), rounded once to the operand type.
-#pragma unroll
-    for (unsigned i = 0; i < H / G::kWaves; ++i) {
-        const unsigned head = i * G::kWaves + w;
-        float x[4];
-        P::query(a, row, head, lane, x);
-        *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        if constexpr (Split) {
-#pragma unroll
-            for (unsigned d = 0; d < 4; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
-            *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
-                U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
-        }
-    }
-    __syncthreads();
     Frag qf[G::kKs];
+    if constexpr (RowQueryOp<P>) {
+        // the producer's operand image: fragments straight from memory; Split stages the lo image where the key loop
+        // reads it (above the V^T area, so one barrier)
+        if constexpr (Split) {
+            const std::uint16_t* lo = P::query_op_lo(a, row);
 #pragma unroll
-    for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(lds + (ln * D + 16U * k) * 2U);
-    __syncthreads();  // the V^T tiles reuse the staging area
+            for (unsigned i = 0; i < H / G::kWaves; ++i) {
+                const unsigned head = i * G::kWaves + w;
+                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) = *reinterpret_cast<const U2*>(lo + head * D + lane * 4U);
+            }
+        }
+        const std::uint16_t* qo = P::query_op(a, row);
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(qo + ln * D + 16U * k);
+        if constexpr (Split) __syncthreads();
+    } else {
+        // Queries: wave w prepares heads w, w + 4, ... (lane = 4 dims), rounded once to the operand type.
+#pragma unroll
+        for (unsigned i = 0; i < H / G::kWaves; ++i) {
+            const unsigned head = i * G::kWaves + w;
+            float x[4];
+            P::query(a, row, head, lane, x);
+            *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
+            if constexpr (Split) {
+                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
+                    U2{tile::pack2_lo<O>(x[0], x[1]), tile::pack2_lo<O>(x[2], x[3])};
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(lds + (ln * D + 16U * k) * 2U);
+        __syncthreads();  // the V^T tiles reuse the staging area
+    }
     Acc o[G::kKs];
 #pragma unroll
     for (unsigned c = 0; c < G::kKs; ++c) o[c] = tile::acc_zero();
@@ -128,6 +162,14 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
         const unsigned nk = P::seg_keys(a, row, c);
         if (k0 >= nk) continue;  // wave-uniform: tile past the segment's visible keys
         // 1. value pieces (in flight during QK); keys past the visible count contribute zeros
+        constexpr bool kKeysEarly = (Opt & (kKsKeysFirst | kKsKeysHalves)) != 0U;
+        constexpr unsigned kEarly = (Opt & kKsKeysFirst) != 0U ? G::kKs : (Opt & kKsKeysHalves) != 0U ? G::kKs / 2U : 0U;
+        const std::uint16_t* const kr = P::key_row(a, row, c, k0 + ln < nk ? k0 + ln : nk - 1U);
+        Frag kf[G::kKs];
+        if constexpr (kKeysEarly) {
+#pragma unroll
+            for (unsigned x = 0; x < kEarly; ++x) kf[x] = tile::frag32(kr + 16U * x);
+        }
         U4 gv[2][4];
 #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
@@ -140,17 +182,18 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
                 gv[p][i] = ok ? x : U4{0U, 0U, 0U, 0U};
             }
         }
+        if constexpr (kKeysEarly) {
+#pragma unroll
+            for (unsigned x = kEarly; x < G::kKs; ++x) kf[x] = tile::frag32(kr + 16U * x);
+            __builtin_amdgcn_sched_barrier(0);  // keep the loads issued before the QK chain
+        }
         // 2. QK: S^T[key 2e + hf][head ln]
         Acc s = tile::acc_zero();
-        {
-            const unsigned k = k0 + ln;
-            const std::uint16_t* kr = P::key_row(a, row, c, k < nk ? k : nk - 1U);
 #pragma unroll
-            for (unsigned x = 0; x < G::kKs; ++x) {
-                const Frag kf = tile::frag32(kr + 16U * x);
-                if constexpr (Split) s = tile::mma<O>(kf, tile::frag32(lds + G::kQlo + (ln * D + 16U * x) * 2U), s);
-                s = tile::mma<O>(kf, qf[x], s);
-            }
+        for (unsigned x = 0; x < G::kKs; ++x) {
+            if constexpr (!kKeysEarly) kf[x] = tile::frag32(kr + 16U * x);
+            if constexpr (Split) s = tile::mma<O>(kf[x], tile::frag32(lds + G::kQlo + (ln * D + 16U * x) * 2U), s);
+            s = tile::mma<O>(kf[x], qf[x], s);
         }
         // 3. V^T tile of this wave
 #pragma unroll

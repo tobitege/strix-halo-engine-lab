@@ -39,7 +39,42 @@ void attention_kv_storage_binds_layout() {
     strix::validate_serial_session_state_layout_identity(model, int8);
 }
 
+void recurrent_state_type_binds_layout() {
+    auto model = strix::ModelContract::qwen38_flash_next();
+    model.recurrent_state = strix::RecurrentStateType::f32;
+    strix::SerialSessionStateLayoutRequest request;
+    request.context_tokens = 4096;
+    const auto f32 = strix::build_serial_session_state_layout(model, request);
+    const auto* f32_matrix = strix::find_session_state_allocation(f32, strix::SessionStateComponent::recurrent_matrix);
+    expect(f32_matrix && f32_matrix->bytes == 108ULL * 1024ULL * 1024ULL, "f32 recurrent matrix layout unchanged");
+    std::uint64_t previous_identity = f32.layout_identity;
+    for (const auto type : {strix::RecurrentStateType::f16, strix::RecurrentStateType::bf16}) {
+        model.recurrent_state = type;
+        const auto typed = strix::build_serial_session_state_layout(model, request);
+        const auto* matrix = strix::find_session_state_allocation(typed, strix::SessionStateComponent::recurrent_matrix);
+        expect(matrix && f32_matrix && matrix->bytes * 2 == f32_matrix->bytes, "16-bit recurrent matrix is half of f32");
+        expect(typed.device_total_bytes + f32_matrix->bytes / 2 == f32.device_total_bytes &&
+                   typed.host_total_bytes == f32.host_total_bytes,
+               "only the recurrent matrix changes size");
+        for (const auto component : {strix::SessionStateComponent::attention_kv, strix::SessionStateComponent::gdn_convolution}) {
+            const auto* a = strix::find_session_state_allocation(typed, component);
+            const auto* b = strix::find_session_state_allocation(f32, component);
+            expect(a && b && a->bytes == b->bytes, "other components keep their f32 size");
+        }
+        expect(typed.layout_identity != previous_identity, "recurrent state type enters the layout identity");
+        previous_identity = typed.layout_identity;
+        strix::validate_serial_session_state_layout_identity(model, typed);
+        bool refused = false;
+        try { strix::validate_serial_session_state_layout_identity(strix::ModelContract{}, typed); }
+        catch (const std::exception&) { refused = true; }
+        expect(refused, "layout identity of a 16-bit type is not valid for an f32 model");
+    }
+    expect(strix::gdn_matrix_state_bytes_per_layer(strix::ModelContract{}) == 3ULL * 1024ULL * 1024ULL,
+           "default (f32) per-layer matrix bytes");
+}
+
 int main() {
+    recurrent_state_type_binds_layout();
     const auto model =
         strix::ModelContract::qwen38_flash_next();
 

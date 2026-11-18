@@ -49,6 +49,7 @@ int main(int argc,char** argv) try {
         "10","11","12","13","14","15","16","17","18","--rope-yarn","4","--context","1048576","--generate","256"};
     const auto bundled=parse(base);
     require(bundled.mtp.enabled && bundled.mtp_bundle_path==bundle.string(),"automatic discovery");
+    require(bundled.mtp.runtime_automatic,"discovered bundle runtime budget grows with context");
     require(bundled.yarn_decode_source==bundle.string(),"bundle source");
     auto import_args=base;
     import_args.insert(import_args.end(),{"--rtx-state-import-file","prefix.json"});
@@ -85,6 +86,7 @@ int main(int argc,char** argv) try {
     }
     explicit_args.insert(explicit_args.end(),{"--mtp-golden","reference.golden","--mtp-golden-sha256",sha});
     const auto explicit_options=parse(explicit_args);
+    require(!explicit_options.mtp.runtime_automatic,"explicit CLI runtime budget is a ceiling");
     inspected.options=explicit_options;
     receipt=serve::parse_json_unique(effective_config_json(inspected));
     require(receipt.find("yarn_decode_route")->find("source")->as_string()=="explicit","effective explicit source");
@@ -110,7 +112,8 @@ int main(int argc,char** argv) try {
     (void)stats;
 #endif
     auto explicit_bundle=base;explicit_bundle.insert(explicit_bundle.end(),{"--mtp-bundle",bundle.string()});
-    require(parse(explicit_bundle).mtp.enabled,"explicit bundle");
+    require(parse(explicit_bundle).mtp.enabled && !parse(explicit_bundle).mtp.runtime_automatic,
+        "explicit bundle retains its runtime ceiling");
     explicit_bundle.push_back("--mtp");refuses([&]{parse(explicit_bundle);});
     explicit_bundle.pop_back();explicit_bundle.insert(explicit_bundle.end(),{"--mtp-policy-id","1"});
     refuses([&]{parse(explicit_bundle);});
@@ -147,6 +150,7 @@ int main(int argc,char** argv) try {
         const auto nd_selected=parse(nd_plain);
         require(nd_selected.mtp.enabled && nd_selected.mtp_native_bundle && nd_selected.mtp.calibration_rows==16U &&
             !nd_selected.route_owned_beyond_mtp,"plain command selects the adjacent bundle");
+        require(nd_selected.mtp.runtime_automatic,"native default bundle also sizes runtime by context");
         auto nd_opted_out=nd_plain;nd_opted_out.push_back("--no-mtp");
         require(!parse(nd_opted_out).mtp.enabled,"--no-mtp keeps plain decode");
         env("STRIX_MTP","0");require(!parse(nd_plain).mtp.enabled,"STRIX_MTP=0 keeps plain decode");env("STRIX_MTP","");

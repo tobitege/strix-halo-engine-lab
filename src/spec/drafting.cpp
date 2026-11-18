@@ -267,6 +267,7 @@ Decision Arbiter::decide(const StepInput& input) {
                 consider(Source::model, k, 0, draft_ms(k));
             }
     }
+    for (std::size_t s = 0; s < source_count; ++s) { arms_[s] = best[s].d; arm_scores_[s] = best[s].score; }
     std::size_t pick = 0;
     for (std::size_t s = 1; s < source_count; ++s)
         if (best[s].score > best[pick].score) pick = s;
@@ -323,7 +324,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         // Retreat only for a per-depth drafter: a black-box drafter's measured rate already prices its misses
         // (on prose, ~50 % first-row acceptance barred a winning MTP drafter for 32 passes again and again).
         model_misses_ = !last_black_box_ && o.proposed > 0 && o.accepted == 0 ? model_misses_ + 1 : 0;
-        if (model_misses_ >= config_.retreat_misses) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
+        // A streak of first-row misses bars the drafter only when it is improbable under the learned first-row rate
+        // (a streak of m has probability (1 - r1)^m): at ~66 % acceptance two misses in a row are routine and must not
+        // idle the drafter for probe_every passes (measured: 58-71 % serial passes on prose at 64-69 % acceptance).
+        const double r1 = std::min(survival(Source::model, 0, 1), 0.999);
+        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(config_.retreat_confidence) / std::log(1.0 - r1))));
+        if (model_misses_ >= std::max(config_.retreat_misses, streak)) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
     }
     if (o.source == Source::lookup) {
         lookup_misses_ = o.proposed > 0 && o.accepted == 0 ? lookup_misses_ + 1 : 0;

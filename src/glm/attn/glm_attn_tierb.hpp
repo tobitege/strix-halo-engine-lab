@@ -73,6 +73,15 @@ void dsa_b(const Mat& q_b, const Mat& wq_b, const float* qr, unsigned qr_stride,
 void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s,
            Knobs k = env_knobs(), const strix::pair::ProducerPublish* pub = nullptr);
 
+// Split-producer chunk frames (xport/split_frame.hpp): the o projection in two launches on the column halves; y_head / y_tail are
+// the rows x 2048 parts (stride 2048); head / tail publish each half; mid() runs between the launches. Same bits as kda_o / dsa_o.
+void kda_o_split(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y_head, float* y_tail, void* ws, hipStream_t s,
+                 Knobs k, const strix::pair::ProducerPublish& head, const strix::pair::ProducerPublish& tail, void (*mid)(void*),
+                 void* mid_ctx);
+void dsa_o_split(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y_head, float* y_tail, void* ws, hipStream_t s,
+                 Knobs k, const strix::pair::ProducerPublish& head, const strix::pair::ProducerPublish& tail, void (*mid)(void*),
+                 void* mid_ctx);
+
 // Per-(group, rows) knob table (default on; STRIX_GLM_TIERB_TABLE=0 off) switched at runtime (A/B in one process).
 void set_table_enabled(bool on);
 

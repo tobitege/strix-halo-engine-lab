@@ -7,17 +7,19 @@ import sys
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
-scratch = pathlib.Path(tempfile.gettempdir())
+scratch = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else pathlib.Path(tempfile.gettempdir())
 binary = pathlib.Path(sys.argv[1]).resolve()
 
 def copy_scope(dest):
-    for rel in ("src/minimax", "src/moe_core", "src/dspark_common", "src/xport",
+    for rel in ("src/minimax", "src/cuda/models/minimax", "src/moe_core", "src/dspark_common", "src/xport",
                 "include/strix/minimax", "include/strix/session", "src/session"):
         shutil.copytree(root / rel, dest / rel)
     (dest / "include/strix/serve").mkdir(parents=True)
     shutil.copy2(root / "include/strix/serve/session_runtime.hpp", dest / "include/strix/serve/session_runtime.hpp")
-    for rel in ("CMakeLists.txt", "cmake/StrixSession.cmake", "src/serve/engine.cpp",
-                "src/serve/session_runtime.cpp", "include/strix/serve/engine.hpp"):
+    for rel in ("src/hip/weight/trellis_sources.hpp", "CMakeLists.txt", "cmake/StrixSession.cmake", "src/serve/engine.cpp",
+                "src/serve/session_runtime.cpp", "include/strix/serve/engine.hpp",
+                "include/strix/prefill_headless.hpp", "include/strix/pinned_host.hpp",
+                "include/strix/lever.hpp", "src/dist_communicator.cpp"):
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / rel, target)
@@ -34,11 +36,38 @@ def audit(tree):
     return subprocess.run([str(binary), "--audit-sources", str(tree)], text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
+with tempfile.TemporaryDirectory(prefix="headless-", dir=scratch) as temp:
+    tree = pathlib.Path(temp) / "tree"
+    copy_scope(tree)
+    owner = tree / "include/strix/prefill_headless.hpp"
+    baseline_audit = audit(tree)
+    # Unrelated stale receipts must not hide a missing receipt for this header.
+    assert "include/strix/prefill_headless.hpp" not in baseline_audit.stdout, baseline_audit.stdout
+    original = owner.read_bytes()
+    for predicate in (b"q.stack_end", b"!q.observed"):
+        assert predicate in original
+        owner.write_bytes(original.replace(predicate, b"true", 1))
+        edited = audit(tree)
+        assert edited.returncode != 0 and "include/strix/prefill_headless.hpp" in edited.stdout, edited.stdout
+    owner.unlink()
+    removed = audit(tree)
+    assert removed.returncode != 0 and "include/strix/prefill_headless.hpp" in removed.stdout, removed.stdout
+
+if len(sys.argv) > 3 and sys.argv[3] == "--headless-only":
+    print("PASS shared headless policy edit/removal census (unrelated receipt drift excluded)")
+    sys.exit(0)
+
 with tempfile.TemporaryDirectory(prefix="reviewed-", dir=scratch) as temp:
     baseline = pathlib.Path(temp) / "tree"
     copy_scope(baseline)
     good = audit(baseline)
     assert good.returncode == 0, good.stdout
+    moved = baseline / "src/hip/weight/trellis_sources.hpp"
+    original = moved.read_bytes()
+    moved.write_bytes(original.replace(b"float materialize(", b"float changed_materialize("))
+    changed_helper = audit(baseline)
+    assert changed_helper.returncode != 0 and "src/hip/weight/trellis_sources.hpp" in changed_helper.stdout, changed_helper.stdout
+    moved.write_bytes(original)
     # The historical source snapshot is the reviewed receipt baseline. CRLF
     # must not create a mismatch because the production audit normalizes it.
     crlf = baseline / "src/minimax/engine/mm_pack.cpp"
@@ -82,3 +111,15 @@ with tempfile.TemporaryDirectory(prefix="queue-owner-", dir=scratch) as temp:
     assert result.returncode != 0 and "src/serve/engine.cpp" in result.stdout, result.stdout
 
 print("PASS receipted Git snapshot and source audit negatives; current source gate retains seven unresolved rows")
+
+for relative in ("include/strix/pinned_host.hpp", "include/strix/lever.hpp", "src/dist_communicator.cpp"):
+    with tempfile.TemporaryDirectory(prefix="host-pin-", dir=scratch) as temp:
+        tree = pathlib.Path(temp) / "tree"
+        copy_scope(tree)
+        owner = tree / relative
+        owner.write_bytes(owner.read_bytes() + b"\n// selector drift\n")
+        edited = audit(tree)
+        assert edited.returncode != 0 and relative in edited.stdout, edited.stdout
+        owner.unlink()
+        removed = audit(tree)
+        assert removed.returncode != 0 and relative in removed.stdout, removed.stdout

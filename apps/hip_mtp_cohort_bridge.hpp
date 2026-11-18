@@ -48,7 +48,8 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
     load.residency.mode = m.sidecar_residency == "copy" ? HipModelResidencyMode::resident_copy : HipModelResidencyMode::registered_file_mapping;
     load.residency.reservation_limits = {m.sidecar_retained_bytes, m.sidecar_setup_bytes};
     const auto assets = HipMtpAssets::load(model, load, actual0.mapped, actual0.manifest, actual0.model, generations);
-    HipMtpBudget native_budget; native_budget.retained_bytes = m.runtime_bytes; native_budget.context_capacity = options.context_tokens;
+    HipMtpBudget native_budget; native_budget.context_capacity = options.context_tokens;
+    native_budget.retained_bytes = mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes, m.runtime_automatic);
     native_budget.maximum_candidate_depth = m.candidate_depth;
     native_budget.normalized_rounding = m.normalized_rounding == "fp32" ? HipMtpInputRounding::fp32 : HipMtpInputRounding::bf16_rne;
     native_budget.projection_rounding = m.projection_rounding == "fp32" ? HipMtpInputRounding::fp32 : HipMtpInputRounding::bf16_rne;
@@ -123,6 +124,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
                 throw std::invalid_argument("MTP cohort window factory returned incompatible actual owner");
             assets->validate_assets_unchanged();
             std::vector<HipMtpReplayRow> replay_rows; replay_rows.reserve(golden.rows.size());
+            const q6p::iu4::SuspendScope exact_golden_scope;  // golden replay = exact arithmetic (onfly INT4 suspended)
             for (std::size_t i = 0; i < request.tokens.size(); ++i) {
                 auto current = l.target->execute_serial(session, r, *request.dispatcher, request.tokens[i]);
                 if (l.pending.valid()) replay_rows.push_back({l.pending, request.tokens[i]});

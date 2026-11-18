@@ -20,6 +20,8 @@
 #include <tuple>
 #include <vector>
 
+#include "strix/lever_cache.hpp"
+
 #if defined(STRIX_DS41_TRELLIS_LIB)
 #include <strix_trellis.h>
 #if defined(STRIX_DS41_TRELLIS_PREPARED) && (!defined(STRIX_TRELLIS_VERSION_MINOR) || STRIX_TRELLIS_VERSION_MINOR < 3)
@@ -97,8 +99,8 @@ bool trellis_dense_row_slices_enabled() noexcept {
 }
 bool trellis_qakv_pair_enabled() noexcept {
     // default on (=0 off): the pair has the bits of the individual q_a / kv submissions
-    static const bool on = [] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_QAKV_PAIR"); return !(e && e[0] == '0'); }();
-    return on;
+    static strix::lever_cache<bool> on{[] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_QAKV_PAIR"); return !(e && e[0] == '0'); }};
+    return on.get();
 }
 bool trellis_row_views_enabled() noexcept {
 #if defined(STRIX_DS41_TRELLIS_DENSE_R1)

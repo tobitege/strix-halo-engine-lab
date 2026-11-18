@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/eager_code_load.hpp"
 #include "strix/device/gate.hpp"
 
 #include <cstdio>
@@ -25,7 +26,11 @@ const Bound& bind_hip(Request request = {}, const std::string& devices_path = {}
 
 // For a main(): takes --devices FILE / --device-id ID out of the argument vector and binds. On a refusal it prints the
 // one-line reason and exits with status 2.
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr);
+// Engine flags (including --deploy-check) cannot bypass admission before the engine parser validates their meaning.
+// First of all it applies eager code-object loading (strix/device/eager_code_load.hpp: restarts the image once with
+// HIP_ENABLE_DEFERRED_LOADING=0 unless STRIX_EAGER_CODE_LOAD=0 or the HIP value is set); CodeLoad::engine leaves that
+// to a binary that resolves its own policy later.
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr, CodeLoad code_load = CodeLoad::shared);
 
 // The binding made by this process, or null before the first bind (and always null without the HIP runtime).
 [[nodiscard]] const Bound* hip_bound() noexcept;

@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/deepseek41_device_forward.hpp"
@@ -926,7 +927,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         m.slot_gate = Dev<std::uint8_t>(k * gs);
         m.slot_up = Dev<std::uint8_t>(k * gs);
         m.slot_down = Dev<std::uint8_t>(k * ds);
-        check(hipHostMalloc(reinterpret_cast<void**>(&m.slot_pinned), k * (2U * gs + ds), hipHostMallocDefault), "expert staging");
+        check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.slot_pinned), k * (2U * gs + ds), hipHostMallocDefault), "expert staging");
     }
     m.index_qprep = Dev<std::uint8_t>(std::size_t{W} * attn::hip::kIdxPrepBytes);
     m.attn_tickets = Dev<std::uint32_t>(std::size_t{W} * attn::hip::kAttnGroupCount);
@@ -959,7 +960,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     if (m.headout) m.head_rows = Dev<float>(m.trellis_head.size() * W * m.trellis_head.front().first.count);
     const std::size_t cols = m.model.engram.rows_per_token();
     m.erows = Dev<std::uint8_t>(std::size_t{m.model.engram.layer_ids.size()} * W * cols * 264U);
-    check(hipHostMalloc(reinterpret_cast<void**>(&m.erows_pinned), m.erows.n, hipHostMallocDefault), "engram staging");
+    check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.erows_pinned), m.erows.n, hipHostMallocDefault), "engram staging");
     m.emb = Dev<float>(W * cols * 256U);
     m.ekv = Dev<float>(W * H * (hc + 1U));
     if (options.world == 2U) {  // the exchanged halves of ds41::engram_tp()
@@ -1064,9 +1065,9 @@ DeviceForward::~DeviceForward() {
         impl_->trellis_oa.reset();
         impl_->trellis.reset();
     }
-    if (impl_ && impl_->slot_pinned != nullptr) (void)hipHostFree(impl_->slot_pinned);
-    if (impl_ && impl_->receive_pinned != nullptr) (void)hipHostFree(impl_->receive_pinned);
-    if (impl_ && impl_->erows_pinned != nullptr) (void)hipHostFree(impl_->erows_pinned);
+    if (impl_ && impl_->slot_pinned != nullptr) (void)strix::host_pin::release(impl_->slot_pinned);
+    if (impl_ && impl_->receive_pinned != nullptr) (void)strix::host_pin::release(impl_->receive_pinned);
+    if (impl_ && impl_->erows_pinned != nullptr) (void)strix::host_pin::release(impl_->erows_pinned);
     if (impl_)
         for (auto e : impl_->op_events) (void)hipEventDestroy(e);
     if (impl_ && impl_->prefetch_stream != nullptr) {
@@ -1093,11 +1094,11 @@ std::span<std::uint8_t> DeviceForward::receive_buffer(std::size_t bytes) {
     auto& m = *impl_;
     if (bytes > m.receive_bytes) {
         check(hipStreamSynchronize(m.stream), "receive buffer");  // no upload still reads the old one
-        if (m.receive_pinned != nullptr) (void)hipHostFree(m.receive_pinned);
+        if (m.receive_pinned != nullptr) (void)strix::host_pin::release(m.receive_pinned);
         m.receive_pinned = nullptr;
         m.receive_bytes = 0;
         const std::size_t n = std::max<std::size_t>(bytes, std::size_t{1} << 20U);
-        check(hipHostMalloc(reinterpret_cast<void**>(&m.receive_pinned), n, hipHostMallocDefault), "receive buffer");
+        check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.receive_pinned), n, hipHostMallocDefault), "receive buffer");
         m.receive_bytes = n;
     }
     return {m.receive_pinned, bytes};

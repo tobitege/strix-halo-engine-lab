@@ -241,6 +241,9 @@ inline QLinear read_image_linear(const SafeTensors& st, const std::string& prefi
 
 inline GlobalWeights load_global(const SafeTensors& st, const LoadPolicy& pol = {}) {
     using namespace detail;
+    weight::WeightMap admitted;
+    auto admission = st.admitted_weights(admitted);
+    if (!admission) throw std::runtime_error("H3 weight admission: " + admission.detail);
     GlobalWeights g;
     g.audio_enabled = pol.audio_enabled;
     g.direct_timestep = pol.direct_timestep;

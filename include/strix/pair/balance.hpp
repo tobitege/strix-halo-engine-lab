@@ -6,6 +6,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace strix::pair {
 struct StageSplit { std::uint32_t cut = 0; double a = 0, b = 0; bool half = false; };
@@ -50,5 +51,22 @@ template<class Legal, class LegalHalf> StageSplit balance_split(std::span<const 
     }
     if (!(score < std::numeric_limits<double>::infinity())) throw std::invalid_argument("pair pipeline has no legal cut");
     return best;
+}
+// Heterogeneous chain: stage s runs layers [cuts[s-1], cuts[s]) (cuts[-1] = 0, the last cut = layer count) on its
+// own device, whose per-layer costs are costs[s] (each covering every layer of the model); the last stage also runs
+// `tail`. With one shared vector and two stages this is predict_split.
+inline std::vector<double> predict_chain(std::span<const std::span<const double>> costs,
+                                         std::span<const std::uint32_t> cuts, double tail) {
+    if (costs.empty() || cuts.size() != costs.size()) throw std::invalid_argument("pipeline chain needs one cut per stage");
+    std::vector<double> work(costs.size(), 0.0);
+    std::uint32_t begin = 0;
+    for (std::size_t s = 0; s < costs.size(); ++s) {
+        if (cuts[s] <= begin || cuts[s] > costs[s].size()) throw std::invalid_argument("pipeline chain cut out of order");
+        for (std::uint32_t layer = begin; layer < cuts[s]; ++layer) work[s] += costs[s][layer];
+        begin = cuts[s];
+    }
+    if (begin != costs.back().size()) throw std::invalid_argument("pipeline chain does not end at the last layer");
+    work.back() += tail;
+    return work;
 }
 } // namespace strix::pair

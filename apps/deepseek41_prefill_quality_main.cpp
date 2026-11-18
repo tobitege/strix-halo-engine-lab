@@ -1,7 +1,13 @@
 #include "strix/device/hip_gate.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/deepseek41_model.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include "strix/model_content_hash.hpp"
 #include "deepseek41_quality_arms.hpp"
+#include <filesystem>
+#include <span>
+#include <unistd.h>
 #include <algorithm>
 #include <chrono>
 #include <iterator>
@@ -89,6 +95,58 @@ std::string trace_json(const PrefillResult& ref, const PrefillResult& got, std::
     o << "]";
     return o.str();
 }
+std::string sha_hex(const void* p, std::size_t n) {
+    return strix::model_content_identity_hex(strix::sha256_bytes(std::span<const std::byte>(static_cast<const std::byte*>(p), n)));
+}
+std::string sha_hex(const std::string& s) { return sha_hex(s.data(), s.size()); }
+
+// Gate mode: one execution witness (tools/strix-gate, schema strix-fast-execution/v1) per arm, from the executed
+// configuration and the dumps this process wrote. Canonical numerical configuration: every precision field of the arm
+// except the null control (null_ulp_layer, null_seed), the loaded run form, the FAST dense threshold and the process's
+// STRIX_* environment, one "key=value" line each in a fixed order (environment sorted).
+std::string numerical_config(const PrefillOptions& a, const PrefillOptions& load, bool replay_oracle) {
+    std::ostringstream o;
+    o << "ds41-numcfg-v1\nfp16_dense=" << a.fp16_dense << "\nbf16_attention=" << a.bf16_attention << "\nfast_attention=" << a.fast_attention
+      << "\nfast_attention_flash=" << a.fast_attention_flash << "\nfast_moe=" << a.fast_moe << "\nfast_dense=" << a.fast_dense
+      << "\nfp16_projections=" << a.fp16_projections << "\napprox_layers=" << a.approx_layer_first << "-" << a.approx_layer_end
+      << "\nfp16_min_rows=" << a.fp16_min_rows << "\nfp16_keep_a8=" << a.fp16_keep_a8 << "\nfp16_fast=" << a.fp16_fast
+      << "\nfp16_wsplit=" << a.fp16_wsplit << "\ndecoder_replay_rows=" << a.decoder_replay_rows
+      << "\ndecoder_replay_oracle=" << replay_oracle << "\nprefill_cone=1\ncontinuation_cone=0\ncontinuation_decoder_replay_rows=0"
+      << "\nrow_split=" << load.row_split << "\nquality_head_rows=" << load.quality_head_rows << "\nmax_positions=" << load.max_positions
+      << "\nwindow_rows=" << load.window_rows << "\nworld=" << load.world
+      << "\nfast_dense_min_rows=" << strix::ds41::fast_profile::dense_min_rows() << "\n";
+    std::vector<std::string> env;
+    for (char** e = environ; e && *e; ++e)
+        if (std::strncmp(*e, "STRIX_", 6) == 0) env.emplace_back(*e);
+    std::sort(env.begin(), env.end());
+    for (const auto& e : env) o << "env " << e << "\n";
+    return o.str();
+}
+struct GateArm {
+    std::string run_id, profile, control, numcfg;
+    std::map<std::string, std::string> prompts;  // name -> the sealed prompts map entry (JSON)
+};
+void write_witnesses(const std::string& dir, const std::map<std::string, GateArm>& arms, unsigned rank, const std::string& binary,
+                     const std::string& model) {
+    for (const auto& [label, a] : arms) {
+        std::ostringstream o;
+        o << "{\"schema\":\"strix-fast-execution/v1\",\"run_id\":\"" << a.run_id << "\",\"rank\":" << rank << ",\"binary_sha256\":\""
+          << binary << "\",\"engine\":\"ds41\",\"profile\":\"" << a.profile << "\",\"model_sha256\":\"" << model
+          << "\",\"numerical_config_sha256\":\"" << sha_hex(a.numcfg) << "\",\"control\":" << a.control << ",\"prompts\":{";
+        bool first = true;
+        for (const auto& [name, entry] : a.prompts) {
+            o << (first ? "" : ",") << "\"" << name << "\":" << entry;
+            first = false;
+        }
+        o << "}}\n";
+        const auto d = std::filesystem::path(dir) / label;
+        std::ofstream(d / ("execution-r" + std::to_string(rank) + ".json")) << o.str();
+        std::ofstream(d / "numerical-config.txt") << a.numcfg;
+        std::printf("gate_witness arm=%s run_id=%s profile=%s dir=%s prompts=%zu\n", label.c_str(), a.run_id.c_str(), a.profile.c_str(),
+                    d.string().c_str(), a.prompts.size());
+    }
+    std::fflush(stdout);
+}
 }  // namespace
 
 int main(int argc,char** argv) try {
@@ -97,8 +155,10 @@ int main(int argc,char** argv) try {
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
     const auto start=std::chrono::steady_clock::now();
-    if(argc!=5 && argc!=6)throw std::runtime_error("MODEL manifest.tsv outdir rank [budget_seconds]");
-    const double budget=argc==6?std::stod(argv[5]):0;
+    // GATE_DIR: gate mode (below); budget_seconds 0 = no budget
+    if(argc<5 || argc>7)throw std::runtime_error("MODEL manifest.tsv outdir rank [budget_seconds [GATE_DIR]]");
+    const double budget=argc>=6?std::stod(argv[5]):0;
+    const std::string gate_dir=argc==7?argv[6]:"";
     if(budget && budget<60)throw std::runtime_error("budget must be >=60 seconds");
     unsigned rank=static_cast<unsigned>(std::stoul(argv[4]));
     if(rank>1)throw std::runtime_error("rank");
@@ -111,7 +171,9 @@ int main(int argc,char** argv) try {
     strix::dist::Communicator comm(strix::dist::Group{rank,2,1,0x616d647072656669ULL},std::move(transport),std::size_t(32)<<20);
     strix::deepseek41::PrefillOptions o;o.rank=rank;o.world=2;o.communicator=&comm;
     o.max_positions=8192;o.row_split=false;o.cone=false;o.quality_head_rows=64;
+    const strix::LoaderCapture gate_capture(!gate_dir.empty());
     strix::deepseek41::DevicePrefill prefill(argv[1],o);
+    const auto gate_files=strix::LoaderCapture::snapshot();
     std::printf("loaded rank=%u seconds=%.3f weights=%llu overlay=%s trace=%d\n",rank,prefill.load_seconds(),static_cast<unsigned long long>(prefill.weight_bytes()),prefill.overlay_description().c_str(),trace);std::fflush(stdout);
     std::ifstream manifest(argv[2]);if(!manifest)throw std::runtime_error("manifest");
     struct Flags {
@@ -121,6 +183,26 @@ int main(int argc,char** argv) try {
     } flags;
     unsigned budget_round=0;
     bool control_done=false;
+    // Gate mode (GATE_DIR): per prompt of n tokens every arm prefills P = (n - 64) / 128 * 128 rows from position 0 (run:
+    // the arm's policy, fast3b<R> with the bound), then the 64 rows [P, P + 64) teacher-forced from that state (extend,
+    // the exact plan), and rank 0 dumps 65 rows for tools/strix-gate/fast_logit_gate.py: the run's last row (position
+    // P - 1), then the 64 (GATE_DIR/<arm>/q-<case>-tf-r0.f32, full vocabulary), with the prompt's first P + 64 tokens as
+    // GATE_DIR/tok/<case>.u32 and, at the end, GATE_DIR/<arm>/execution-r0.json from the executed configuration.
+    std::map<std::string,GateArm> gate_arms;
+    std::string gate_binary,gate_model;
+    if(!gate_dir.empty()){
+        strix::verify_loader_snapshot(gate_files);
+        gate_model=strix::deepseek41::quality::model_witness(argv[1],prefill.overlay_path());
+        strix::verify_loader_snapshot(gate_files);
+        std::string peer_model(gate_model.size(),'\0');
+        comm.exchange_host(std::as_bytes(std::span(gate_model)),std::as_writable_bytes(std::span(peer_model)),
+                           strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control),0x6d6f646cU,0U});
+        if(peer_model!=gate_model)throw std::runtime_error("gate mode: ranks loaded different model content");
+    }
+    if(!gate_dir.empty() && rank==0){
+        gate_binary=strix::model_content_identity_hex(strix::sha256_file_content("/proc/self/exe",nullptr));
+    }
+    const auto unix_now=static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     std::string name,path;unsigned n;
     for(std::string line;std::getline(manifest,line);){
         if(line.empty()||line[0]=='#')continue;
@@ -140,6 +222,7 @@ int main(int argc,char** argv) try {
         std::ifstream f(path);std::vector<std::uint32_t> ids;std::uint32_t id;while(f>>id)ids.push_back(id);
         if(ids.size()!=n)throw std::runtime_error("prompt length");
         PrefillResult ref;bool have_ref=false;
+        std::vector<float> gate_ref;  // gate mode: the exact arm's 65 rows of this prompt
         for(const auto& label:arms){
             if(label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_")!=std::string::npos)throw std::runtime_error("arm label "+label);
             auto precision=arm_precision(label);precision.trace=trace;
@@ -148,8 +231,82 @@ int main(int argc,char** argv) try {
             if(hipMemcpy(flags.p,&stop,4,hipMemcpyHostToDevice)!=hipSuccess)throw std::runtime_error("budget flag upload");
             comm.exchange(nullptr,flags.p,flags.p+1,4,strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control),15U,++budget_round});
             if(hipMemcpy(&peer_stop,flags.p+1,4,hipMemcpyDeviceToHost)!=hipSuccess)throw std::runtime_error("budget flag download");
-            if(stop || peer_stop){std::printf("budget_stop next=%s arm=%s elapsed=%.3f\n",name.c_str(),label.c_str(),elapsed);std::fflush(stdout);return 0;}
+            if(stop || peer_stop){
+                std::printf("budget_stop next=%s arm=%s elapsed=%.3f\n",name.c_str(),label.c_str(),elapsed);std::fflush(stdout);
+                if(!gate_dir.empty())strix::verify_loader_snapshot(gate_files);
+                if(!gate_dir.empty() && rank==0)write_witnesses(gate_dir,gate_arms,rank,gate_binary,gate_model);
+                return 0;
+            }
             prefill.set_precision_for_new_sequence(precision);
+            if(!gate_dir.empty()){
+                if(n<192)throw std::runtime_error("gate mode: prompts of at least 192 tokens");
+                const std::uint32_t P=(n-64)/128*128,total=P+64;
+                const std::span<const std::uint32_t> all(ids.data(),total);
+                const auto t0=std::chrono::steady_clock::now();
+                std::uint32_t next=0;
+                auto executed=precision;
+                bool replay_oracle=false;
+                auto pass=[&]{
+                    prefill.set_cone(true);  // the prefill as served (exact suffix replay, or the arm's bounded plan)
+                    auto a=prefill.run(all.first(P));
+                    executed=strix::deepseek41::quality::executed_precision(precision,a);
+                    replay_oracle=a.decoder_replay_oracle;
+                    prefill.set_cone(false);  // the 64 teacher rows: every row of every layer
+                    auto b=prefill.extend(all.subspan(P,64));
+                    const std::size_t V=a.logits.size();
+                    if(b.teacher_logits.size()!=64*V || b.logits.size()!=V)throw std::runtime_error("gate mode: teacher logit shape");
+                    std::vector<float> z(65*V);
+                    std::copy(a.logits.begin(),a.logits.end(),z.begin());
+                    std::copy(b.teacher_logits.begin(),b.teacher_logits.end(),z.begin()+std::ptrdiff_t(V));
+                    next=a.next_token;
+                    return z;
+                };
+                auto z=pass();
+                const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+                if(label=="exact" && !control_done){
+                    if(const auto again=pass();again.size()!=z.size() || std::memcmp(again.data(),z.data(),z.size()*4))throw std::runtime_error("repeated incumbent run drift (gate mode)");
+                    std::printf("exact_repeat_control=bitwise_equal case=%s\n",name.c_str());std::fflush(stdout);control_done=true;
+                }
+                unsigned nonfinite=0;for(float v:z)nonfinite+=!std::isfinite(v);
+                if(nonfinite)throw std::runtime_error("nonfinite gate logits");
+                const std::size_t V=z.size()/65;
+                std::uint64_t hash=14695981039346656037ULL;
+                for(float value:z){std::uint32_t bits;std::memcpy(&bits,&value,4);for(unsigned b=0;b<4;++b){hash=(hash^(bits&255U))*1099511628211ULL;bits>>=8;}}
+                if(rank==0){
+                    namespace fs=std::filesystem;
+                    const fs::path ad=fs::path(gate_dir)/label,td=fs::path(gate_dir)/"tok";
+                    fs::create_directories(ad);fs::create_directories(td);
+                    const std::string tok_name=name+".u32",dump_name="q-"+name+"-tf-r0.f32";
+                    std::ofstream(td/tok_name,std::ios::binary).write(reinterpret_cast<const char*>(all.data()),std::streamsize(total)*4);
+                    std::ofstream(ad/dump_name,std::ios::binary).write(reinterpret_cast<const char*>(z.data()),std::streamsize(z.size())*4);
+                    auto& g=gate_arms[label];
+                    if(g.run_id.empty()){
+                        g.run_id=label+"-"+std::to_string(unix_now)+"-"+std::to_string(::getpid());
+                        g.profile=strix::deepseek41::quality::arm_profile(executed);
+                        g.control=precision.null_ulp_layer<0?std::string("null"):"{\"kind\":\""+std::string(precision.null_ulp_layer==0?"layer0-null":"layer-null")+
+                                  "\",\"layer\":"+std::to_string(precision.null_ulp_layer)+",\"magnitude\":1,\"unit\":\"ulp\"}";
+                        g.numcfg=numerical_config(executed,o,replay_oracle);
+                    }
+                    std::ostringstream e;
+                    e<<"{\"tokens\":"<<total<<",\"tokens_sha256\":\""<<sha_hex(all.data(),std::size_t(total)*4)<<"\",\"rows\":65,\"files\":{\"tf\":{\"name\":\""
+                     <<dump_name<<"\",\"bytes\":"<<z.size()*4<<",\"sha256\":\""<<sha_hex(z.data(),z.size()*4)<<"\",\"width\":"<<V<<"}}}";
+                    g.prompts[name]=e.str();
+                }
+                std::printf("{\"case\":\"%s\",\"arm\":\"%s\",\"rank\":%u,\"tokens\":%u,\"prefill\":%u,\"rows\":65,\"seconds\":%.6f,\"next\":%u,\"nonfinite\":%u,\"hash\":\"%016llx\"}\n",
+                            name.c_str(),label.c_str(),rank,total,P,seconds,next,nonfinite,static_cast<unsigned long long>(hash));
+                if(label=="exact"){gate_ref=std::move(z);std::fflush(stdout);continue;}
+                if(gate_ref.size()!=z.size() || rank!=0){std::fflush(stdout);continue;}
+                double sum=0;unsigned top=0;std::ostringstream kl;kl.precision(9);
+                for(unsigned q=0;q<65;++q){
+                    const float* x=gate_ref.data()+std::size_t(q)*V;const float* y=z.data()+std::size_t(q)*V;
+                    auto lp=log_softmax(x,V),lq=log_softmax(y,V);double k=0;
+                    for(std::size_t i=0;i<V;++i)k+=std::exp(lp[i])*(lp[i]-lq[i]);
+                    sum+=k;top+=std::max_element(x,x+V)-x==std::max_element(y,y+V)-y;kl<<(q?",":"")<<k;
+                }
+                std::printf("{\"diag\":1,\"case\":\"%s\",\"arm\":\"%s\",\"rows\":65,\"mean_kl\":%.9g,\"top1\":%u,\"kl\":[%s]}\n",name.c_str(),label.c_str(),sum/65,top,kl.str().c_str());
+                std::fflush(stdout);
+                continue;
+            }
             auto r=prefill.run(ids);
             if(label=="exact" && !control_done){
                 auto repeat=prefill.run(ids);
@@ -184,5 +341,7 @@ int main(int argc,char** argv) try {
             std::fflush(stdout);
         }
     }
+    if(!gate_dir.empty())strix::verify_loader_snapshot(gate_files);
+    if(!gate_dir.empty() && rank==0)write_witnesses(gate_dir,gate_arms,rank,gate_binary,gate_model);
     return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"prefill-quality: %s\n",e.what());return 2;}

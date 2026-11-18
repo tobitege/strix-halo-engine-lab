@@ -1,0 +1,24 @@
+{
+  "module": "\"\"\"Small library catalogue helpers.\"\"\"\nimport csv\nfrom dataclasses import dataclass\nfrom typing import Dict, Iterable, List, Optional\n\n\n@dataclass\nclass Book:\n    code: str\n    title: str\n    author: str\n    copies: int = 1\n    loaned: int = 0\n\n\ndef load_books(path: str) -> Dict[str, Book]:\n    books: Dict[str, Book] = {}\n    with open(path, newline='') as handle:\n        for row in csv.DictReader(handle):\n            book = Book(row['code'], row['title'], row['author'], int(row.get('copies') or 1))\n            books[book.code] = book\n    return books\n\n\ndef find_book(books: Dict[str, Book], code: str) -> Optional[Book]:\n    return books.get(code.strip().upper())\n\n\ndef lend(books: Dict[str, Book], code: str) -> bool:\n    book = find_book(books, code)\n    if book is None or book.loaned >= book.copies:\n        return False\n    book.loaned += 1\n    return True\n\n\ndef give_back(books: Dict[str, Book], code: str) -> bool:\n    book = find_book(books, code)\n    if book is None or book.loaned == 0:\n        return False\n    book.loaned -= 1\n    return True\n\n\ndef available(books: Iterable[Book]) -> List[Book]:\n    return [b for b in books if b.loaned < b.copies]\n\n\ndef by_author(books: Iterable[Book], author: str) -> List[Book]:\n    key = author.casefold()\n    return sorted((b for b in books if b.author.casefold() == key), key=lambda b: b.title)\n\n\ndef save_books(path: str, books: Dict[str, Book]) -> None:\n    with open(path, 'w', newline='') as handle:\n        writer = csv.writer(handle)\n        writer.writerow(['code', 'title', 'author', 'copies'])\n        for book in books.values():\n            writer.writerow([book.code, book.title, book.author, book.copies])\n",
+  "edit": [
+    "Rename the function `find_book` to `lookup_book` everywhere.",
+    "Rename the function `give_back` to `return_book` everywhere.",
+    "Add a one-line docstring to every function.",
+    "Rename the field `loaned` to `on_loan` everywhere.",
+    "Make `lend` and `give_back` raise KeyError when the code is unknown instead of returning False.",
+    "Add a `year: int = 0` field to Book and read and write it in the CSV helpers.",
+    "Rename the parameter `books` to `catalogue` in every function.",
+    "Change `available` and `by_author` to return tuples instead of lists."
+  ],
+  "edit_suffix": " Return the complete updated module in one code block, with no explanation.",
+  "json": [
+    "Return only JSON with keys name, ingredients (array of strings) and steps (array of strings) for a simple tomato soup.",
+    "Return only JSON describing three planets of the solar system: an array of objects with keys name, order_from_sun and has_rings.",
+    "Return only JSON with keys city, transport and activities (array of objects with time and place) for a one-day visit to a river town.",
+    "Return only JSON for a small bookshop inventory: an array of five objects with keys title, author, price and in_stock.",
+    "Return only JSON with keys project, owner, tasks (array of objects with id, title, status) for a garden clean-up plan.",
+    "Return only JSON describing a weekly training plan: an object with one key per weekday and values with activity and minutes.",
+    "Return only JSON with keys device, settings (object) and alerts (array of strings) for a home weather station.",
+    "Return only JSON listing four board games as objects with keys name, players_min, players_max and minutes."
+  ]
+}

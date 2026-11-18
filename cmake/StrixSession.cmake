@@ -107,6 +107,11 @@ function(strix_session_add_runtime)
     add_executable(strix-serve "${_strix_session_root}/apps/strix_serve_main.cpp")
     target_link_libraries(strix-serve PRIVATE strix_session_shell)
     strix_session_warnings(strix-serve)
+    # The skeleton family serves /health without weights: every build mode (also the CUDA-only trees) has it,
+    # so an installed package can be smoke-tested on any OS.
+    add_executable(strix-skeleton-serve "${_strix_session_root}/examples/skeleton_engine/main.cpp")
+    target_link_libraries(strix-skeleton-serve PRIVATE strix_session_shell)
+    strix_session_warnings(strix-skeleton-serve)
     if(BUILD_TESTING)
         foreach(test runtime http_replay registry turn_cache)
             add_executable(session_${test}_tests "${_strix_session_root}/tests/session_${test}_tests.cpp")

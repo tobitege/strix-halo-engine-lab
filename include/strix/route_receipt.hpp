@@ -178,6 +178,12 @@ inline void lever(std::string_view lever_name, std::string_view requested, std::
     for (auto& l : detail::levers()) if (l.name == next.name) { l = std::move(next); return; }
     detail::levers().push_back(std::move(next));
 }
+// Add a numerical variant without changing the legacy default fingerprint.
+// The default remains visible in receipts; only deviations enter rank agreement.
+inline void numerical_variant(std::string_view name, std::string_view requested,
+                              std::string_view effective, std::string_view legacy_default) {
+    lever(name, requested, effective, Reason::selected, effective != legacy_default);
+}
 inline std::vector<Lever> levers() {
     std::lock_guard<std::mutex> lock(detail::lever_mutex());
     return detail::levers();

@@ -167,4 +167,40 @@ std::string verify_suffix_replay(const SuffixReplayGeometry& g, const SuffixRepl
     return problem;
 }
 
+SuffixReplayPlan plan_bounded_replay(const SuffixReplayGeometry& g, std::uint64_t cached, std::uint64_t total, std::uint32_t bound) {
+    require_geometry(g);
+    if (total <= cached) throw std::invalid_argument("ds41 bounded replay needs at least one new row");
+    if (bound == 0U || bound % g.window != 0U) throw std::invalid_argument("ds41 bounded replay: the bound must be a positive multiple of the window");
+    SuffixReplayPlan plan;
+    plan.cached = cached; plan.total = total;
+    plan.layers.resize(g.layers);
+    if (g.draft_rows > bound)
+        throw std::invalid_argument("ds41-decoder-replay-bounded-v1: draft_rows = " + std::to_string(g.draft_rows) +
+                                    " exceeds R = " + std::to_string(bound));
+    const std::uint64_t begin = std::max(cached, bounded_replay_key_floor(total, bound));
+    for (std::uint32_t layer = 0; layer < g.layers; ++layer) {
+        auto& l = plan.layers[layer];
+        l.layer = layer;
+        l.out_begin = l.kv_begin = layer < g.first_decoder ? cached : begin;
+    }
+    // the first decoder layer's input: every new row (its compressed KV and index keys; the engine keeps x0 = 0)
+    plan.encoder_output_begin = cached;
+    // a layer that computes row `cached` reads its ring only above its key floor: no ring row of the prefix when cut > cached
+    plan.ring_rows = cached > 0U && begin == cached ? std::min<std::uint64_t>(cached, g.window - 1U) : 0U;
+    plan.full_row_layers = (total - cached) * g.layers;
+    for (const auto& l : plan.layers) plan.replay_row_layers += total - l.out_begin;
+    return plan;
+}
+
+std::uint32_t moe_window_rows(std::uint32_t base, std::uint32_t chunk, std::uint32_t pass_rows, std::uint32_t cap) {
+    if (base == 0U || chunk == 0U) throw std::invalid_argument("ds41 moe window: base and chunk rows must be positive");
+    const std::uint64_t whole = (std::uint64_t{pass_rows} + chunk - 1U) / chunk * chunk;
+    const std::uint64_t top = std::max<std::uint64_t>(cap / chunk * chunk, base);
+    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(whole, base, top));
+}
+
+bool moe_joint_layer(std::uint32_t peer_rows, std::uint32_t own_rows, std::uint32_t max_rows) {
+    return max_rows != 0U && std::uint64_t{peer_rows} + own_rows <= max_rows;
+}
+
 } // namespace strix::ds41

@@ -111,3 +111,5 @@ New records serialize only controlled identifiers, enumerations and numbers.
 They omit paths, host/account names, PIDs, process lists, command lines, device
 serials/BDFs, raw errors and raw environment/configuration. This boundary applies
 to these records, not every existing engine log.
+
+`gdn-register-fit.sh BASE_BIN_DIR CANDIDATE_BIN_DIR OUTPUT_DIR` in `scripts/bench/rtx/` compares the shared CUDA GDN fixture digest and three interleaved 8K synthetic prefill pairs, with separate logits and timing logs. Supply `STRIX_DEVICES` and run inside the shared GPU guard and operator FIFO; bound the complete workload, including initialization and idle spacing, to 210 seconds. This tests a scheduling/register change, not model quality or a new profile.

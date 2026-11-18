@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 
 #include "strix/ds41_formats.hpp"
 
@@ -94,14 +95,18 @@ public:
         std::string dtype;
         std::vector<std::uint64_t> shape;
         std::uint64_t offset = 0, bytes = 0;  // absolute in the file
+        weight::Slice source;
     };
     // nullptr if the index has no such tensor or its shard is missing.
     [[nodiscard]] const Tensor* find(const std::string& name);
     void read(const Tensor& t, std::uint8_t* out) const;
+    weight::Status admitted_weights(weight::WeightMap& out) const { return weight::bind_ds41(index_,out); }
+    const weight::TensorIndex& tensor_index() const noexcept { return index_; }
     [[nodiscard]] const std::filesystem::path& dir() const noexcept { return dir_; }
 
 private:
     void load_header(const std::filesystem::path& file);
+    weight::TensorIndex index_;
     bool reject_duplicate_names_ = false;
     std::filesystem::path dir_;
     std::map<std::string, std::string> shard_of_;  // tensor name -> shard file name

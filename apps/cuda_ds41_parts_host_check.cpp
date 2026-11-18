@@ -18,9 +18,9 @@
 // routed in ROUTES (the windows come from the same file: an in-sample residency), hash a seeded random subset.
 
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_parts_host_driver.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_parts_host_driver.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
 #include "strix/ds41_hot_placement.hpp"
 #include "strix/gguf_reader.hpp"
 

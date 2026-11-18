@@ -171,6 +171,79 @@ std::uint64_t prefix_cache_checksum(std::span<const std::byte> bytes) noexcept {
     return std::rotl((hash ^ tail) * prime, 27) ^ (hash >> 17);
 }
 
+// Handles may outlive the store: its destructor detaches the anchor under the anchor mutex.
+// Lock order: anchor mutex, then the store mutex.
+struct PrefixStateCache::QueueProtection::Anchor {
+    explicit Anchor(PrefixStateCache* c) : cache(c) {}
+    std::mutex mutex;
+    PrefixStateCache* cache = nullptr;
+};
+PrefixStateCache::QueueProtection& PrefixStateCache::QueueProtection::operator=(QueueProtection&& o) noexcept {
+    if (this != &o) {
+        release();
+        anchor_ = std::move(o.anchor_); entry_ = std::move(o.entry_);
+        digest_ = o.digest_; position_ = o.position_;
+        o.anchor_.reset(); o.entry_.reset();
+    }
+    return *this;
+}
+void PrefixStateCache::QueueProtection::release() noexcept {
+    if (!anchor_) return;
+    {
+        std::lock_guard anchor(anchor_->mutex);
+        if (auto* cache = anchor_->cache) {
+            std::lock_guard lock(cache->mutex_);
+            cache->queue_release_locked(*this);
+        }
+    }
+    anchor_.reset(); entry_.reset();
+}
+void PrefixStateCache::queue_release_locked(const QueueProtection& p) noexcept {
+    const auto it = entries_.find(p.digest_);
+    // Owner equivalence, not the digest alone: a re-inserted entry with the same digest is not ours.
+    if (it == entries_.end() || !it->second.queue_refs ||
+        p.entry_.owner_before(it->second.checkpoint) || it->second.checkpoint.owner_before(p.entry_)) return;
+    if (--it->second.queue_refs) return;
+    queue_protected_bytes_ -= it->second.queue_bytes;
+    it->second.queue_bytes = 0;
+    stats_.queue_protected_entries -= 1;
+    stats_.queue_protected_bytes = queue_protected_bytes_;
+}
+PrefixStateCache::QueueProtection PrefixStateCache::protect_longest(const PrefixLookupTicket& ticket, std::uint64_t max_bytes) {
+    QueueProtection out;
+    if (!ticket.block_rows || ticket.lookup_tokens > ticket.tokens.size() ||
+        ticket.digests.size() != ticket.lookup_tokens / ticket.block_rows) return out;
+    const auto cap = max_bytes ? max_bytes : policy_.host_byte_budget;
+    std::lock_guard lock(mutex_);
+    for (auto k = ticket.digests.size(); k > 0; --k) {
+        const auto it = entries_.find(ticket.digests[k - 1]);
+        if (it == entries_.end()) continue;
+        const auto& c = *it->second.checkpoint;
+        const auto position = static_cast<std::uint64_t>(k) * ticket.block_rows;
+        // The same exact check the restore lookup applies; a collision is left for that lookup to erase.
+        if (c.retention.scope || !(c.identity == ticket.identity) || c.block_rows != ticket.block_rows ||
+            c.position != position) continue;
+        if (const auto stored = c.tokens(); stored.size() != position ||
+            !std::equal(stored.begin(), stored.end(), ticket.tokens.begin())) continue;
+        if (!it->second.queue_refs) {
+            std::uint64_t bytes = c.fixed.bytes;
+            for (const auto& seg : c.segments) if (seg) bytes += seg->payload.bytes;
+            if (bytes > cap || queue_protected_bytes_ > cap - bytes) { ++stats_.queue_protection_cap_skips; return out; }
+            it->second.queue_bytes = bytes;
+            queue_protected_bytes_ += bytes;
+            stats_.queue_protected_entries += 1;
+            stats_.queue_protected_bytes = queue_protected_bytes_;
+        }
+        ++it->second.queue_refs;
+        ++stats_.queue_protections;
+        out.anchor_ = queue_anchor_; out.entry_ = it->second.checkpoint;
+        out.digest_ = it->first; out.position_ = position;
+        return out;
+    }
+    ++stats_.queue_protection_misses;
+    return out;
+}
+
 PrefixStateCache::PrefixStateCache(PrefixStateCachePolicy policy, PrefixCacheAllocator allocate)
     : policy_(std::move(policy)), allocate_(std::move(allocate)) {
     require(policy_.host_byte_budget != 0 && static_cast<bool>(allocate_),
@@ -182,9 +255,11 @@ PrefixStateCache::PrefixStateCache(PrefixStateCachePolicy policy, PrefixCacheAll
         update_disk_gauge();
         writer_ = std::thread([this] { writer_loop(); });
     }
+    queue_anchor_ = std::make_shared<QueueProtection::Anchor>(this);
 }
 
 PrefixStateCache::~PrefixStateCache() {
+    { std::lock_guard lock(queue_anchor_->mutex); queue_anchor_->cache = nullptr; }
     if (writer_.joinable()) {
         {
             std::lock_guard lock(queue_mutex_);
@@ -290,7 +365,7 @@ bool PrefixStateCache::reclaim_one_locked(std::optional<std::uint64_t> scope, st
         auto i = entries_.find(d);
         const auto& c = *i->second.checkpoint;
         if (c.chain_retention && !scope) continue; // this adopter has scoped victim authority
-        if ((scope && c.retention.scope != *scope) || i->second.protected_entry ||
+        if ((scope && c.retention.scope != *scope) || i->second.protected_entry || i->second.queue_refs ||
             (!protected_name.empty() && c.name == protected_name)) continue;
         // Physical slab owners cannot be reclaimed while their backing is leased.
         // Generic lookups may be evicted: their lease stays charged in the ledger.
@@ -968,6 +1043,13 @@ void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> c
 void PrefixStateCache::erase_locked(const ModelContentIdentity& digest, bool eviction) {
     const auto it = entries_.find(digest);
     if (it == entries_.end()) return;
+    if (it->second.queue_refs) {
+        // Only explicit removal or an invalid entry reaches here; the handles then release nothing.
+        queue_protected_bytes_ -= it->second.queue_bytes;
+        stats_.queue_protected_entries -= 1;
+        stats_.queue_protected_bytes = queue_protected_bytes_;
+        ++stats_.queue_protected_erased;
+    }
     if (it->second.checkpoint->chain_retention) release_chain_locked(*it->second.checkpoint, eviction);
     if (it->second.checkpoint->retention.scope && it->second.checkpoint->encoded)
         named_views_.at(it->second.checkpoint->retention.scope).erase(it->second.checkpoint->name);
@@ -1028,12 +1110,12 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             continue;
         }
         auto first=lru_.begin();
-        while(first!=lru_.end() && entries_.at(*first).checkpoint->chain_retention) ++first;
+        while(first!=lru_.end() && (entries_.at(*first).checkpoint->chain_retention || entries_.at(*first).queue_refs)) ++first;
         if(first==lru_.end()) break;
         auto victim = entries_.find(*first);
         if(payload_pool_ && policy_.retention==PrefixCacheRetention::lru) {
             auto oldest=lru_.begin();
-            while(oldest!=lru_.end() && entries_.at(*oldest).checkpoint.use_count()!=1) ++oldest;
+            while(oldest!=lru_.end() && (entries_.at(*oldest).checkpoint.use_count()!=1 || entries_.at(*oldest).queue_refs)) ++oldest;
             if(oldest==lru_.end()) break;
             victim=entries_.find(*oldest);
         }
@@ -1110,7 +1192,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             }
             if (certified_only) mark_private_prefix_successors_locked(incoming, newest);
             for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-                if (it->second.checkpoint->retention.scope || it->second.checkpoint.use_count() != 1) continue;
+                if (it->second.checkpoint->retention.scope || it->second.checkpoint.use_count() != 1 || it->second.queue_refs) continue;
                 const auto& c = *it->second.checkpoint;
                 unsigned rank = 0;
                 unsigned ordinary_rank = 0;
@@ -1147,7 +1229,7 @@ void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const Prefi
             for (const auto& d : lru_) {
                 auto i = entries_.find(d);
                 const auto& c = *i->second.checkpoint;
-                if (c.retention.scope && !c.chain_retention && !i->second.protected_entry && (protected_name.empty() || c.name != protected_name)) {
+                if (c.retention.scope && !c.chain_retention && !i->second.protected_entry && !i->second.queue_refs && (protected_name.empty() || c.name != protected_name)) {
                     generic = i; break;
                 }
             }
@@ -1199,13 +1281,11 @@ bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> check
             ++stats_.rejected_over_budget; ++stats_.budget_skips;
             return false;
         }
-        if (!policy_.legacy) {
-            evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? checkpoint.get() : nullptr);
-            if ((policy_.retention == PrefixCacheRetention::fair && entries_.size() >= 256) ||
-                retained_bytes_locked() > policy_.host_byte_budget - need) {
-                ++stats_.budget_skips; ++stats_.rejected_over_budget; return false;
-            }
-        } else evict_to_budget_locked(need);
+        evict_to_budget_locked(need, !policy_.legacy && policy_.retention == PrefixCacheRetention::fair ? checkpoint.get() : nullptr);
+        if ((!policy_.legacy && policy_.retention == PrefixCacheRetention::fair && entries_.size() >= 256) ||
+            retained_bytes_locked() > policy_.host_byte_budget - need) {
+            ++stats_.budget_skips; ++stats_.rejected_over_budget; return false;
+        }
         add_locked(checkpoint);
         ++stats_.inserted;
     }
@@ -1277,9 +1357,9 @@ PrefixLookupTicket PrefixStateCache::prepare_ticket(const ModelContentIdentity& 
 }
 
 PrefixLookupTicket PrefixStateCache::prepare_lookup(const ModelContentIdentity& identity, std::span<const std::uint32_t> tokens,
-    std::uint32_t block_rows, std::uint64_t limit) const {
+    std::uint32_t block_rows, std::uint64_t limit, bool probe_disk) const {
     auto owned = std::make_shared<const std::vector<std::uint32_t>>(tokens.begin(), tokens.end());
-    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, true);
+    auto ticket = prepare_ticket(identity, *owned, block_rows, limit, probe_disk);
     ticket.owned = std::move(owned);
     return ticket;
 }
@@ -1374,7 +1454,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
                         if (conversation.size()<=128) promoted->conversation=conversation;
                         evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? promoted.get() : nullptr);
                         if ((policy_.retention != PrefixCacheRetention::fair || entries_.size()<256) &&
-                            (policy_.legacy || retained_bytes_locked() <= policy_.host_byte_budget - need)) {
+                            retained_bytes_locked() <= policy_.host_byte_budget - need) {
                             add_locked(promoted);
                             auto& entry = entries_.at(promoted->digest);
                             entry.reuse=1;

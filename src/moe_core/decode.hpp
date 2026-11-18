@@ -105,7 +105,9 @@ static __device__ __forceinline__ void gate_up4_cta(const Args& a, unsigned bxr,
                                                        Single && Traits::template single_stream_for<Depth>(a, dp, slot), ready);
 }
 
-template <int W>
+// SplitOut (split-producer chunk frames, MiniMax only): out is stored through a.split_index(r, col) (a SplitLayout)
+// instead of row-major; the default instantiation is the unchanged row-major store.
+template <int W, bool SplitOut = false>
 static __device__ __forceinline__ void down4_combine(const Args& a, const Dispatch* dp, unsigned block) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     // Finish every slot's block, then the G4 combine per row: acc = 0; fmaf over its experts in ascending id; + shared.
@@ -134,12 +136,17 @@ static __device__ __forceinline__ void down4_combine(const Args& a, const Dispat
         float v[4];
         finish(dp->first[Traits::kSharedSlot] + r, a.shared.down.svh, v);
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
-            a.out[static_cast<std::size_t>(r) * Traits::kHidden + block * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
+        for (int j = 0; j < 4; ++j) {
+            if constexpr (SplitOut)
+                a.out[a.split_index(r, block * 128 + lane + 32U * static_cast<unsigned>(j))] = acc[j] + v[j];
+            else
+                a.out[static_cast<std::size_t>(r) * Traits::kHidden + block * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
+        }
     }
 }
 
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false,
+          bool SplitOut = false>
 static __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, unsigned by, _Float16* xs, WideV4* rowbuf,
                                           std::uint32_t ready = 0) {
     const Dispatch* dp = a.disp();
@@ -176,7 +183,7 @@ static __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, uns
 #pragma unroll
             for (unsigned h = 0; h < 2; ++h)
                 if (Traits::last_arrival(a.dn4_counter(cg * 2U + h), (dp->count + 1) * Traits::kDownSplits)) {
-                    down4_combine<W>(a, dp, cg * 2U + h);
+                    down4_combine<W, SplitOut>(a, dp, cg * 2U + h);
                     Traits::lean_publish(a.pub, a.pub.tiles);
                 }
         }
@@ -194,7 +201,7 @@ static __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, uns
         if constexpr (!PartialOnly) {
             const unsigned block = cg * W / 8;
             if (Traits::last_arrival(a.dn4_counter(block), (dp->count + 1) * (8 / W) * Traits::kDownSplits)) {
-                down4_combine<W>(a, dp, block);
+                down4_combine<W, SplitOut>(a, dp, block);
                 Traits::lean_publish(a.pub, a.pub.tiles);
             }
         }

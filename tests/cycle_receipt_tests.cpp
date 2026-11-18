@@ -258,13 +258,117 @@ void log_line_format() {
     r.begin_ns = 123;
     r.end_ns = 456;
     r.add_draft_depth(2, 4);
+    r.admitted = 6;
+    r.forwards = 2;
+    r.solo[static_cast<std::size_t>(CycleSoloReason::no_rows)] = 1;
     check(format_cycle_receipt(r, 7) ==
         "serve cycle seq=7 lanes=4 rows=16 useful=13 pad=3 emitted=14 draft_rows=0/4/0/0/0/0/0/0 draft_ms=20.500000 "
-        "verify_ms=138.000000 host_ms=2.750000 ms=161.250000 prompt=1 begin_ns=123 end_ns=456",
+        "verify_ms=138.000000 host_ms=2.750000 ms=161.250000 prompt=1 begin_ns=123 end_ns=456 admitted=6 forwards=2 "
+        "solo=0/1/0/0/0/0",
         "log line format");
+    check(std::string(cycle_solo_reason_name(1)) == "no_rows" && std::string(cycle_solo_reason_name(99)) == "unknown",
+        "solo reason names");
+    CycleLedger ledger(4);
+    check(ledger.add(r), "receipt with forwards accepted");
+    const auto j = parse_json(ledger.json());
+    const auto& totals = at(j, "totals");
+    check(at(totals, "forwards").as_int() == 2 && at(totals, "admitted").as_int() == 6, "ledger totals carry admitted and forwards");
+    const auto& solo = at(totals, "solo").as_array();
+    check(solo.size() == kCycleSoloReasons && solo[1].as_int() == 1, "ledger totals carry solo reasons");
 }
 } // namespace
 
+
+// A window of eight requests like a load test: serial prompt units, a late lane, a full cohort, a tail.
+void run_window_partition_and_rates() {
+    using strix::serve::RunWindow;
+    RunWindow w;
+    check(!w.open(), "run closed at start");
+    const std::int64_t ms = 1000000;
+    std::int64_t t = 5 * ms;
+    for (int i = 0; i < 8; ++i) w.request(t);
+    check(w.open(), "run opens with the first request");
+    for (int i = 0; i < 7; ++i) {  // seven prompts before any decode step: one first token each
+        w.admission(t, t + 150 * ms, 20, 1);
+        t += 150 * ms;
+        if (i) w.hold();
+    }
+    w.host_control(2 * ms);
+    t += 2 * ms;
+    w.step(t, t + 54 * ms, 7, 7, 7);  // the eighth lane is late: a seven-lane step is not the cohort
+    t += 54 * ms;
+    w.admission(t, t + 200 * ms, 46, 1);
+    t += 200 * ms;
+    for (int i = 0; i < 10; ++i) {
+        w.step(t, t + 74 * ms, 8, 8, 8);
+        t += 74 * ms;
+        w.host_control(ms / 10);
+        t += ms / 10;
+    }
+    const std::int64_t last_full = t - ms / 10;
+    w.step(t, t + 29 * ms, 1, 1, 1);  // tail: one lane left
+    t += 29 * ms + 3 * ms;            // 3 ms nobody claimed
+    const auto r = w.close(t);
+    check(!w.open(), "run closes");
+    check(r.consistent(), "run consistent");
+    check(r.requests == 8 && r.peak_lanes == 8 && r.prompt_units == 8 && r.prompt_tokens == 186, "run counts");
+    check(r.holds == 6, "run holds");
+    check(r.admission_outputs == 8 && r.ramp.outputs == 7 && r.full.outputs == 80 && r.partial.outputs == 1, "run outputs by class");
+    check(r.outputs() == 96, "run outputs");
+    check(r.ramp.steps == 1 && r.full.steps == 10 && r.partial.steps == 1, "run steps by class");
+    check(r.admission_ns == 1250 * ms && r.ramp.ns == 54 * ms && r.full.ns == 740 * ms && r.partial.ns == 29 * ms, "run interval sums");
+    check(r.host_control_ns == 3 * ms && r.other_ns() == 3 * ms, "run host control and unclaimed time");
+    check(r.wall_ns() == r.admission_ns + r.host_control_ns + r.ramp.ns + r.full.ns + r.partial.ns + r.other_ns(), "run partition");
+    check(r.last_full_ns == last_full && r.tail_ns() == 32 * ms + ms / 10, "run tail");
+    check(r.first_output_ns - r.begin_ns == 150 * ms, "run first output");
+    // the steady rate comes from the full-cohort steps only; the whole-run rate from the window
+    check(near(r.steady_rate(), 80.0 / 0.740, 1e-9), "run steady rate");
+    check(near(r.whole_rate(), 96.0 * 1e9 / static_cast<double>(r.wall_ns()), 1e-9), "run whole rate");
+    check(r.whole_rate() < r.steady_rate(), "whole-run rate below the steady rate");
+    const std::string line = strix::serve::format_run_receipt(r, "pack=p draft=on");
+    check(line.rfind("serve run requests=8 cancelled=0 peak_lanes=8 outputs=96 ", 0) == 0, "run line head");
+    check(line.find(" full_steps=10 full_outputs=80 full_rows=80 full_ms=740.000") != std::string::npos, "run line full class");
+    check(line.find(" admission_ms=1250.000 holds=6") != std::string::npos, "run line admission");
+    check(line.size() > 16 && line.compare(line.size() - 15, 15, "pack=p draft=on") == 0, "run line identity");
+}
+
+// Cancelled lanes, held proposals (a step that commits nothing) and a first event with several tokens.
+void run_window_edges() {
+    using strix::serve::RunWindow;
+    const std::int64_t ms = 1000000;
+    RunWindow w;
+    w.step(0, ms, 2, 2, 2);  // nothing is open: ignored
+    w.admission(0, ms, 4, 1);
+    w.request(10 * ms);
+    w.request(10 * ms);
+    w.admission(10 * ms, 30 * ms, 100, 3);  // the first event carries three tokens (a prompt-lookup window)
+    w.admission(30 * ms, 40 * ms, 50, 0);   // a piece of a resumable prefill: no token yet
+    w.step(40 * ms, 60 * ms, 2, 6, 5);      // drafted rows: six rows, five tokens committed
+    w.step(60 * ms, 80 * ms, 2, 2, 0);      // every proposal held: time counts, no output
+    w.cancel();
+    w.step(80 * ms, 95 * ms, 1, 1, 1);      // partial cohort after the cancel
+    w.step(95 * ms, 90 * ms, 1, 1, 1);      // a clock that runs backwards is refused
+    w.step(95 * ms, 96 * ms, 0, 0, 0);      // no lane
+    const auto r = w.close(100 * ms);
+    check(r.consistent(), "edges consistent");
+    check(r.requests == 2 && r.cancelled == 1 && r.peak_lanes == 2, "edges counts");
+    check(r.admission_outputs == 3 && r.prompt_units == 2 && r.prompt_tokens == 150, "edges first event of three tokens");
+    check(r.full.steps == 2 && r.full.outputs == 5 && r.full.rows == 8 && r.full.ns == 40 * ms, "edges held step counts its time");
+    check(r.partial.steps == 1 && r.partial.outputs == 1 && r.ramp.steps == 0, "edges partial cohort");
+    check(near(r.steady_rate(), 5.0 / 0.040, 1e-9), "edges steady rate is not inferred from the partial step");
+    check(r.outputs() == 9 && r.other_ns() == 5 * ms, "edges outputs and unclaimed time");
+    check(r.last_output_ns == 95 * ms && r.first_output_ns == 30 * ms, "edges output stamps");
+    // a second window starts clean; the digest depends on lane and token order
+    w.request(200 * ms);
+    w.token(0, 7), w.token(1, 9);
+    const auto a = w.close(201 * ms);
+    w.request(300 * ms);
+    w.token(1, 9), w.token(0, 7);
+    const auto b = w.close(301 * ms);
+    check(a.requests == 1 && a.outputs() == 0 && a.full.steps == 0 && a.tail_ns() == 0, "second window is clean");
+    check(a.digest != b.digest && a.digest != strix::serve::RunReceipt{}.digest, "digest orders lanes and tokens");
+    check(a.steady_rate() == 0.0 && a.whole_rate() == 0.0, "empty window has no rate");
+}
 int main() {
 #if defined(_MSC_VER)
     // A failed assertion or abort must fail the test, never open a dialog.
@@ -280,6 +384,8 @@ int main() {
         rows_identity_and_totals();
         json_round_trip();
         log_line_format();
+        run_window_partition_and_rates();
+        run_window_edges();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << '\n';
         return 1;

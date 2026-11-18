@@ -557,6 +557,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         native.failed = [&] { failed.store(true); if (probing) probe.fail(); };
         native.stop_requested = [&] { return http_serve_stop_requested().load(); };
         native.session_mutex = runner.session_mutex;
+        native.queue_protection = runner.queue_protection_binding();
         const auto capacity = std::max(runner.slots(), runner.slots_capacity);
         if (capacity > UINT32_MAX) throw std::invalid_argument("Qwen owner slot capacity overflow");
         qwen::HttpSessionOwner owner(queue, options.context_tokens, static_cast<std::uint32_t>(capacity), std::move(native));

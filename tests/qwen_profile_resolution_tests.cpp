@@ -151,6 +151,20 @@ void defaults_matrix() {
     }
     strix::qpf2k::baseline=saved;
 }
+void pending_weights_inspection() {
+    const auto o = options({"decoder", "model.gguf", "1", "--profile", "turbo", "--turbo-weights", "converted",
+                            "--print-effective-config"});
+    const auto c = dc::resolve_effective_config({o, {}}, strix::ModelContract::qwen38_flash_next(), {}, {}, "", {}, {});
+    const auto text = dc::effective_config_json(c);
+    check(text.find("converted") != std::string::npos && text.find("pending") != std::string::npos,
+          "inspection must serialize the refused weight request");
+    bool refused = false;
+    bool exported = false;
+    try { pr::apply(c.options.product_profile, [&](const char*, const char*) { exported = true; return true; }); }
+    catch (const std::invalid_argument&) { refused = true; }
+    check(refused && !exported, "execution must refuse pending weights before exporting");
+}
+
 void config_matrix() {
     for (auto profile : {"default","fast","quality"}) for (bool allow : {false,true}) for (bool base : {false,true}) {
         std::vector<std::string> args{"decoder","model.gguf","1","--profile",profile};
@@ -181,7 +195,7 @@ void config_matrix() {
         }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
-            {"--profile"},{"--profile","turbo"},{"--profile","fast","--profile=default"},
+            {"--profile"},{"--profile","turbbo"},{"--profile","fast","--profile=default"},
             {"--output-head-profile","fp16-output-head"}}) {
         auto argv=std::vector<std::string>{"decoder","model.gguf","1"}; argv.insert(argv.end(),args.begin(),args.end());
         try { (void)options(argv); check(false,"invalid CLI must refuse"); }
@@ -241,6 +255,7 @@ void common_adapters() {
 }
 int main(int argc,char** argv) try {
     emit=argc==2 && std::string_view(argv[1])=="--fixtures";
+    pending_weights_inspection();
     product_matrix(); admission_matrix(); defaults_matrix(); config_matrix(); identities();
 #ifndef STRIX_STEP1_ORIGINAL
     common_adapters();

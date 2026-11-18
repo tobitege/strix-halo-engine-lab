@@ -1,4 +1,4 @@
-// Exhaustive check of src/cuda/qwen_amd_math.cuh against gfx1151 (qwen-rtx-prefill probes p1/p2).
+// Exhaustive check of include/strix/cuda/amd_math.cuh against gfx1151 (qwen-rtx-prefill probes p1/p2).
 //   qwen_amd_math_tests <tables dir>
 // The dir holds tbl_exp_pm.bin, tbl_rsq_1_4.bin, tbl_rcp_1_2.bin, hard_v_{exp,rsq,rcp}_f32.bin (inputs then outputs),
 // hash_v_{exp,rsq,rcp}_f32.bin (FNV-1a 64 of the hardware outputs per 4096 consecutive input patterns) and, optionally,
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-#include "../../src/cuda/qwen_amd_math.cuh"
-#include "../../src/cuda/qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math.cuh"
+#include "strix/cuda/amd_math_tables.hpp"
 
 namespace am = strix::cuda::amdmath;
 

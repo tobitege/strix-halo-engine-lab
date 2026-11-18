@@ -1,7 +1,7 @@
-#include "strix/cuda_qwen_prefill.hpp"
-#include "strix/cuda_qwen_prefix_plan.hpp"
-#include "strix/cuda_qwen_prefix_store.hpp"
-#include "strix/cuda_vram_guard.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefix_plan.hpp"
+#include "strix/cuda/qwen_prefix_store.hpp"
+#include "strix/cuda/vram_guard.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <cuda_runtime.h>

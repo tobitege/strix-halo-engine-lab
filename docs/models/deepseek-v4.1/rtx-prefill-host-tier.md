@@ -1,9 +1,33 @@
 # RTX prefill host placement
 
-The prefill service accepts `--host-gib G --host-pin-order layer|deadline|early`.
+The prefill service accepts `--host-gib G --host-pin-order layer|deadline|early|interleave [--file-ring-mib N]`.
+`auto` (the default) picks interleave or layer once at load from a measured table (`resolve_host_pin_order` in
+`include/strix/ds41_host_pin_plan.hpp`; the choice and its reason are in the service's `describe`): interleave when
+the layer order would stream >= 10 GB of experts from the file (streamed bytes minus the admitted host budget),
+else layer. Admission uses the lesser of free physical memory and free commit, retaining the configured
+floor; unknown headroom declines automatic growth. The effective host budget is capped to that room after staging.
+`interleave` places FILE layers among the HOST ones so the disk read of each hides behind earlier host
+copies (the copy stream and the disk work in parallel instead of one after the other), and pins the preload slots
+first (back-to-back requests leave no idle time for a disk preload). Its file-read ring (`--file-ring-mib 0` = auto)
+is 4 GiB taken out of the admitted host budget (at least 8 GiB before the ring). Each automatic page is guarded;
+allocation failure releases the partial ring and restores 256 MiB staging with a recomputed layer placement and budget.
+An explicit `--file-ring-mib N` is preserved and retains allocation-failure semantics. Whole-layer streaming resolves
+automatic order to layer before placement. These decisions do not change inference arithmetic or resident counts.
+Measured on one RTX at equal pinned memory (68 GiB layer vs 64 + 4 GiB interleave, ABAB, 4 pairs, 3 reps):
+2K warm -13 %, cold -16 %; 8K warm -6 % (3 of 4 pairs faster); 32K -1 % (2 pairs). The one losing case sets the
+crossover: layer-order file tier 8.4 GB, 8K +3 % warm / +6 % cold (the 4 GiB ring leaves less pinned, so ~6 GB more
+comes from the disk and the 8K compute already hid the reads); at 12-24 GB interleave wins at every length.
+Overrides: `--host-pin-order interleave` or `layer` (old ascending fill, 256 MiB staging). Kit:
+`scripts/bench/cuda/ds41_prefill_matrix.sh` (service matrix, cold/warm, GPU clock) + `ds41_prefill_summary.py`.
+The matrix requires READY and a complete successful repetition set with matching state SHA-256, logits hash and next
+token. Missing or differing results fail the command; exit cleanup stops its service and sampler. For custom lengths,
+standalone summary calls must supply matching `--lengths N ... --reps R` (defaults: 2048 8192 32768, three reps).
+The crossover remains calibrated to the platform and workload above; these host checks do not broaden qualification
+or independently validate the timing claims. Host order is outside the service profile levers; use
+`--host-pin-order layer --file-ring-mib 256` for legacy placement/staging, including when comparing `--baseline`.
 `early` is the legacy ascending fill without the layers the idle preload already holds: the pinned
 layers lead the schedule and later FILE reads overlap their compute.
-`layer` is the default and preserves the ascending host-budget allocation.
+`layer` preserves the ascending host-budget allocation (the default before interleave).
 `deadline` selects the longest affordable suffix of the streamed layer schedule,
 starting at the last layer and stopping when the next streamed part will not fit.
 It excludes the first device-slot-count streamed layers, which the idle preload

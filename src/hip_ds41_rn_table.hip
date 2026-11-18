@@ -1,6 +1,7 @@
 // STRIX_DS41_RN_WIDE=2: the per site x format x rows table of hip_ds41_rn_table.hpp.
 
 #include "strix/hip_ds41_rn_table.hpp"
+#include "strix/lever_cache.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -67,8 +68,8 @@ constexpr SiteRow table[] = {
 };
 
 bool forced_shape() {
-    static const bool forced = [] { const char* e = std::getenv("STRIX_DS41_RN_SHAPE"); return e != nullptr && e[0] != 0; }();
-    return forced;
+    static strix::lever_cache<bool> forced{[] { const char* e = std::getenv("STRIX_DS41_RN_SHAPE"); return e != nullptr && e[0] != 0; }};
+    return forced.get();
 }
 
 } // namespace
@@ -81,11 +82,11 @@ RnWideOff::RnWideOff() : previous(rn_wide_off) { rn_wide_off = true; }
 RnWideOff::~RnWideOff() { rn_wide_off = previous; }
 
 int rn_wide_mode() {
-    static const int mode = [] {
+    static strix::lever_cache<int> mode{[] {
         const char* e = std::getenv("STRIX_DS41_RN_WIDE");
         return e && e[0] == '0' ? 0 : e && e[0] == '1' ? 1 : 2;
-    }();
-    return rn_wide_off ? 0 : mode;
+    }};
+    return rn_wide_off ? 0 : mode.get();
 }
 
 bool rn_table_select(const Q8A8View& view, RnWideShape& shape) {

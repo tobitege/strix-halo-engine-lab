@@ -36,6 +36,29 @@
 namespace strix {
 namespace {
 void require(bool value,const char* message){if(!value)throw std::invalid_argument(message);}
+// All physically evaluated draft rows, including rows after the first rejection.
+// Equality on those later rows is teacher-forced agreement, not prefix acceptance.
+void log_verification_rows(std::uint64_t at,std::uint32_t rows,std::uint32_t active,
+    std::span<const std::uint32_t> candidates,std::span<const std::uint32_t> selected,
+    std::span<const float> probabilities,std::uint32_t accepted,std::span<const std::uint32_t> eos,
+    std::uint32_t budget,bool diagnostic=false) {
+    static const bool enabled=envcfg::flag("STRIX_MTP_VERIFY_LOG",false);
+    if(!enabled)return;
+    bool prefix=true;
+    const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto compared=rows==1U?selected.size():static_cast<std::size_t>(active-1U);
+    for(std::size_t k=0;k<candidates.size() && k<selected.size() && k<compared;++k) {
+        const bool equal=candidates[k]==selected[k];
+        const bool terminal=std::find(eos.begin(),eos.end(),selected[k])!=eos.end();
+        const bool eligible=k+1U<budget;
+        const bool reached=prefix && eligible;
+        std::fprintf(stderr,"mtp-verify ns=%llu at=%llu d=%zu rows=%u active=%u budget=%u diagnostic=%u proposal=%u target=%u equal=%u eligible=%u reached=%u accepted=%u greedy_accept=%u eos=%u p=%.9g\n",
+            static_cast<unsigned long long>(ns),static_cast<unsigned long long>(at),k+1U,rows,active,budget,diagnostic?1U:0U,
+            candidates[k],selected[k],equal?1U:0U,eligible?1U:0U,reached?1U:0U,
+            k<accepted?1U:0U,reached && equal && !terminal?1U:0U,terminal?1U:0U,k<probabilities.size()?probabilities[k]:-1.0F);
+        prefix=reached && equal && !terminal;
+    }
+}
 void write_position_word(const ExecutionRuntimeResources& resources,std::uint64_t value) {
     for(const auto& allocation:resources.session_state_layout->allocations) {
         if(allocation.component!=SessionStateComponent::position_history) continue;
@@ -703,6 +726,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && k+1U<selected.size() && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
             const auto n_keep=q.transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):k+1U;
             if(q.transaction) k=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
+            log_verification_rows(q.initial->source_position(),rows,rows,q.candidates,selected,q.probabilities,k,q.eos,q.budget);
             // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(q.transaction)result.selection_failure=provisional->selection_prefix()->selection_failure;
             i.commit_window_prefix(p.owner,session,p.previous,rows,n_keep);
@@ -1061,6 +1085,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
             auto& previous=i.window_base;previous=session;
             host_phase_mark("4 verify prologue");
+            ++out.target_forwards;
             auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");
             attempted_target=true;out.attempted_window=true;
@@ -1076,6 +1101,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             while(!transaction && !diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && a+1U<selected.size() && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
             const auto n_keep=transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):a+1U;
             if(transaction) a=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
+            log_verification_rows(initial.source_position(),rows,active,candidates,selected,probabilities,a,eos,budget,diagnostic);
             host_phase_mark("7a select/accept");
             // Never promote a ticket or emit an ID for an undecided row-zero failure (n_keep 0).
             if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
@@ -1101,6 +1127,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             inputs.insert(inputs.end(),candidates.begin(),candidates.begin()+static_cast<std::ptrdiff_t>(rows-1));
             if(i.bounded)i.checkpoint->capture_window(session);else i.checkpoint->capture(session);
+            ++out.target_forwards;
             auto native=owner->window->execute_mtp_captured(session,inputs,capture);
             // Successful return proves actual target consumption. Rejected
             // admission leaves the original ready session untouched; dispatch
@@ -1116,6 +1143,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             const bool complete=transaction?(selected.size()==rows && provisional->selection_prefix()->accepted_draft_inputs==rows-1U &&
                 std::none_of(inputs.begin(),inputs.end(),is_eos)):
                 selected.size()==rows && assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary).accepts_complete_chunk();
+            log_verification_rows(initial.source_position(),rows,active,candidates,selected,probabilities,complete?rows-1U:0U,eos,budget,diagnostic);
             if(complete) {
                 if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,session.next_position);
                 out.committed_rows=i.target->accept_verified_window(provisional,initial,session,eos,budget);
@@ -1137,6 +1165,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             if(transaction){transaction->discard();transaction->reset();}
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {
+            ++out.target_forwards;
             auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending,
                 index<drafts.size()?&drafts[index]:nullptr,
                 transaction?HipMtpHostRowSelector{[&](auto row){
@@ -1147,9 +1176,12 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             if(index<candidates.size()) out.verified_candidates=std::max(out.verified_candidates,static_cast<std::uint32_t>(index+1U));
             const bool accepted=index<candidates.size() && candidates[index]==pending;
-            if(accepted)++out.accepted_candidates;
+            // Full-chain diagnostics force a one-row commit even when a draft
+            // matches. It is agreement, not an accepted extra emission.
+            if(accepted && !diagnostic)++out.accepted_candidates;
             if(diagnostic || is_eos(pending) || !accepted)break;
         }
+        log_verification_rows(initial.source_position(),1U,1U,candidates,out.emitted_tokens,probabilities,out.accepted_candidates,eos,budget,diagnostic);
         calibrate(out.accepted_candidates,out.emitted_tokens.size());
         observe(use_window,out.emitted_tokens.size());
         seal();i.busy=false;return out;

@@ -48,12 +48,18 @@ inline PromptCompilerRequests prompt_compiler_requests(const Options& options,
     const auto a8_down_q80 = numerical_profile_q80_a8_down(options.numerical_profile);
     const auto q5k_a8_gateup = numerical_profile_q5k_a8_gateup(options.numerical_profile);
     const auto dense_a8 = numerical_profile_dense_a8(options.numerical_profile);
-    const auto qsa_prefetch_plan = qsa_input_prefetch::build_plan(model, manifest);
-    const auto shared_prefetch_plan = shared_expert_prefetch::build_plan(model, manifest);
+    // The same plans as the decode builder (hip_decode_token_main.cpp): layer/step lists only for an enabled
+    // organization. A base without --prefetch-q8-qsa-input, --prefetch-q8-shared-expert or --lane-chain-hyper-output
+    // (an explicit organization) otherwise failed "... requires opt-in" in the serving memory check (issue 758).
+    const auto qsa_prefetch_plan = options.prefetch_q8_qsa_input ?
+        qsa_input_prefetch::build_plan(model, manifest) : qsa_input_prefetch::Plan{};
+    const auto shared_prefetch_plan = options.prefetch_q8_shared_expert ?
+        shared_expert_prefetch::build_plan(model, manifest) : shared_expert_prefetch::Plan{};
     const auto wave_router_admission = WaveRouterManifestAdmission::create(manifest);
     HipModelResidencyPolicy policy;
     policy.mode = options.residency;
-    const auto lane_chain_steps = lane_chain_hyper_output_steps(model, manifest, policy);
+    const auto lane_chain_steps = options.lane_chain_hyper_output ?
+        lane_chain_hyper_output_steps(model, manifest, policy) : std::vector<std::uint32_t>{};
     strix::ExecutionBindingRequest
         binding_request;
     binding_request.logical_rows = 1;

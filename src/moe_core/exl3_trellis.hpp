@@ -16,6 +16,7 @@
 
 #include "../core/hadamard.hpp"
 #include "../core/trellis_codec.hpp"
+#include "../hip/weight/trellis_sources.hpp"
 
 namespace strix::moe_core {
 
@@ -37,31 +38,13 @@ __device__ __forceinline__ float half_bits(std::uint16_t h) { return __half2floa
 // One wave: input transform of the 128 channels [begin, begin + 128) of one row.
 __device__ __forceinline__ void transform_block(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
                                                 unsigned lane) {
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(x[c] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[begin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
+    strix::weight::hip::trellis_source_detail::input_block(x, suh, out, begin, lane);
 }
 // Same transform on the lane's four x values already in registers (xv[j] = x[begin + lane + 32 j]), so a caller that
 // transforms one block for several (suh, out) pairs loads x once. transform_block_at is this helper behind the loads.
 __device__ __forceinline__ void transform_block_values(const float (&xv)[4], const std::uint16_t* suh, _Float16* out,
                                                        unsigned begin, unsigned obegin, unsigned lane) {
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(xv[j] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[obegin + lane + 32U * static_cast<unsigned>(j)] = static_cast<_Float16>(v[j]);
+    strix::weight::hip::trellis_source_detail::input_values(xv, suh, out, begin, obegin, lane);
 }
 // Same transform, writing the 128 results at out[obegin ...] (an LDS chunk that starts at channel begin - obegin).
 __device__ __forceinline__ void transform_block_at(const float* x, const std::uint16_t* suh, _Float16* out, unsigned begin,
@@ -74,13 +57,7 @@ __device__ __forceinline__ void transform_block_at(const float* x, const std::ui
 // Same transform, returning the four per-lane values in registers (no store).
 __device__ __forceinline__ void transform_values(const float* x, const std::uint16_t* suh,
                                                 unsigned begin, unsigned lane, float (&v)[4]) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = begin + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(x[c] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
+    strix::weight::hip::trellis_source_detail::input_registers(x, suh, begin, lane, v);
 }
 
 // ---------------------------------------------------------------- mul1 decode (shared codec)
@@ -118,6 +95,12 @@ __device__ __forceinline__ void core_tile(const unsigned char* tile, const LaneG
     const Half2 w1 = mul1_pair(t.template state<2>(), t.template state<3>());
     const Half2 w2 = mul1_pair(t.template state<4>(), t.template state<5>());
     const Half2 w3 = mul1_pair(t.template state<6>(), t.template state<7>());
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w0));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w1));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w2));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w3));
+#endif
 #pragma unroll
     for (int r = 0; r < R; ++r)
         if (static_cast<unsigned>(r) < nrows) {
@@ -132,6 +115,9 @@ __device__ __forceinline__ void core_tile(const unsigned char* tile, const LaneG
 __device__ __forceinline__ float reduce4(float v) {
     v += __shfl_down(v, 2, 4);
     v += __shfl_down(v, 1, 4);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisPartial, v);
+#endif
     return v;
 }
 
@@ -163,6 +149,12 @@ __device__ __forceinline__ void compute_slot(const Slot<Bits, R>& s, const LaneG
     const Half2 w1 = mul1_pair(t.template state<2>(), t.template state<3>());
     const Half2 w2 = mul1_pair(t.template state<4>(), t.template state<5>());
     const Half2 w3 = mul1_pair(t.template state<6>(), t.template state<7>());
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w0));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w1));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w2));
+    strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisDecode, __builtin_bit_cast(unsigned, w3));
+#endif
 #pragma unroll
     for (int r = 0; r < R; ++r)
         if (static_cast<unsigned>(r) < nrows) {
@@ -428,17 +420,10 @@ template <int Bits> using Norm = core::trellis::Norm<Bits>;
 using Mul1 = core::trellis::Mul1;
 template <int Bits> using Mul1PairDecode = core::trellis::PairDecode8<Bits, core::trellis::Mul1>;
 
-template <int Bits> struct Exl3Trellis : core::trellis::Codec<Bits, core::trellis::Mul1> {
+// Bound to the registered legacy mul1 operand-source header, hip/weight/trellis_sources.hpp: the codec, codebook value, input block,
+// H128 and scale of the source; InputTransform stays this named policy for the kernels' derived traits.
+template <int Bits> struct Exl3Trellis : strix::weight::hip::LegacyMul1Source<static_cast<unsigned>(Bits)> {
     using InputTransform = Exl3Trellis<Bits>;
-    static __host__ __device__ __forceinline__ float codebook_value(std::uint32_t state, Mul1 = {}) { return Mul1::value(state); }
-    static __device__ __forceinline__ void input_block(const float* x, const std::uint16_t* suh, _Float16* out,
-                                                      unsigned begin, unsigned lane) {
-        transform_block(x, suh, out, begin, lane);
-    }
-    static __device__ __forceinline__ void h128(float (&v)[4], unsigned lane) { hadamard128(v, lane); }
-    static __device__ __forceinline__ float scale(float x, std::uint16_t sign) {
-        return materialize(x * half_bits(sign));
-    }
 };
 
 // Scalar-default policy: preserve the previous codebook conversion and order.

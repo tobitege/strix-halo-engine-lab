@@ -322,6 +322,9 @@ void test_tables() {
     CHECK(a.span_rows(13, 13) == 184 && a.span_rows(31, 31) == 994 && a.span_rows(511, 1) == 1024 && a.max_span_rows() == 1024);
     CHECK(a.projector_weight_elements() == 5120ULL * 9216ULL + 5120ULL * 5120ULL);
     CHECK(a.device_options().split_activations);
+    // One resolver: the family's device options (server and CLI both take them) carry the shared attention default.
+    CHECK(a.device_options().attention_terms == vision::attention_terms_from_env());
+    CHECK(vision::EncoderOptions{}.attention_terms == vision::attention_terms_from_env());
     struct Row {
         int w, h, tw, th;
     };

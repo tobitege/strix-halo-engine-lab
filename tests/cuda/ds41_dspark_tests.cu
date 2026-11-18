@@ -2,7 +2,7 @@
 // STRIX_DS41_DSPARK_GGUF): main rows, ring seeding with wrap-around, draft steps at positions 130 / 133 / 7 (tokens,
 // confidence, logits, every stage's streams), appends from device memory after a verify, restricted and real draft
 // vocabularies (STRIX_DS41_DSPARK_VOCAB_DIR), then a smoke timing. STRIX_DS41_DSPARK_BENCH=1: timing only.
-#include "strix/cuda_ds41_dspark.hpp"
+#include "strix/cuda/ds41_dspark.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 #include "../ds41_dspark_model.hpp"
 

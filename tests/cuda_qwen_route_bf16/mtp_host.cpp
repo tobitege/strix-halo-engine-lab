@@ -1,4 +1,4 @@
-#include "strix/cuda_qwen_mtp_diagnostic.hpp"
+#include "strix/cuda/qwen_mtp_diagnostic.hpp"
 #include <cstdio>
 #include <limits>
 namespace md=strix::cuda::qwen_mtp_diagnostic;

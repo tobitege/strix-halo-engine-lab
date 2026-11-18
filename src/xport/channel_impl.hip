@@ -26,7 +26,8 @@ void hip_check(hipError_t e, const char* what) {
 using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
-constexpr std::size_t kTxFlag = 0, kRxFlag = 8;  // u64 index: separate 64-byte lines
+constexpr std::size_t kTxFlag = 0, kRxFlag = 8, kHeadFlag = 16;  // u64 index: separate 64-byte lines
+constexpr std::size_t kHeadCounter = 8;  // unsigned index in counter_dev_ (64 bytes): the head producer's own counter
 
 __global__ void publish_kernel(std::uint64_t* flag, std::uint64_t sequence) {
     if (threadIdx.x == 0) {
@@ -318,6 +319,26 @@ ProducerTarget Channel<Traits>::producer_target() {
 }
 
 template<class Traits>
+ProducerTarget Channel<Traits>::head_target() {
+    return ProducerTarget{flags_dev_ + kHeadFlag, counter_dev_ + kHeadCounter, next_ + 1};
+}
+
+template<class Traits>
+void Channel<Traits>::split_head(std::size_t head, Publish how) {
+    check();
+    if (head == 0 || head >= options_.capacity) throw std::invalid_argument("glmxfer: split head outside 1..capacity-1");
+    if (head_next_ != 0) throw std::logic_error("glmxfer: split_head() twice for one message");
+    const std::uint64_t s = next_ + 1;
+    if (how == Publish::kernel) {
+        hipLaunchKernelGGL(publish_kernel, dim3(1), dim3(32), 0, options_.stream, flags_dev_ + kHeadFlag, s);
+        hip_check(hipGetLastError(), "head publish kernel");
+    } else if (how == Publish::write_value) {
+        hip_check(hipStreamWriteValue64(options_.stream, flags_dev_ + kHeadFlag, s, 0), "head publish write");
+    }
+    head_next_ = head;
+}
+
+template<class Traits>
 void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
     check();
     if (bytes == 0 || bytes > options_.capacity) throw std::invalid_argument("glmxfer: message size outside 1..capacity");
@@ -332,6 +353,11 @@ void Channel<Traits>::send(std::size_t bytes, const Tag& tag, Publish how) {
     next_ = s;
     tail_deferred_ = options_.crc && options_.crc_deferred && bytes > kInlineCrcMax;
     Job job{s, bytes, tag, false};
+    if (head_next_ != 0) {
+        if (head_next_ >= bytes) throw std::invalid_argument("glmxfer: split head not below the message size");
+        job.head = head_next_;
+        head_next_ = 0;
+    }
     if (fold_next_ != RowFold::none) {
         if (!can_fold(bytes)) throw std::invalid_argument("glmxfer: fold of a message outside the fold capacity");
         job.fold = fold_next_;
@@ -373,6 +399,7 @@ void Channel<Traits>::send_host(const void* local, void* remote, std::size_t byt
     check();
     if (!local || !remote || bytes == 0 || bytes > options_.capacity)
         throw std::invalid_argument("glmxfer: direct host payload outside 1..capacity");
+    if (head_next_ != 0) throw std::logic_error("glmxfer: split_head() before send_host() (direct payloads are one frame)");
     const auto s = next_ + 1;
     if (s > received_ + options_.depth) throw std::logic_error("glmxfer: direct host slot still in use");
     hip_check(hipStreamWriteValue64(options_.stream, flags_dev_ + kTxFlag, s, 0), "direct host producer ready");
@@ -471,28 +498,54 @@ template<class Traits>
 void Channel<Traits>::process(const Job& job) {
     const auto t0 = Clock::now();
     const auto deadline = t0 + options_.timeout;
-    unsigned n = 0;
-    while (!job.seal && __atomic_load_n(&flags_host_[kTxFlag], __ATOMIC_ACQUIRE) < job.sequence) {
-        if (stop_.load(std::memory_order_relaxed)) fail("glmxfer: stopped while waiting for a producer");
-        if ((++n & 1023U) == 0 && Clock::now() > deadline)
-            fail("glmxfer: producer of sequence " + std::to_string(job.sequence) + " not published within the timeout");
-        _mm_pause();
+    const auto wait_flag = [&](std::size_t index, const char* what) {
+        unsigned n = 0;
+        while (__atomic_load_n(&flags_host_[index], __ATOMIC_ACQUIRE) < job.sequence) {
+            if (stop_.load(std::memory_order_relaxed)) fail(std::string("glmxfer: stopped while waiting for a ") + what);
+            if ((++n & 1023U) == 0 && Clock::now() > deadline)
+                fail(std::string("glmxfer: ") + what + " of sequence " + std::to_string(job.sequence) +
+                     " not published within the timeout");
+            _mm_pause();
+        }
+    };
+    // Split-producer frame: the head moves (no trailer) while the GPU still produces the tail. Plain bytes of the same
+    // stream, so the peer's head lands in the same RX bytes as in the one-frame form; nothing is released before the
+    // tail's identity / CRC checks below.
+    Clock::time_point h1{};
+    if (job.head != 0) {
+        wait_flag(kHeadFlag, "head producer");
+        const auto h0 = Clock::now();
+        try {
+            peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
+                transport_->exchange(std::span<const std::byte>(tx_slot(job.sequence), job.head),
+                                     std::span<std::byte>(rx_slot(job.sequence), job.head));
+            });
+        } catch (const std::exception& e) {
+            fail(std::string("glmxfer: transport (head): ") + e.what());
+        }
+        h1 = Clock::now();
+        stats_.splits += 1;
+        stats_.head_wire += seconds(h0, h1);
     }
+    if (!job.seal) wait_flag(kTxFlag, "producer");
     const auto t1 = Clock::now();
+    if (job.head != 0) stats_.tail_wait += seconds(h1, t1);
     const std::byte* tx = job.direct_tx ? job.direct_tx : (job.seal ? seal_tx_ : tx_slot(job.sequence));
     std::byte* rx = job.direct_rx ? job.direct_rx : (job.seal ? seal_rx_ : rx_slot(job.sequence));
     const bool deferred = options_.crc && options_.crc_deferred && job.bytes > kInlineCrcMax;
     std::uint64_t tx_ticket = 0;
     if (deferred) tx_ticket = crc_worker_->submit(tx, job.bytes);  // overlaps the wire below
-    const auto t = make_trailer<Traits>(job.tag, options_.epoch, options_.plan, job.sequence,
+    auto t = make_trailer<Traits>(job.tag, options_.epoch, options_.plan, job.sequence,
         job.bytes, options_.rank, deferred,
         !deferred && options_.crc ? dist::crc32c(std::span<const std::byte>(tx, job.bytes)) : 0U,
         prev_deferred_, prev_tx_crc_);
+    if (job.head != 0) t.flags |= kTrailerSplit;
     Trailer p;
     try {
         peer_wait_.measure(static_cast<std::uint32_t>(job.tag.kind), [&] {
             if (job.direct_rx) exchange_frame_direct(*transport_, tx, rx, job.bytes, t, p);
-            else exchange_frame(*transport_, job.seal ? seal_tx_ : tx_slot(job.sequence), rx, job.bytes, t);
+            else exchange_frame(*transport_, (job.seal ? seal_tx_ : tx_slot(job.sequence)) + job.head, rx + job.head,
+                                job.bytes - job.head, t);
         });
     } catch (const std::exception& e) {
         fail(std::string("glmxfer: transport: ") + e.what());

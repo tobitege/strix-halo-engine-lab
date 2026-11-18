@@ -57,7 +57,41 @@ int main() {
     for (const auto context : {"524289"})
         rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2", "--context", context}, "0 < context");
     rejects({"decoder", "model.gguf", "1", "--rope-yarn", "4", "--context", "1048577"}, "0 < context");
-    rejects({"decoder", "model.gguf", "1", "--context", "262145", "--unqualified-context"}, "native rotary context");
+    // Storage capacity never opts into experimental rotary arithmetic, on CLI or HTTP.
+    rejects({"decoder", "model.gguf", "1", "--rope-yarn", "off", "--context", "262145", "--unqualified-context"}, "native rotary context");
+    for (const auto context : {"262145", "300000", "524288", "524289", "1048576"}) {
+        const auto factor = std::stoull(context) <= 524288U ? "2" : "4";
+        for (bool http : {false, true}) {
+            std::vector<std::string> args{"decoder", "model.gguf", "1", "--context", context};
+            if (http) args.push_back("--http-serve");
+            rejects(std::move(args), std::string("--rope-yarn ") + factor);
+        }
+        require(parse({"decoder", "model.gguf", "1", "--context", context, "--rope-yarn", factor}).rotary.factor() ==
+            std::stoul(factor), "explicit opt-in preserves supported extent");
+    }
+    require(parse({"decoder", "model.gguf", "1", "--context", "262144"}).rotary == native, "native up to 262144");
+    rejects({"decoder", "model.gguf", "1", "--context", "1048577"}, "native rotary context");
+    {   // No --context: a known prompt above native refuses with an actionable recommendation.
+        std::vector<std::string> args{"decoder", "model.gguf"};
+        args.insert(args.end(), 262144U, "1");
+        args.insert(args.end(), {"--generate", "1"});
+        auto off = args; off.insert(off.end(), {"--rope-yarn", "off"});
+        rejects(std::move(args), "--rope-yarn 2 --context 262145");
+        rejects(std::move(off), "native rotary context");
+        // 262,143 + 1 generated token fits native: it keeps native RoPE (bits) and its automatic context.
+        std::vector<std::string> fits{"decoder", "model.gguf"};
+        fits.insert(fits.end(), 262143U, "1");
+        fits.insert(fits.end(), {"--generate", "1"});
+        const auto n = parse(std::move(fits));
+        require(n.rotary == native && !n.context_explicit, "a prompt native admits stays native");
+        // Recommend the smallest covering factor without selecting it.
+        std::vector<std::string> band{"decoder", "model.gguf"};
+        band.insert(band.end(), 524287U, "1");
+        band.insert(band.end(), {"--generate", "1"});
+        rejects(std::move(band), "--rope-yarn 2 --context 524288");
+    }
+    require(recommended_qwen_rope_yarn(262144) == 0U && recommended_qwen_rope_yarn(262145) == 2U &&
+        recommended_qwen_rope_yarn(524289) == 4U && recommended_qwen_rope_yarn(1048577) == 0U, "diagnostic factor bands");
     rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2", "--context", "524288", "--baseline"}, "native rotary context");
     require(parse({"decoder","model.gguf","1","--rope-yarn","2","--context","8192","--baseline"}).rotary == native,
         "baseline suppresses CLI YaRN before YaRN context validation");

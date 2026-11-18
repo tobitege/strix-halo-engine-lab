@@ -14,6 +14,7 @@
 // prefill). A failure inside the suffix follows the engine's contract: ImportFatal, the server stops (the peer may be
 // inside a collective that can no longer pair up). A broken pair link is fatal in any phase (the communicator poisons
 // itself).
+#include "strix/pair/state_relay.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -326,24 +327,24 @@ std::vector<std::uint8_t> dsa_relay(unsigned rank, bool ok, std::span<const std:
             prepared = false;
         }
     }
-    const std::uint64_t hdr[2] = {prepared ? 1U : 0U, dsa_bytes};
-    std::uint64_t peer[2] = {};
-    xchg(std::as_bytes(std::span(hdr)), std::as_writable_bytes(std::span(peer)), 0);
-    if (!ok) throw std::runtime_error("import relay: nothing usable is staged on this rank for the relay");
-    if (!sized) throw std::runtime_error("import relay: this rank's staged state has " + std::to_string(mine.size()) + " bytes, expected " +
-                                         std::to_string(expect));
-    if (!prepared) throw std::runtime_error("import relay: this rank cannot allocate the relay buffers");
-    if (peer[0] != 1U || peer[1] != dsa_bytes) throw std::runtime_error("import relay: the peer cannot relay / receive");
-    std::uint64_t seq = 1;
-    for (std::uint64_t o = 0; o < dsa_bytes; o += chunk, ++seq) {
-        const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(chunk, dsa_bytes - o));
-        const std::span<std::uint8_t> part(dsa.data() + o, n);
-        if (rank == 0) xchg(std::as_bytes(part), std::span<std::byte>(), seq);
-        else xchg(std::as_bytes(part), std::as_writable_bytes(part), seq);  // the block it sends back is copied out first
+    // The relay leg itself is the shared one (strix/pair/state_relay.hpp): header {ok, bytes, hash} both ways, chunks
+    // rank 0 -> rank 1, then both ranks vote on the received hash before returning.
+    strix::pair::state::RelayStats rs;
+    try {
+        (void)strix::pair::state::relay_piece(rank == 0, prepared, std::span<std::uint8_t>(dsa), chunk,
+                                              [&](std::span<const std::byte> a, std::span<std::byte> b, std::uint64_t q) { xchg(a, b, q); },
+                                              strix::pair::state::state_hash, 0, &rs);
+    } catch (const std::runtime_error& e) {
+        if (!ok) throw std::runtime_error("import relay: nothing usable is staged on this rank for the relay");
+        if (!sized)
+            throw std::runtime_error("import relay: this rank's staged state has " + std::to_string(mine.size()) + " bytes, expected " +
+                                     std::to_string(expect));
+        if (!prepared) throw std::runtime_error("import relay: this rank cannot allocate the relay buffers");
+        throw std::runtime_error(std::string("import relay: ") + e.what());
     }
     if (stats) {
-        stats->bytes = dsa_bytes;
-        stats->chunks = seq - 1;
+        stats->bytes = rs.bytes;
+        stats->chunks = rs.chunks;
         stats->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
     if (rank == 0) return {};
@@ -381,7 +382,7 @@ template <class Xchg, class Relay, class Restore, class Suffix>
 std::uint32_t import_transaction(bool prepared, const std::string& why, const Binding& binding, std::uint64_t frontier, Xchg&& vote,
                                  Relay&& relay, Restore&& restore, Suffix&& suffix) {
     import_vote("prepare", prepared, why, binding, frontier, vote, 1);
-    relay();  // its own header vote: both throw together
+    relay();  // header and final hash votes: both throw together
     bool restored = true;
     std::string err;
     try {

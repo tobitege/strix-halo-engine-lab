@@ -8,10 +8,10 @@
 // through LayerCore (the assembly's API: tiled weights, fused sites) with only the attention output o and the combined
 // y taken from the capture, and every op output is compared through the LayerCore tap. Exit status 1 on any difference.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_layer_core.hpp"
-#include "strix/cuda_ds41_weights.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_layer_core.hpp"
+#include "strix/cuda/ds41_weights.hpp"
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/deepseek41_plan.hpp"

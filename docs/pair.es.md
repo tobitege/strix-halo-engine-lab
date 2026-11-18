@@ -62,3 +62,21 @@ PerfOpt activado/desactivado solo con el mismo kernel.
 - Valores predeterminados de transporte e intercambio de prefill de DeepSeek:
   [valores predeterminados de producción](models/deepseek-v4.1/production-defaults.md),
   [contextos largos en dos nodos](models/deepseek-v4.1/long-context.md).
+
+## Entrega del estado del prompt: una copia por dueño
+
+Cuando un host de prefill entrega el estado de un prompt al par, cada familia declara una vez sus piezas
+(`include/strix/pair/state_decls.hpp`: porciones por rango, bytes compartidos, capas de una etapa, metadatos
+replicados) y el planificador compartido (`include/strix/pair/state_owners.hpp`) decide qué cruza cada enlace: las
+piezas compartidas van una vez al rango 0, que las retransmite al rango 1 por el enlace del par con hash comprobado
+(`include/strix/pair/state_relay.hpp`). La NIC del host de prefill la comparten los dos destinos. A 32K y 1 GbE
+(medido con `scripts/bench/handoff/owners_probe.py`, ABAB, en caliente): GLM DSA una vez de 12,38 a 6,90 s
+(predeterminado); MiniMax claves de índice una vez de 5.033 a 4.530 MB (`--ik-once` en el productor, opcional; 8K de
+11,14 a 10,04 s). El modo prefijo primero (`STRIX_HANDOFF_PREFIX_FIRST`, apagado) envía sólo las filas que los rangos no
+tienen, cuando la familia tenga el recibo de invariancia de filas con la longitud del prompt.
+
+Los tiempos del planificador son cotas optimistas del enlace con solapamiento perfecto; GLM recibe el estado completo
+antes de retransmitirlo. No miden la latencia total ni califican la equivalencia nativa del modelo o del estado.
+Las transferencias todavía usan diseños por familia; la transferencia de prefijos no está conectada y ninguna familia
+declara invariancia de filas. DS41 estima capacidad de tensores/tokens; `ds41_serialized_bytes` usa los vectores reales
+y el diseño del serializador para contar también el enmarcado y los top-k cortos o ausentes.

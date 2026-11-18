@@ -1,10 +1,10 @@
-// Tests of src/cuda/qwen_moe.cu (CUDA routed-MoE prefill, A8 profile) against a literal host transcription of the HIP
+// Tests of src/cuda/models/qwen/qwen_moe.cu (CUDA routed-MoE prefill, A8 profile) against a literal host transcription of the HIP
 // kernels: prefill_prologue/quantize_row (src/hip_moe_q4k_a8_probe.hip:41-73, 159-173), build_prefill_csr
 // (src/hip_moe_q4k_a8_known_rows.hip:403-452, the serial builder the parallel one reproduces), project_prefill_wmma with
 // gate_up_chains (:791-909), down_prefill_wmma with down_chains (:957-1032), known_moe_prefill_merge/commit_kernel
 // (src/hip_moe_experts_launcher.hip:2660-2708). Every buffer the pipeline may write is pre-filled with the same sentinel on
 // both sides and compared byte for byte in full (so stray writes are detected too).
-//   qwen_moe_tests <tables dir> [bench]
+//   qwen_moe_tests <tables dir> [bench|fastmma|fastmma-check|fastmma-bench]
 // Optional: STRIX_QWEN_GGUF (real expert weights, default path of qwen_gguf_host.hpp), qrtx-build\fx\d64.dump.
 #include <cuda_runtime.h>
 
@@ -20,9 +20,9 @@
 #include <string>
 #include <vector>
 
-#include "strix/cuda_qwen_moe.hpp"
-#include "strix/cuda_qwen_route_bf16.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_moe.hpp"
+#include "strix/cuda/qwen_route_bf16.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
 
@@ -52,7 +52,7 @@ static float canon(float x) { return x != x ? f_of(0x7fc00000U) : x; }
 static bool finite(float x) { return (b_of(x) & 0x7f800000U) != 0x7f800000U; }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Host gfx1151 expf: the same algorithm as amd_expf (src/cuda/qwen_amd_math.cuh, verified exhaustively against gfx1151),
+// Host gfx1151 expf: the same algorithm as amd_expf (include/strix/cuda/amd_math.cuh, verified exhaustively against gfx1151),
 // with the tables read on the host.
 struct HostExp {
     std::vector<u32> bits; std::vector<u32> hard_in; std::vector<float> hard_out;
@@ -677,8 +677,12 @@ static void fixture_replay(const am::Tables& tables) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// CUDA 13 has no unsynchronised __shfl_xor: same spelling as qwen_moe.cu.
+__device__ __forceinline__ unsigned test_shfl_xor(unsigned v, int delta, int width) { return __shfl_xor_sync(0xffffffffU, v, delta, width); }
+#define __shfl_xor test_shfl_xor
 namespace route_rounding {
 #include "../../src/hip_moe_route_bf16.inc"
+#undef __shfl_xor
 __global__ void probe(const u32* inputs, float* storage, u32* returned, u32* widened, u32 count) {
     const auto i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
@@ -721,12 +725,234 @@ static void route_rounding_device_test() {
     cudaFree(in);cudaFree(returned);cudaFree(widened);cudaFree(storage);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// moe_mma FAST form (single FP32 chain, qwen-cuda-moe-i8fma-v1) against the exact kernels on the same device inputs.
+//   project: hv / u intermediates and the down codes; down: rawdots from the exact kernel's down codes (isolates the down GEMM),
+//   and end to end (FAST project then FAST down). Errors are reported as relative L2 plus max abs, binned by position inside the
+//   CSR tile (0-15, 16-31, 32-47, 48-63), by output quad inside 64 (o % 64 / 16) and by slot, so a clustered (edge/last block/
+//   partial tile) error shows as one bin standing out. The exact kernels are compared bytewise by the existing pipeline tests.
+struct ErrAcc {
+    double e2 = 0, r2 = 0, max_abs = 0; size_t n = 0;
+    void add(double ref, double got) {
+        const double e = got - ref; e2 += e * e; r2 += ref * ref; max_abs = std::max(max_abs, std::fabs(e)); ++n;
+    }
+    double rel() const { return r2 > 0 ? std::sqrt(e2 / r2) : (e2 > 0 ? 1.0 : 0.0); }
+};
+struct ErrBins {
+    ErrAcc all, pos[4], quad[4], slot[10];
+    void add(double ref, double got, u32 p, u32 q4, u32 sl) { all.add(ref, got); pos[p].add(ref, got); quad[q4].add(ref, got); slot[sl].add(ref, got); }
+    double worst_bin() const {
+        double w = 0;
+        for (const auto& b : pos) w = std::max(w, b.rel());
+        for (const auto& b : quad) w = std::max(w, b.rel());
+        for (const auto& b : slot) if (b.n) w = std::max(w, b.rel());
+        return w;
+    }
+    void print(const char* what) const {
+        std::printf("  %-14s n=%zu relL2=%.3e maxabs=%.3e | pos %.2e %.2e %.2e %.2e | outq %.2e %.2e %.2e %.2e | worst bin %.2e (%.1fx)\n", what, all.n, all.rel(),
+                    all.max_abs, pos[0].rel(), pos[1].rel(), pos[2].rel(), pos[3].rel(), quad[0].rel(), quad[1].rel(), quad[2].rel(), quad[3].rel(),
+                    worst_bin(), all.rel() > 0 ? worst_bin() / all.rel() : 0.0);
+    }
+};
+static std::vector<u8> snap(const Device& d, const State& s, int v) {
+    std::vector<u8> h(s.view[v].size());
+    CK(cudaMemcpy(h.data(), d.view[v], h.size(), cudaMemcpyDeviceToHost));
+    return h;
+}
+static void fast_case(const std::string& name, u32 T, unsigned kind, const HostWeights& w, u32 NE, std::mt19937& rng, const am::Tables& tables) {
+    State s; init_state(s, T); synthetic_inputs(s, NE, kind, rng);
+    Device d; upload_weights(d, w); upload_state(d, s, true);
+    auto& rv = d.rows_view;
+    mo::enqueue_prologue(rv, T, mo::hidden, nullptr); mo::enqueue_csr(rv, T, nullptr);
+    mo::enqueue_project(rv, T, d.weights, tables, nullptr, false); CK(cudaDeviceSynchronize());
+    const auto inter_e = snap(d, s, V_inter), dc_e = snap(d, s, V_dcodes);
+    mo::enqueue_down(rv, T, d.weights, nullptr, false); CK(cudaDeviceSynchronize());
+    const auto raw_e = snap(d, s, V_raw);
+    CK(cudaMemset(d.view[V_raw], 0xA7, s.view[V_raw].size()));
+    mo::enqueue_down(rv, T, d.weights, nullptr, true); CK(cudaDeviceSynchronize());
+    const auto raw_f1 = snap(d, s, V_raw);
+    mo::enqueue_project(rv, T, d.weights, tables, nullptr, true); CK(cudaDeviceSynchronize());
+    const auto inter_f = snap(d, s, V_inter), dc_f = snap(d, s, V_dcodes);
+    CK(cudaMemset(d.view[V_raw], 0xA7, s.view[V_raw].size()));
+    mo::enqueue_down(rv, T, d.weights, nullptr, true); CK(cudaDeviceSynchronize());
+    const auto raw_f2 = snap(d, s, V_raw);
+    // tile positions of every (row, slot)
+    const auto sz = mo::csr_sizes(T);
+    std::vector<u32> tcount(1), tbeg(sz.max_tiles + 1), rows(sz.assignments), slots(sz.assignments), summary(32);
+    CK(cudaMemcpy(tcount.data(), d.tcount, 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(tbeg.data(), d.tbeg, tbeg.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(rows.data(), d.rows, rows.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(slots.data(), d.slots, slots.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(summary.data(), d.summary, 128, cudaMemcpyDeviceToHost));
+    std::vector<u8> pos(static_cast<size_t>(T) * 10, 0);
+    u32 partial = 0, tiny = 0;
+    for (u32 t = 0; t < tcount[0]; ++t) {
+        const u32 cnt = tbeg[t + 1] - tbeg[t];
+        if (cnt < 64) ++partial;
+        if (cnt <= 8) ++tiny;
+        for (u32 i = tbeg[t]; i < tbeg[t + 1]; ++i) pos[static_cast<size_t>(rows[i]) * 10 + slots[i]] = static_cast<u8>(i - tbeg[t]);
+    }
+    ErrBins hv, uu, r1, r2; size_t code_diff = 0, code_n = 0;
+    for (u32 r = 0; r < T; ++r) for (u32 k = 0; k < 10; ++k) {
+        const u32 p = pos[static_cast<size_t>(r) * 10 + k] >> 4;
+        const float* ie = reinterpret_cast<const float*>(inter_e.data() + static_cast<size_t>(r) * stride_of(V_inter)) + k * 2 * mo::ffn;
+        const float* inf = reinterpret_cast<const float*>(inter_f.data() + static_cast<size_t>(r) * stride_of(V_inter)) + k * 2 * mo::ffn;
+        const i8* ce = reinterpret_cast<const i8*>(dc_e.data() + static_cast<size_t>(r) * stride_of(V_dcodes)) + k * mo::ffn;
+        const i8* cf = reinterpret_cast<const i8*>(dc_f.data() + static_cast<size_t>(r) * stride_of(V_dcodes)) + k * mo::ffn;
+        for (u32 f = 0; f < mo::ffn; ++f) {
+            hv.add(ie[f], inf[f], p, (f % 64) >> 4, k); uu.add(ie[mo::ffn + f], inf[mo::ffn + f], p, (f % 64) >> 4, k);
+            code_diff += ce[f] != cf[f]; ++code_n;
+        }
+        const float* a = reinterpret_cast<const float*>(raw_e.data() + static_cast<size_t>(r) * stride_of(V_raw)) + k * mo::hidden;
+        const float* b1 = reinterpret_cast<const float*>(raw_f1.data() + static_cast<size_t>(r) * stride_of(V_raw)) + k * mo::hidden;
+        const float* b2 = reinterpret_cast<const float*>(raw_f2.data() + static_cast<size_t>(r) * stride_of(V_raw)) + k * mo::hidden;
+        for (u32 o = 0; o < mo::hidden; ++o) { r1.add(a[o], b1[o], p, (o % 64) >> 4, k); r2.add(a[o], b2[o], p, (o % 64) >> 4, k); }
+    }
+    std::printf("fast %s: T=%u tiles=%u (partial %u, <=8 rows %u) summary0=%u down-code flips %.4f%%\n", name.c_str(), T, tcount[0], partial, tiny, summary[0],
+                100.0 * static_cast<double>(code_diff) / static_cast<double>(std::max<size_t>(code_n, 1)));
+    hv.print("project hv"); uu.print("project u"); r1.print("down (same A)"); r2.print("down end2end");
+    expect(summary[0] == 0, name + " summary");
+    expect(hv.all.rel() < 1e-5 && uu.all.rel() < 1e-5, name + " project relL2");
+    expect(r1.all.rel() < 1e-5, name + " down relL2");
+    expect(r2.all.rel() < 3e-2, name + " end-to-end relL2");
+    expect(hv.worst_bin() < 4.0 * hv.all.rel() + 1e-12 && uu.worst_bin() < 4.0 * uu.all.rel() + 1e-12 && r1.worst_bin() < 4.0 * r1.all.rel() + 1e-12,
+           name + " error uniform across tile position / output quad / slot");
+    g_checked += hv.all.n * 2 + r1.all.n * 2;
+    free_device(d);
+}
+static void fast_tests(const am::Tables& tables) {
+    std::mt19937 rng(99);
+    for (const auto [gt, dt] : {std::pair{mo::type_q4_k, mo::type_q5_1}, std::pair{mo::type_q5_k, mo::type_q8_0},
+                                std::pair{mo::type_q4_k, mo::type_q8_0}, std::pair{mo::type_q5_k, mo::type_q5_1}}) {
+        const u32 NE = 24;
+        HostWeights w = synthetic_weights(gt, dt, NE, rng);
+        const std::string tag = "syn gate" + std::to_string(gt) + "/down" + std::to_string(dt);
+        fast_case(tag + " T=1000 skew+dup", 1000, 1 | 2 | 4, w, NE, rng, tables);
+        fast_case(tag + " T=37", 37, 0, w, NE, rng, tables);   // few rows per expert: tiny partial tiles
+        fast_case(tag + " T=11", 11, 2, w, NE, rng, tables);
+    }
+    // Real weights: first NE experts of the first layer of every (gate, down) type pair of the model.
+    strix::qwen_gguf::Model model;
+    std::vector<std::pair<u32, u32>> seen;
+    for (u32 layer = 0; layer < 96 && seen.size() < 4; ++layer) {
+        const std::string pre = "blk." + std::to_string(layer) + ".";
+        u32 gt = 0, dt = 0;
+        try { gt = static_cast<u32>(model.tensor(pre + "ffn_gate_exps.weight").ggml_type); dt = static_cast<u32>(model.tensor(pre + "ffn_down_exps.weight").ggml_type); }
+        catch (...) { continue; }
+        if (!(gt == mo::type_q4_k || gt == mo::type_q5_k) || !(dt == mo::type_q5_1 || dt == mo::type_q8_0)) continue;
+        if (std::find(seen.begin(), seen.end(), std::pair{gt, dt}) != seen.end()) continue;
+        seen.push_back({gt, dt});
+        const u32 NE = 48;
+        HostWeights w; w.gate_type = gt; w.down_type = dt; w.experts_alloc = NE;
+        u32 t1, t2, t3;
+        w.gate = read_experts(model, pre + "ffn_gate_exps.weight", NE, t1); w.up = read_experts(model, pre + "ffn_up_exps.weight", NE, t2);
+        w.down = read_experts(model, pre + "ffn_down_exps.weight", NE, t3);
+        const std::string tag = "real blk" + std::to_string(layer) + " gate" + std::to_string(gt) + "/down" + std::to_string(dt);
+        fast_case(tag + " T=2000", 2000, 1 | 4, w, NE, rng, tables);
+        fast_case(tag + " T=100", 100, 0, w, NE, rng, tables);
+    }
+    expect(!seen.empty(), "real-weight layers found");
+    std::printf("real-weight type pairs tested: %zu\n", seen.size());
+}
+// 8192 prompt rows, 512 experts (the model's routing spread: ~160 assignments / expert), exact vs FAST per kernel.
+static void fast_bench(const am::Tables& tables) {
+    std::mt19937 rng(7);
+    for (const auto [gt, dt] : {std::pair{mo::type_q4_k, mo::type_q5_1}, std::pair{mo::type_q5_k, mo::type_q8_0}}) {
+        const u32 NE = 512, T = 8192;
+        HostWeights w = synthetic_weights(gt, dt, NE, rng);
+        State s; init_state(s, T); synthetic_inputs(s, NE, 0, rng);
+        s.view[V_inter].clear(); s.view[V_inter].shrink_to_fit(); s.view[V_inter].assign(16, 0);
+        Device d; upload_weights(d, w); upload_state(d, s, false);
+        auto& rv = d.rows_view;
+        mo::enqueue_prologue(rv, T, mo::hidden, nullptr); mo::enqueue_csr(rv, T, nullptr); CK(cudaDeviceSynchronize());
+        u32 tc = 0; CK(cudaMemcpy(&tc, d.tcount, 4, cudaMemcpyDeviceToHost));
+        std::printf("bench gate %u down %u T=%u NE=%u: tiles %u (64-row tiles, fill %.1f%%)\n", gt, dt, T, NE, tc, 100.0 * T * 10 / (64.0 * tc));
+        cudaEvent_t e[5]; for (auto& x : e) CK(cudaEventCreate(&x));
+        float best[4] = {1e9F, 1e9F, 1e9F, 1e9F};
+        for (int it = 0; it < 6; ++it) {
+            CK(cudaEventRecord(e[0]));
+            mo::enqueue_project(rv, T, d.weights, tables, nullptr, false); CK(cudaEventRecord(e[1]));
+            mo::enqueue_project(rv, T, d.weights, tables, nullptr, true); CK(cudaEventRecord(e[2]));
+            mo::enqueue_down(rv, T, d.weights, nullptr, false); CK(cudaEventRecord(e[3]));
+            mo::enqueue_down(rv, T, d.weights, nullptr, true); CK(cudaEventRecord(e[4]));
+            CK(cudaEventSynchronize(e[4]));
+            for (int k = 0; k < 4; ++k) { float ms; cudaEventElapsedTime(&ms, e[k], e[k + 1]); if (it >= 2) best[k] = std::min(best[k], ms); }
+        }
+        std::printf("bench per layer: project exact %.3f ms fast %.3f ms (x%.2f) | down exact %.3f ms fast %.3f ms (x%.2f) | x40 layers: exact %.1f ms fast %.1f ms\n",
+                    best[0], best[1], best[0] / best[1], best[2], best[3], best[2] / best[3], 40 * (best[0] + best[2]), 40 * (best[1] + best[3]));
+        std::fflush(stdout);
+        (void)std::system("nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm --format=csv,noheader");
+        free_device(d);
+    }
+}
+
+// Dump of the FAST project + down outputs (all state views) for byte comparison between tile-variant builds.
+static void fast_dump_case(FILE* out, u32 T, unsigned kind, const HostWeights& w, u32 NE, std::mt19937& rng, const am::Tables& tables) {
+    State s; init_state(s, T); synthetic_inputs(s, NE, kind, rng);
+    Device d; upload_weights(d, w); upload_state(d, s, true);
+    auto& rv = d.rows_view;
+    mo::enqueue_prologue(rv, T, mo::hidden, nullptr); mo::enqueue_csr(rv, T, nullptr);
+    mo::enqueue_project(rv, T, d.weights, tables, nullptr, true);
+    mo::enqueue_down(rv, T, d.weights, nullptr, true); CK(cudaDeviceSynchronize());
+    for (const int v : {V_inter, V_dcodes, V_ddeltas, V_dsums, V_raw}) { const auto h = snap(d, s, v); std::fwrite(h.data(), 1, h.size(), out); }
+    free_device(d);
+}
+static void fast_dump(const am::Tables& tables, const char* path) {
+    FILE* out = std::fopen(path, "wb");
+    if (!out) { std::printf("cannot open %s\n", path); std::exit(2); }
+    std::mt19937 rng(4242);
+    for (const auto [gt, dt] : {std::pair{mo::type_q4_k, mo::type_q5_1}, std::pair{mo::type_q5_k, mo::type_q8_0}}) {
+        HostWeights w = synthetic_weights(gt, dt, 24, rng);
+        fast_dump_case(out, 1000, 1 | 2 | 4, w, 24, rng, tables);
+        fast_dump_case(out, 37, 0, w, 24, rng, tables);
+    }
+    strix::qwen_gguf::Model model;
+    for (u32 layer = 0; layer < 96; ++layer) {
+        const std::string pre = "blk." + std::to_string(layer) + ".";
+        u32 gt = 0, dt = 0;
+        try { gt = static_cast<u32>(model.tensor(pre + "ffn_gate_exps.weight").ggml_type); dt = static_cast<u32>(model.tensor(pre + "ffn_down_exps.weight").ggml_type); }
+        catch (...) { continue; }
+        if (!(gt == mo::type_q4_k || gt == mo::type_q5_k) || !(dt == mo::type_q5_1 || dt == mo::type_q8_0)) continue;
+        HostWeights w; w.gate_type = gt; w.down_type = dt; w.experts_alloc = 48;
+        u32 t1, t2, t3;
+        w.gate = read_experts(model, pre + "ffn_gate_exps.weight", 48, t1); w.up = read_experts(model, pre + "ffn_up_exps.weight", 48, t2);
+        w.down = read_experts(model, pre + "ffn_down_exps.weight", 48, t3);
+        fast_dump_case(out, 2000, 1 | 4, w, 48, rng, tables);
+        std::printf("dumped real blk%u gate%u down%u\n", layer, gt, dt);
+        break;
+    }
+    std::fclose(out);
+}
+#ifdef STRIX_WFMT_CAPTURE
+#include "qwen_moe_wfmt_capture.inc"
+#endif
 int main(int argc, char** argv) {
+#ifdef STRIX_WFMT_CAPTURE
+    if (argc == 5 && std::string_view(argv[1]) == "--wfmt-backend-capture" &&
+        std::string_view(argv[3]) == "--tables") {
+        CK(cudaSetDevice(0));
+        am::Tables tables = am::load_tables(argv[4]);
+        wfmt_capture(tables,argv[2]);
+        am::free_tables(tables);
+        return 0;
+    }
+#endif
     if (argc < 2) { std::printf("usage: qwen_moe_tests <tables dir> [bench|fixture]\n"); return 2; }
     const std::string mode = argc > 2 ? argv[2] : "";
     CK(cudaSetDevice(0));
     am::Tables tables = am::load_tables(argv[1]);
+#ifdef STRIX_WFMT_CAPTURE
+    if (mode.rfind("wfmt-capture=", 0) == 0) { wfmt_capture(tables,mode.c_str()+13); am::free_tables(tables); return 0; }
+#endif
     if (mode == "fixture") { fixture_replay(tables); std::printf("%s: %d failures, %llu bytes compared\n", g_fail ? "FAIL" : "PASS", g_fail, g_checked); return g_fail ? 1 : 0; }
+    if (mode == "fastmma" || mode == "fastmma-check") {
+        fast_tests(tables);
+        if (mode == "fastmma") fast_bench(tables);
+        std::printf("%s: %d failures, %llu values compared\n", g_fail ? "FAIL" : "PASS", g_fail, g_checked);
+        return g_fail ? 1 : 0;
+    }
+    if (mode == "fastmma-bench") { fast_bench(tables); return 0; }
+    if (mode.rfind("fastdump=", 0) == 0) { fast_dump(tables, mode.c_str() + 9); return 0; }
     if (mode == "bench") {
         // T = 8192, 128 synthetic experts (VRAM < 2 GB), uniform routes, intermediates off.
         std::mt19937 rng(7);

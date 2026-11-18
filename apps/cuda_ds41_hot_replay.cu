@@ -18,9 +18,9 @@
 // experts of the non-test sequences, --source-gib of pinned host memory (or the placement's pc-ram lists if any).
 
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
-#include "strix/cuda_ds41_parts_host_driver.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_parts_host_driver.hpp"
 #include "strix/ds41_hot_placement.hpp"
 
 #include <cuda_runtime.h>

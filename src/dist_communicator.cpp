@@ -1,6 +1,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/hip_check.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 #include "dist_latency_trace.hpp"
@@ -1804,8 +1805,8 @@ public:
         const auto count = (capacity - 1U) / chunk + 1U;
         const auto allocation = capacity + count * sizeof(Trailer);
         try {
-            check(hipHostMalloc(reinterpret_cast<void**>(&send), allocation, hipHostMallocDefault), "pipeline send");
-            check(hipHostMalloc(reinterpret_cast<void**>(&receive), allocation, hipHostMallocDefault), "pipeline receive");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&send), allocation, hipHostMallocDefault), "pipeline send");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&receive), allocation, hipHostMallocDefault), "pipeline receive");
             check(hipStreamCreateWithFlags(&tx, hipStreamNonBlocking), "pipeline tx stream");
             check(hipStreamCreateWithFlags(&rx, hipStreamNonBlocking), "pipeline rx stream");
             check(hipEventCreateWithFlags(&producer, hipEventDisableTiming), "pipeline producer");
@@ -1829,8 +1830,8 @@ public:
         if (consumer) (void)hipEventDestroy(consumer);
         if (tx) (void)hipStreamDestroy(tx);
         if (rx) (void)hipStreamDestroy(rx);
-        if (send) (void)hipHostFree(send);
-        if (receive) (void)hipHostFree(receive);
+        if (send) (void)strix::host_pin::release(send);
+        if (receive) (void)strix::host_pin::release(receive);
     }
 };
 
@@ -1869,13 +1870,13 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
     // small readiness pools; "ready" falls back to fused above its limit.
     if (const char* v = std::getenv("STRIX_DIST_STAGING"); v && std::string(v) == "copy") fused_ = false;
     const unsigned staging_flags = fused_ ? hipHostMallocCoherent : hipHostMallocDefault;
-    check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned send buffer");
-    check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned receive buffer");
+    check(strix::host_pin::allocate(reinterpret_cast<void**>(&send_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned send buffer");
+    check(strix::host_pin::allocate(reinterpret_cast<void**>(&receive_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned receive buffer");
     if (d2h_kernel_bytes_) {
         const auto status = hipHostGetDevicePointer(&send_device_alias_, send_host_, 0);
         if (status != hipSuccess) {
-            (void)hipHostFree(receive_host_);
-            (void)hipHostFree(send_host_);
+            (void)strix::host_pin::release(receive_host_);
+            (void)strix::host_pin::release(send_host_);
             receive_host_ = send_host_ = nullptr;
             check(status, "mapped pinned send buffer for copy kernel");
         }
@@ -1887,8 +1888,8 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             check(hipDeviceGetAttribute(&native_atomics, hipDeviceAttributeHostNativeAtomicSupported, device), "host atomics");
             if (!native_atomics) throw std::runtime_error("staged readiness requires native host atomics");
             const auto count = std::min(max_bytes_, staged_ready_bytes_) + sizeof(Trailer);
-            check(hipHostMalloc(reinterpret_cast<void**>(&staged_send_host_), count, hipHostMallocCoherent), "coherent staged send");
-            check(hipHostMalloc(reinterpret_cast<void**>(&staged_receive_host_), count, hipHostMallocCoherent), "coherent staged receive");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&staged_send_host_), count, hipHostMallocCoherent), "coherent staged send");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&staged_receive_host_), count, hipHostMallocCoherent), "coherent staged receive");
             check(hipHostMalloc(reinterpret_cast<void**>(&producer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "producer readiness");
             check(hipHostMalloc(reinterpret_cast<void**>(&consumer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "consumer readiness");
             new (producer_flag_) StagedReady{};
@@ -1909,10 +1910,10 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             if (staged_counters_) (void)hipFree(staged_counters_);
             if (consumer_flag_) (void)hipHostFree(consumer_flag_);
             if (producer_flag_) (void)hipHostFree(producer_flag_);
-            if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
-            if (staged_send_host_) (void)hipHostFree(staged_send_host_);
-            (void)hipHostFree(receive_host_);
-            (void)hipHostFree(send_host_);
+            if (staged_receive_host_) (void)strix::host_pin::release(staged_receive_host_);
+            if (staged_send_host_) (void)strix::host_pin::release(staged_send_host_);
+            (void)strix::host_pin::release(receive_host_);
+            (void)strix::host_pin::release(send_host_);
             throw;
         }
     }
@@ -1954,14 +1955,14 @@ void Communicator::resize_bytes(std::size_t bytes, bool grow_pipeline) {
     const auto chunk = pipeline_ ? pipeline_->chunk : 0;
     const bool overlap_default = pipeline_ && pipeline_->crc_overlap_default;
     if (grow_pipeline) pipeline_.reset();
-    check(hipHostFree(send_host_), "release send capacity");
+    check(strix::host_pin::release(send_host_), "release send capacity");
     send_host_ = nullptr;
-    check(hipHostFree(receive_host_), "release receive capacity");
+    check(strix::host_pin::release(receive_host_), "release receive capacity");
     receive_host_ = nullptr;
     send_device_alias_ = nullptr;
     const unsigned flags = fused_ ? hipHostMallocCoherent : hipHostMallocDefault;
-    check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), bytes + sizeof(Trailer), flags), "grow pinned send buffer");
-    check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), bytes + sizeof(Trailer), flags), "grow pinned receive buffer");
+    check(strix::host_pin::allocate(reinterpret_cast<void**>(&send_host_), bytes + sizeof(Trailer), flags), "grow pinned send buffer");
+    check(strix::host_pin::allocate(reinterpret_cast<void**>(&receive_host_), bytes + sizeof(Trailer), flags), "grow pinned receive buffer");
     if (d2h_kernel_bytes_) check(hipHostGetDevicePointer(&send_device_alias_, send_host_, 0), "grow send alias");
     if (chunk && grow_pipeline) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, overlap_default);
     max_bytes_ = bytes;
@@ -2188,10 +2189,10 @@ Communicator::~Communicator() {
     if (consumer_flag_) (void)hipHostFree(consumer_flag_);
     if (staged_counters_) (void)hipFree(staged_counters_);
     if (producer_flag_) (void)hipHostFree(producer_flag_);
-    if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
-    if (staged_send_host_) (void)hipHostFree(staged_send_host_);
-    (void)hipHostFree(send_host_);
-    (void)hipHostFree(receive_host_);
+    if (staged_receive_host_) (void)strix::host_pin::release(staged_receive_host_);
+    if (staged_send_host_) (void)strix::host_pin::release(staged_send_host_);
+    (void)strix::host_pin::release(send_host_);
+    (void)strix::host_pin::release(receive_host_);
     if (pre_copy_) (void)hipEventDestroy(pre_copy_);
     if (h2d_done_) (void)hipEventDestroy(h2d_done_);
     if (trace_) std::fclose(trace_);

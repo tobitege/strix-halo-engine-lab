@@ -9,10 +9,11 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/step_digest.hpp"
             "${SERVER}" "${CMAKE_CURRENT_BINARY_DIR}/step_digest.hpp"
     DEPENDS "${SERVER}" source_contract.py VERBATIM)
 add_executable(ds41_step_digest_tests step_digest_tests.cpp "${CMAKE_CURRENT_BINARY_DIR}/step_digest.hpp")
-target_include_directories(ds41_step_digest_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(ds41_step_digest_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 target_compile_features(ds41_step_digest_tests PRIVATE cxx_std_20)
 target_link_libraries(ds41_step_digest_tests PRIVATE Threads::Threads)
 if(MSVC)
+    target_compile_definitions(ds41_step_digest_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(ds41_step_digest_tests PRIVATE /W4 /WX /EHsc)
 else()
     target_compile_options(ds41_step_digest_tests PRIVATE -Wall -Wextra -Werror)

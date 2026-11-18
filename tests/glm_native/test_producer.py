@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('cache', ROOT/'src/glm/rtxpf/producer/cache.py')
+spec = importlib.util.spec_from_file_location('cache', ROOT/'src/cuda/models/glm/producer/cache.py')
 cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cache)
 

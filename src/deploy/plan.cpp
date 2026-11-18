@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <locale>
@@ -102,6 +103,41 @@ std::string Plan::to_json() const {
     return json + ",\"deployment_id\":" + quote(hash()) + "}";
 }
 
+RankBudget fit_rank(std::uint32_t rank, std::uint32_t node, const DeviceFacts& d, std::uint64_t margin,
+                    std::uint32_t context, std::uint32_t slots, const std::function<Footprint()>& footprint) {
+    RankBudget b;
+    b.rank = rank;
+    b.node = node;
+    b.total_bytes = d.mem_total_bytes; b.free_bytes = d.mem_free_bytes; b.margin_bytes = margin;
+    b.budget_bytes = b.free_bytes > margin ? b.free_bytes - margin : 0;
+    if (b.free_bytes < margin) b.reason = "margin exceeds measured free memory";
+    try {
+        b.footprint = footprint();
+        const auto& f = b.footprint;
+        b.kv_bytes = f.kv_total ? f.kv_total : checked_mul(checked_mul(f.kv_per_token, context), slots);
+        auto needed = b.kv_bytes;
+        if (b.reason.empty() && needed > b.budget_bytes) b.reason = "KV reservation exceeds budget";
+        b.after_kv_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
+        needed = checked_add(needed, f.workspace);
+        if (b.reason.empty() && needed > b.budget_bytes) b.reason = "workspace exceeds remaining budget";
+        b.after_workspace_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
+        needed = checked_add(checked_add(needed, f.weights), f.staging);
+        for (const auto& extra : f.extra) needed = checked_add(needed, extra.second);
+        // KV/slots and every mandatory owner win over optional cache RAM.
+        for (const auto& [name, cap] : f.elastic_extra) {
+            const auto bytes = fit_elastic_extra(cap, needed, b.budget_bytes);
+            b.footprint.extra.emplace_back(name, bytes);
+            needed = checked_add(needed, bytes);
+        }
+        b.footprint.elastic_extra.clear();
+        b.required_bytes = needed;
+        b.fits = b.free_bytes >= margin && needed <= b.budget_bytes;
+        if (!b.fits && b.reason.empty()) b.reason = "weights/staging/extras exceed remaining budget";
+        if (b.fits) b.free_after_bytes = b.budget_bytes - needed;
+    } catch (const std::exception& e) { b.reason = e.what(); }
+    return b;
+}
+
 Plan resolve(const Spec& input, const std::vector<DeviceFacts>& devices, const FootprintProvider& provider) {
     Plan p;
     p.requested = input;
@@ -146,37 +182,9 @@ Plan resolve(const Spec& input, const std::vector<DeviceFacts>& devices, const F
                     std::vector<RankBudget> ranks;
                     bool fits = true;
                     for (std::uint32_t rank = 0; rank < count; ++rank) {
-                        RankBudget b;
-                        b.rank = rank;
-                        b.node = topology == "single" ? static_cast<std::uint32_t>(placement) : rank;
-                        const auto& d = devices[b.node];
-                        b.total_bytes = d.mem_total_bytes; b.free_bytes = d.mem_free_bytes; b.margin_bytes = margin;
-                        b.budget_bytes = b.free_bytes > margin ? b.free_bytes - margin : 0;
-                        if (b.free_bytes < margin) b.reason = "margin exceeds measured free memory";
-                        try {
-                            b.footprint = provider.footprint(input, c, rank);
-                            const auto& f = b.footprint;
-                            b.kv_bytes = f.kv_total ? f.kv_total : checked_mul(checked_mul(f.kv_per_token, c.context), c.slots);
-                            auto needed = b.kv_bytes;
-                            if (b.reason.empty() && needed > b.budget_bytes) b.reason = "KV reservation exceeds budget";
-                            b.after_kv_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
-                            needed = checked_add(needed, f.workspace);
-                            if (b.reason.empty() && needed > b.budget_bytes) b.reason = "workspace exceeds remaining budget";
-                            b.after_workspace_bytes = needed <= b.budget_bytes ? b.budget_bytes - needed : 0;
-                            needed = checked_add(checked_add(needed, f.weights), f.staging);
-                            for (const auto& extra : f.extra) needed = checked_add(needed, extra.second);
-                            // KV/slots and every mandatory owner win over optional cache RAM.
-                            for (const auto& [name, cap] : f.elastic_extra) {
-                                const auto bytes = fit_elastic_extra(cap, needed, b.budget_bytes);
-                                b.footprint.extra.emplace_back(name, bytes);
-                                needed = checked_add(needed, bytes);
-                            }
-                            b.footprint.elastic_extra.clear();
-                            b.required_bytes = needed;
-                            b.fits = b.free_bytes >= margin && needed <= b.budget_bytes;
-                            if (!b.fits && b.reason.empty()) b.reason = "weights/staging/extras exceed remaining budget";
-                            if (b.fits) b.free_after_bytes = b.budget_bytes - needed;
-                        } catch (const std::exception& e) { b.reason = e.what(); }
+                        const auto node = topology == "single" ? static_cast<std::uint32_t>(placement) : rank;
+                        auto b = fit_rank(rank, node, devices[node], margin, c.context, c.slots,
+                                          [&] { return provider.footprint(input, c, rank); });
                         if (!b.fits) {
                             fits = false;
                             p.reasons.push_back(topology + "/" + format.decode + "/" + format.prefill + " slots=" +

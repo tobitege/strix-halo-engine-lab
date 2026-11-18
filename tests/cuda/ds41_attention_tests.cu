@@ -4,8 +4,8 @@
 // over layers 0..24 of the released plan (decode windows and prefill chunks). STRIX_DEEPSEEK41_GGUF=<file> adds
 // layers with real weights (inputs from real token embeddings through the layer's Q8_0 sites); STRIX_DS41_ATTN_BENCH=1
 // prints timings.
-#include "strix/cuda_ds41_attention.hpp"
-#include "strix/cuda_ds41_core.hpp"
+#include "strix/cuda/ds41_attention.hpp"
+#include "strix/cuda/ds41_core.hpp"
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_formats.hpp"

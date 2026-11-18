@@ -407,6 +407,9 @@ void parsing_and_apply() {
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
           pr::parse("quality") == pr::Name::quality, "parse names");
     refuses([] { (void)pr::parse("turbo"); }, "default, fast or quality", "unknown profile");
+    // An empty table proves admission is checked before indexing, without triggering UB on an unfixed build.
+    for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench})
+        refuses([&] { (void)pr::resolve(pr::Name::turbo, app, in(), {}); }, "turbo", "direct TURBO resolution");
     char a0[] = "app", a1[] = "--profile", a2[] = "fast", a3[] = "--steps";
     char* with_value[] = {a0, a1, a2};
     char* bare[] = {a0, a1, a3};

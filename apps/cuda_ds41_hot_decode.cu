@@ -14,10 +14,10 @@
 // steps (timing; no reference). One JSON line per step: tokens, FNV, match, wall / device ms, remote layers, slots,
 // answer items, RTT (sum, max), server time, dynamic hits / copies; --timeline: one line per (step, layer).
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
-#include "strix/cuda_ds41_hot_site.hpp"
-#include "strix/cuda_ds41_parts_host_driver.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_hot_site.hpp"
+#include "strix/cuda/ds41_parts_host_driver.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_hot_placement.hpp"
 
@@ -93,15 +93,16 @@ double mean(const std::vector<double>& v) { return v.empty() ? 0.0 : std::accumu
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
-    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
-    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
+    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel. The driver
+    // reads this once, when the CUDA runtime starts, so it is set before the start gate (which starts the runtime).
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #else
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);
 #endif
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 3) usage("MODEL.gguf PLACEMENT.json [options]");
     const std::string model = argv[1], placement_path = argv[2];
     std::string budgets_arg, state_file, ref_file, connect, token_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out;

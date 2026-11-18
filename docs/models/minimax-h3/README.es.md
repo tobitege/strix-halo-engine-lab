@@ -45,6 +45,12 @@ un nodo.
 
 ## Instalación y ejecución
 
+**Pesos:** no los publicamos. El DiT y los dos VAE del paso 2 son idénticos byte a byte a
+[`Comfy-Org/MiniMax-H3@54472221`](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707) (`diffusion_models/`, `vae/`); la LoRA de 6 pasos y el VAE de vídeo rápido
+no proceden de ninguna fuente pública fijada; el pack del codificador de texto se construye en local con
+`tools/h3/te/te_pack.py`. La [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/0919fb684102ef115126612f3fbb84d1027e7317/LICENSE) concede uso y redistribución solo fuera de la
+Unión Europea, el Reino Unido, la República de Corea y Estados Unidos; léela antes de descargar.
+
 1. **Compilar** en cada nodo (ROCm, gfx1151):
 
    ```sh

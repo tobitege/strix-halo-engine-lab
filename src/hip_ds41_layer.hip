@@ -1,8 +1,11 @@
 #include "strix/hip_check.hpp"
+#include "core/f16_dense_q8a8.hpp"  // FAST lever ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
 #include "ds41_dense_adapter.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1)
 #include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "strix/hip_ds41_prefill.hpp"
 #include "strix/ds41_exact_flags.hpp"
@@ -12,6 +15,7 @@
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 
+#include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
 
 #include <hip/hip_fp16.h>
@@ -29,6 +33,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "strix/lever_cache.hpp"
 
 // Pointers that never alias are declared __restrict__ (kernel parameters, or the parameters of the
 // force-inlined bodies of the view kernels, since restrict on struct members is not used by the
@@ -63,9 +69,28 @@ constexpr unsigned chunk_k = chunk / 32; // values per lane in a chunk
 constexpr unsigned hc_tile = 8;          // rows per mix-partial block
 constexpr unsigned mix_waves = hc_mix_count + 1;
 
+// The sublayer input an expansion reads: p[i], or, with the rank partials (HcSiteView::sub_low / sub_high), the canonical
+// rank sum (p[i] + low[i]) + high[i] read in place: the expression and order of canonical_sum_kernel, FP32 adds only (no
+// product, so contraction cannot differ), the same value the materialised sum stored. low and high are both set or both null.
+struct HcSub {
+    const float* __restrict__ p;
+    const float* __restrict__ low;
+    const float* __restrict__ high;
+    __device__ __forceinline__ float operator[](std::size_t i) const {
+        const float s = p[i];
+        return low ? (s + low[i]) + high[i] : s;
+    }
+    __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
+};
+// Only the collapse site and the separate expansion take the terms (enqueue_hc_site routes them there): the other site
+// kernels see constant null terms, so the branch folds away and their code stays the stored-sub form (a runtime branch
+// there raised hc_site_fast_kernel to 175 VGPRs).
+__host__ __device__ inline HcSub hc_sub(const HcSiteView& v) { return HcSub{v.sub, v.sub_low, v.sub_high}; }
+__host__ __device__ inline HcSub hc_sub_stored(const HcSiteView& v) { return HcSub{v.sub, nullptr, nullptr}; }
+
 // Copy k of element i of row r after the expansion of the previous sublayer (as hc_expand):
 // post[k] * sub[i] + sum_j comb[j][k] * residual[j][i], the sum from 0 in ascending j.
-__device__ __forceinline__ float copy_value(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ float copy_value(HcSub sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, unsigned r, unsigned k, unsigned i, unsigned hidden) {
     const float* res = residual + static_cast<std::size_t>(r) * hc_copies * hidden;
     const HcMix& m = em[r];
@@ -75,7 +100,7 @@ __device__ __forceinline__ float copy_value(const float* __restrict__ sub, const
     return m.post[k] * sub[static_cast<std::size_t>(r) * hidden + i] + s;
 }
 // All copies of element i of row r: expanded (sub not null) or read from the stored stream.
-__device__ __forceinline__ void site_copies(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_copies(HcSub sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, const float* __restrict__ stream, unsigned r, unsigned i,
                                             unsigned hidden, float* e) {
     const std::size_t row = static_cast<std::size_t>(r) * hc_copies * hidden;
@@ -198,7 +223,7 @@ __global__ __launch_bounds__(256) void hc_collapse_kernel(const float* __restric
     out[index] = y;
 }
 
-__global__ __launch_bounds__(256) void hc_expand_kernel(const float* __restrict__ sub, const float* __restrict__ residual,
+__global__ __launch_bounds__(256) void hc_expand_kernel(HcSub sub, const float* __restrict__ residual,
                                                         const HcMix* __restrict__ mixes, unsigned hidden, unsigned long long total,
                                                         float* __restrict__ out) {
     const auto index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -365,7 +390,7 @@ __global__ __launch_bounds__(1024) void norm_split_kernel(NormView v) {
 constexpr unsigned site_waves = 8, site_mixes = hc_mix_count / site_waves, site_unroll = 10;
 static_assert(site_waves * site_mixes == hc_mix_count, "three mixes per wave");
 
-__device__ __forceinline__ void site_partial_row(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_partial_row(HcSub sub, const float* __restrict__ residual,
                                                  const HcMix* __restrict__ em, float* __restrict__ stream,
                                                  const std::uint16_t* __restrict__ fn, float* __restrict__ partial, unsigned hidden,
                                                  unsigned chunks, unsigned c, unsigned r) {
@@ -400,7 +425,7 @@ __device__ __forceinline__ void site_partial_row(const float* __restrict__ sub, 
     }
 }
 
-__device__ __forceinline__ void site_body(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_body(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                           const HcMix* __restrict__ em, float* __restrict__ stream, const std::uint16_t* __restrict__ fn,
                                           float* __restrict__ partial, std::uint32_t* __restrict__ counters,
                                           const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
@@ -466,7 +491,7 @@ __device__ __forceinline__ void site_body(const HcSiteView& v, const float* __re
 }
 __global__ __launch_bounds__(32 * site_waves) void hc_site_kernel(HcSiteView v, unsigned mix_chunks, unsigned partial_blocks,
                                                                   unsigned norm_chunks) {
-    site_body(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
+    site_body(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
               v.sums, mix_chunks, partial_blocks, norm_chunks);
 }
 
@@ -609,7 +634,7 @@ __device__ __forceinline__ void mix_final_fast_wave(const float* __restrict__ pa
 
 // Value e (< chunk) of the stream chunk at c0 of row r: expanded (as copy_value) or read from the stored stream.
 template <bool Expand>
-__device__ __forceinline__ float site_stream_value(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ float site_stream_value(HcSub sub, const float* __restrict__ residual,
                                                    const HcMix* __restrict__ em, const float* __restrict__ srow, unsigned r,
                                                    unsigned kc, unsigned i, unsigned hidden, unsigned e) {
     if constexpr (Expand) return copy_value(sub, residual, em, r, kc, i, hidden);
@@ -623,8 +648,11 @@ __device__ __forceinline__ float site_stream_value(const float* __restrict__ sub
 // row g on wave g. Collapse (with Expand and Mix): the block takes the chunk at the same hidden offset in each of the
 // hc copies in turn (each chunk as above) and also stores the collapse of the expanded values with the expansion's
 // pre (as norm_input: from 0, ascending copies) to v.collapse_out.
-template <bool Expand, bool Mix, unsigned G, bool Collapse = false>
-__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+// Once (with Collapse): one read of the hc residual copies and sub at the block's hidden offset expands every copy
+// (copy_value's expressions, ascending j, so the same bits) into its own LDS slice before the copies' dots; without
+// it each copy's chunk re-reads all the residual copies and sub (4x the loads, the previous form).
+template <bool Expand, bool Mix, unsigned G, bool Collapse = false, bool Once = false>
+__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                                   const HcMix* __restrict__ em, float* __restrict__ stream,
                                                   const std::uint16_t* __restrict__ fn, float* __restrict__ partial,
                                                   std::uint32_t* __restrict__ counters, unsigned mix_chunks, float* lds,
@@ -640,12 +668,43 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
     for (unsigned g = 0; g < G; ++g)
 #pragma unroll
         for (unsigned u = 0; u < site_x_per_thread; ++u) y[g][u] = 0.0F;
-    for (unsigned q = 0; q < copies; ++q) {
-        if (q) __syncthreads();  // the previous copy's dots have read xs
-        const unsigned c = q * per_tile + b, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
-        float x[G][site_x_per_thread];
+    static_assert(!Once || Collapse, "one read of the copies only with the collapse");
+    if constexpr (Once) {  // xs[k * G + g]: copy k of tile row g at the hidden offset b * chunk
+        const unsigned i0 = b * chunk;
 #pragma unroll
         for (unsigned g = 0; g < G; ++g) {
+            const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
+            const float* res = residual + static_cast<std::size_t>(r) * n;
+            const HcMix& m = em[r];
+#pragma unroll
+            for (unsigned u = 0; u < site_x_per_thread; ++u) {  // past the chunk: a repeat of its last value, not stored
+                const unsigned e = threadIdx.x + u * site_threads, ec = e < chunk ? e : chunk - 1U;
+                float rv[hc_copies];
+#pragma unroll
+                for (unsigned j = 0; j < hc_copies; ++j) rv[j] = res[j * H + i0 + ec];
+                const float sv = sub[static_cast<std::size_t>(r) * H + i0 + ec];
+#pragma unroll
+                for (unsigned k = 0; k < hc_copies; ++k) {
+                    float s = 0.0F;  // copy_value
+#pragma unroll
+                    for (unsigned j = 0; j < hc_copies; ++j) s = s + m.comb[j * hc_copies + k] * rv[j];
+                    const float x = m.post[k] * sv + s;
+                    const float pre = m.pre[k];
+                    y[g][u] = y[g][u] + pre * x;
+                    xs[k * G + g][e] = x;
+                    if (r0 + g < rows && ((u + 1U) * site_threads <= chunk || e < chunk))
+                        stream[static_cast<std::size_t>(r0 + g) * n + k * H + i0 + e] = x;
+                }
+            }
+        }
+    }
+    for (unsigned q = 0; q < copies; ++q) {
+        if (!Once && q) __syncthreads();  // the previous copy's dots have read xs
+        const unsigned c = q * per_tile + b, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
+        float (*xq)[pad] = Once ? xs + q * G : xs;
+        float x[G][site_x_per_thread];
+#pragma unroll
+        for (unsigned g = 0; g < (Once ? 0U : G); ++g) {
             const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
             const float* srow = stream + static_cast<std::size_t>(r) * n + c0;
 #pragma unroll
@@ -668,7 +727,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
                 for (unsigned k = 0; k < chunk_k; ++k) raw[j][k] = f[static_cast<std::size_t>(j) * n + k * wave];
         }
 #pragma unroll
-        for (unsigned g = 0; g < G; ++g) {
+        for (unsigned g = 0; g < (Once ? 0U : G); ++g) {
             float* srow = stream + static_cast<std::size_t>(r0 + g) * n + c0;
 #pragma unroll
             for (unsigned u = 0; u < site_x_per_thread; ++u) {  // xs is padded to whole passes: its stores need no branch
@@ -693,7 +752,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
                 float sq = 0.0F;
 #pragma unroll
                 for (unsigned k = 0; k < chunk_k; ++k) {
-                    const float xv = xs[g][k * wave + l];
+                    const float xv = xq[g][k * wave + l];
                     if (w == g) sq = sq + xv * xv;
 #pragma unroll
                     for (unsigned j = 0; j < site_mixes; ++j) acc[j] = acc[j] + f[j][k] * xv;
@@ -742,7 +801,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
 // groups over the 8 waves.
 constexpr unsigned site_norm_part_max = 8, site_norm_groups_max = site_norm_part_max * chunk_k / site_waves;
 template <bool Expand>
-__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                                const HcMix* __restrict__ em, const float* __restrict__ stream,
                                                const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
                                                float* __restrict__ deltas, std::int32_t* __restrict__ sums_out, unsigned b,
@@ -810,19 +869,19 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
     __shared__ float sq[32];
     __shared__ unsigned last;
     if (blockIdx.x < partial_blocks)
-        site_fast_partial<Expand, Mix, G>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
+        site_fast_partial<Expand, Mix, G>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
                                           last);
     else
-        site_fast_norm<Expand>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
+        site_fast_norm<Expand>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
 }
 // Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
-template <unsigned G>
+template <unsigned G, bool Once = false>
 __global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteView v, unsigned mix_chunks) {
-    __shared__ float lds[G * site_x_per_thread * site_threads];
+    __shared__ float lds[(Once ? hc_copies : 1U) * G * site_x_per_thread * site_threads];
     __shared__ unsigned last;
-    site_fast_partial<true, true, G, true>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
-                                           last);
+    site_fast_partial<true, true, G, true, Once>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks,
+                                                 lds, last);
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
 template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix) {
@@ -1492,8 +1551,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     if constexpr (Lean >= 1) asm volatile("" : "+v"(magic));
     // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), (abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
 #pragma unroll
     for (unsigned rt = 0; rt < RT; ++rt) {
@@ -1502,8 +1564,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     }
     // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), (wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
 #pragma unroll
     for (unsigned t = 0; t < OT; ++t) {
@@ -2116,10 +2181,12 @@ __global__ __launch_bounds__(256) void round_bf16_kernel(float* __restrict__ val
 
 // One block per row: wave (copy cc, chunk c) computes the chunk sums of h*h, key*key and (h*(q*k))*key;
 // the copy's totals are the ascending chunk sums; then every thread applies the gates (in place through
-// hc_stream only).
+// hc_stream only). gate_off (may be null): a row whose flag is nonzero gets gate 0 on every copy, so the add is h + 0 * value,
+// as the upstream model's gate.masked_fill(~token_mask, 0) at image positions.
 __global__ __launch_bounds__(1024) void engram_inject_kernel(float* __restrict__ hc_stream, const float* __restrict__ kv,
                                                              const float* __restrict__ qn, const float* __restrict__ kn, unsigned hidden,
-                                                             float eps, float inv_sqrt_hidden) {
+                                                             float eps, float inv_sqrt_hidden,
+                                                             const std::uint8_t* __restrict__ gate_off) {
     __shared__ float part[3][hc_copies][32];
     __shared__ float gates[hc_copies];
     const unsigned chunks = (hidden + chunk - 1U) / chunk;
@@ -2150,7 +2217,8 @@ __global__ __launch_bounds__(1024) void engram_inject_kernel(float* __restrict__
         for (unsigned j = 0; j < chunks; ++j) { hh = hh + part[0][cp][j]; kk = kk + part[1][cp][j]; dk = dk + part[2][cp][j]; }
         const float rh = declared_rsqrt(hh / static_cast<float>(hidden) + eps);
         const float rk = declared_rsqrt(kk / static_cast<float>(hidden) + eps);
-        gates[cp] = engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
+        const float gate = engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
+        gates[cp] = gate_off != nullptr && gate_off[blockIdx.x] != 0U ? 0.0F : gate;
     }
     __syncthreads();
     const float* value = row_kv + hc_copies * hidden;
@@ -2187,13 +2255,21 @@ void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32
     hip_check(hipGetLastError(), "hc collapse launch");
 }
 
+// The canonical-sum terms of a sub (HcSub): both or neither, only with sub, none of the three inside [out, out + out_bytes).
+static bool sub_terms_clear(const float* sub, const float* low, const float* high, std::size_t sub_bytes, const void* out,
+                            std::size_t out_bytes) {
+    return (low == nullptr) == (high == nullptr) && (!low || sub) && !overlap(out, out_bytes, sub, sub_bytes) &&
+           !overlap(out, out_bytes, low, sub_bytes) && !overlap(out, out_bytes, high, sub_bytes);
+}
+
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                       float* out, void* stream) {
+                       float* out, void* stream, const float* sub_low, const float* sub_high) {
     const std::size_t n = std::size_t{rows} * hc_copies * hidden * 4;
-    require(!overlap(out, n, residual, n) && !overlap(out, n, sub, n / hc_copies), "hc expand output must not alias its inputs");
+    require(!overlap(out, n, residual, n) && sub && sub_terms_clear(sub, sub_low, sub_high, n / hc_copies, out, n),
+            "hc expand output must not alias its inputs");
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
-    hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), sub, residual, mixes,
-                       hidden, total, out);
+    hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), HcSub{sub, sub_low, sub_high},
+                       residual, mixes, hidden, total, out);
     hip_check(hipGetLastError(), "hc expand launch");
 }
 
@@ -2205,7 +2281,10 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     require(v.rows && H && H % chunk == 0 && v.stream && norm_chunks <= 32U && (v.fn || v.norm_weight || v.sub) &&
                 (v.tile == 0 || v.tile == 1 || v.tile == 2 || v.tile == 4 || v.tile == 8) && v.norm_part <= site_norm_part_max &&
                 (!v.sub || (v.residual && v.expand_mixes && !overlap(v.stream, stream_bytes, v.residual, stream_bytes) &&
-                            !overlap(v.stream, stream_bytes, v.sub, stream_bytes / hc_copies))) &&
+                            sub_terms_clear(v.sub, v.sub_low, v.sub_high, stream_bytes / hc_copies, v.stream, stream_bytes) &&
+                            sub_terms_clear(v.sub, v.sub_low, v.sub_high, stream_bytes / hc_copies, v.collapse_out,
+                                            stream_bytes / hc_copies))) &&
+                (v.sub || (!v.sub_low && !v.sub_high)) &&
                 (!v.fn || (v.base && v.scale && v.mixes_out && v.partial && v.counters && v.iters >= 1 &&
                            v.mixes_out != v.expand_mixes && v.mixes_out != v.collapse_mixes)) &&
                 (!v.norm_weight || ((v.out || v.codes) && (!v.out || v.out_stride >= H) &&
@@ -2216,12 +2295,21 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                                      !overlap(v.sub, stream_bytes / hc_copies, v.collapse_out, stream_bytes / hc_copies))),
             "hc site view");
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
-    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true);
-    const bool fast = v.form == 2 || (v.form == 0 && fast_env);
+    static strix::lever_cache<bool> fast_env{[] { return strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true); }};
+    const bool fast = v.form == 2 || (v.form == 0 && fast_env.get());
+    // STRIX_DS41_HC_COLLAPSE_ONCE=0: the collapse site re-reads the residual copies and sub for every copy (the previous
+    // form); default on from hc_collapse_once_min_rows rows: one read expands every copy, tiles of at most 2 rows.
+    // Scheduling only, same bits. Measured (tests/hip_ds41_layer_bench.hip, H 5120, ms per site, previous tile 4 -> one
+    // read tile 2): 4096 rows 5.22 -> 4.80, 1024 1.348 -> 1.242, 256 0.351 -> 0.341; one read at tile 4 loses at 256 rows
+    // (0.380) and gains less above (4.98 at 4096); below 256 rows not measured, so the previous form stays there.
+    static strix::lever_cache<bool> once_env{[] { return strix::envcfg::flag("STRIX_DS41_HC_COLLAPSE_ONCE", true); }};
+    const auto collapse_route = hc_collapse_route(v, once_env.get());
+    const bool once = collapse_route.once;
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
+    require(!v.sub_low || v.collapse_out || !one, "hc site: the canonical-sum terms need the collapse site or the separate expansion");
     if (!one) {
-        if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream);
+        if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream, v.sub_low, v.sub_high);
         if (v.fn) {
             HcMixView m;
             m.stream = v.stream; m.fn = v.fn; m.base = v.base; m.scale = v.scale; m.rows = v.rows; m.hidden = H; m.iters = v.iters;
@@ -2250,8 +2338,9 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         part = part < norm_chunks ? part : norm_chunks;
         const unsigned tiles = (v.rows + g - 1U) / g;
         if (v.collapse_out) {  // one block per hidden chunk (every copy) and tile of at most 4 rows (8: ~100 VGPRs spilled)
-            const unsigned gc = g < 4U ? g : 4U, ctiles = (v.rows + gc - 1U) / gc;
-            const auto kernel = gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>;
+            const unsigned gc = collapse_route.tile, ctiles = (v.rows + gc - 1U) / gc;
+            const auto kernel = once ? (gc == 1 ? hc_site_collapse_kernel<1, true> : hc_site_collapse_kernel<2, true>)
+                                     : (gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>);
             hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
             hip_check(hipGetLastError(), "hc site collapse launch");
             return;
@@ -2351,8 +2440,8 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     }
     // Outputs per wave (1, 2 or 4; same bits): STRIX_DS41_FP8_W, default 1 at 1-2 rows (one contiguous row stream per
     // wave) and 2 from 3 rows (each row's unpacked A8 codes serve two outputs). 5-8 rows take at most 2 (4 spills).
-    static const unsigned env_w = [] { const char* e = std::getenv("STRIX_DS41_FP8_W"); return e && (e[0] == '1' || e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 0U; }();
-    const unsigned set = fp8_outputs_per_wave ? fp8_outputs_per_wave : env_w;
+    static strix::lever_cache<unsigned> env_w{[] { const char* e = std::getenv("STRIX_DS41_FP8_W"); return e && (e[0] == '1' || e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 0U; }};
+    const unsigned set = fp8_outputs_per_wave ? fp8_outputs_per_wave : env_w.get();
     const unsigned want = set ? set : view.rows <= 2 ? 1U : 2U;
     const bool w4 = want >= 4U && view.per_group % 4U == 0, w2 = want >= 2U && view.per_group % 2U == 0;
     if (view.rows == 1) { if (w4) launch_fp8_a8<1, 4>(view, q); else if (w2) launch_fp8_a8<1, 2>(view, q); else launch_fp8_a8<1, 1>(view, q); }
@@ -2439,7 +2528,8 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
     // W outputs per wave share every activation load; W must divide the group size.
     // Packed rows (CB4/U5/U6) at 1-2 rows: STRIX_DS41_PACKED_W=1|2|4 caps the outputs per wave (same bits,
     // W-independent). Default 1: P10 turn A, R1 greedy 46.85 -> 43.85 ms/token against 4.
-    static const unsigned packed_w = [] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U; }();
+    static strix::lever_cache<unsigned> packed_w_cache{[] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U; }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = view.packed != 0U && v.rows <= 2;
     const bool w4 = view.per_group % 4U == 0 && !(cap && packed_w < 4U), w2 = view.per_group % 2U == 0 && !(cap && packed_w < 2U);
     // The output A8 in the product kernel when one block owns whole groups: 1-2 rows at 4 outputs per wave (32 per
@@ -2476,10 +2566,11 @@ void launch_q8_ready(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q
 }
 template <unsigned P>
 void launch_q8_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
-    static const unsigned packed_w = [] {
+    static strix::lever_cache<unsigned> packed_w_cache{[] {
         const char* e = std::getenv("STRIX_DS41_PACKED_W");
         return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U;
-    }();
+    }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = P != 0U && v.rows <= 2;
     const bool w4 = v.per_group % 4U == 0 && !(cap && packed_w < 4U);
     const bool w2 = v.per_group % 2U == 0 && !(cap && packed_w < 2U);
@@ -2538,7 +2629,8 @@ void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
         enqueue_q8_0_a8(b, stream);
         return;
     }
-    static const unsigned packed_w = [] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '1' || e[0] == '2') ? unsigned(e[0] - '0') : 4U; }();
+    static strix::lever_cache<unsigned> packed_w_cache{[] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '1' || e[0] == '2') ? unsigned(e[0] - '0') : 4U; }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = x.packed != 0U && x.rows <= 2;
     const bool w4 = x.per_group % 4U == 0 && y.per_group % 4U == 0 && !(cap && packed_w < 4U);
     const bool w2 = x.per_group % 2U == 0 && y.per_group % 2U == 0 && !(cap && packed_w < 2U);
@@ -2564,8 +2656,8 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     }
     if (v.rows <= max_rows) {  // decode rows: lanes kernel, else the wide or the plain site kernel (same bits)
         // Same bits, 16-byte loads (hip_ds41_f16_rows.hip); STRIX_DS41_F16_LANES=0 keeps this kernel.
-        static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
-        if (lanes && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
+        static strix::lever_cache<bool> lanes_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_LANES", true); }};
+        if (lanes_cache.get() && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
         // DSpark's wide-load kernel (same bits; superseded by the lanes kernel) when the lanes are switched off
         if (f16_rows_wide_enabled && v.width % f16_chunk == 0U && v.x_stride % 4U == 0U) {  // same bits, more bandwidth
             if (v.count >= 2048U)
@@ -2742,18 +2834,100 @@ bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
     return engram_f16_pf_supported(v) && (v.rows + 47U) / 48U * 48U * 8U <= (v.rows + 63U) / 64U * 64U * 9U;
 }
 
-void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+// FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1 or set_fast_engram(1 / 0; -1 = the environment); default
+// off): the Engram KV projection on the shared dense FP16 WMMA core (core/f16_dense_tall.hpp, 128-row CTAs x 256
+// columns) instead of the exact FP32 FMA chains of f16_tiled_pf (measured 4.2 TFLOPS: 77 ms per 1,024 rows).
+// Contract (the shared core's): x is rounded to FP16 (RNE); BF16 values of 2^-17 <= |x| < 2^16 convert exactly, smaller
+// ones lose low bits in FP16's subnormal range (absolute error <= 2^-25); the products are then exact in FP32 and the
+// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 65520 (FP16 RNE overflow),
+// Inf and NaN (FP16 would overflow); then the WMMA launch exits and the exact separate kernel runs instead (the lever-off
+// bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
+int fast_engram_mode = -1;
+void set_fast_engram(int mode) { fast_engram_mode = mode; }
+static bool fast_engram_on() {
+    static const bool env = fast_profile::engram_on();
+    return fast_engram_mode >= 0 ? fast_engram_mode != 0 : env;
+}
+namespace {
+// Sets *flag when any x of the view would overflow FP16 under RNE: |x| >= 65520 (FP32 bits 0x477FF000), Inf and NaN.
+__global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned* flag) {
+    const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
+    bool out = false;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x; i < total; i += static_cast<std::size_t>(gridDim.x) * 256U) {
+        const std::size_t row = i / per_row, c = i - row * per_row;
+        const uint4 e = *reinterpret_cast<const uint4*>(v.x + row * v.x_stride + c * 4U);
+        const unsigned words[4] = {e.x, e.y, e.z, e.w};
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k) {
+            const unsigned m = words[k] & 0x7FFFFFFFU;
+            out = out || m >= 0x477FF000U;  // 65520: FP16 RNE overflows from here (Inf and NaN included)
+        }
+    }
+    if (out) atomicOr(flag, 1U);
+}
+struct EngramWmmaArgs {
+    const float* x;
+    const _Float16* w;  // [n][in] row-major
+    float* y;           // [rows][stride]
+    unsigned in, rows, n, stride, skip_idle;
+    const unsigned* flag;
+};
+struct EngramWmmaCols {
+    const EngramWmmaArgs& a;
+    __device__ __forceinline__ strix::core::f16_dense_tall::ColumnTile tile(unsigned t) const {
+        if (t < a.n / 16U) return {a.w + static_cast<std::size_t>(t) * 16U * a.in, a.y + t * 16U, a.stride, true};
+        return {a.w, a.y, a.stride, false};
+    }
+};
+__global__ __launch_bounds__(256) void engram_wmma_kernel(EngramWmmaArgs a) {
+    if (*a.flag != 0U) return;  // an x outside the exact FP16 set: the exact kernel below runs this view
+    __shared__ strix::core::f16_dense_tall::Storage<16> lds;
+    strix::core::f16_dense_tall::core<16>(a.x, a.in, a.rows, EngramWmmaCols{a}, lds, strix::core::f16_dense_tall::RawStore{},
+                                          a.skip_idle != 0U);
+}
+}  // namespace
+
+bool engram_f16_wmma_supported(const F16RowsView& v) noexcept {
+    return engram_f16_pf_admitted(v) && v.x_stride == v.width && v.width % 128U == 0U && v.count % 256U == 0U;
+}
+
+static bool enqueue_engram_f16_wmma(const F16RowsView& v, void* stream) {
+    // The device flag is per stream (not capturable, not shareable across the per-thread default stream's threads).
+    if (as_stream(stream) == hipStreamPerThread) return false;
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    hip_check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram WMMA capture status");
+    if (capture != hipStreamCaptureStatusNone) return false;
+    EngramWideFlag& w = engram_wide_flag(stream);
+    const std::lock_guard<std::mutex> submit(w.submit);
+    hip_check(hipMemsetAsync(w.p, 0, sizeof(unsigned), as_stream(stream)), "Engram FP16 scan reset");
+    hipLaunchKernelGGL(engram_x_f16_scan, dim3(256), dim3(256), 0, as_stream(stream), v, w.p);
+    const EngramWmmaArgs a{v.x, reinterpret_cast<const _Float16*>(v.weight), v.out, v.width, v.rows, v.count, v.out_stride,
+                           strix::core::f16_dense_tall::tail_policy() ? 1U : 0U, w.p};
+    hipLaunchKernelGGL(engram_wmma_kernel, dim3((v.rows + 127U) / 128U, v.count / 256U), dim3(256), 0, as_stream(stream), a);
+    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, false>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+                       0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(w.p));
+    hip_check(hipGetLastError(), "Engram FP16 WMMA launch");
+    return true;
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream, bool fast_engram) {
     // Read on every call (in-process A/B); =0 restores enqueue_f16_rows with all its controls.
     const char* e = std::getenv("STRIX_DS41_ENGRAM_F16_PF");
+    if (fast_engram && !(e && e[0] == '0') && engram_f16_wmma_supported(v) && enqueue_engram_f16_wmma(v, stream)) return;
     if (!(e && e[0] == '0') && engram_f16_pf_admitted(v)) enqueue_engram_f16_pf(v, stream);
     else enqueue_f16_rows(v, stream);
 }
 
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+    enqueue_engram_f16_rows(v, stream, fast_engram_on());
+}
+
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
     // STRIX_DS41_F16_PAIR (on by default since P16, =0 off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
-    static const bool pair = strix::envcfg::flag("STRIX_DS41_F16_PAIR", true);
-    static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
-    if (pair && lanes && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
+    static strix::lever_cache<bool> pair_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_PAIR", true); }};
+    static strix::lever_cache<bool> lanes_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_LANES", true); }};
+    if (pair_cache.get() && lanes_cache.get() && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
         enqueue_f16_rows_lanes_pair(a, b, stream);
         return;
     }
@@ -2823,9 +2997,12 @@ void enqueue_q8_0_a8_prefill(const Q8A8PrefillView& v, void* stream) {
 // STRIX_DS41_PF_CORE=1 (opt-in, see hip_ds41_prefill.hpp): the dense Q8_0 x A8 prefill on the shared tiled core. The
 // same forms (tall selector, two-part fusion, fused A8) as policy values; the same bits as the kernels below.
 static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, void* stream) {
-    static const bool tall_rotate = strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false);
-    static const bool dense_stats = strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false);
-    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
+    static strix::lever_cache<bool> tall_rotate_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false); }};
+    static strix::lever_cache<bool> dense_stats_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false); }};
+    static strix::lever_cache<bool> staged_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true); }};
+    const bool tall_rotate = tall_rotate_cache.get();
+    const bool dense_stats = dense_stats_cache.get();
+    const bool staged = staged_cache.get();
     const bool lean_ok = std::uint64_t(v.rows) * v.x_stride < 0x7fffffffULL &&
         std::uint64_t(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
     if (v.k_parts == 2U) {
@@ -2845,10 +3022,11 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
         enqueue_q8_0_a8_dense_prefill_core(part, stream);
         return false;
     }
-    static const unsigned tall_env = [] {
+    static strix::lever_cache<unsigned> tall_env_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
         return e && std::strcmp(e, "auto") == 0 ? 1U : e ? unsigned(std::strtoul(e, nullptr, 10)) : 0U;
-    }();
+    }};
+    const unsigned tall_env = tall_env_cache.get();
     unsigned tall = v.tall ? v.tall : tall_env;
     if (tall == 1U) {
         tall = strix::core::integer_dense_form(v.rows, v.width, v.count, v.row_width, lean_ok);
@@ -2859,10 +3037,11 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
         }
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
-    static const bool stats = [] {
+    static strix::lever_cache<bool> stats_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
         return e != nullptr && e[0] == '1';
-    }();
+    }};
+    const bool stats = stats_cache.get();
     if (stats) {
         struct Count { unsigned long long calls = 0, rows = 0; };
         static std::mutex lock;
@@ -3219,16 +3398,98 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
         }
 }
 
+// FAST lever ds41-dense-f16-v1: the dense Q8_0 x A8 products as ONE FP16 WMMA chain on the shared FP16 dense core
+// (policy core::f16_dense_tall::q8a8, "dense-q8a8-f16-v1": weights decoded once per CTA stage, 128- or 256-row CTAs).
+// STRIX_DS41_FAST_DENSE=1 (default off; also set by the profile STRIX_DS41_FAST_PREFILL=1) or set_fast_dense(1 / 0; -1 = the environment). Calls under
+// STRIX_DS41_FAST_DENSE_MIN_ROWS rows (default 128) and shapes the policy does not take keep the exact kernels.
+// The outputs' A8 is not written here (the caller quantizes, as after any form that returns false).
+int fast_dense_mode = -1;
+void set_fast_dense(int mode) { fast_dense_mode = mode; }
+static bool fast_dense_on() {
+    static strix::lever_cache<bool> env{[] { return fast_profile::dense_on(); }};  // the lever or STRIX_DS41_FAST_PREFILL
+    // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
+    return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env.get());
+}
+static bool valid_q8_0_a8_dense_prefill_view(const Q8A8DensePrefillView& v) {
+    const std::uint32_t row_width = v.row_width ? v.row_width : v.width;
+    return v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 &&
+           v.x_stride >= v.width && v.x_stride % 16U == 0 && v.out_stride >= v.count &&
+           reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 && row_width % 32U == 0 && v.k_offset % 32U == 0 &&
+           std::uint64_t{v.k_offset} + v.width <= row_width &&
+           (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 &&
+                            v.a8_stride >= v.count && v.a8_stride % 32U == 0)) &&
+           (v.k_parts == 1U || (v.k_parts == 2U && !v.accumulate && !v.a8_codes && v.row_width &&
+                                std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
+                                std::uint64_t{v.x_stride} >= 2ULL * v.width));
+}
+static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePrefillView& v) {
+    strix::core::f16_dense_tall::q8a8::View f{};
+    f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
+    f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
+    f.k_bytes = v.k_offset / 32U * 34U;
+    f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
+    f.accumulate = v.accumulate ? 1U : 0U;
+    return f;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream, unsigned groups = 1U, std::size_t weight_group_bytes = 0U) {
+    static strix::lever_cache<unsigned> min_rows_cache{[] { return fast_profile::dense_min_rows(); }};
+    const unsigned min_rows = min_rows_cache.get();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    q8a8::View f = fast_dense_view(v);
+    if (groups > 1U) f.batch = groups, f.batch_in = v.width, f.batch_out = v.count, f.batch_weight_bytes = weight_group_bytes;
+    if (v.rows < min_rows || !q8a8::supported(f)) return false;
+    q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
+    return true;
+}
+bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& v, unsigned groups, std::size_t weight_group_bytes, void* stream) {
+    // STRIX_DS41_FAST_DENSE_BATCH (default on; 0 = one launch per group, the previous form): scheduling only, same bits
+    static strix::lever_cache<bool> batch_cache{[] { return strix::envcfg::flag("STRIX_DS41_FAST_DENSE_BATCH", true); }};
+    const bool batch = batch_cache.get();
+    if (!valid_q8_0_a8_dense_prefill_view(v) || v.exact || !batch || groups < 2U || !fast_dense_on() || v.k_parts != 1U || v.accumulate ||
+        std::uint64_t{v.width} * groups > v.x_stride || std::uint64_t{v.count} * groups > v.out_stride)
+        return false;
+    return enqueue_fast_dense(v, stream, groups, weight_group_bytes);
+}
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& v) {
+    return v.k_parts == 1U && !v.accumulate && v.a8_codes == nullptr && strix::core::f16_dense_tall::q8a8::supported(fast_dense_view(v));
+}
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& v, void* stream) {
+    if (!q8_0_a8_fast_core_supported(v)) return false;
+    strix::core::f16_dense_tall::q8a8::enqueue_parts(fast_dense_view(v), 1U, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 core launch (shared expert)");
+    return true;
+}
+
+// q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
+// transform is the flash prologue's rope512 (rope_pair on pairs (d, d + 1), d = o % 512 >= 448, pair (d - 448) / 2,
+// the row's table), so image = to_bf16(rope(q)) with the bits query16 + frag_from_f32 produced from the FP32 q.
+struct QbRopeImage {
+    using Args = const attn::RopeRow*;
+    static constexpr strix::attn_core::tile::Operand kOp = strix::attn_core::tile::Operand::bf16;
+    static __device__ __forceinline__ void pair(const Args& rope, unsigned r, unsigned o, float& x0, float& x1) {
+        const unsigned d = o % attn::kHeadDim;
+        if (d < attn::kHeadDim - attn::kRopeDim) return;
+        const unsigned p = (d - (attn::kHeadDim - attn::kRopeDim)) / 2U;
+        attn::rope_pair(x0, x1, rope[r].c[p], rope[r].s[p], false);
+    }
+};
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& v, std::uint16_t* image, const void* rope, void* stream) {
+    static strix::lever_cache<unsigned> min_rows_cache{[] { return fast_profile::dense_min_rows(); }};
+    const unsigned min_rows = min_rows_cache.get();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
+    if (!fast_dense_on() || rope == nullptr || v.k_parts != 1U || v.a8_codes != nullptr || v.rows < min_rows ||
+        v.count % attn::kHeadDim != 0U || !q8a8::supported_image(f, image))
+        return false;
+    q8a8::enqueue_image<QbRopeImage>(f, image, static_cast<const attn::RopeRow*>(rope), as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense q image launch");
+    return true;
+}
+
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
-    require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
-                v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
-                (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)) &&
-                (!v.a8_codes || (v.a8_deltas && v.a8_sums && !v.accumulate && v.count % 32U == 0 && v.a8_stride >= v.count &&
-                                 v.a8_stride % 32U == 0)) &&
-                (v.k_parts == 1U || (v.k_parts == 2U && !v.accumulate && !v.a8_codes && v.row_width &&
-                                     std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
-                                     std::uint64_t{v.x_stride} >= 2ULL * v.width)),
-            "Q8_0 x A8 dense prefill view");
+    require(valid_q8_0_a8_dense_prefill_view(v), "Q8_0 x A8 dense prefill view");
+    if (!v.exact && fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
     if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
@@ -3259,15 +3520,17 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
     }
     unsigned outputs = 32U;
     const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
-    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
+    static strix::lever_cache<bool> staged_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true); }};
+    const bool staged = staged_cache.get();
     // STRIX_DS41_DENSE_TALL=22 / 41 / 14 / 21 / 12: RT OT of the tall form for every call (staged only); auto: by shape,
     // from the gfx1151 smoke (prefill measurements): >= 3072 rows, or 2048 rows and >= 1024 outputs: 1 x 4 (q_a / kv);
     // >= 256 rows with >= 4096 outputs and width >= 4096: 1 x 2 (wo_b halves); else the wide form. Every form: the same bits.
-    static const unsigned tall_env = [] {
+    static strix::lever_cache<unsigned> tall_env_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
         if (e != nullptr && std::string(e) == "auto") return 1U;
         return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0U;
-    }();
+    }};
+    const unsigned tall_env = tall_env_cache.get();
     unsigned tall = v.tall ? v.tall : tall_env;
     if (tall == 1U) {
         // auto, by the production attention sites (site benchmark, gfx1151, every form bitwise): from 256 rows the Lean 4
@@ -3286,10 +3549,11 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         }
         // STRIX_DS41_DENSE_TALL_ROTATE=1 (exactness gates only): every call takes the next of 814 / 914 / 822 in turn,
         // whatever its shape, so one --reference run covers the three selector forms on every site
-        static const bool rotate = [] {
+        static strix::lever_cache<bool> rotate_cache{[] {
             const char* e = std::getenv("STRIX_DS41_DENSE_TALL_ROTATE");
             return e != nullptr && e[0] == '1';
-        }();
+        }};
+        const bool rotate = rotate_cache.get();
         static std::atomic<unsigned> turn{0U};
         if (rotate) pick = std::array<unsigned, 3>{814U, 914U, 822U}[turn.fetch_add(1U, std::memory_order_relaxed) % 3U];
         if (pick != 0U && !lean_ok) pick = pick == 914U ? 114U : pick == 822U ? 22U : 14U;
@@ -3299,10 +3563,11 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                                                           : 0U;
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
-    static const bool stats = [] {
+    static strix::lever_cache<bool> stats_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
         return e != nullptr && e[0] == '1';
-    }();
+    }};
+    const bool stats = stats_cache.get();
     if (stats) {
         struct Count { unsigned long long calls = 0, rows = 0; };
         static std::mutex lock;
@@ -3398,13 +3663,13 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
 }
 
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,
-                           std::uint32_t hidden, float eps, void* stream) {
+                           std::uint32_t hidden, float eps, void* stream, const std::uint8_t* gate_off) {
     require(hc_stream && kv && q_norm && k_norm && rows && hidden, "Engram injection view");
     const float inv = static_cast<float>(1.0 / __builtin_sqrt(static_cast<double>(hidden)));
     const unsigned chunks = (hidden + chunk - 1U) / chunk;
     require(chunks * hc_copies <= 32U, "Engram injection hidden size");
     hipLaunchKernelGGL(engram_inject_kernel, dim3(rows), dim3(wave * hc_copies * chunks), 0, as_stream(stream), hc_stream, kv, q_norm,
-                       k_norm, hidden, eps, inv);
+                       k_norm, hidden, eps, inv, gate_off);
     hip_check(hipGetLastError(), "Engram injection launch");
 }
 
@@ -3416,6 +3681,8 @@ LaunchAccess launch_access(const HcSiteView& v) {
     const std::uint64_t H = v.hidden, n = H * hc_copies, R = v.rows;
     const std::uint64_t partial = hc_mix_partial_floats(v.rows, v.hidden) * 4, counters = hc_site_counter_count(v.rows) * 4;
     a.read(v.sub, R * H * 4);
+    a.read(v.sub_low, R * H * 4);
+    a.read(v.sub_high, R * H * 4);
     a.read(v.residual, R * n * 4);
     a.read(v.expand_mixes, R * sizeof(HcMix));
     a.read(v.stream, R * n * 4);
@@ -3498,10 +3765,12 @@ LaunchAccess launch_access(const F16RowsView& v) {
 }
 
 LaunchAccess launch_access_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                                  const float* out) {
+                                  const float* out, const float* sub_low, const float* sub_high) {
     LaunchAccess a;
     const std::uint64_t n = std::uint64_t{hidden} * hc_copies;
     a.read(sub, std::uint64_t{rows} * hidden * 4);
+    a.read(sub_low, std::uint64_t{rows} * hidden * 4);
+    a.read(sub_high, std::uint64_t{rows} * hidden * 4);
     a.read(residual, rows * n * 4);
     a.read(mixes, std::uint64_t{rows} * sizeof(HcMix));
     a.write(out, rows * n * 4);

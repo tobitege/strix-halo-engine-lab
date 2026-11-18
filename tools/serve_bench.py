@@ -19,6 +19,7 @@ Cycle receipts are read from the server log (--log, the bytes the burst appended
 
   serve cycle seq=.. lanes=.. rows=.. useful=.. pad=.. emitted=.. draft_rows=a/b/.. draft_ms=.. verify_ms=..
       host_ms=.. ms=.. prompt=0|1 begin_ns=.. end_ns=..        (strix/serve/cycle_receipt.hpp, STRIX_SERVE_RECEIPT=1)
+      [admitted=.. forwards=.. solo=single/no_rows/wide/padding/alone/no_owner]   (optional; forwards = logical target executions)
   batch cycle sessions=.. groups=.. rows=.. solo=.. emitted=.. ms=.. begin_ns=.. end_ns=..   (older cycle log)
 
 The older form has no prompt flag and no useful/padding split; the report says so instead of guessing.
@@ -86,12 +87,16 @@ def parse_cycles(log):
         draft_rows = None
         if re.fullmatch(r"\d+(/\d+)*", fields.get("draft_rows", "")):
             draft_rows = [int(v) for v in fields["draft_rows"].split("/")]
+        solo = None
+        if re.fullmatch(r"\d+(/\d+)*", fields.get("solo", "")):
+            solo = [int(v) for v in fields["solo"].split("/")]
         cycles.append(dict(form="serve", lanes=values["lanes"], rows=values["rows"], useful=values["useful"],
                            pad=values["pad"], emitted=values["emitted"], ms=float(values["ms"]),
                            prompt=bool(values["prompt"]) if values.get("prompt") is not None else None,
                            draft_ms=values.get("draft_ms"), verify_ms=values.get("verify_ms"),
                            host_ms=values.get("host_ms"), draft_rows=draft_rows,
-                           begin_ns=values.get("begin_ns"), end_ns=values.get("end_ns")))
+                           begin_ns=values.get("begin_ns"), end_ns=values.get("end_ns"),
+                           admitted=values.get("admitted"), forwards=values.get("forwards"), solo=solo))
     if cycles:
         return cycles
     for line in BATCH_CYCLE.findall(log):
@@ -266,11 +271,55 @@ def percentile(values, q):
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def peak_1s(times, chunk_token_counts):
+    """Peak tokens in a half-open 1 s arrival window; None without measured counts for every chunk,
+    or when arrivals span less than 1 s. Total usage cannot recover variable chunk sizes."""
+    if (not times or not isinstance(chunk_token_counts, (list, tuple))
+            or len(times) != len(chunk_token_counts)
+            or any(type(n) is not int or n < 0 for n in chunk_token_counts)
+            or max(times) - min(times) < 1.0):
+        return None
+    chunks, best, total, j = sorted(zip(times, chunk_token_counts)), 0, 0, 0
+    for t, count in chunks:
+        while j < len(chunks) and chunks[j][0] < t + 1.0:
+            total += chunks[j][1]
+            j += 1
+        best = max(best, total)
+        total -= count
+    return float(best)
+
+
+def peak_events_1s(events):
+    """Pool measured chunks, never per-request usage ratios; incomplete measurements yield None."""
+    times, counts = [], []
+    traced = any(event.get("emission_trace_present") for event in events)
+    for event in events:
+        if traced:
+            if (event.get("error") is not None or not event.get("emission_trace_valid")):
+                return None
+            times.extend(event["emission_times_ns"])
+            counts.extend(event["emission_counts"])
+            continue
+        ts = event.get("token_times") or []
+        if event.get("error") is not None or not ts:
+            continue
+        ns = event.get("chunk_token_counts")
+        if not isinstance(ns, (list, tuple)) or len(ns) != len(ts):
+            return None
+        times.extend(ts)
+        counts.extend(ns)
+    if traced and times:
+        origin = min(times)
+        times = [(t - origin) / 1e9 for t in times]
+    return peak_1s(times, counts)
+
+
 def request_metrics(event):
     """One request's event record -> its numbers.
 
     event: arrival (s), token_times (s, one per content chunk), tokens (usage completion tokens, or None: the
-    chunk count is used), optional error. A request with fewer than two tokens has no per-request rate."""
+    chunk count is used), optional error and chunk_token_counts (measured tokens per content chunk).
+    A request with fewer than two tokens has no per-request rate. Without per-chunk counts the peak is unknown."""
     times = event.get("token_times") or []
     tokens = event.get("tokens")
     if tokens is None:
@@ -279,7 +328,7 @@ def request_metrics(event):
     rate = (tokens - 1) / (last - first) if tokens >= 2 and times and last > first else None
     return dict(tokens=tokens, arrival=event["arrival"], first_token=first, last_token=last,
                 ttft_s=first - event["arrival"] if first is not None else None, tok_s=rate,
-                prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
+                peak_1s_tok_s=peak_events_1s([event]), prompt_tokens=event.get("prompt_tokens"), restored_tokens=event.get("restored_tokens"),
                 ids_sha256=event.get("ids_sha256"), error=event.get("error"))
 
 
@@ -298,6 +347,7 @@ def burst_metrics(events):
         ttft_p50_s=percentile(ttft, 50), ttft_p95_s=percentile(ttft, 95),
         per_request_tok_s_p50=percentile(rates, 50), per_request_tok_s_min=min(rates) if rates else None,
         sum_per_request_tok_s=sum(rates) if rates else None,
+        peak_1s_tok_s=peak_events_1s(events),
         prompt_tokens=sum(r["prompt_tokens"] or 0 for r in done),
         prompt_tokens_restored=sum(restored) if restored else None,
         ids_sha256=[r["ids_sha256"] for r in requests],
@@ -349,9 +399,77 @@ def _chunk_has_text(chunk):
     return False
 
 
+def measured_chunk_tokens(chunk):
+    """Count only per-token logprob entries aligned to this chunk's emitted text.
+
+    Chat uses logprobs.content/reasoning_content; completions use logprobs.tokens.
+    Arrays of alternatives, final usage, and cumulative token IDs are not counts.
+    Unknown or unaligned entries make the chunk unmeasured, rather than estimated.
+    """
+    def aligned(entries, text, chat):
+        if not isinstance(entries, list) or not entries:
+            return None
+        if chat:
+            if not all(isinstance(e, dict) and isinstance(e.get("token"), str) for e in entries):
+                return None
+            spellings = [e["token"] for e in entries]
+        else:
+            if not all(isinstance(e, str) for e in entries):
+                return None
+            spellings = entries
+        if "".join(spellings) == text:
+            return len(entries)
+        # Standard chat logprobs can spell byte-fallback tokens differently from
+        # their decoded text. Their actual bytes still provide direct alignment.
+        if chat and all(isinstance(e.get("bytes"), list) and
+                        all(type(b) is int and 0 <= b <= 255 for b in e["bytes"]) for e in entries):
+            raw = bytes(b for e in entries for b in e["bytes"])
+            if raw.decode("utf-8", errors="replace") == text:
+                return len(entries)
+        return None
+
+    total, measured = 0, False
+    for choice in chunk.get("choices") or []:
+        logprobs = choice.get("logprobs") or {}
+        if not isinstance(logprobs, dict):
+            return None
+        if choice.get("text"):
+            count = aligned(logprobs.get("tokens"), choice["text"], False)
+            if count is None:
+                return None
+            total, measured = total + count, True
+        delta = choice.get("delta") or {}
+        for field in ("content", "reasoning_content"):
+            if delta.get(field):
+                count = aligned(logprobs.get(field), delta[field], True)
+                if count is None:
+                    return None
+                total, measured = total + count, True
+    return total if measured else None
+
+
+def validate_emission_trace(trace, tokens):
+    """Validate committed-token publications; their server clock is independent of client arrival time."""
+    if not isinstance(trace, dict) or trace.get("clock") != "steady_ns" or trace.get("includes_stop_tokens") is not True:
+        return None, "unsupported emission trace contract"
+    events = trace.get("events")
+    if not isinstance(events, list) or type(tokens) is not int or tokens < 0:
+        return None, "missing emission events or final usage"
+    times, counts = [], []
+    for event in events:
+        if (not isinstance(event, list) or len(event) != 2 or type(event[0]) is not int or event[0] < 0
+                or type(event[1]) is not int or event[1] <= 0 or (times and event[0] < times[-1])):
+            return None, "invalid or nonmonotonic emission event"
+        times.append(event[0])
+        counts.append(event[1])
+    if sum(counts) != tokens:
+        return None, "emission count differs from final usage"
+    return (times, counts), None
+
+
 def stream_request(url, body, timeout, clock=time.perf_counter):
     """Sends one streamed request and returns its event record (see request_metrics)."""
-    event = dict(arrival=clock(), token_times=[], tokens=None, error=None)
+    event = dict(arrival=clock(), token_times=[], chunk_token_counts=[], tokens=None, error=None)
     request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -361,13 +479,23 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
                 now = clock()
                 payload = line[5:].strip()
                 if payload == b"[DONE]":
+                    event["finished"] = now
                     break
                 chunk = json.loads(payload)
+                trace = find_key(chunk.get("strix"), "token_emissions")
+                if trace is not None:
+                    event["emission_trace_present"] = True
+                    event["emission_trace"] = trace
                 if "error" in chunk:
                     event["error"] = "server error: " + json.dumps(chunk["error"])[:200]
                     break
                 if _chunk_has_text(chunk):
                     event["token_times"].append(now)
+                    count = measured_chunk_tokens(chunk)
+                    if count is None:
+                        event["chunk_token_counts"] = None
+                    elif event["chunk_token_counts"] is not None:
+                        event["chunk_token_counts"].append(count)
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     if isinstance(usage.get("completion_tokens"), int):
@@ -386,6 +514,21 @@ def stream_request(url, body, timeout, clock=time.perf_counter):
                         break
     except (urllib.error.URLError, OSError, ValueError) as error:
         event["error"] = f"{type(error).__name__}: {error}"[:200]
+    # A usage mismatch can reveal omitted textless/EOS tokens. Never distribute
+    # those tokens over chunks or derive a count from final/cumulative metadata.
+    if (event["chunk_token_counts"] is not None and event["tokens"] is not None
+            and sum(event["chunk_token_counts"]) != event["tokens"]):
+        event["chunk_token_counts"] = None
+    if event.get("emission_trace_present"):
+        measured, reason = validate_emission_trace(event.pop("emission_trace"), event["tokens"])
+        event["emission_trace_valid"] = measured is not None
+        event["emission_trace_reason"] = reason
+        event["emission_peak_scope"] = "server committed publications, stop tokens included as in final usage"
+        if measured is not None:
+            ns, counts = measured
+            # Pool integer stamps before subtracting one origin, avoiding long-uptime precision loss.
+            event["emission_times_ns"] = ns
+            event["emission_counts"] = counts
     return event
 
 

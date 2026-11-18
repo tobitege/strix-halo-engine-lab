@@ -15,6 +15,14 @@ petición, las opciones y las puertas están en [docs/engine/serving/serving.md]
 | Par GLM-5.3 Flash | `strix-glm5-serve` (uno por rank) | rutas de chat y completions con SSE; batching continuo de hasta ocho peticiones, los tokens de cada petición son iguales a los de la misma petición servida sola; MTP exacto con una petición, verificación MTP por lotes desde dos (`STRIX_GLM_SERVE_G2=0` la desactiva); prefill por chunks con prioridad al decode (`--prefill-chunk`, 0 lo desactiva); caché exacta de prefijos de prompt, 4 GiB por rank por defecto (`--prefix-cache-gib 0` la desactiva) (filas medidas: caché de prefijos desactivada; 8 prompts de chat cortos integrados con la plantilla de chat de GLM, 22–59 tokens de prompt (media ~33), hasta 128 tokens greedy cada uno, arranque con barrera) | [página de GLM](models/glm-5.3/README.es.md#glm-serve) |
 | Nemotron 3.5 Bolt E4B | `strix-gemma4-serve` | batching continuo de hasta ocho peticiones de chat (`STRIX_G4_SERVE_SLOTS`), los tokens de cada petición son iguales a los de la misma petición servida sola; drafter MTP y búsqueda en el prompt con una petición; `--profile default\|fast\|quality` | [página de Nemotron](models/nemotron-3.5-bolt-e4b/README.es.md#how-fast) |
 
+Qwen en un nodo con un recipe MTP de sidecar explícito (por ejemplo
+`recipes/qwen-distill-g-yarn.mtp-bundle.json`): las ventanas de verificación del recipe necesitan una
+organización fija del objetivo (17 flags, entre ellas `--virtual-q8-lm-head --prefetch-q8-lm-head`) y un
+golden de calibración volcado con el comando por tiles. El servidor nombra cualquier flag que falte antes
+de cargar el modelo. Los dos comandos, verificados en un nodo Strix Halo de 124 GiB con el objetivo
+UD-Q4_K_XL de 111,3 GB, están en
+[engine/serving/serving.md](engine/serving/serving.md#one-node-explicit-sidecar-mtp-recipe).
+
 ## Exposición de los servidores
 
 DeepSeek V4.1 usa chat sin razonamiento cuando la petición omite la elección.
@@ -75,6 +83,9 @@ permanecer en un cable directo o en una red privada.
 
 - [Servicio por HTTP](engine/serving/serving.md): contratos de petición, decode por batch, prefill de prompt
   predeterminado, salida restringida, políticas de planificación medidas.
+- [Memo de tokens del prompt](engine/serving/token-memo.md): un turno que reenvía su historial solo codifica la cola nueva.
+- Protección de prefijos en cola (servidor Qwen, `STRIX_PREFIX_QUEUE_PROTECT=1`, desactivada por defecto): una petición
+  en espera retiene el estado de prefijo compatible más largo de la caché para que el desalojo no lo descarte antes de admitirla.
 - [Caché de estado de prefijo](engine/serving/prefix-state-cache.md) y
   [composición del prefill de servicio con la caché de prefijo](engine/serving/serving-prefill-prefix-cache.md).
 - [Cualificación de la caché de prefijo de DeepSeek](engine/serving/ds41-prefix-cache-qualification.md),

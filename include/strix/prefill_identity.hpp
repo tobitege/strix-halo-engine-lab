@@ -28,6 +28,8 @@ enum class PrefillOption : unsigned {
     index_proj_wmma,    // Candidate BF16 indexer projections; explicit opt-in until qualified
     gdn_fp16_chunk,     // Candidate chunked GDN prefill on FP16 WMMA (qwen-gdn-fp16-chunk rev 2/3); explicit opt-in until qualified
     index_score_wmma,   // Candidate FAST BF16 index scores; explicit opt-in until qualified
+    ple_rows_f16,       // Candidate FAST PLE key/value rows on the shared FP16 dense core (q8_rows::tiled); explicit opt-in until qualified
+    gdn_gates_f16,      // Candidate FAST GDN beta/alpha gates on the shared FP16 dense core (f16_dense_tall); needs gdn_fp16_chunk
     count
 };
 
@@ -42,6 +44,8 @@ inline constexpr std::array<PrefillOptionInfo, static_cast<unsigned>(PrefillOpti
     {"index_proj_wmma", "STRIX_PREFILL_INDEX_PROJ_WMMA", "idxproj16"},
     {"gdn_fp16_chunk", "STRIX_QPF2K_GDN_FP16_CHUNK", "gdnchunk16"},
     {"index_score_wmma", "STRIX_PREFILL_INDEX_SCORE_WMMA", "idxscore16"},
+    {"ple_rows_f16", "STRIX_PREFILL_PLE_ROWS_F16", "plef16"},
+    {"gdn_gates_f16", "STRIX_PREFILL_GDN_GATES_F16", "gatef16"},
 }};
 
 // Options whose implementation is built in and enabled by default. An option joins this mask only when it is READY;
@@ -53,7 +57,9 @@ inline constexpr unsigned kPrefillGdnChunkRev3 = 1U << static_cast<unsigned>(Pre
 // Implemented candidates may be exercised explicitly without promotion to READY.
 inline constexpr unsigned kPrefillOptionsCandidates = (1U << static_cast<unsigned>(PrefillOption::index_proj_wmma)) |
     (1U << static_cast<unsigned>(PrefillOption::gdn_fp16_chunk)) |
-    (1U << static_cast<unsigned>(PrefillOption::index_score_wmma));
+    (1U << static_cast<unsigned>(PrefillOption::index_score_wmma)) |
+    (1U << static_cast<unsigned>(PrefillOption::ple_rows_f16)) |
+    (1U << static_cast<unsigned>(PrefillOption::gdn_gates_f16));
 
 // Candidate index arithmetic is not qualified for MTP or nested scheduling.
 inline constexpr bool index_wmma_unqualified_route(unsigned mask, unsigned fast_components) {
@@ -75,6 +81,13 @@ inline PrefillIdentityOverride& prefill_identity_override() {
 }  // namespace detail
 
 inline unsigned prefill_option_bit(PrefillOption option) { return 1U << static_cast<unsigned>(option); }
+
+// Apply after resolving controls or removing route options, before publishing an identity.
+inline unsigned normalize_prefill_options(unsigned mask) {
+    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk)))
+        mask &= ~(kPrefillGdnChunkRev3 | prefill_option_bit(PrefillOption::gdn_gates_f16));
+    return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates | kPrefillGdnChunkRev3);
+}
 
 // Command line: --prefill-exact-fp16 and --prefill-disable a,b. Call before the first prefill (the mask is read per call).
 inline void set_prefill_identity_override(bool exact, unsigned disabled) {
@@ -115,7 +128,7 @@ inline unsigned resolve_prefill_options(Get get, bool exact = false, unsigned di
         }
         if (value && value[0] == '0') mask &= ~bit;
     }
-    return mask;
+    return normalize_prefill_options(mask);
 }
 
 // The active set: environment, then the command line override.
@@ -123,8 +136,7 @@ inline unsigned prefill_options_active() {
     unsigned mask = resolve_prefill_options([](const char* name) { return std::getenv(name); });
     const auto& o = detail::prefill_identity_override();
     if (o.set) mask = o.exact ? 0U : mask & ~o.disabled;
-    if (!(mask & prefill_option_bit(PrefillOption::gdn_fp16_chunk))) mask &= ~kPrefillGdnChunkRev3;
-    return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates | kPrefillGdnChunkRev3);
+    return normalize_prefill_options(mask);
 }
 inline bool prefill_option_enabled(PrefillOption option) { return (prefill_options_active() & prefill_option_bit(option)) != 0U; }
 

@@ -242,6 +242,7 @@ ServePreparation prepare_serve(const std::vector<std::string>& arguments) {
             else if (a == "--resume-check-tokens") check_tokens = static_cast<std::uint32_t>(number(next(), UINT32_MAX, a.c_str()));
             else if (a == "--check-only") check_only = true;
             else if (session_option(p, session_options, a, next)) {}
+            else if (defaults::product_option(a, next, nullptr)) {}  // --profile NAME, --turbo-weights*: print_or_apply()
             else throw std::invalid_argument("unknown option " + a);
         }
         if (no_mtp && dspark_mode_value.empty()) dspark_mode_value = "off";  // shared opt-out; --dspark-mode wins

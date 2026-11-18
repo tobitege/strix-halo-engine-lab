@@ -4,9 +4,9 @@
 // below and above the pooled-selection regime (> 2048 positions), several long sessions per window, two consecutive
 // windows (the second reuses the pooled caches). Needs a CUDA device; no model.
 //   qwen_qsa_multi_test <tables dir>
-#include "strix/cuda_qwen_qsa.hpp"
+#include "strix/cuda/qwen_qsa.hpp"
 
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 
 #include <cuda_runtime.h>
 
@@ -119,7 +119,9 @@ int main(int argc, char** argv) {
     std::vector<float2> cs(P * qsa::kRotaryPairs);
     for (auto& c : cs) { const float a = uniform(0.0F, 6.2831853F); c = make_float2(std::cos(a), std::sin(a)); }
     const auto* rope = upload(cs);
-    auto ws_a = qsa::allocate_workspace(8, P), ws_b = qsa::allocate_workspace(8, P);
+    auto ws_a = qsa::allocate_workspace(8, P), ws_b = qsa::allocate_workspace(8, P), ws_g = qsa::allocate_workspace(8, P);
+    qsa::SegmentMap* dmap = nullptr;  // the graph step's device map (layer_core_device + prepare_replay, as the prefill driver)
+    ck(cudaMalloc(&dmap, sizeof(qsa::SegmentMap)), "device map");
 
     // cases: (first position, rows) per segment; every case runs two consecutive windows
     const std::vector<std::vector<std::pair<std::uint64_t, std::uint32_t>>> cases = {
@@ -132,11 +134,12 @@ int main(int argc, char** argv) {
     for (std::size_t c = 0; c < cases.size(); ++c) {
         auto segs = cases[c];
         const auto n = static_cast<std::uint32_t>(segs.size());
-        std::vector<State> a, b;
+        std::vector<State> a, b, g;
         for (const auto& sg : segs) {
             auto kv = bf16_random(P * 1024, 1.0F), raw = bf16_random(P * 128, 1.0F);
             a.push_back(make_state(kv, raw));
             b.push_back(make_state(kv, raw));
+            g.push_back(make_state(kv, raw));
         }
         for (int window = 0; window < 2; ++window) {
             std::uint32_t rows = 0;
@@ -145,7 +148,7 @@ int main(int argc, char** argv) {
             const auto q = bf16_valued(std::uint64_t{rows} * qsa::kQGateWidth, 2.0F);
             const auto k = bf16_valued(std::uint64_t{rows} * qsa::kKvWidth, 2.0F);
             const auto v = bf16_valued(std::uint64_t{rows} * qsa::kKvWidth, 2.0F);
-            const Rows ra = make_rows(hidden, q, k, v, rows), rb = make_rows(hidden, q, k, v, rows);
+            const Rows ra = make_rows(hidden, q, k, v, rows), rb = make_rows(hidden, q, k, v, rows), rg = make_rows(hidden, q, k, v, rows);
             // per segment
             std::uint32_t off = 0;
             for (std::uint32_t i = 0; i < n; ++i) {
@@ -158,6 +161,23 @@ int main(int argc, char** argv) {
             for (std::uint32_t i = 0; i < n; ++i)
                 ms.push_back(qsa::SegmentState{segs[i].second, segs[i].first, qsa::LayerState{b[i].kv, b[i].raw, b[i].pooled, &b[i].valid}});
             qsa::layer_core_multi(rb.view(0), ms.data(), n, w, rope, tables, ws_b, stream);
+            // graph step: fixed graph shape + device map (else the eager multi core keeps the sessions in step)
+            std::vector<qsa::SegmentState> gs;
+            std::vector<std::uint32_t> seg_rows;
+            for (std::uint32_t i = 0; i < n; ++i) {
+                gs.push_back(qsa::SegmentState{segs[i].second, segs[i].first, qsa::LayerState{g[i].kv, g[i].raw, g[i].pooled, &g[i].valid}});
+                seg_rows.push_back(segs[i].second);
+            }
+            qsa::MultiShape gshape{};
+            const bool graph_ok = qsa::graph_shape(seg_rows.data(), n, ws_g, gshape);
+            if (graph_ok) {
+                qsa::SegmentMap hm{};
+                qsa::prepare_replay(gs.data(), n, ws_g, hm);
+                ck(cudaMemcpyAsync(dmap, &hm, sizeof(hm), cudaMemcpyHostToDevice, stream), "map copy");
+                qsa::layer_core_device(rg.view(0), dmap, gshape, w, rope, tables, ws_g, stream);
+            } else {
+                qsa::layer_core_multi(rg.view(0), gs.data(), n, w, rope, tables, ws_g, stream);
+            }
             ck(cudaStreamSynchronize(stream), "case");
             const int before = failures;
             const std::string tag = "case " + std::to_string(c) + " window " + std::to_string(window);
@@ -166,25 +186,32 @@ int main(int argc, char** argv) {
             expect_same(ra.k, rb.k, std::uint64_t{rows} * qsa::kKvWidth, tag + " k");
             expect_same(ra.iq, rb.iq, std::uint64_t{rows} * qsa::kIndexQWidth, tag + " index q");
             expect_same(ra.ik, rb.ik, std::uint64_t{rows} * qsa::kIndexDim, tag + " index k");
+            expect_same(ra.out, rg.out, std::uint64_t{rows} * qsa::kAttnWidth, tag + " graph attention output");
             for (std::uint32_t i = 0; i < n; ++i) {
                 const std::string s = tag + " segment " + std::to_string(i);
                 expect_same(a[i].kv, b[i].kv, P * 1024, s + " kv");
                 expect_same(a[i].raw, b[i].raw, P * 128, s + " raw index");
                 expect_same(a[i].pooled, b[i].pooled, P / 4 * qsa::kIndexDim, s + " pooled keys");
+                expect_same(a[i].kv, g[i].kv, P * 1024, s + " graph kv");
+                expect_same(a[i].pooled, g[i].pooled, P / 4 * qsa::kIndexDim, s + " graph pooled keys");
+                if (a[i].valid != g[i].valid) { std::printf("    DIFF %s graph pooled valid %u vs %u\n", s.c_str(), a[i].valid, g[i].valid); ++failures; }
                 if (a[i].valid != b[i].valid) { std::printf("    DIFF %s pooled valid %u vs %u\n", s.c_str(), a[i].valid, b[i].valid); ++failures; }
             }
             std::printf("%s (%u segments, %u rows, pooled valid", tag.c_str(), n, rows);
             for (std::uint32_t i = 0; i < n; ++i) std::printf(" %u", b[i].valid);
-            std::printf(") %s\n", failures == before ? "BIT-IDENTICAL" : "DIFFER");
+            std::printf(") graph=%s %s\n", graph_ok ? "device-map" : "eager", failures == before ? "BIT-IDENTICAL" : "DIFFER");
             for (auto* p : {static_cast<void*>(ra.hidden), static_cast<void*>(ra.q_gate), static_cast<void*>(ra.k), static_cast<void*>(ra.v),
                             static_cast<void*>(ra.iq), static_cast<void*>(ra.ik), static_cast<void*>(ra.out), static_cast<void*>(rb.hidden),
                             static_cast<void*>(rb.q_gate), static_cast<void*>(rb.k), static_cast<void*>(rb.v), static_cast<void*>(rb.iq),
-                            static_cast<void*>(rb.ik), static_cast<void*>(rb.out)})
+                            static_cast<void*>(rb.ik), static_cast<void*>(rb.out), static_cast<void*>(rg.hidden), static_cast<void*>(rg.q_gate),
+                            static_cast<void*>(rg.k), static_cast<void*>(rg.v), static_cast<void*>(rg.iq), static_cast<void*>(rg.ik),
+                            static_cast<void*>(rg.out)})
                 cudaFree(p);
             for (auto& sg : segs) sg.first += sg.second;  // the next window continues every session
         }
         for (auto& s : a) { cudaFree(s.kv); cudaFree(s.raw); cudaFree(s.pooled); }
         for (auto& s : b) { cudaFree(s.kv); cudaFree(s.raw); cudaFree(s.pooled); }
+        for (auto& s : g) { cudaFree(s.kv); cudaFree(s.raw); cudaFree(s.pooled); }
     }
     std::printf("%s (%d differences)\n", failures == 0 ? "QSA MULTI PASS" : "QSA MULTI FAIL", failures);
     return failures == 0 ? 0 : 3;

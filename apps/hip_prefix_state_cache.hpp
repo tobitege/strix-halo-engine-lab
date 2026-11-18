@@ -12,6 +12,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefix_state_cache.hpp"
+#include "strix/serve/prefix_cache_queue_binding.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/session_state_cache.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -519,6 +520,12 @@ public:
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept { return fixed_bytes_; }
     [[nodiscard]] const PrefixStateCacheRequestStats& request() const noexcept { return *request_; }
     [[nodiscard]] PrefixStateCache& store() noexcept { return *store_; }
+    // Queue protection over this store with this session's lookup identity, block rows and restore limit
+    // (begin_request looks up prompt.size() - 1 rows). Null binding without a store.
+    [[nodiscard]] serve::QueuedPrefixProtection::Binding queue_protection_binding(std::uint64_t max_bytes = 0) {
+        if (!store_ || !block_rows_) return {};
+        return serve::prefix_cache_queue_binding(store_, [this] { return active_identity(); }, block_rows_, max_bytes);
+    }
     // False: the component registry of --rtx-state-import / STRIX_RTX_EXPORT_STATE alone (no capture, no lookup).
     void disable_store_before_ready() {
         PrefixAsyncCapture::reap(true); segments_.clear(); row_chain_->clear(); store_.reset();

@@ -92,6 +92,31 @@ int main() {
     catch (const std::invalid_argument&) { storage_rejected = true; }
     expect(storage_rejected, "restore rejects same-ID forged physical storage metadata");
 
+    // recurrent state contract: a record written under one type is never restored under another
+    for (const auto type : {strix::RecurrentStateType::f16, strix::RecurrentStateType::bf16}) {
+        auto typed = model; typed.recurrent_state = type;
+        const auto typed_layout = strix::build_serial_session_state_layout(typed, layout_request);
+        const auto typed_snapshot = strix::build_serial_session_snapshot_plan(typed, typed_layout, request);
+        static_cast<void>(strix::build_serial_session_restore_plan(typed, typed_layout,
+            request.runtime_compatibility_identity, typed_snapshot));  // same type restores
+        for (const auto* other : {&snapshot, &typed_snapshot}) {
+            bool refused = false;
+            try { static_cast<void>(strix::build_serial_session_restore_plan(
+                other == &snapshot ? typed : model, other == &snapshot ? typed_layout : layout,
+                request.runtime_compatibility_identity, other == &snapshot ? snapshot : typed_snapshot)); }
+            catch (const std::invalid_argument&) { refused = true; }
+            expect(refused, "restore refuses a snapshot written under a different recurrent state type");
+        }
+        auto other_type = model; other_type.recurrent_state = type == strix::RecurrentStateType::f16 ?
+            strix::RecurrentStateType::bf16 : strix::RecurrentStateType::f16;
+        const auto other_layout = strix::build_serial_session_state_layout(other_type, layout_request);
+        bool refused = false;
+        try { static_cast<void>(strix::build_serial_session_restore_plan(other_type, other_layout,
+            request.runtime_compatibility_identity, typed_snapshot)); }
+        catch (const std::invalid_argument&) { refused = true; }
+        expect(refused, "restore refuses f16 <-> bf16 records of identical size");
+    }
+
     for (std::size_t index = 0;
          index < restore.ranges.size();
          ++index) {

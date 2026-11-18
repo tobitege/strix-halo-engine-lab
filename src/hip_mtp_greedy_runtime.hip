@@ -11,6 +11,7 @@
 #include "strix/mtp_batch_window_controller.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/serve/cycle_receipt.hpp"
+#include "strix/session/cycle_pack.hpp"
 #include <hip/hip_runtime.h>
 #include <optional>
 #include <algorithm>
@@ -105,6 +106,7 @@ struct HipMtpGreedyRuntime::Impl {
     std::vector<double> ngram_acceptance;
     // Candidates from this index on came from a context source (n-gram/context drafter); SIZE_MAX: none.
     std::size_t external_first=SIZE_MAX;
+    bool pack_reconcile=false; // STRIX_SERVE_CYCLE_PACK: this cycle's reconcile completion is packed by the cohort
     bool cohort_external=false; // a cohort extension set the verifier's external rows (cleared at finish_cycle)
     // STRIX_MTP_DRAFT_DEPTH_MAX=N (opt-in, drafts only) or set_draft_depth_max: predictor drafts per cycle at most.
     std::uint32_t depth_max=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_DEPTH_MAX");
@@ -146,6 +148,8 @@ bool HipMtpGreedyRuntime::failed() const noexcept {
     return impl_->failed || impl_->mtp->failed() || (impl_->window && impl_->window->failed());
 }
 const HipMtpRuntime& HipMtpGreedyRuntime::native_runtime() const noexcept {return *impl_->mtp;}
+void HipMtpGreedyRuntime::defer_reconcile_for_cycle_pack(bool on) noexcept {impl_->pack_reconcile=on;}
+bool HipMtpGreedyRuntime::draft_chain_open() const noexcept {return impl_->ds.open;}
 void HipMtpGreedyRuntime::use_window_verifier(std::shared_ptr<HipMtpWindowVerifier> window) {
     auto& i=*impl_;require(!i.busy && !failed() && !i.cycled && window && window->target_owner()==i.target,
         "MTP window verifier must retain the same actual idle target before the first cycle");
@@ -549,6 +553,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
     auto& i=*impl_;require(i.busy && !i.failed,"MTP greedy cycle finish requires a drafted cycle");
     auto is_eos=[&](std::uint32_t t){return std::find(eos.begin(),eos.end(),t)!=eos.end();};
     HipMtpGreedyCycleResult out;
+    out.target_forwards=verified.target_forwards;
     out.final_target=initial;
     out.proposed_candidates=static_cast<std::uint32_t>(i.candidates.size());
     try {
@@ -591,7 +596,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
         }
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
-        i.mtp->defer_next_reconcile_completion(mtp_device_handoff() && !out.eos && !out.terminal_budget);
+        i.mtp->defer_next_reconcile_completion((mtp_device_handoff() && !out.eos && !out.terminal_budget) || i.pack_reconcile);
+        i.pack_reconcile=false;
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
         i.mtp->defer_next_reconcile_completion(false);
         reconcile_draft_proposal_state(i.draft,*i.session);
@@ -723,6 +729,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
             const auto drafts=i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+            ++out.target_forwards;
             auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
                 index<drafts.size()?&drafts[index]:nullptr,
                 transaction?HipMtpHostRowSelector{[&](auto row){
@@ -746,7 +753,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         if(i.context)i.context->finish_cycle(out.emitted_tokens,std::min(i.candidates.size(),out.emitted_tokens.size()),out.accepted_candidates);
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
-        i.mtp->defer_next_reconcile_completion(mtp_device_handoff() && !out.eos && !out.terminal_budget);
+        i.mtp->defer_next_reconcile_completion((mtp_device_handoff() && !out.eos && !out.terminal_budget) || i.pack_reconcile);
+        i.pack_reconcile=false;
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
         i.mtp->defer_next_reconcile_completion(false);
         reconcile_draft_proposal_state(i.draft,*i.session);
@@ -766,6 +774,41 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
 }
 namespace {
 struct CohortItem {std::size_t member;std::uint32_t rows;};
+// STRIX_SERVE_CYCLE_PACK: one fence for the predictor owners of a cohort phase (draft chain ends, deferred
+// reconciliations) instead of one copy and fence per member. Scheduling only: same launches, same checks.
+bool draft_batch_enabled();
+bool cohort_cycle_pack(std::size_t members) {return members>=2U && strix::session::serve_cycle_pack_choice(members).on;}
+void pack_predictor_owners(std::span<const HipMtpGreedyCohortMember> members,const std::vector<bool>& take) {
+    static thread_local std::unique_ptr<strix::session::CyclePack> pack;
+    std::vector<const HipMtpResources*> owners;
+    for(std::size_t k=0;k<members.size();++k) if(take[k]) owners.push_back(&members[k].runtime->native_runtime().resources());
+    if(owners.size()<2U) return;
+    if(!pack) pack=std::make_unique<strix::session::CyclePack>();
+    HipMtpResources::complete_packed(owners,*pack);
+}
+// Defers every member's reconciliation completion through its finish loop; settle() then fences them once.
+struct PackedReconcile {
+    struct FailMember {
+        std::span<const HipMtpGreedyCohortMember> members;
+        void operator()(std::size_t k) const noexcept {
+            members[k].runtime->defer_reconcile_for_cycle_pack(false);
+            members[k].runtime->fail_cycle();
+        }
+    };
+    std::span<const HipMtpGreedyCohortMember> members;
+    session::CyclePackSettlement<FailMember> settlement;
+    bool on=false;
+    PackedReconcile(std::span<const HipMtpGreedyCohortMember> m,std::size_t n):members(m),settlement(m.size(),FailMember{m}),on(cohort_cycle_pack(n)) {}
+    void defer(std::size_t member) {if(on){settlement.take(member);members[member].runtime->defer_reconcile_for_cycle_pack(true);}}
+    void settle() {
+        if(!on) return;
+        pack_predictor_owners(members,settlement.selected());
+        settlement.settle([&](std::size_t k) {
+            members[k].runtime->defer_reconcile_for_cycle_pack(false);
+            members[k].runtime->native_runtime().resources().settle_deferred();
+        });
+    }
+};
 void default_small_cohorts(std::span<const HipMtpGreedyCohortMember> members,
     std::vector<CohortItem> items,std::vector<HipMtpGreedyCycleResult>& out,std::vector<bool>& open,
     HipMtpGreedyCohortStats* stats) {
@@ -789,13 +832,16 @@ void default_small_cohorts(std::span<const HipMtpGreedyCohortMember> members,
                     r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
             }
             auto verified=HipMtpWindowVerifier::verify_cohort(requests,*primary);
+            PackedReconcile packed(members,g.size());
             for(std::size_t k=0;k<g.size();++k) {
                 const auto& c=members[g[k].member];
                 auto& o=out[g[k].member];
+                packed.defer(g[k].member);
                 o=c.runtime->finish_cycle(*c.initial,std::move(verified[k]),c.budget,c.eos);
                 open[g[k].member]=false;
                 o.shared.verify_members=static_cast<std::uint32_t>(g.size());o.shared.verify_rows=g[k].rows;
             }
+            packed.settle();
             if(stats){++stats->cohort_windows;stats->cohort_sessions+=g.size();stats->cohort_rows+=total;stats->shared.shared_window(g.size(),total);}
         }
         for(const auto& x:solo) {
@@ -884,15 +930,18 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
                 r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
         }
         auto verified=HipMtpWindowVerifier::verify_cohort(requests,primaries,sizes);
+        PackedReconcile packed(members,order.size());
         for(std::size_t k=0;k<order.size();++k) {
             const auto& c=members[order[k].member];
             auto& o=out[order[k].member];
+            packed.defer(order[k].member);
             o=c.runtime->finish_cycle(*c.initial,std::move(verified[k]),c.budget,c.eos);
             open[order[k].member]=false;
             o.shared.verify_members=shared[k].first;o.shared.verify_rows=shared[k].first?order[k].rows:0U;
             o.shared.verify_decline=shared[k].second;
             if(stats) stats->shared.decline(shared[k].second);
         }
+        packed.settle();
         if(stats){++stats->cohort_windows;stats->cohort_sessions+=order.size();stats->cohort_rows+=total;stats->cohort_chunks+=sizes.size();}
     }
     for(const auto& x:solo) {
@@ -1139,6 +1188,11 @@ std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCoh
         std::vector<std::size_t> retained(members.size(),0U);
         // The controller's acceptance history learns from predictor drafts only (context rows have their own).
         auto observed=requests;
+        if(cohort_cycle_pack(members.size()) && !draft_batch_enabled()) {
+            std::vector<bool> chains(members.size(),false);
+            for(std::size_t k=0;k<members.size();++k) chains[k]=open[k] && members[k].runtime->draft_chain_open();
+            pack_predictor_owners(members,chains);
+        }
         for(std::size_t k=0;k<members.size();++k) if(open[k]) {
             members[k].runtime->draft_end();
             retained[k]=members[k].runtime->drafted_probabilities().size();
@@ -1163,7 +1217,9 @@ std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCoh
         std::vector<std::uint32_t> accepted;
         std::uint32_t emitted=0;
         for(const auto& r:out) {accepted.push_back(r.accepted_candidates);emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());}
-        controller.observe(observed,rows,accepted,draft_ms,target_ms,draft_steps);
+        // The complete candidates (context rows included, marked by external_first) as choose() priced them: the yield
+        // calibration compares like with like; observe() updates predictor histories below external_first only.
+        controller.observe(requests,rows,accepted,draft_ms,target_ms,draft_steps);
         if(draft_batch_enabled() && draft_batch_ab()) draft_batch_ab_timing().add(members.size(),draft_ms,draft_ms+target_ms,emitted);
         // STRIX_MTP_BATCH_LOG=2 adds the plan's estimate (of the executed plan, probes included) and per member
         // slot:position:limit:remaining budget:planned rows/predictor steps launched/predictor drafts retained
@@ -1239,8 +1295,13 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         const auto before=stats?*stats:HipMtpGreedyCohortStats{};
         std::vector<HipMtpGreedyCycleResult> out;
         if(joint) {
+            // A group's sessions must fit one wide cohort step (every wide launcher's session table).
+            static_assert(kMtpJointGroupLanesMax<=kCohortWideMaxSessions,"joint group wider than a wide cohort step");
             thread_local std::size_t group_start=0;
-            const auto groups=mtp_cohort_partition(members.size(),group_start++);
+            // Above the lane bound (fixed two rows each) STRIX_SERVE_JOINT_GROUP_LANES=9..16 lets one group take up to
+            // that many requests (one target forward reads the weights for all); default 16 (8 = one forward per eight).
+            const auto cap=joint->max_group_lanes(members.size(),group_start);
+            const auto groups=mtp_cohort_partition(members.size(),group_start++,cap);
             out.resize(members.size());
             for(const auto& group:groups) {
                 std::vector<HipMtpGreedyCohortMember> part;
@@ -1321,6 +1382,11 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         std::vector<MtpSharedExecutionCycle> drafts;
         if(interleaved) {
             drafts=cohort_drafts(members,open,stats);
+            if(cohort_cycle_pack(members.size()) && !draft_batch_enabled()) {
+                std::vector<bool> chains(members.size(),false);
+                for(std::size_t m=0;m<members.size();++m) chains[m]=open[m] && members[m].runtime->draft_chain_open();
+                pack_predictor_owners(members,chains);
+            }
             for(std::size_t m=0;m<members.size();++m) if(open[m]) members[m].runtime->draft_end();
         }
         for(std::size_t m=0;m<members.size();++m) if(open[m])
@@ -1366,7 +1432,12 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"draft_batch","STRIX_MTP_DRAFT_BATCH",draft_batch_enabled(),draft_batch_enabled()?"1":"0"},
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
+        {"row_measured","STRIX_SERVE_ROW_MEASURED",mtp_serve_row_budget_enabled() && mtp_serve_row_measured_lanes()!=0U,
+            std::string(mtp_serve_row_measured_choice())+" lanes=0x"+[]{char b[16];std::snprintf(b,sizeof b,"%x",mtp_serve_row_measured_lanes());return std::string(b);}()},
         {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
+        {"joint_group_lanes","STRIX_SERVE_JOINT_GROUP_LANES",mtp_serve_row_budget_enabled() && mtp_serve_joint_group_lanes(0)!=8U,
+            mtp_serve_joint_group_lanes(0)==mtp_serve_joint_group_lanes(1)?std::to_string(mtp_serve_joint_group_lanes(0)):std::string("ab")},
+        {"cycle_pack","STRIX_SERVE_CYCLE_PACK",strix::session::serve_cycle_pack_choice(2).on,strix::session::serve_cycle_pack_choice(2).on?"1":"0"},
     };
 }
 } // namespace strix

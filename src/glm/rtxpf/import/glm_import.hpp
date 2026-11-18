@@ -140,15 +140,30 @@ struct Begin {
 // Begin.version 1: each rank receives every component. Version 2 ('DSA once'): the same encoding; rank 0
 // receives every component, rank 1 only the KDA components (its DSA components reach it from rank 0 over
 // the pair link, outside this wire), so the DSA bytes cross the producer's link once.
+// Versions 3 / 4 = 1 / 2 with the index tail (strix::state::RawRows::open_tail): ikey / igate carry only the open
+// pool block's rows [P - P % 4, P) (P % 4 rows, none when P % 4 == 0); the closed blocks travel as pooled rows only.
 struct Component {
     unsigned layer, id;
     std::uint64_t rows, stride;
+    std::uint64_t first = 0;  // first slot row of the component (the index tail starts at P - P % 4)
 };
-// Version 2: the components a rank does not receive (rank 1's DSA ids 2..5). The producer drops exactly these from
+inline bool known_version(unsigned version) { return version >= 1 && version <= 4; }
+inline bool dsa_once(unsigned version) { return version == 2 || version == 4; }
+inline bool index_tail(unsigned version) { return version == 3 || version == 4; }
+inline unsigned wire_version(bool dsa_once_on, bool index_tail_on) { return (index_tail_on ? 3U : 1U) + (dsa_once_on ? 1U : 0U); }
+inline strix::state::RawRows index_form(unsigned version) {
+    return index_tail(version) ? strix::state::RawRows::open_tail : strix::state::RawRows::full;
+}
+// The slot rows of component `id` (3 ikey, 4 igate: the index window of the version; others start at row 0).
+inline strix::state::RowWindow component_rows(unsigned version, unsigned id, std::uint64_t frontier) {
+    if (id == 3 || id == 4) return state_layout::index_rows(index_form(version), frontier);
+    return {0, id == 5 ? state_layout::pooled_rows(frontier) : frontier};
+}
+// DSA once: the components a rank does not receive (rank 1's DSA ids 2..5). The producer drops exactly these from
 // its export stream, and layout() omits them, so both ends agree by construction.
-inline bool omitted(unsigned version, unsigned rank, unsigned id) { return version == 2 && rank == 1 && id >= 2; }
+inline bool omitted(unsigned version, unsigned rank, unsigned id) { return dsa_once(version) && rank == 1 && id >= 2; }
 inline std::vector<Component> layout(const Begin& b) {
-    require((b.version == 1 || b.version == 2) && b.world == 2 && b.rank < 2 && (b.layers == 45 || b.layers == 46),
+    require(known_version(b.version) && b.world == 2 && b.rank < 2 && (b.layers == 45 || b.layers == 46),
             "unsupported import layout/rank");
     const bool dsa = !omitted(b.version, b.rank, 2);
     require(b.frontier > 0 && b.frontier < b.total && b.total <= 131072, "invalid import frontier");
@@ -159,8 +174,11 @@ inline std::vector<Component> layout(const Begin& b) {
             out.push_back({l, 1, 32, state_layout::kConvFloatsPerHead * sizeof(float)});
         } else if (dsa) {
             out.push_back({l, 2, b.frontier, 1024});
-            out.push_back({l, 3, b.frontier, 256});
-            out.push_back({l, 4, b.frontier, 256});
+            const auto index = component_rows(b.version, 3, b.frontier);
+            if (index.rows) {
+                out.push_back({l, 3, index.rows, 256, index.first});
+                out.push_back({l, 4, index.rows, 256, index.first});
+            }
             if (state_layout::pooled_rows(b.frontier)) out.push_back({l, 5, state_layout::pooled_rows(b.frontier), 512});
         }
     }

@@ -25,6 +25,40 @@ void require(bool ok, const std::string& what) {
     if (!ok) throw std::runtime_error("route receipt test failed: " + what);
 }
 
+void chunk_order_fingerprints() {
+    route::reset();
+        namespace rr = strix::route;
+        rr::lever("minimax.prefill_identity", "default", "default");
+        const auto legacy = rr::fingerprint();
+        const auto register_order = [](const char* asked) {
+            const bool invariant = asked && std::string_view(asked) == "invariant";
+            rr::numerical_variant("minimax.moe_prefill_order", asked ? asked : "default",
+                                  invariant ? "invariant" : "adaptive", "adaptive");
+        };
+        const auto compare_peer = [](std::uint64_t peer) {
+            return rr::compare_ranks([peer](const void* out, void* in, std::size_t bytes) {
+                std::memcpy(in, out, bytes);
+                static_cast<std::uint64_t*>(in)[1] = peer;
+            });
+        };
+        for (const char* asked : {static_cast<const char*>(nullptr), "", "adaptive"}) {
+            register_order(asked);
+            require(rr::fingerprint() == legacy, "adaptive must preserve legacy fingerprint");
+            require(compare_peer(legacy) == legacy, "matching adaptive ranks");
+        }
+        register_order("invariant");
+        const auto invariant = rr::fingerprint();
+        require(invariant != legacy, "invariant must change fingerprint");
+        require(compare_peer(invariant) == invariant, "matching invariant ranks");
+        for (const bool local_invariant : {true, false}) {
+            register_order(local_invariant ? "invariant" : "adaptive");
+            bool rejected = false;
+            try { (void)compare_peer(local_invariant ? legacy : invariant); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "mismatched rank orders must be rejected in both directions");
+        }
+}
+
 void counters() {
     route::reset();
     route::set_enabled(true);
@@ -192,6 +226,7 @@ int main() {
         off_switch();
         layers_and_delta();
         levers_and_fingerprint();
+        chunk_order_fingerprints();
         rank_comparison();
         threads();
     } catch (const std::exception& e) {

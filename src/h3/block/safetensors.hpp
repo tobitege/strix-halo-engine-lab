@@ -2,6 +2,7 @@
 // MiniMax H3: minimal safetensors reader (host). Header = u64 LE length + JSON {name: {dtype, shape, data_offsets}},
 // tensor bytes follow the header; offsets are relative to the end of the header. Reads are positioned (seek + read)
 // under a mutex, so one reader can serve several threads.
+#include "strix/weight/admission.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -68,47 +69,30 @@ public:
                     if (!tensors_.emplace(name, t).second) throw std::runtime_error("safetensors: duplicate sharded tensor " + name);
                     owners_[name] = child.get();
                 }
+                index_.container = weight::Container::safetensors; index_.schema = "safetensors@1";
+                index_.tensors.insert(index_.tensors.end(), child->index_.tensors.begin(), child->index_.tensors.end());
                 shards_.push_back(std::move(child));
             }
             if (shards_.empty()) throw std::runtime_error("safetensors: no completed checkpoint shards");
             return;
         }
-        f_ = std::fopen(path.c_str(), "rb");
-        if (!f_) throw std::runtime_error("safetensors: cannot open " + path);
-        const auto file_bytes = std::filesystem::file_size(path);
-        unsigned char lenb[8];
-        if (std::fread(lenb, 1, 8, f_) != 8) throw std::runtime_error("safetensors: short header");
-        std::uint64_t hl = 0;
-        for (int i = 7; i >= 0; --i) hl = (hl << 8U) | lenb[i];
-        if (hl == 0 || hl > (1ULL << 30U)) throw std::runtime_error("safetensors: bad header length");
-        std::string hdr(static_cast<std::size_t>(hl), '\0');
-        if (std::fread(hdr.data(), 1, hdr.size(), f_) != hdr.size()) throw std::runtime_error("safetensors: short header");
-        data_base_ = 8 + hl;
-        fixture::Json root = fixture::JsonParser(hdr).parse();
-        for (const auto& [name, e] : root.obj()) {
-            if (name == "__metadata__") {
-                if (e.is_object())
-                    for (const auto& [k, v] : e.obj())
-                        if (v.is_string()) metadata_[k] = v.str();
-                continue;
-            }
-            StTensor t;
-            t.name = checkpoint_name(name, names);
-            t.dtype_name = e.at("dtype").str();
+        auto status = weight::open_source(path, source_);
+        weight::TensorIndex index;
+        if (status) status = weight::index_safetensors(source_, index);
+        if (!status) throw std::runtime_error("safetensors: " + status.detail);
+        index_ = index;
+        for (const auto& [key,value] : index.metadata) metadata_[key] = value;
+        for (const auto& raw : index.tensors) {
+            StTensor t; t.name = checkpoint_name(raw.name, names); t.dtype_name = raw.wire_dtype;
             t.dtype = parse_st_dtype(t.dtype_name);
-            for (const auto& s : e.at("shape").arr()) t.shape.push_back(static_cast<std::int64_t>(s.num()));
-            const auto& off = e.at("data_offsets").arr();
-            t.begin = data_base_ + static_cast<std::uint64_t>(off.at(0).num());
-            t.end = data_base_ + static_cast<std::uint64_t>(off.at(1).num());
-            if (t.end < t.begin || t.end > file_bytes)
-                throw std::runtime_error("safetensors: tensor outside completed file " + name);
-            if (st_dtype_size(t.dtype) && t.nbytes() != t.numel() * st_dtype_size(t.dtype))
-                throw std::runtime_error("safetensors: size mismatch for " + name);
-            const auto canonical=t.name;
-            if (!tensors_.emplace(canonical, std::move(t)).second)
+            for (auto dim : raw.extents) t.shape.push_back(static_cast<std::int64_t>(dim));
+            t.begin = raw.payload.range.offset; t.end = t.begin + raw.payload.range.bytes;
+            const auto canonical = t.name;
+            if (!tensors_.emplace(canonical,std::move(t)).second)
                 throw std::runtime_error("safetensors: duplicate canonical tensor " + canonical);
         }
     }
+
     ~SafeTensors() {
         if (f_) std::fclose(f_);
     }
@@ -116,6 +100,7 @@ public:
     SafeTensors& operator=(const SafeTensors&) = delete;
 
     const std::map<std::string, StTensor>& tensors() const { return tensors_; }
+    weight::Status admitted_weights(weight::WeightMap& out) const { return weight::bind_h3(index_,out); }
     const std::map<std::string, std::string>& metadata() const { return metadata_; }
     const StTensor* find(const std::string& name) const {
         auto it = tensors_.find(name);
@@ -129,16 +114,10 @@ public:
     // Raw bytes of a tensor into dst (nbytes of the tensor).
     void read_raw(const StTensor& t, void* dst) const {
         if (!shards_.empty()) { owners_.at(t.name)->read_raw(t, dst); return; }
-        std::lock_guard<std::mutex> lk(mu_);
-#if defined(_WIN32)
-        if (_fseeki64(f_, static_cast<long long>(t.begin), SEEK_SET) != 0)
-#else
-        if (fseeko(f_, static_cast<off_t>(t.begin), SEEK_SET) != 0)
-#endif
-            throw std::runtime_error("safetensors: seek failed for " + t.name);
-        const std::size_t n = static_cast<std::size_t>(t.nbytes());
-        if (std::fread(dst, 1, n, f_) != n) throw std::runtime_error("safetensors: short read for " + t.name);
+        auto status = source_->read({t.begin,t.nbytes()}, {reinterpret_cast<weight::Byte*>(dst),static_cast<std::size_t>(t.nbytes())});
+        if (!status) throw std::runtime_error("safetensors: " + status.detail);
     }
+
     template <class T> std::vector<T> read_vec(const std::string& name, StDtype expect) const {
         const StTensor& t = at(name);
         if (t.dtype != expect) throw std::runtime_error("safetensors: unexpected dtype " + t.dtype_name + " for " + name);
@@ -152,6 +131,8 @@ private:
     std::vector<std::unique_ptr<SafeTensors>> shards_;
     std::map<std::string, SafeTensors*> owners_;
     std::string path_;
+    std::shared_ptr<const weight::Source> source_;
+    weight::TensorIndex index_;
     std::FILE* f_ = nullptr;
     std::uint64_t data_base_ = 0;
     std::map<std::string, StTensor> tensors_;

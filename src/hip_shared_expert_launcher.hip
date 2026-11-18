@@ -1,5 +1,7 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "core/row_layout.hpp"
+#include "core/ordered_reduce.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
@@ -587,13 +589,9 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
 }
 
 // Cohort rows: the same activation and scalar gate as rows_shared_activation_scalar_kernel for rows that are not
@@ -618,16 +616,37 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_site_k
     float sum = 0.0F;
     for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
         sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
 }
 
-// Opt-in producer: retain the FP32 image and the scalar's 256-leaf tree; only the tiled prefix also writes FP16.
+// The shared gate of one row: the scalar dot (thread-strided sums, the 256-leaf tree) and its sigmoid at
+// workspace[intermediate_size]. One body for the activation/scalar pre-kernel and the dot-only kernel of the paired route.
+__device__ __forceinline__ void shared_gate_dot(float* workspace, const std::uint16_t* input, const void* scalar_weights,
+    std::uint32_t intermediate_size, std::uint32_t input_width, float* scratch) {
+    float sum = 0.0F;
+    // Unrolled for loads in flight (one CTA per row is latency bound); the sum keeps its sequential feature order.
+#pragma unroll 10
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    // The scratch halving tree, levels 16..1 in wave 0 registers (same pairing and bits, 3 barriers instead of 9).
+    const float dot = ::strix::core::ordered_reduce::tree_to_lane0<kThreads>(scratch, sum, threadIdx.x);
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-dot));
+}
+// Paired route (core/glu_pair.hpp): the gate|up epilogue already wrote act16, only the shared gate remains (one CTA per row).
+__global__ void __launch_bounds__(kThreads) rows_shared_gate_dot_kernel(std::uint64_t workspace_base,
+    std::uint64_t workspace_stride, std::uint64_t input_base, std::uint64_t input_stride, const void* scalar_weights,
+    std::uint32_t intermediate_size, std::uint32_t input_width) {
+    __shared__ float scratch[kThreads];
+    shared_gate_dot(reinterpret_cast<float*>(workspace_base + blockIdx.y * workspace_stride),
+        reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride), scalar_weights, intermediate_size,
+        input_width, scratch);
+}
+
+// Opt-in producer for the tiled prefix (every row it covers feeds the kPre down from FP16): FP16 activation plus the
+// scalar's 256-leaf tree. The FP32 activation has no reader on these rows and is not written (tail rows keep the
+// complete activation kernel).
 __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_pre_kernel(
     std::uint64_t workspace_base, std::uint64_t workspace_stride, std::uint64_t input_base,
     std::uint64_t input_stride, const void* scalar_weights, std::uint32_t intermediate_size,
@@ -638,8 +657,9 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_pre_ke
     if (index < intermediate_size) {
         const float gate = workspace[index];
         const float up = workspace[intermediate_size + index];
-        const float act = (gate / (1.0F + expf(-gate))) * up;
-        workspace[index] = act;
+        // The product as one v_mul_f32: without an FP32 store, LLVM would fold it with the FP16 cast into one
+        // v_fma_mixlo_f16 (a single rounding, 1-ulp different from the FP32 activation's RNE FP16).
+        const float act = core::glu_pair::act(gate, up);
         if (blockIdx.y < pre_rows) {
             a16[blockIdx.y * q8_rows::tiled::scratch_pitch(intermediate_size) + index] = static_cast<_Float16>(act);
             unsigned bad = isfinite(act) && !(fabsf(act) <= 65504.0F);
@@ -649,17 +669,8 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_pre_ke
         }
     }
     if (blockIdx.x != 0) return;
-    const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
-    float sum = 0.0F;
-    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
-        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
-    scratch[threadIdx.x] = sum;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+    shared_gate_dot(workspace, reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride), scalar_weights,
+        intermediate_size, input_width, scratch);
 }
 
 template <
@@ -1602,6 +1613,7 @@ __device__ __forceinline__ float shared_rows_coefficient(unsigned scale, std::in
 }
 // gate then up (two segments) into each row's contiguous FP32 workspace.
 template <unsigned Rows> struct SharedGateUpRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::shared_expert;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -1616,6 +1628,7 @@ template <unsigned Rows> struct SharedGateUpRowsSite {
     __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = value; }
 };
 template <unsigned Rows> struct SharedDownRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::shared_expert;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = float;
     static constexpr unsigned rows = Rows;
 #if defined(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)
@@ -1653,8 +1666,33 @@ struct SharedGateUpTiledSite {
         reinterpret_cast<float*>(output0 + r * output_stride)[out] = value;
     }
 };
+// Paired gate|up of the shared-pre rows (core/glu_pair.hpp, STRIX_QPF2K_GLU_PAIR): outputs interleave 16-blocks of
+// gate and up, the epilogue writes the kPre down's FP16 activation rows (and its overflow count) directly; no FP32
+// gate|up or activation image. Inject (fixture only): FP32 gate|up rows (2 * features, compact) replace the accumulators.
+template <bool Inject = false> struct SharedGluPairTiledSite {
+    using Input = std::uint16_t;
+    static constexpr bool glu_pair = true;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;  // gate, up: features outputs each
+    std::uint32_t width, outputs;
+    _Float16* a16;  // rows at q8_rows::tiled::scratch_pitch(features)
+    unsigned* overflow;
+    const float* injected;
+    __device__ void store_pair(std::uint32_t feature, std::uint32_t r, bool live, float gate, float up) const {
+        const std::uint32_t features = outputs / 2U;
+        if constexpr (Inject) {
+            const float* row = injected + static_cast<std::uint64_t>(r) * outputs;
+            gate = live ? row[feature] : 0.0F;
+            up = live ? row[features + feature] : 0.0F;
+        }
+        core::glu_pair::store(a16 + static_cast<std::uint64_t>(r) * q8_rows::tiled::scratch_pitch(features) + feature, live,
+            gate, up, overflow);
+    }
+};
 struct SharedDownTiledSite {
     using Input = float;
+    static constexpr unsigned dense_lean_site = 32U;  // STRIX_QPF2K_DENSE_LEAN_SITES bit 32: FP16-scratch A form 4 (DENSE_FORM=4: -20 %)
     const unsigned char* input0;  // the workspace rows: activation [intermediate] then the shared gate
     std::uint64_t input_stride;
     q8_rows::Segments segments;
@@ -2211,9 +2249,16 @@ KnownSharedR2Views known_shared_prefill_views(std::span<const ExecutionDispatchC
     }
     return views;
 }
+// The shared-pre FP16 preimage pool: one slot per stream (gate|up may itself use tiled::scratch and grow it after the
+// admission). Callers hold shared_pre_mutex() while they use a slot.
+struct SharedPreSlot { void* p = nullptr; std::uint64_t bytes = 0; };
+std::mutex& shared_pre_mutex() { static std::mutex mutex; return mutex; }
+std::map<hipStream_t, SharedPreSlot>& shared_pre_slots() { static std::map<hipStream_t, SharedPreSlot> slots; return slots; }
 bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
     hipStream_t stream, const HipSharedExpertLauncherConfig& config, bool first_barrier = false,
-    int shared_pre_override = -1, const float* injected_gate_up = nullptr) {
+    int shared_pre_override = -1, const float* injected_gate_up = nullptr, int glu_pair_override = -1,
+    unsigned paired_form = ~0U, SharedPreFixtureRoute* route = nullptr) {
+    if (route) *route = {};
     const auto& s = views.shape;
     const auto at = [&](std::uint64_t r) {
         auto v = views;
@@ -2247,12 +2292,8 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
         pre_site.output0 = reinterpret_cast<unsigned char*>(views.output.address); pre_site.output_stride = s.output_stride_bytes;
         if (q8_rows::tiled::supported(pre_site, pre_rows) && q8_rows::tiled::supported(pre_site, pre_rows, q8_rows::tiled::kPre)) {
             try {
-                // A distinct per-stream pool: gate|up may itself use tiled::scratch and grow it after this admission.
-                struct Slot { void* p = nullptr; std::uint64_t bytes = 0; };
-                static std::mutex mutex;
-                static std::map<hipStream_t, Slot> slots;
-                const std::lock_guard lock(mutex);
-                auto& slot = slots[stream];
+                const std::lock_guard lock(shared_pre_mutex());
+                auto& slot = shared_pre_slots()[stream];
                 const auto bytes = (static_cast<std::uint64_t>(pre_rows) + 255U) / 256U * 256U *
                     q8_rows::tiled::scratch_pitch(s.intermediate) * 2U;
                 if (slot.bytes < bytes) {
@@ -2279,9 +2320,59 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
             }
         }
     }
+    // Paired gate|up (core/glu_pair.hpp): with the FP16 preimage admitted and the tiled gate|up admitted for the same rows,
+    // the gate|up epilogue writes the preimage itself (same SiLU, RNE cast and overflow count as the pre-kernel) and the
+    // activation pass shrinks to the scalar gate's dot. STRIX_QPF2K_GLU_PAIR: 0 = pre-kernel, 1 = paired (default form
+    // rule), 2 = paired on form 0. Any failed check keeps the pre-kernel route.
+    static const int glu_pair_env = strix::envcfg::integer("STRIX_QPF2K_GLU_PAIR", 1);
+    const int glu_pair = glu_pair_override < 0 ? glu_pair_env : glu_pair_override;
+    const auto fill_pair = [&](auto& site) {
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
+            {reinterpret_cast<const void*>(views.weights.up_q8.address), s.intermediate}});
+        site.width = s.hidden; site.outputs = 2U * s.intermediate;
+        site.input0 = reinterpret_cast<const unsigned char*>(views.input.address); site.input_stride = s.input_stride_bytes;
+        site.a16 = pre_image; site.overflow = pre_overflow; site.injected = injected_gate_up;
+    };
+    bool paired = false;
+    if (pre_image && (glu_pair == 1 || glu_pair == 2) && q8_rows::tiled::site_enabled(16U) && tiled_rows >= q8_rows::tiled::min_rows(16U)) {
+        SharedGluPairTiledSite<> site{};
+        fill_pair(site);
+        paired = q8_rows::tiled::supported(site, pre_rows);
+    }
+    if (route) {
+        route->producer = paired ? SharedPreProducer::paired : pre_image ? SharedPreProducer::pre_kernel
+            : SharedPreProducer::complete_activation;
+        if (paired) route->fallback = SharedPreFallback::none;
+        else if (pre_image) {
+            if (glu_pair != 1 && glu_pair != 2) route->fallback = SharedPreFallback::pair_disabled;
+            else if (!q8_rows::tiled::site_enabled(16U)) route->fallback = SharedPreFallback::pair_site_disabled;
+            else if (tiled_rows < q8_rows::tiled::min_rows(16U)) route->fallback = SharedPreFallback::pair_short_rows;
+            else route->fallback = SharedPreFallback::pair_unsupported;
+        } else if (!(shared_pre_override < 0 ? shared_pre_env : shared_pre_override != 0))
+            route->fallback = SharedPreFallback::disabled;
+        else if (qpf2k::suppressed(qpf2k::Item::shared_pre) || qpf2k::suppressed(qpf2k::Item::dense))
+            route->fallback = SharedPreFallback::suppressed;
+        else if (!tiled_rows) route->fallback = SharedPreFallback::short_rows;
+        else route->fallback = SharedPreFallback::preimage_unavailable;
+    }
     const auto tiled = [&](bool down) -> std::uint64_t {
         if (!tiled_rows || !q8_rows::tiled::site_enabled(down ? 32U : 16U) || tiled_rows < q8_rows::tiled::min_rows(down ? 32U : 16U)) return 0U;
         const auto n = static_cast<std::uint32_t>(tiled_rows);
+        if (!down && paired) {
+            const unsigned form = paired_form != ~0U ? paired_form : glu_pair == 2 ? 0U : ~0U;
+            // Same any-order rule as the FP32 gate|up below (it reads only the MoE input).
+            if (injected_gate_up) {
+                SharedGluPairTiledSite<true> site{};
+                fill_pair(site);
+                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form, route ? &route->form : nullptr);
+            } else {
+                SharedGluPairTiledSite<> site{};
+                fill_pair(site);
+                q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled(), ~0U, 0U, form, route ? &route->form : nullptr);
+            }
+            check_hip(hipGetLastError(), "known shared prefill paired gate|up launch");
+            return tiled_rows;
+        }
         if (down && pre_image) {
             q8_rows::tiled::launch_projection<SharedDownTiledSite, q8_rows::tiled::kPre>(pre_site, pre_rows, stream, false,
                 q8_rows::tiled::form<SharedDownTiledSite>(q8_rows::tiled::kPre), q8_rows::tiled::raster(q8_rows::tiled::kPre), pre_image);
@@ -2320,16 +2411,29 @@ bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
             else { known_shared_engine_projection<8U>(down, at(r), stream, config, any); r += 8U; }
         }
     };
+    if (paired) {
+        // The shared gate's dot first (it reads only the input): the paired gate|up then writes the FP16 preimage just
+        // before its down reads it, still MALL-resident (a dot between them evicts it: down +6 % measured).
+        hipLaunchKernelGGL(rows_shared_gate_dot_kernel, dim3(1U, pre_rows), dim3(kThreads), 0, stream, views.workspace.address,
+            s.workspace_stride_bytes, views.input.address, s.input_stride_bytes,
+            reinterpret_cast<const void*>(views.weights.shared_gate_f32.address), config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "known shared prefill shared gate dot launch");
+    }
     each_width(false);
-    // Diagnostic injection is after the real gate|up transaction and before either activation producer.
-    if (injected_gate_up) check_hip(hipMemcpy2DAsync(reinterpret_cast<void*>(views.workspace.address), s.workspace_stride_bytes,
-        injected_gate_up, 2U * s.intermediate * sizeof(float), 2U * s.intermediate * sizeof(float), rows.size(),
-        hipMemcpyDeviceToDevice, stream), "shared pre diagnostic gate/up injection");
+    // Diagnostic injection is after the real gate|up transaction and before either activation producer. Paired rows
+    // read the injection in their epilogue; only the other rows take the copy (it would overwrite the gate's float).
+    const std::uint64_t injected_from = paired ? pre_rows : 0U;
+    if (injected_gate_up && injected_from < rows.size())
+        check_hip(hipMemcpy2DAsync(reinterpret_cast<void*>(views.workspace.address + injected_from * s.workspace_stride_bytes),
+            s.workspace_stride_bytes, injected_gate_up + injected_from * 2U * s.intermediate, 2U * s.intermediate * sizeof(float),
+            2U * s.intermediate * sizeof(float), rows.size() - injected_from, hipMemcpyDeviceToDevice, stream),
+            "shared pre diagnostic gate/up injection");
     if (pre_image) {
         static std::atomic<bool> witnessed{false};
         if (!witnessed.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr, "qpf2k shared pre active (rows %u, stream %p)\n", pre_rows, static_cast<void*>(stream));
-        hipLaunchKernelGGL(rows_shared_activation_scalar_pre_kernel,
+            std::fprintf(stderr, "qpf2k shared pre active (rows %u, stream %p, glu pair %d)\n", pre_rows, static_cast<void*>(stream),
+                paired ? 1 : 0);
+        if (!paired) hipLaunchKernelGGL(rows_shared_activation_scalar_pre_kernel,
             dim3((config.intermediate_size + kThreads - 1U) / kThreads, pre_rows),
             dim3(kThreads), 0, stream, views.workspace.address, s.workspace_stride_bytes, views.input.address,
             s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
@@ -2358,11 +2462,31 @@ unsigned shared_expert_shared_pre_fixture_overflow_count() { return q8_rows::den
 
 // Explicit fixture seam, independent of the immutable production environment parser; admission is still mandatory.
 bool shared_expert_shared_pre_fixture_launch(std::span<const ExecutionDispatchContext> rows,
-    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up) {
+    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up, int glu_pair,
+    unsigned paired_form, SharedPreFixtureRoute* route) {
     const auto views = known_shared_prefill_views(rows, config);
     const auto stream = known_shared_rows_stream();
     check_hip(hipPeekAtLastError(), "shared pre fixture stale launch error");
-    return known_shared_prefill_enqueue(rows, views, stream, config, false, shared_pre ? 1 : 0, injected_gate_up);
+    return known_shared_prefill_enqueue(rows, views, stream, config, false, shared_pre ? 1 : 0, injected_gate_up, glu_pair,
+        paired_form, route);
+}
+std::vector<std::uint16_t> shared_expert_shared_pre_fixture_a16(void* raw_stream, std::uint32_t rows, std::uint32_t features) {
+    const auto stream = static_cast<hipStream_t>(raw_stream);
+    const auto pitch = static_cast<std::uint64_t>(q8_rows::tiled::scratch_pitch(features));
+    std::vector<std::uint16_t> image(static_cast<std::size_t>(rows * pitch)), result;
+    {
+        const std::lock_guard lock(shared_pre_mutex());
+        const auto it = shared_pre_slots().find(stream);
+        if (it == shared_pre_slots().end() || !it->second.p || it->second.bytes < image.size() * 2U)
+            throw std::logic_error("shared pre fixture: no preimage slot for this stream");
+        check_hip(hipStreamSynchronize(stream), "shared pre fixture preimage drain");
+        check_hip(hipMemcpy(image.data(), it->second.p, image.size() * 2U, hipMemcpyDeviceToHost), "shared pre fixture preimage read");
+    }
+    result.reserve(static_cast<std::size_t>(rows) * features);
+    for (std::uint64_t r = 0; r < rows; ++r)
+        result.insert(result.end(), image.begin() + static_cast<std::ptrdiff_t>(r * pitch),
+            image.begin() + static_cast<std::ptrdiff_t>(r * pitch + features));
+    return result;
 }
 
 void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
@@ -2555,10 +2679,10 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
 void shared_expert_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
     const auto stream = static_cast<hipStream_t>(raw_stream);
-    if (segments.size() < 2U || segments.size() > 8U || !stream)
-        throw std::invalid_argument("known-window cohort shared rows require two to eight sessions and a stream");
-    std::array<KnownSharedR2Views, 8> views{};
-    std::array<unsigned, 8> counts{};
+    if (segments.size() < 2U || segments.size() > kCohortWideMaxSessions || !stream)
+        throw std::invalid_argument("known-window cohort shared rows require two to sixteen sessions and a stream");
+    std::array<KnownSharedR2Views, kCohortWideMaxSessions> views{};
+    std::array<unsigned, kCohortWideMaxSessions> counts{};
     unsigned total = 0;
     std::uint64_t workspace_extent = 0;
     for (std::size_t k = 0; k < segments.size(); ++k) {

@@ -153,7 +153,7 @@ by construction: the node reproduces the plain chunk body byte for byte, then ru
   thread decodes too) into a per-connection buffer, then the usual segment parse, bounds and coverage checks run.
   Decoded chunks are limited to 256 MiB. The chunk reply adds `wire_bytes`, `decoded_bytes` and `decode_ms`; the
   commit reply adds `wire_bytes` and `encoding`.
-- **Producer** (`src/cuda/qwen_handoff.cpp`, service flags):
+- **Producer** (`src/cuda/models/qwen/qwen_handoff.cpp`, service flags):
   - `--handoff-codec bp-v1|identity` (default identity) chooses the encoding. A request can override it with
     `"handoff_codec"`. The producer falls back to plain chunks when the node does not list the codec.
   - `--handoff-encode-threads N` (4) sets the encoder workers.

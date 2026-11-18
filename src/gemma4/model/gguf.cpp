@@ -61,6 +61,12 @@ ModelManifest load_gguf_model(const std::filesystem::path& path) {
     const auto* pattern = info.find_metadata("gemma4.attention.sliding_window_pattern");
     if (!pattern || pattern->unsigned_array.size() != layers) throw std::runtime_error("missing GGUF layer schedule");
     ModelManifest m;
+    std::shared_ptr<const weight::Source> source;
+    auto status = weight::open_source(path.string(), source);
+    weight::TensorIndex index;
+    if (status) status = weight::index_gguf(info, source, index);
+    if (status) status = weight::bind_gemma4(index, m.weights);
+    if (!status) throw std::runtime_error("gemma4 admission: " + status.detail);
     for (std::uint32_t l = 0; l < layers; ++l) {
         const bool g = l % 6 == 5;
         if (pattern->unsigned_array[l] != (g ? 0U : 1U)) throw std::runtime_error("unsupported GGUF attention schedule");

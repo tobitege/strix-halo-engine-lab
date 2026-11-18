@@ -174,15 +174,15 @@ Compilación y después la ejecución medida (exactitud y velocidad; un servidor
 de extremo a extremo):
 
 ```powershell
-pwsh src/glm/rtxpf/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
+pwsh src/cuda/models/glm/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
     -TierstreamSource TIERSTREAM_DIR [-CutlassDir CUTLASS_DIR]
-python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `
+python -B src/cuda/models/glm/producer/decode_qualification_window.py --build BUILD_DIR `
     --model MODEL_DIR --prompt-dir PROMPT_DIR --unit-file OUT_DIR/glm-units.bin `
     --unit-manifest-sha256 MANIFEST_SHA256 --full-card --allow-gpu
 ```
 
 Para una tarjeta menor sustituya `--full-card` por `--vram-total-gib 24 --ram-total-gib 32` (o sus propios límites).
-El archivo de unidades, todas las opciones y las filas medidas: [guía de GLM RTX](../src/glm/rtxpf/README.md).
+El archivo de unidades, todas las opciones y las filas medidas: [guía de GLM RTX](../src/cuda/models/glm/README.md).
 
 El servicio de GLM (`glm_native_service`) acepta además `--dgpu auto|<uuid>`: comprueba mediante NVML, antes de
 cualquier llamada CUDA, que la tarjeta es una RTX PRO `sm_120` (`auto` elige la tarjeta válida con más memoria) y la

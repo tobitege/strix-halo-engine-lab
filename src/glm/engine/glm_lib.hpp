@@ -5,6 +5,7 @@
 // Dry run (design notes): while a LoadPlan is set, every call records the device allocations, staging and file
 // bytes it would use and returns null handles; nothing is read and nothing is allocated.
 #include "glm/engine/glm_mem.hpp"
+#include "strix/pinned_host.hpp"
 #include "glm/engine/glm_pack.hpp"
 #include "strix/glm/engine.hpp"
 
@@ -227,7 +228,7 @@ public:
     std::uint64_t allocated_bytes() const { return allocated_; }
     const std::vector<std::uint64_t>& recorded() const { return recorded_; }
     void release_staging() {
-        if (stage_) (void)hipHostFree(stage_);
+        if (stage_) (void)strix::host_pin::release(stage_);
         stage_ = nullptr;
         std::vector<std::uint8_t>().swap(whole_);
     }
@@ -484,7 +485,7 @@ private:
     static constexpr std::size_t kStage = std::size_t{1} << 30;  // > the largest slice (full lm_head on one node, ~476 MB)
     std::uint8_t* stage(std::uint64_t bytes) {
         if (bytes > stage_bytes_) throw std::runtime_error("staging buffer too small");
-        if (!stage_) hip_ok(hipHostMalloc(reinterpret_cast<void**>(&stage_), stage_bytes_, hipHostMallocDefault), "staging");
+        if (!stage_) hip_ok(strix::host_pin::allocate(reinterpret_cast<void**>(&stage_), stage_bytes_, hipHostMallocDefault), "staging");
         return stage_;
     }
     void plan_upload(std::uint64_t n) {

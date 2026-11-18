@@ -23,6 +23,8 @@
 //   __device__ static void shared(const Args<P>&, unsigned row, unsigned pos);
 #include <hip/hip_runtime.h>
 #include "device_plan_index.hpp"
+#include "../core/ordered_reduce.hpp"
+#include "../core/wave_uniform.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -240,21 +242,42 @@ __global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View 
     __syncthreads();
     if(failure){P::failure(v,t,failure|status,count,rows);return;}
     if(t<P::kExperts) {
+        // Exclusive prefix of the expert's count over the blocks, in block order (integer: any batching is the same
+        // bits). kBatch loads in flight per round instead of one dependent L2 round trip per block.
+        constexpr unsigned kBatch=16U;
         unsigned n=0U;
-        for(unsigned k=0;k<blocks;++k){unsigned* const c=scratch+PackedPlan<P>::kHead+k*P::kExperts+t;const unsigned x=*c;*c=n;n+=x;}
+        unsigned* const c=scratch+PackedPlan<P>::kHead+t;
+        for(unsigned k0=0;k0<blocks;k0+=kBatch) {
+            unsigned x[kBatch];
+#pragma unroll
+            for(unsigned j=0;j<kBatch;++j)x[j]=k0+j<blocks?c[(k0+j)*P::kExperts]:0U;
+#pragma unroll
+            for(unsigned j=0;j<kBatch;++j)if(k0+j<blocks){c[(k0+j)*P::kExperts]=n;n+=x[j];}
+        }
         if(n>P::kCountLimit)atomicOr(&failure,P::kInvalid);
         n_of[t]=n;
     }
     __syncthreads();
     if(failure){if(t==0U)atomicOr(scratch,failure);P::failure(v,t,failure|status,count,rows);return;}
     const unsigned n=t<P::kExperts?n_of[t]:0U,nb=(n+cap-1U)/cap;
-    if(t<P::kExperts){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
-    __syncthreads();
-    for(unsigned d=1U;d<P::kExperts;d<<=1U) {
-        unsigned x[3]={};
-        if(t>=d&&t<P::kExperts)for(unsigned k=0;k<3U;++k)x[k]=scan[k][t-d];
+    // Inclusive scans of (count, touched, batches) over the experts: one wave scan each, then the prefix of the wave
+    // totals (2 barriers instead of 2 x log2(kExperts) + 1). Integer sums mod 2^32: the same bits as Hillis-Steele.
+    {
+        constexpr unsigned kScanWaves=P::kExperts/32U;
+        static_assert(P::kExperts%32U==0U&&P::kExperts<=P::kThreads&&kScanWaves<=32U,"csr_scan: experts in whole waves");
+        __shared__ unsigned wave_total[3][kScanWaves];
+        const unsigned lane=t&31U,wave=::strix::core::wave_index(t);
+        unsigned in[3]={n,n!=0U,nb};
+        if(t<P::kExperts) {
+#pragma unroll
+            for(unsigned k=0;k<3U;++k)in[k]=::strix::core::ordered_reduce::wave_inclusive_scan(in[k],lane);
+            if(lane==31U)for(unsigned k=0;k<3U;++k)wave_total[k][wave]=in[k];
+        }
         __syncthreads();
-        if(t>=d&&t<P::kExperts)for(unsigned k=0;k<3U;++k)scan[k][t]+=x[k];
+        if(t<P::kExperts) {
+#pragma unroll
+            for(unsigned k=0;k<3U;++k){unsigned p=in[k];for(unsigned w=0;w<wave;++w)p+=wave_total[k][w];scan[k][t]=p;}
+        }
         __syncthreads();
     }
     if(t<experts) {

@@ -218,7 +218,7 @@
     "default": "CLI tool (not in the serving path)",
     "exact": "No engine effect; CPU-only full-file hashing and optional structural audits.",
     "gain": "No throughput claim",
-    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g needs separate supply.",
+    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g is fetched from its published repository.",
     "off_switch": "Omit the explicit CLI command; no startup work is installed.",
     "doc_anchor": "docs/operations/release-assets.md"
   },
@@ -559,10 +559,21 @@
     "name": "Batched MTP predictor priming",
     "flag_or_env": "STRIX_MTP_PRIME_ROWS",
     "default": "ON (STRIX_MTP_PRIME_ROWS=0 disables)",
-    "exact": "Same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
-    "gain": "MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
+    "exact": "Original eight-row route only: same binary at 262,144 tokens: end-of-prompt state digest (target state, predictor rows, held row), terminal FP32 logits digest, tokens and MTP acceptance counters equal on and off.",
+    "gain": "Original eight-row route only: MTP-route prompt at 262,144 tokens (YaRN f2, T8192): 210.9-213.2 -> 202.8-203.8 s, -8.1 to -10.0 s in three pairs; decode unchanged.",
     "preconditions": "MTP route with a tiled prompt and the production draft chain; other configurations keep the one-row loop.",
     "off_switch": "STRIX_MTP_PRIME_ROWS=0 (restart)",
+    "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
+  },
+  {
+    "engine": "qwen",
+    "name": "MTP priming batch capacity",
+    "flag_or_env": "STRIX_MTP_PRIME_BATCH",
+    "default": "64 rows, clamped to 8..128 (restart)",
+    "exact": "Shared per-row bodies and original eight-row HC/cache-projection tiles; compiler and native bitwise validation of wider batches are pending.",
+    "gain": "No wider-batch timing claim.",
+    "preconditions": "Same admission as STRIX_MTP_PRIME_ROWS. Allocation retries eight slots, then uses one-row priming; final row stays on the one-row path.",
+    "off_switch": "STRIX_MTP_PRIME_BATCH=8 restores original batches; STRIX_MTP_PRIME_ROWS=0 disables batching (restart)",
     "doc_anchor": "docs/optimizations.md#qwen-mtp-prime-rows"
   },
   {
@@ -696,6 +707,17 @@
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_SHARED_PRE=0",
     "doc_anchor": "docs/optimizations.md#qwen-shared-pre"
+  },
+  {
+    "engine": "qwen",
+    "name": "Paired GLU store for the shared-expert preimage",
+    "flag_or_env": "STRIX_QPF2K_GLU_PAIR",
+    "default": "1",
+    "exact": "Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle; final logits are identical at 8K, 32K and 128K.",
+    "gain": "Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node); request level within clock noise (-0.1 % at 8K, -0.5 % at 32K)",
+    "preconditions": "STRIX_QPF2K_SHARED_PRE admitted, tiled gate|up admitted for the same rows, features a multiple of 16.",
+    "off_switch": "STRIX_QPF2K_GLU_PAIR=0",
+    "doc_anchor": "docs/optimizations.md#qwen-glu-pair"
   },
   {
     "engine": "qwen",
@@ -1008,12 +1030,12 @@
   {
     "engine": "deepseek",
     "name": "Engram projection split across ranks",
-    "flag_or_env": "STRIX_DS41_ENGRAM_TP",
+    "flag_or_env": "STRIX_DS41_ENGRAM_TP; STRIX_DS41_ENGRAM_READY; STRIX_DS41_ENGRAM_FROM_LEAD",
     "default": "on for steps of up to 8 rows",
     "exact": "Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.",
     "gain": "R1 decode \u22120.61 ms/step (\u22122.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 \u22122.1 %, R2 \u22121.5 %, R4 \u22121.0 %, R6 \u22121.0 % (95 % intervals below zero), R8 \u22120.6 % (3/3 pairs faster)",
-    "preconditions": "Two ranks with the F8 Engram KV (STRIX_DS41_F16_AS_F8); otherwise each rank runs the full projection.",
-    "off_switch": "STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only)",
+    "preconditions": "Two ranks with the F8 Engram KV (STRIX_DS41_F16_AS_F8); otherwise each rank runs the full projection. Batch lead-row delivery requires startup agreement: both ranks enable it, have asynchronous direct readers, and fit the maximum step payload in scratch and communicator capacity; either refusal restores independent reads. Ready views require admitted routes for every chunk size, including the tail; otherwise use the full-payload exchange.",
+    "off_switch": "STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only); STRIX_DS41_ENGRAM_READY=0 (batch steps: halves by device copies instead of the ready views); STRIX_DS41_ENGRAM_FROM_LEAD=0 (pair batch steps: each rank reads its own Engram rows from storage)",
     "doc_anchor": "docs/optimizations.md#ds-engram-tp"
   },
   {
@@ -1851,6 +1873,17 @@
     "preconditions": "v4 prefill MoE core with the MT-fit row tiles (the defaults); a stage uses the side stream only when it has both MT8 and tail items.",
     "off_switch": "STRIX_MMX_PREFILL_TAIL_STREAM=0",
     "doc_anchor": "docs/optimizations.md#mm-pf-tail-stream"
+  },
+  {
+    "engine": "minimax",
+    "name": "Prefill MoE tail rows on the pipelined kernel",
+    "flag_or_env": "STRIX_MMX_PREFILL_PIPE_TAIL",
+    "default": "1",
+    "exact": "Same items, operands, k order and split partials; the partial block (MT 1-7) runs item_pipe with a guarded store. Fixture 12,480 cells memcmp vs item_core_v3; pair logits and both-rank state digests identical at 8K and 32K.",
+    "gain": "PAIR TTFT, valid runs without kfd evictions in the window: 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s.",
+    "preconditions": "MT-fit row plans (the default); class MT8 partial stays on the old kernel.",
+    "off_switch": "STRIX_MMX_PREFILL_PIPE_TAIL=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-pipe-tail"
   },
   {
     "engine": "minimax",
@@ -2712,6 +2745,17 @@
   },
   {
     "engine": "glm",
+    "name": "FAST shared expert on 128-row slices",
+    "flag_or_env": "STRIX_GLM_PF_WMMA_SHARED128",
+    "default": "on wherever the FAST WMMA prefill runs with 128-row tiles",
+    "exact": "Bitwise to the glm-pf-wmma-x identity (64-row slices equal on every buffer in hip_glm_pf_wmma_tests arm 7; pair 8K logits of both ranks equal).",
+    "gain": "Pair FAST 8K warm 8.606 -> 8.571 s (-0.4 %, 2 ABAB pairs); whole MoE call at 2048 rows 26.73 -> 26.54 ms.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 and STRIX_GLM_PF_WMMA_ROWS=128 (default).",
+    "off_switch": "STRIX_GLM_PF_WMMA_SHARED128=0 (64-row shared slices, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-shared128"
+  },
+  {
+    "engine": "glm",
     "name": "FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)",
     "flag_or_env": "STRIX_GLM_PF_KDA_WMMA",
     "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
@@ -2723,6 +2767,28 @@
   },
   {
     "engine": "glm",
+    "name": "Exact MLA absorb / out GEMM heads-mid CTA order (glm-pf-mla-gemm-heads)",
+    "flag_or_env": "STRIX_GLM_PF_MLA_GEMM_HEADS",
+    "default": "on (exact and FAST routes)",
+    "exact": "bitwise (placement only; prefill tests STRIX_GLM_PF_TEST_ONLY=mla 48 checks, v3 == v1 explicit arms and v3 == v2)",
+    "gain": "layer bench C 4096 t0 4096 us/row exact arm: absorb 2.38 -> 1.16, out 2.16 -> 2.01; pair e2e exact 8K one pair warm 12.24 / 12.52 s, cold 12.99 / 12.73 s (off / on): inside noise, rebased ABAB pending",
+    "preconditions": "mla_gemm_rows_v3 (default GEMM version 3)",
+    "off_switch": "STRIX_GLM_PF_MLA_GEMM_HEADS=0",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-gemm-heads"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST MLA absorb / out GEMMs on the shared FP16 WMMA tile core (glm-pf-mla-wmma-v1)",
+    "flag_or_env": "STRIX_GLM_PF_MLA_WMMA, STRIX_GLM_PF_MLA_OB16",
+    "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
+    "exact": "FAST identity (FP16-rounded activations, WMMA FP32 accumulation, one chain per output ascending in k); gate vs FAST without it KL 0.0053 / top-1 98.2 % / dNLL -0.0002, vs exact KL 0.0048 / 97.5 % / -0.0045 (1,536 rows prose / code / chat); the bf16 q-tilde image is bitwise to the operand conversion it replaces (the opt-in FP16 o-bar image is not bitwise at C 4096)",
+    "gain": "layer bench C 4096 us/row FAST arm absorb + o-bar + out 9.171 -> 7.938 (-5.0 ms per call, 22 calls per rank at 8K; o-bar image alone -2.6 ms per call over 4 ABAB pairs); pair FAST 8K (pre-#668 base, 3 strict ABAB pairs, against FAST without it) warm 8.504 -> 8.399 s (-1.2 %, 963 -> 975 tok/s), cold 9.847 -> 9.489 s (-3.6 %); rebased (with both images) ABAB pending",
+    "preconditions": "fused attn-wmma MLA core or the MLA DSA path, heads 32 / 64, rows >= 1; 16-byte aligned buffers",
+    "off_switch": "STRIX_GLM_PF_MLA_WMMA=0 (or exact mode); STRIX_GLM_PF_MLA_OB16 default off (opt-in =1 FP16 o-bar image: not bitwise at C 4096, no e2e gain)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-wmma"
+  },
+  {
+    "engine": "glm",
     "name": "FAST fused MLA/DSA attention core (glm-pf-attn-wmma)",
     "flag_or_env": "STRIX_GLM_PF_ATTN_WMMA",
     "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
@@ -2731,6 +2797,39 @@
     "preconditions": "32 MLA heads per rank (TP2).",
     "off_switch": "STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)",
     "doc_anchor": "docs/optimizations.md#glm-pf-attn-wmma"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST fused attention core reads q-tilde as a bf16 image",
+    "flag_or_env": "STRIX_GLM_PF_MLA_QT16",
+    "default": "on wherever the FAST fused MLA core runs with the v3 absorb GEMM",
+    "exact": "Bitwise to the glm-pf-attn-wmma identity: the absorb GEMM keeps its FP32 chains and stores tile::to_bf16 of each result, the operand bits the core made of FP32 q-tilde. hip_glm_prefill_tests (STRIX_GLM_PF_TEST_ONLY=mla): o-bar, MLA output and guards equal for T 32 and T 16 with finite and NaN/Inf latents; layer bench arm 23 == 21; pair 8K logits of both ranks equal in every A/B run.",
+    "gain": "Pair FAST 8K, warm: 8.617 -> 8.524 s median (-99 ms, 3 ABAB pairs: -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k; layer bench C 4096: absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 with the fused core (STRIX_GLM_PF_ATTN_WMMA not 0), 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.",
+    "off_switch": "STRIX_GLM_PF_MLA_QT16=0 (FP32 q-tilde, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-qt16"
+  },
+  {
+    "engine": "deepseek41",
+    "name": "DS41 FAST flash reads q as a bf16 image after RoPE",
+    "flag_or_env": "STRIX_DS41_FAST_ATTN_Q16",
+    "default": "on in ds41-attn-bf16flash-v1 layers when q_b runs on dense-q8a8-f16-v1",
+    "exact": "Bitwise: the q_b epilogue applies the flash prologue's rope_pair and tile::to_bf16; fast-dense test 0 differing values, pair 11,594 logits fnv equal in 12 processes.",
+    "gain": "q_b 2048x1024x8192 1.505 -> 1.352 ms; pair 11,594 warm ABAB +15/+30/-29 ms (no wall gain beyond noise).",
+    "preconditions": "STRIX_DS41_FAST_ATTN=2 flash layers, q_b on the FAST dense core (rows >= STRIX_DS41_FAST_DENSE_MIN_ROWS); other q_b forms keep FP32 q.",
+    "off_switch": "STRIX_DS41_FAST_ATTN_Q16=0 (FP32 q, same bits)",
+    "doc_anchor": "docs/optimizations.md#ds41-pf-flash-q16"
+  },
+  {
+    "engine": "minimax",
+    "name": "MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE",
+    "flag_or_env": "STRIX_MM_PF_MSA_Q16",
+    "default": "on in MSA mode 11 / 12 layers when q comes from the v4 dense core",
+    "exact": "Bitwise: dense_finish_kernel runs the same msa::norm_rope_lane and pack2; test_prefill_dense image + lo equal at T 9..4096; pair 8K state fnv equal in 6 runs.",
+    "gain": "pair 8K warm ABAB -1.87/-1.10/-0.50 s (directional; larger than the byte saving explains, being traced).",
+    "preconditions": "STRIX_MM_PF_MSA_FLASH flash layers, n > 8, v4 dense qkv (n >= 1024); library-GEMM rows keep FP32 q.",
+    "off_switch": "STRIX_MM_PF_MSA_Q16=0 (FP32 q, same bits)",
+    "doc_anchor": "docs/optimizations.md#mm-pf-msa-q16"
   },
   {
     "engine": "glm",

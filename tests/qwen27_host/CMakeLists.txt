@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+project(strix_qwen27_host LANGUAGES CXX)
+include(CTest)
+include(../../cmake/StrixDenseModels.cmake)
+# A consumer of the graph target must not need a family library or manual dependencies.
+add_executable(strix-dense-model-graph-link-tests ../dense_model_graph_link_tests.cpp)
+target_link_libraries(strix-dense-model-graph-link-tests PRIVATE strix_model_graph)
+if(MSVC)
+    target_compile_options(strix-dense-model-graph-link-tests PRIVATE /W4 /WX /permissive-)
+else()
+    target_compile_options(strix-dense-model-graph-link-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
+endif()
+add_test(NAME strix-dense-model-graph-link-tests COMMAND strix-dense-model-graph-link-tests)
+# Exercise the existing Gemma API after extracting its file/format reader.
+add_executable(strix-gemma4-shared-reader-tests ../gemma4_shared_reader_tests.cpp
+    ../../src/gemma4/model/safetensors.cpp)
+target_link_libraries(strix-gemma4-shared-reader-tests PRIVATE strix_weight_archive)
+target_include_directories(strix-gemma4-shared-reader-tests PRIVATE ../../src)
+if(MSVC)
+    target_compile_options(strix-gemma4-shared-reader-tests PRIVATE /W4 /WX)
+endif()
+add_test(NAME strix-gemma4-shared-reader-tests COMMAND strix-gemma4-shared-reader-tests)

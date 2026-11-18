@@ -200,10 +200,22 @@ struct Fixture {
         }
         return result;
     }
-    struct PreResult { std::vector<std::byte> arena; unsigned overflow; };
+    struct PreResult { std::vector<std::byte> arena; unsigned overflow; std::vector<std::uint16_t> a16; };
+    // The FP32 gate|up / activation floats of the shared-pre rows have no reader (their down reads the FP16 preimage,
+    // their gate is float 640): the producers may leave them unwritten. Zero them before comparing routes.
+    std::vector<std::byte> mask_dead(std::vector<std::byte> arena, unsigned pre_rows) const {
+        for (unsigned r = 0; r < pre_rows && r < contexts.size(); ++r) {
+            const auto at = static_cast<std::size_t>(temporary[r].address - scratch.address);
+            for (unsigned i = 0; i < 1280U; ++i)
+                if (i != 640U) std::fill_n(arena.begin() + static_cast<std::ptrdiff_t>(at + i * sizeof(float)), sizeof(float), std::byte{0});
+        }
+        return arena;
+    }
     // poison: the output and temporary views start from this byte (the rest of the arena from the seed), so a store
     // missing in both routes cannot hide behind a common initial value (compare two poisons, see written_equal).
-    PreResult run_pre(bool pre, const float* injection, hipStream_t stream, bool admitted = true, int poison = -1) {
+    // Explicit producers ignore inherited form/pair settings: 0 pre-kernel, 1 paired form 4, 2 paired form 0.
+    PreResult run_pre(bool pre, const float* injection, hipStream_t stream, bool admitted = true, int poison = -1, int pair = 1,
+        SharedPreFallback fallback = SharedPreFallback::none) {
         auto start = seed;
         if (poison >= 0)
             for (std::size_t r = 0; r < contexts.size(); ++r)
@@ -213,9 +225,19 @@ struct Fixture {
         write(scratch, start);
         const auto before = shared_expert_shared_pre_fixture_overflow_count();
         auto current = scope(); current.stream = stream;
+        SharedPreFixtureRoute route;
+        const unsigned requested_form = pair == 2 ? 0U : 4U;
         { const HipLaunchScope active(current);
-          require(shared_expert_shared_pre_fixture_launch(contexts, config, pre, injection) == (pre && admitted),
+          require(shared_expert_shared_pre_fixture_launch(contexts, config, pre, injection, pair, requested_form, &route) == (pre && admitted),
               "shared pre fixture did not take the requested admitted route"); }
+        const auto expected_producer = !pre || !admitted ? SharedPreProducer::complete_activation
+            : pair == 0 ? SharedPreProducer::pre_kernel : SharedPreProducer::paired;
+        const auto expected_fallback = !pre ? SharedPreFallback::disabled
+            : !admitted ? fallback : pair == 0 ? SharedPreFallback::pair_disabled : SharedPreFallback::none;
+        require(route.producer == expected_producer, "shared pre producer was not exercised");
+        require(route.fallback == expected_fallback, "shared pre fallback reason changed");
+        require(route.form == (expected_producer == SharedPreProducer::paired ? requested_form : ~0U),
+            "shared pre effective paired form was not exercised");
         check(hipStreamSynchronize(stream), "complete shared pre fixture");
         const auto delta = shared_expert_shared_pre_fixture_overflow_count() - before;
         auto result = read(scratch), masked = result;
@@ -237,7 +259,10 @@ struct Fixture {
         for (std::size_t w = 0; w < weight_views.size(); ++w) {
             require(read(weight_views[w]) == original_weights[w], "shared pre changed weight bytes"); guards(weight_views[w]);
         }
-        return {std::move(result), delta};
+        std::vector<std::uint16_t> a16;
+        if (pre && admitted)
+            a16 = shared_expert_shared_pre_fixture_a16(stream, static_cast<std::uint32_t>(contexts.size() / 32U * 32U), 640U);
+        return {std::move(result), delta, std::move(a16)};
     }
     // The window owner's detached form: a second stream and a private workspace at the arena's row
     // stride. Returns the arena run's bytes with the workspace rows read from the private copy; the
@@ -387,7 +412,7 @@ void shared_pre_fixtures(bool bench) {
     {
         Fixture short_rows(16U, false); short_rows.config.dense_f16_prefill = true; short_rows.prepare(0, false);
         const auto a = short_rows.run_pre(false, nullptr, short_rows.owner.stream, false);
-        const auto b = short_rows.run_pre(true, nullptr, short_rows.owner.stream, false);
+        const auto b = short_rows.run_pre(true, nullptr, short_rows.owner.stream, false, -1, 1, SharedPreFallback::short_rows);
         require(a.arena == b.arena && a.overflow == b.overflow, "shared pre changed a short path");
     }
     for (unsigned rows : {32U, 40U, 48U, 56U, 64U, 256U, 288U, 512U, 1000U, 1024U, 8192U}) {
@@ -401,18 +426,53 @@ void shared_pre_fixtures(bool bench) {
                 write(injection, bytes_of(values));
                 const auto* device = kind ? reinterpret_cast<const float*>(injection.address) : nullptr;
                 for (const auto stream : {f.owner.stream, side}) {
+                    const unsigned pre_rows = rows / 32U * 32U;
+                    const auto dead = [&](const std::vector<std::byte>& arena) { return f.mask_dead(arena, pre_rows); };
                     const auto a = f.run_pre(false, device, stream), b = f.run_pre(true, device, stream);
-                    require(a.arena == b.arena, "shared pre BF16 / complete FP32 temporary / guard bytes differ");
+                    require(dead(a.arena) == dead(b.arena), "shared pre BF16 / complete FP32 temporary / guard bytes differ");
+                    // Producers of the preimage: paired form 4, the activation pre-kernel, paired form 0. Same
+                    // FP16 bytes, gate, outputs and counter.
+                    for (const int pair : {0, 2}) {
+                        const auto c = f.run_pre(true, device, stream, true, -1, pair);
+                        require(dead(c.arena) == dead(b.arena), "paired gate|up changed output / gate / tail bytes");
+                        if (c.a16 != b.a16) {
+                            std::size_t n = 0, shown = 0;
+                            for (std::size_t k = 0; k < b.a16.size() && k < c.a16.size(); ++k) {
+                                if (b.a16[k] == c.a16[k]) continue;
+                                if (shown++ < 6) {
+                                    float act = 0.0F;
+                                    std::memcpy(&act, a.arena.data() + static_cast<std::size_t>(f.temporary[k / 640U].address - f.scratch.address) + (k % 640U) * sizeof(float), sizeof(act));
+                                    std::cerr << "a16 diff rows " << rows << " kind " << kind << " pair " << pair << " r " << k / 640U << " i " << k % 640U
+                                              << std::hex << " prod 0x" << b.a16[k] << " route 0x" << c.a16[k] << " oracle 0x"
+                                              << __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(act)) << std::dec << "\n";
+                                }
+                                ++n;
+                            }
+                            std::cerr << "a16 diffs " << n << " of " << b.a16.size() << " (sizes " << b.a16.size() << "/" << c.a16.size() << ")\n";
+                        }
+                        require(c.a16 == b.a16, "paired gate|up FP16 preimage bytes differ");
+                        require(c.overflow == b.overflow, "paired gate|up overflow counter delta differs");
+                    }
+                    // Preimage oracle: the RNE FP16 of the default route's FP32 activation (NaN: any NaN).
+                    require(b.a16.size() == static_cast<std::size_t>(pre_rows) * 640U, "shared pre preimage size");
+                    for (unsigned r = 0; r < pre_rows; ++r) for (unsigned i = 0; i < 640U; ++i) {
+                        float act = 0.0F;
+                        std::memcpy(&act, a.arena.data() + static_cast<std::size_t>(f.temporary[r].address - f.scratch.address) + i * sizeof(float), sizeof(act));
+                        const auto want = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(act));
+                        const auto got = b.a16[static_cast<std::size_t>(r) * 640U + i];
+                        const bool nan = (got & 0x7c00U) == 0x7c00U && (got & 0x3ffU);
+                        require(std::isnan(act) ? nan : got == want, "shared pre preimage differs from the FP16 of the default activation");
+                    }
                     if (stream == f.owner.stream) {
                         // Two poisons per route: written bytes (equal under both poisons) and their values must match, and
                         // every other output/temporary byte must keep its poison in both routes.
-                        const auto a1 = f.run_pre(false, device, stream, true, 0xa5), a2 = f.run_pre(false, device, stream, true, 0x5a);
-                        const auto b1 = f.run_pre(true, device, stream, true, 0x5a), b2 = f.run_pre(true, device, stream, true, 0xa5);
+                        const auto a1 = dead(f.run_pre(false, device, stream, true, 0xa5).arena), a2 = dead(f.run_pre(false, device, stream, true, 0x5a).arena);
+                        const auto b1 = dead(f.run_pre(true, device, stream, true, 0x5a).arena), b2 = dead(f.run_pre(true, device, stream, true, 0xa5).arena);
                         std::size_t written = 0;
-                        for (std::size_t i = 0; i < a1.arena.size(); ++i) {
-                            const bool wa = a1.arena[i] == a2.arena[i], wb = b1.arena[i] == b2.arena[i];
+                        for (std::size_t i = 0; i < a1.size(); ++i) {
+                            const bool wa = a1[i] == a2[i], wb = b1[i] == b2[i];
                             require(wa == wb, "shared pre wrote a different byte set than the default");
-                            require(!wa || a1.arena[i] == b1.arena[i], "shared pre written byte differs (distinct poison)");
+                            require(!wa || a1[i] == b1[i], "shared pre written byte differs (distinct poison)");
                             written += wa;
                         }
                         require(written > 0, "shared pre poison comparison saw no written bytes");
@@ -440,7 +500,7 @@ void shared_pre_fixtures(bool bench) {
                           require(shared_expert_shared_pre_fixture_launch(f.contexts, f.config, pre, device) == pre,
                               "queued shared pre route changed"); }
                     check(hipStreamSynchronize(stream), "complete queued shared pre reuse");
-                    require(read(f.scratch) == a.arena, "queued shared pre bytes differ");
+                    require(dead(read(f.scratch)) == dead(a.arena), "queued shared pre bytes differ");
                     require(shared_expert_shared_pre_fixture_overflow_count() - queued_before == 3U * a.overflow,
                         "queued shared pre counter deltas differ");
                 }
@@ -449,7 +509,7 @@ void shared_pre_fixtures(bool bench) {
             const bool prior_baseline = qpf2k::baseline; qpf2k::baseline = true;
             try {
                 const auto a = f.run_pre(false, nullptr, f.owner.stream, false);
-                const auto b = f.run_pre(true, nullptr, f.owner.stream, false);
+                const auto b = f.run_pre(true, nullptr, f.owner.stream, false, -1, 1, SharedPreFallback::suppressed);
                 require(a.arena == b.arena && a.overflow == b.overflow, "suppressed shared pre changed fallback");
             } catch (...) { qpf2k::baseline = prior_baseline; throw; }
             qpf2k::baseline = prior_baseline;

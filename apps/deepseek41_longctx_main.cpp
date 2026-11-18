@@ -56,7 +56,7 @@ using strix::hip_check;
 struct Args {
     std::string model, prompt_path, transport, state_in, state_out, tokens_out, logits_out;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, teacher = 0, generate = 16, max_positions = 0;
-    std::uint32_t chunk = 1024, window = 8, lanes = 4, moe_chunk = 4096, segment = 0;
+    std::uint32_t chunk = 1024, window = 8, lanes = 4, moe_chunk = 0, segment = 0;
     unsigned connect_timeout = 60;
     bool stream_experts = false, tp = true, row_split = false, gather = true, timing = false, prefill_only = false, prefill_rest = false;
 };

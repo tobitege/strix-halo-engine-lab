@@ -1,4 +1,5 @@
 #pragma once
+#include <span>
 #include "strix/compiled_mtp_draft_plan.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_runtime_allocator.hpp"
@@ -54,6 +55,7 @@ struct HipMtpBudget {
 struct HipMtpReservation {
     std::uint64_t device_pool_bytes=0,selector_payload_bytes=0,retained_payload_budget=0;
 };
+namespace session { class CyclePack; }
 class HipMtpResources;
 struct MtpNativeContext {
     const ModelContract* model=nullptr;
@@ -129,6 +131,11 @@ public:
     void defer_completion();
     [[nodiscard]] bool completion_deferred() const noexcept;
     void settle_deferred() const;
+    // STRIX_SERVE_CYCLE_PACK: fences several submitted owners (each on its own stream) with ONE host wait: the
+    // streams join the first owner's stream, one gather reads every first-error status, one fence. Each owner's
+    // next complete() then checks that status without its own copy and fence, so the caller must complete (or
+    // settle) every listed owner before enqueuing more work on it. Owners that are not pending are skipped.
+    static void complete_packed(std::span<const HipMtpResources* const> owners, session::CyclePack& pack);
     // Deferred completions: begun, carried into later work on the stream, completed by another entry.
     [[nodiscard]] std::array<std::uint64_t,3> deferred_counts() const noexcept;
     void fail() noexcept;

@@ -2,7 +2,7 @@
 
 `glm-pf-rtx-native-v1` is a hardware-native, numerically changing prefill
 candidate for sm_120. It is **not qualified or connected to automatic routing**.
-The [explicit full-model producer](../../../src/glm/rtxpf/producer/README.md)
+The [explicit full-model producer](../../../src/cuda/models/glm/producer/README.md)
 adds a persistent CUDA service, validated compressed cache, opportunistic
 expert tiers and the node's transactional wire sender. It is capped at 32K
 inputs and has no full-model device or composed-route qualification.
@@ -38,7 +38,7 @@ H128 block before SwiGLU.
 
 ## Decode and native FFN schedule
 
-The implementation lives in [src/glm/rtxpf](../../../src/glm/rtxpf/).
+The implementation lives in [src/cuda/models/glm](../../../src/cuda/models/glm/).
 The codebook, packed reader, fragment permutation, transforms and original
 provenance derive from
 [glm_trellis_device.hpp](../../../src/glm/moe/glm_trellis_device.hpp).
@@ -453,7 +453,7 @@ Missing data is `NO-REFERENCE`, never an exactness or quality pass.
 
 ## Standalone verification
 
-See the [benchmark instructions](../../../src/glm/rtxpf/bench/README.md) for
+See the [benchmark instructions](../../../src/cuda/models/glm/bench/README.md) for
 CPU fixtures, offline compilation/disassembly and a bounded GPU window.
 Host tests exhaust all 65,536 mul1 states independently for every admitted rate,
 compare packed decoding against node instruction emulation and a scalar bit

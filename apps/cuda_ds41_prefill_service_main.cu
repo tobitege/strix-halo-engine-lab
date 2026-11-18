@@ -4,7 +4,7 @@
 //
 //   strix-cuda-ds41-prefill-service MODEL.gguf [--host 127.0.0.1] [--port 8095] [--positions N]
 //       [--vram-cap-gib G] [--vram-reserve-gib G] [--no-auto-budget [--device-gib G | --tiers DHF..]] [--no-expert-residency]
-//       [--expert-rank FILE] [--xfer-group N] [--xfer-piece-mib N] [--host-gib G | --host-gib-auto G (opportunistic, e.g. 32)] [--overlay OVERLAY.gguf] [--host-pin-order layer|deadline|early]
+//       [--expert-rank FILE] [--xfer-group N] [--xfer-piece-mib N] [--host-gib G | --host-gib-auto G (opportunistic, e.g. 32)] [--overlay OVERLAY.gguf] [--host-pin-order auto (default: interleave when the layer order streams >= 10 GB from the file, else layer)|interleave|layer|deadline|early] [--file-ring-mib N (0 = auto: 4096 out of --host-gib under interleave, else 256)]
 //       [--host-commit-floor-gib F (20 with --host-gib-auto)] [--host-pin-wait-s S] [--slots S] [--chunk C] [--moe-chunk M]
 //       [--no-host-promote | --host-promote] [--host-promote-max-gib G] [--baseline]
 //       [--window W] [--io-threads N] [--engram-threads N] [--buffered] [--engram-upload mapped|stream]
@@ -73,8 +73,8 @@
 // Events on stdout (one JSON line each): {"event":"loaded",...}, {"event":"READY",...}, {"event":"request",...},
 // {"event":"STOPPED"}. SIGINT / SIGTERM stop accepting, finish the running prefill and exit.
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_replay.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/serve/json.hpp"
@@ -1500,6 +1500,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-rank") o.expert_rank = next();
         else if (a == "--xfer-group") o.xfer_group_experts = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--xfer-piece-mib") o.xfer_piece_mib = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--file-ring-mib") o.file_ring_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--engram-upload") o.engram_upload = next();
         else if (a == "--engram-cache-mib") o.engram_cache_mib = std::stoul(next());
         else if (a == "--no-gpu-probe") o.gpu_probe = false;
@@ -1701,6 +1702,7 @@ int main(int argc, char** argv) {
         freeaddrinfo(res);
 
         CudaPrefill p(model, o);
+        o = p.effective_options();  // one resolver: the service reports the host order / budget / ring the engine chose
         std::printf("{\"event\":\"loaded\",\"describe\":%s}\n", p.describe().c_str());
         std::fflush(stdout);
         Service svc(p, o, c);

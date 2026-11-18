@@ -1,7 +1,7 @@
-#include "glm/rtxpf/producer/policy.hpp"
-#include "glm/rtxpf/producer/dgpu.hpp"
-#include "glm/rtxpf/producer/schedule.hpp"
-#include "glm/rtxpf/producer/state_slices.hpp"
+#include "cuda/models/glm/producer/policy.hpp"
+#include "cuda/models/glm/producer/dgpu.hpp"
+#include "cuda/models/glm/producer/schedule.hpp"
+#include "cuda/models/glm/producer/state_slices.hpp"
 #include <iostream>
 #include <vector>
 using namespace strix::glm::rtxpf::producer;

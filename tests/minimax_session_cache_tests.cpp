@@ -529,6 +529,42 @@ int main() {
       std::memcpy(data.data() + 8 + header.size(), &value, sizeof(value));
       return data;
     };
+#ifdef __linux__
+    {
+      // Structurally valid EXL3 transport rejected only by value admission.
+      const auto model = dir / "nonfinite-pack";
+      std::filesystem::create_directories(model);
+      const std::string header = R"({"layer.trellis":{"dtype":"I16","shape":[8,8,32],"data_offsets":[0,4096]},"layer.suh":{"dtype":"F16","shape":[128],"data_offsets":[4096,4352]},"layer.svh":{"dtype":"F16","shape":[128],"data_offsets":[4352,4608]}})";
+      Bytes data(8 + header.size() + 4608, 0);
+      const auto length = static_cast<std::uint64_t>(header.size());
+      std::memcpy(data.data(), &length, 8);
+      std::memcpy(data.data() + 8, header.data(), header.size());
+      for (std::size_t at = 4096; at < 4608; at += 2) {
+        data[8 + header.size() + at] = 0;
+        data[8 + header.size() + at + 1] = 0x3c; // F16 one
+      }
+      atomic_write(model / "model.safetensors", data);
+      { strix::minimax::engine::detail::PackReader valid(model.string());
+        check(valid.weight_map().size() == 1, "finite transform fixture admitted"); }
+      data[8 + header.size() + 4097] = 0x7c; // F16 infinity
+      atomic_write(model / "model.safetensors", data);
+      const auto fd_count = [] {
+        std::size_t count = 0;
+        for ([[maybe_unused]] const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) ++count;
+        return count;
+      };
+      const auto before = fd_count();
+      for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        bool refused = false;
+        try { strix::minimax::engine::detail::PackReader invalid(model.string()); }
+        catch (const std::runtime_error& error) {
+          refused = std::string_view(error.what()).starts_with("MiniMax admission:");
+        }
+        check(refused, "nonfinite transform rejected by admission");
+        check(fd_count() == before, "rejected PackReader construction closes every descriptor");
+      }
+    }
+#endif
     for (const auto& name : {"visible.safetensors", ".weights.safetensors", ".cache/weights.safetensors", "sub/.cache/opaque-shard"}) {
       const auto path = dir / "model" / name;
       std::filesystem::create_directories(path.parent_path());
@@ -793,20 +829,40 @@ int main() {
     refuses([&] { tiny_disk.checkpoint(sample()); });
     check(!tiny_disk.on_disk("A"), "oversized disk checkpoint unpublished");
     const auto replacement_dir = dir / "replacement-peak";
+    constexpr std::uint64_t replacement_budget = 1400000;
     Exchange peak_exchange = [&](std::span<const std::uint8_t> phase_bytes) {
       std::string phase(phase_bytes.begin(), phase_bytes.end());
       if (phase.find("rank-durable") != std::string::npos) {
         std::uint64_t peak_bytes = 0;
         for (const auto& file : std::filesystem::directory_iterator(replacement_dir))
           if (file.path().extension() == ".session") peak_bytes += file.file_size();
-        check(peak_bytes <= 900000, "replacement durable peak within quota");
+        check(peak_bytes <= replacement_budget, "replacement durable peak within quota");
       }
       return Bytes(phase_bytes.begin(), phase_bytes.end());
     };
-    Cache replacement(c.compat, 0, 1, 32ULL << 20, replacement_dir, peak_exchange, 8, 900000);
+    Cache replacement(c.compat, 0, 1, 32ULL << 20, replacement_dir, peak_exchange, 8, replacement_budget);
     replacement.checkpoint(sample());
-    replacement.checkpoint(sample());
-    check(replacement.on_disk("A") && replacement.stats().evictions == 1, "replacement peak evicts old generation before writing");
+    auto replacement_victim = sample(); replacement_victim.id = "B";
+    replacement.checkpoint(replacement_victim);
+    auto replacement_value = sample(); replacement_value.sections[0].bytes[0] = 7;
+    replacement.checkpoint(replacement_value);
+    check(replacement.on_disk("A") && !replacement.on_disk("B") && replacement.stats().evictions == 1,
+          "replacement peak evicts another session while preserving the current generation");
+    check(replacement.resume("A", true).sections[0].bytes[0] == 7, "replacement publishes the new generation");
+    // A single generation fits 900 kB, but two cannot coexist. Refusal must
+    // preserve the old payload and manifest rather than deleting the current id.
+    const auto refused_replacement_dir = dir / "replacement-refused";
+    Cache refused_replacement(c.compat, 0, 1, 32ULL << 20, refused_replacement_dir, self, 8, 900000);
+    refused_replacement.checkpoint(sample());
+    const auto prior_checkpoint = encode(refused_replacement.resume("A", true));
+    const auto prior_manifest = read(refused_replacement_dir / "A.group", 100000);
+    const auto prior_disk_bytes = refused_replacement.stats().disk_bytes;
+    check(prior_disk_bytes > 450000 && prior_disk_bytes <= 900000, "replacement refusal fixture requires coexistence headroom");
+    refuses([&] { refused_replacement.checkpoint(replacement_value); });
+    check(refused_replacement.on_disk("A") && refused_replacement.stats().evictions == 0 &&
+              refused_replacement.stats().disk_bytes == prior_disk_bytes, "replacement refusal retains the old generation without eviction");
+    check(read(refused_replacement_dir / "A.group", 100000) == prior_manifest, "replacement refusal preserves manifest bytes");
+    check(encode(refused_replacement.resume("A", true)) == prior_checkpoint, "replacement refusal preserves restorable checkpoint bytes");
     // Independent Cache handles must not admit, publish or evict while another
     // writer holds the directory transaction across a collective exchange.
     auto lock_dir = dir / "lock-test";
@@ -823,8 +879,11 @@ int main() {
       }
       return Bytes(phase_bytes.begin(), phase_bytes.end());
     };
-    Cache writer(c.compat, 0, 1, 32ULL << 20, lock_dir, held_exchange, 8, 1400000);
-    Cache contender(c.compat, 0, 1, 32ULL << 20, lock_dir, self, 8, 1400000);
+    // This fixture publishes three generations of A while testing lock ownership.
+    // All retained generations remain charged; quota eviction is tested above.
+    const auto lock_budget = 3 * encode(sample()).size() + 4096;
+    Cache writer(c.compat, 0, 1, 32ULL << 20, lock_dir, held_exchange, 8, lock_budget);
+    Cache contender(c.compat, 0, 1, 32ULL << 20, lock_dir, self, 8, lock_budget);
     std::exception_ptr writer_error;
     std::thread writing([&] { try { writer.checkpoint(sample()); } catch (...) { writer_error = std::current_exception(); } });
     bool checkpoint_refused = false, delete_refused = false;
@@ -839,7 +898,7 @@ int main() {
     if (writer_error) std::rethrow_exception(writer_error);
     check(checkpoint_refused && delete_refused, "lock covers quota/publication/eviction/delete");
     contender.checkpoint(sample()); // replacement charges both generations at peak
-    check(contender.stats().disk_bytes <= 1400000, "replacement peak cap");
+    check(contender.stats().disk_bytes <= lock_budget, "replacement peak cap");
 #ifndef _WIN32
     // A separate process holds flock: library writers must honor the same lock.
     int ready[2], done_pipe[2];

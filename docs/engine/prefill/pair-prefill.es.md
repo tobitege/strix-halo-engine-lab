@@ -123,7 +123,16 @@ lugar de la de atención, y el estado de secuencia de la capa N se queda en la e
 traspaso. Los logits y los tokens generados tras el traspaso son iguales bit a bit a los de
 los cortes de capa entera. Medido a 32K: 22.5: 11.82/11.85 s, 23: 11.61-11.69 s, 23.5:
 11.84 s, 22: 12.08 s, por lo que el predeterminado sigue siendo 23; el medio paso sirve para
-prompts y modelos cuyos costes por capa sitúan el punto de equilibrio dentro de una capa. Un
+prompts y modelos cuyos costes por capa sitúan el punto de equilibrio dentro de una capa. Desde
+la política de chunks por longitud y los kernels QSA más rápidos, el medio corte 23.5 gana por
+debajo de 64K y pierde a 128K (la etapa B tiene 7 de las 12 capas QSA; el bloque de atención que
+cede, ~0.3 s a 32K y ~1.65 s a 128K, es menor que la diferencia entre etapas por debajo de 64K y
+mayor a 128K), así que sin corte explícito ni archivo de costes `qwen.pair_half_cut`
+(`STRIX_QWEN_PAIR_HALF_CUT`, auto: activo por debajo de 65,537 tokens de contexto; `0` mantiene
+23, `1` fuerza 23.5) lo elige por prompt (`cut-source=measured-default-half`). Medido exacto /
+FAST ms, 23 frente a 23.5: 8K 3,320 / 3,051 frente a 3,285 / 3,003; 32K 11,176 / 10,111 frente a
+11,105 / 10,023; 64K 21,604 / 19,634 frente a 21,512 / 19,369; 128K 42,489 / 38,123 frente a
+42,714 / 38,404; logits idénticos. Un
 archivo de costes (`STRIX_QWEN_PF_PIPE_COSTS`) puede añadir un objeto `attention` junto a
 `layers` (coste por capa del subbloque de atención, mismas unidades); solo entonces el modelo
 de costes ofrece también cortes de media capa. El tipo de corte y el equilibrio de media capa

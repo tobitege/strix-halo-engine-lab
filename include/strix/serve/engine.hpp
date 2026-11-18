@@ -190,6 +190,12 @@ struct GenerationJob {
     // Request field "draft_depth_max" (batched decoding, measurement): at most this many predictor drafts per
     // cycle for this request (0/absent = the engine's setting). Drafts only: never the request's output.
     std::uint32_t draft_depth_max = 0;
+    // Request field "copy_rows" (measurement): the widest context-copy verify window of this request in rows (1..16;
+    // <= 8 = no wide copy window; 0/absent = the engine's setting). Drafts only: never the request's output.
+    std::uint32_t copy_rows = 0;
+    // Request field "window_rows" (measurement): window row budget of the cohort steps this request runs in (1..16;
+    // 0/absent = the engine's setting; above 8 the marginal rule still decides). Packing only: never the request's output.
+    std::uint32_t window_rows = 0;
     // Request field "tool_draft" (batched decoding): strict tool-call frame proposals on/off for this request;
     // unset = the engine's setting (on by default; STRIX_BATCH_TOOL_DRAFT=0 turns it off). Drafts only.
     std::optional<bool> tool_draft;
@@ -211,6 +217,13 @@ struct GenerationJob {
     std::function<bool()> client_gone = {}; // connection lifetime guarded by the shared frontend
     // Resolves the virtual ids of prompt (strix/session/embed_rows.hpp); null: the prompt holds none.
     std::shared_ptr<const session::EmbedTable> embeds = {};
+    // Diagnostic only: record committed publish groups without requesting scores or changing decode.
+    bool trace_emissions = false;
+};
+
+struct TokenEmission {
+    std::int64_t steady_ns = 0;
+    std::uint64_t count = 0;
 };
 
 struct GenerationStats {
@@ -240,6 +253,8 @@ struct GenerationStats {
     // Steady-clock nanoseconds of the job's execution span, stamped by the queue when the job finishes (0: not
     // stamped). The power receipt of a request is taken over this span, not over the time its response is rendered.
     std::int64_t exec_begin_ns = 0, exec_end_ns = 0;
+    bool emission_trace = false;
+    std::vector<TokenEmission> token_emissions;
 };
 
 // A request-local failure preserves its terminal receipt without poisoning the engine.
@@ -298,6 +313,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::vector<std::uint32_t> pending_;
+    bool trace_emissions_ = false;
+    std::vector<TokenEmission> token_emissions_;
     std::shared_ptr<GenerationOutput> output_;
     GenerationProgress progress_;
     GenerationStats stats_;
@@ -443,6 +460,10 @@ public:
     // would spin. Returns has_queued_work() at return.
     bool wait_work_until(std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
+    // At most `max` waiting (not cancelled) entries in queue order, under the queue lock. The visitor must
+    // be cheap (no cache lock, no hashing) and must not re-enter the queue; it returns false to stop.
+    void visit_waiting(std::size_t max,
+        const std::function<bool(const GenerationJob&, const std::shared_ptr<GenerationTicket>&)>& visit) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
     // request in it). The observation it adds reads and writes only the queue's own counters, never an engine's

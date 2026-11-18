@@ -91,6 +91,11 @@ public:
                              unsigned rows, unsigned flag_stride, hipStream_t s) override;
     // The next reduction's TX slot for a producer that writes and publishes it (boundary_rows then only posts it).
     ProducerSlot producer_slot(unsigned rows, hipStream_t s) override;
+    // Split-producer chunk frame (xport/split_frame.hpp): the same slot produced in two column parts. The payload layout is
+    // SplitLayout{rows, 4096, head_cols}; the next boundary reads it with post_expand_split. Only the kernel-wait form
+    // without the bracket (the default) supports it; otherwise nullptr data (the engine then runs unsplit).
+    SplitSlot producer_slot_split(unsigned rows, unsigned head_cols, hipStream_t s) override;
+    void split_head(unsigned rows, unsigned head_cols) override;
     // Completion point for callers that end without the head (prefill chunks, gate_residual, G3 dumps): waits for every
     // posted exchange, seals the last deferred CRC and throws if any exchange failed. Results of the call are trusted
     // only after this (argmax() calls it itself). The engine's seam has no such hook yet: proposed as
@@ -121,6 +126,7 @@ private:
     std::size_t attention_bytes_ = 0;
     std::unique_ptr<Exchanger> xf_;
     std::uint64_t step_ = 0, layer_ = 0;
+    unsigned split_cols_ = 0;  // head columns of the split slot handed out by producer_slot_split() for the next boundary
     const float* produced_ = nullptr;  // the TX slot handed out by producer_slot() for the next boundary
     float* bracket_ = nullptr;  // [max_rows][4][4096], allocated on first boundary()
     bool kwait_ = true, use_bracket_ = false;

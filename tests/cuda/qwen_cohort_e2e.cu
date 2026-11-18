@@ -22,8 +22,8 @@
 //
 // Env: STRIX_QWEN_GGUF, STRIX_QWEN_MTP, STRIX_QWEN_DRAFT_VOCAB, STRIX_QWEN_MIN_P (0.7), STRIX_COHORT_DEPTH (7),
 // STRIX_COHORT_POLICY (fair|max).
-#include "strix/cuda_qwen_cohort.hpp"
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_cohort.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <cuda_profiler_api.h>

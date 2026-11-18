@@ -94,6 +94,13 @@ inline constexpr unsigned kMaxDenseJobs = 4;
 struct PrefillDenseJob {
     Exl3 w{};
     float* out = nullptr;
+    // Optional query image (MSA FAST flash layers; output % 128 == 0, 128-column heads): instead of out, the BF16
+    // image of each head after msa::norm_rope_lane (norm weights image_w [128], RoPE row image_rope[row]) as the flash
+    // core's query_op reads it, and with image_lo its lo terms (mode 12). Same bits as the flash prologue on out.
+    std::uint16_t* image = nullptr;
+    std::uint16_t* image_lo = nullptr;
+    const float* image_w = nullptr;
+    const void* image_rope = nullptr;  // const msa::RopeRow* (strix/minimax_msa.hpp)
 };
 bool prefill_dense_supported(const Exl3& w);
 std::size_t prefill_dense_workspace_bytes(const PrefillDenseJob* jobs, unsigned count, unsigned rows);
@@ -172,12 +179,27 @@ int prefill_pipe_override();
 // Under PIPE: paired MT8 bands. -1 = STRIX_MMX_PREFILL_PIPE_PAIR (default auto: calls >= 2048 rows), 0 = off,
 // 1 = every call, 2 = auto.
 void set_prefill_pipe_pair(int value);
+// Under PIPE: the MT8 class on 8 waves of one output tile each (in place of pairs and paired bands). -1 =
+// STRIX_MMX_PREFILL_PIPE_N16 (default off), 0 = off, 1 = on, 2 = auto (the calls without paired bands). Same bits.
+void set_prefill_pipe_n16(int value);
 // Dense linears under PIPE: tall bands. -1 = STRIX_MMX_PREFILL_DENSE_BAND (default 0 = off), 0 = off, 4 / 8 = bands of
 // 4 / 8 waves over 512 / 1024 rows.
 void set_prefill_dense_band(int value);
 // v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
 // 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
 void set_prefill_tail_stream(int on);
+// MoE numeric order contract: -1 = STRIX_MMX_PF_ORDER (default adaptive), 0 = adaptive (S from the expert's rows in
+// the chunk, today's identity), 1 = invariant (gate/up/down S = 1: bits independent of chunking, identity
+// mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it. The same switch binds the dense v4
+// linears (enqueue_prefill_dense) to core::fixed_linear_contract (S = kDenseFixedSplits); MoE + dense together are the
+// named identity mmx-pf-linear-s1-v1.
+// Test fixture only: one host thread, all device work synchronized before each
+// change, restore -1 before leaving the fixture. Never change a running engine.
+void set_prefill_moe_order(int invariant);
+bool prefill_order_invariant();
+inline constexpr int kDenseFixedSplits = 1;
+// Split of one dense v4 job: the fixed contract under the invariant order, else gemm_splits (the library's).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows);
 void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
 // Profiling only: `marker(label, stream, user)` after "start" and each launch ("gather", "gate_up[.mtN]", "finish",

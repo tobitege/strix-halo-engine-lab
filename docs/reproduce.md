@@ -119,7 +119,8 @@ and manifests. Unpinned sizes must be read from actual manifests/files; bpw is n
 | Engine | Mirror repository | Upstream source + revision | Files / layout | Size | License notes |
 |---|---|---|---|---|---|
 | Qwen | [Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) | `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` | `UD-Q4_K_XL/*.gguf`, merged as `Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf`; public base `MTP/*.gguf` | Target about 111.33 GB; default distilled sidecar 2,786,568,256 bytes | Qwen Community License; base MTP is not distill-g. |
-| Qwen GSQ | [Qwen3.8-Flash-Next-GSQ-hybrid-Q2](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-hybrid-Q2) | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f920` plus project composition recipe | `hybrid-q2.gguf`; same distilled draft/vocabulary prerequisites | Unpinned | Qwen Community License; separate numerical/quality identity. |
+| Qwen distill-g MTP head | [Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) | Distilled from the base `MTP/*.gguf` of `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` | `mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` | 2,786,568,256 bytes, SHA-256 `5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c` | Qwen Community License (`LICENSE` in the repository); fetched at revision `1233b2ca` through its `SHA256SUMS`. |
+| Qwen GSQ | [Qwen3.8-Flash-Next-GSQ-hybrid-Q2](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-hybrid-Q2) | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f920` (unmodified Q2_0 and IQ3_S mirror: [Qwen3.8-Flash-Next-GSQ-RCO-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-RCO-GGUF-mirror)) plus project composition recipe | `hybrid-q2.gguf`; same distilled draft/vocabulary prerequisites | Unpinned | Qwen Community License; separate numerical/quality identity. |
 | Qwen YaRN MTP bundle | Project recipe in this repository | Expanded distill-g pins and explicit 1M budgets | [`recipes/qwen-distill-g-yarn.mtp-bundle.json`](../recipes/qwen-distill-g-yarn.mtp-bundle.json); copy beside the GGUF as `<model>.mtp-bundle.json` | JSON only; sidecar and the `draft-vocab/` directory supplied separately | Preserves draft provenance; calibration caches locally on first use. |
 | DeepSeek pair/RTX | [deepseek-v4.1-flash-gguf-mirror](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror) | `kyuz0/deepseek-v4.1-flash-gguf@20408f69` | `DeepSeek-V4.1-Flash-1017-Q2.gguf`, `DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf` | 365,713,686,528 + 7,966,294,016 bytes | MIT; preserve notices. |
 | DeepSeek pair overlay | [DeepSeek-V4.1-Flash-1017-strix-dense-U6](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6) | Project conversion in same repository; immutable revision not recorded by fetcher | `c-u6.gguf`, `c-u6.json` | Unpinned | DeepSeek MIT; retain conversion provenance. |
@@ -128,6 +129,8 @@ and manifests. Unpinned sizes must be read from actual manifests/files; bpw is n
 | MiniMax | [MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) | `Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw@c33e7a66` | Under `minimax/`: same EXL3 patterns plus `dspark/*` | Exact bytes unpinned (3.06 bpw) | MiniMax Community License, non-commercial by default; attribution **Built with MiniMax M3.1-Flash**. Review commercial/distribution permission. |
 | MiniMax EXL3 draft | same MiniMax mirror | Project packs: the `dspark/` draft re-quantized to EXL3 4-bit (fc included) with `src/minimax/dspark/ref/quant_draft.py --K 4 --fc` | Under `minimax-drafts/`: `dspark-exl3-K4fc-sh/` (production, scaled-Hessian metric) and `dspark-exl3-K4fc/` (previous pack); each `config.json`, `model-dspark-exl3.safetensors`, `model.safetensors.index.json` | 1,134,088,202 bytes per weight file; sha256 `341142bb9d2b9cbe35ccdd5c32f9b21ca374cdc268f988e5ac843becc03f941d` (K4fc-sh) and `29b86c0e9df79eefce92146f498ca720a7e0703301cb44a720a07ab1566872d2` (K4fc), all files in the mirror's `SHA256SUMS` | Same MiniMax Community License and attribution as the MiniMax row. |
 | MiniMax draft provenance | [MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) | `incoai/MiniMax-M3.1-Flash-DFlash2@ac07a7c1` | Draft source; fetcher selects `dspark/*` from main MiniMax mirror rather than this separate mirror | Unpinned | Retain MiniMax and draft conversion terms. |
+| MiniMax H3 | Upstream only | [`Comfy-Org/MiniMax-H3@54472221`](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/54472221d27c695fca9621b0c3ed52f06c4af707), base `MiniMaxAI/MiniMax-H3@0919fb68` | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`, `vae/minimax_h3_video_vae_fp16.safetensors`, `vae/minimax_h3_audio_vae_fp32.safetensors`; 6-step LoRA and fast video VAE have no pinned public source; `te-pack/` built locally | 20,970,379,616 + 5,207,808,496 + 605,254,808 bytes | MiniMax H3 Community License: use and redistribution only outside the EU, UK, Republic of Korea and USA; NOTICE text required. |
+| MiniMax H3-Image | Upstream only | [`Comfy-Org/MiniMax-H3-Image@0bb149f5`](https://huggingface.co/Comfy-Org/MiniMax-H3-Image/tree/0bb149f51e3156ed4b90dd45d5620346bfe1df8f), base `MiniMaxAI/MiniMax-H3-Image@5f904730` | `diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors` or `..._w4a8.safetensors`, `vae/minimax_h3_image_vae_fp16.safetensors` (the runner's `--model` layout) | 20,979,314,802 or 12,549,794,530 + 1,168,505,312 bytes | MiniMax-H3-Image Community License, same territory clause. |
 
 The DeepSeek pair layout under `--model-dir models` is:
 
@@ -152,7 +155,9 @@ receipt and state below. Qwen continues to use its separate `draft-vocab/` direc
 For explicit CPU bundle integrity checks, see [release asset verification](operations/release-assets.md).
 
 Qwen additionally requires `mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` and `draft-vocab/`.
-The fetcher explicitly does not supply the locally distilled sidecar; never rename base MTP
+The Qwen fetch recipe downloads the distilled sidecar from [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)
+at a pinned revision, verifies it against that repository's `SHA256SUMS`
+(SHA-256 `5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c`) and places it beside the model. Never rename base MTP
 as distill-g. Even `plain` precheck requires these assets. RTX additionally needs deployment
 `MODEL.receipt.json` and exported `STATE.bin`, not downloaded or shipped. The receipt binds
 model hash, size and modification time; state must be a valid attention-state export.
@@ -598,6 +603,59 @@ SSH cleanup failure reports unverified teardown; the remote timeout still bounds
 The outer timeout includes setup/teardown plus forced-kill grace. Forced termination/network
 failure may prevent final report delivery; inspect retained evidence privately.
 
+### DeepSeek V4.1 CUDA prefill -> pair decode hand-off
+
+[`scripts/bench/hetpf/`](../scripts/bench/hetpf/README.md) runs the same prompt through three routes (CUDA prefill with
+the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
+breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
+
+### FAST prefill router product (GLM, MiniMax)
+
+[`scripts/bench/router-wmma/`](../scripts/bench/router-wmma/) holds the device unit gate and timing (`unit.sh BUILD_DIR
+OUT_DIR`: exact vs every WMMA launch form, overflow fallback rows, GPU clock and MemAvailable), the GLM TP2 scored
+prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and its FAST gate comparison
+(`score_cmp.py REF CAND PROMPT`: KL <= 0.02, top-1 >= 93 %, dNLL <= +0.01).
+
+### MiniMax pair: chunk-invariant linear order
+
+`STRIX_MMX_PF_ORDER=invariant` is the default (table item `pf_order`; `adaptive` is the off switch and the
+`STRIX_MM_BASELINE=1` value; a defaulted value that cannot run on a load, e.g. `STRIX_MM_MOE=off`, declines to
+`adaptive` with a printed reason, an explicit `invariant` stays a hard error). Quality evidence: 6 x 32K units of
+different content against 3 one-ulp L0 nulls each (`scripts/bench/chunkinv/gate32b_chain.sh`, `gate32b_stats.py`):
+pooled signed dNLL -0.053, 95 % CI [-0.148, +0.041], inside the null spread [-0.263, +0.240]; KL q50/q90 above every
+null in 0 of 6 units; needle/two-hop/QA task 40/42 in both orders. It binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared
+gate/up/down, MoE part `mmx-pf-moe-s1-v1`) and `core::fixed_linear_contract` for the dense q/k/v/o (S = 1; the v4 core
+runs every call whose `strix_gemm` split would differ): together the identity `mmx-pf-linear-s1-v1`, cache field
+`prefill_order=mmx-pf-linear-s1-v1`, receipt lever `minimax.linear_order`. `adaptive` keeps the former rows-dependent
+splits. Invariant order applies only to prefill; decode and verification retain their existing routes, including
+`STRIX_MM_LINEARS=load`. Startup rejects `STRIX_MM_LINEARS=off`, `STRIX_MM_MOE=off`, unsupported or missing dense
+weights, and insufficient dense workspace. Mandatory dense dispatch fails explicitly instead of falling back.
+Host engine-route regressions: configure `tests/minimax_route_host`, build Release, then run `ctest --output-on-failure -C Release`.
+Dense device gate: `strix-hip-mmx-moe-bench --test --tests test_prefill_dense` (chunks 256/1024/4096/whole,
+4096 + 1..17 tails, 1..17-row calls, library cross-check, adaptive control). Quality: the FAST logit gate floor rule with
+layer-0 nulls (`tools/strix-gate/README.md`, onset-matched floor). Gates:
+`strix-chunk-order-contract-tests` (host order reference, chunks 256/1024/4096/whole and 1..17-row tails) and
+`strix-hip-mmx-moe-bench --test --tests test_prefill_chunk_invariance` (device bytes). One pair run (TTFT, state FNV,
+MemAvailable, kfd `evicted_ms`, busy/sclk) is `scripts/bench/chunkinv/pair_run.sh --bin RANK --model DIR --peer HOST
+--out DIR STRIX_MMX_PF_ORDER=... -- <rank args>`, run inside the caller's pair GPU turn.
+Each run creates a fresh `DIR/run.*` on both hosts and preserves existing contents; peer collisions fail.
+Relative inputs are resolved from each host's launch directory. Failed ranks, collection failures or missing
+TTFT/state/token records return nonzero. The device fixture covers device-planned final outputs only, not
+host-planner cross-chunk equality, intermediate buffers, every variant or complete model state. The dense
+contract is used by invariant prefill linears; the fixtures alone do not qualify whole-engine invariance.
+
+### Prefill window-loop census from a kernel trace
+
+[`scripts/bench/prefill-trace/`](../scripts/bench/prefill-trace/README.md) reads a rocprofv3 kernel trace of a prefill
+process and reports the per-window launch loop of one run: span, GPU idle inside it, time per kernel kind, launches
+per hardware queue, and the compute-unit time the flash kernel and the kernels that cannot share a CU with it leave free.
+
+### MiniMax MSA flash layer ranges (FAST gate)
+
+[`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
+(one-term or two-term operands) against the exact path in one detached pair run: onset-matched one-ulp nulls for the
+floor rule, optional multi-site / magnitude nulls as a diagnostic, cold and warm TTFT, evicted_ms and GPU clocks per token.
+
 ## Long-context retrieval and reasoning checks (Qwen)
 
 `tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
@@ -657,7 +715,7 @@ measured by this adapter. Without `drafter-mtp/` the drafter arm is skipped and 
   Kit token exactness and reference candidates remain unavailable for MTP. Prompt lists are accepted.
 - The GLM pair HTTP server (`strix-glm5-serve`, see the [GLM page](models/glm-5.3/README.md#glm-serve)) is not driven
   by the kit yet; GLM RTX exposes a file queue, not this HTTP interface.
-- Default Qwen distill-g and some project assets still need separate publication/supply.
+- Default Qwen distill-g is published ([hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0)) and the Qwen fetch recipe downloads it; some other project assets still need separate publication/supply.
   Full-profile prerequisites remain required for prefill-only/plain-only runs.
 - List/all presence checks are not profile-aware for GSQ. Check does not establish native
   execution or fidelity; skip verification cannot establish model content.

@@ -1,5 +1,5 @@
 // Host-only production virtual-cache reader. No CUDA imports or device work.
-#include "glm/rtxpf/producer/shards.hpp"
+#include "cuda/models/glm/producer/shards.hpp"
 #include <iostream>
 #include <chrono>
 using namespace strix::glm::rtxpf::producer;

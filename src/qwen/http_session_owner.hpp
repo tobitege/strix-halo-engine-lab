@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/serve/queued_prefix_protection.hpp"
 #include "strix/serve/session_runtime.hpp"
 
 namespace strix::qwen {
@@ -36,6 +37,8 @@ public:
         std::function<bool()> stop_requested;
         std::function<void()> failed;
         std::mutex* session_mutex = nullptr;
+        // Optional cache binding of the queue protection (STRIX_PREFIX_QUEUE_PROTECT, default OFF).
+        serve::QueuedPrefixProtection::Binding queue_protection;
     };
 
     HttpSessionOwner(serve::GenerationQueue&, std::uint64_t context,
@@ -45,6 +48,7 @@ public:
     HttpSessionOwner& operator=(const HttpSessionOwner&) = delete;
     void run();
     serve::SessionRuntime& runtime() noexcept { return runtime_; }
+    [[nodiscard]] const serve::QueuedPrefixProtection::Stats& queue_protection_stats() const noexcept { return protection_.stats(); }
 
 private:
     class ControlEngine final : public session::Engine {
@@ -74,6 +78,7 @@ private:
     bool drained_ = false;
     enum class Turn { growth, admission, work } turn_ = Turn::growth;
     serve::SessionRuntime runtime_;
+    serve::QueuedPrefixProtection protection_;
 };
 
 } // namespace strix::qwen

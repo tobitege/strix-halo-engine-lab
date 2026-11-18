@@ -1,4 +1,5 @@
 #include "strix/route_receipt.hpp"
+#include "strix/prefill_headless.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-minimax-rank: one rank of the MiniMax M3.1 Flash TP2 engine (both ranks run the same command line).
@@ -18,11 +19,14 @@
 //   --tf ORACLE_DIR [--tf-write]                     full teacher-forced logits of ORACLE_DIR/rows.u32 (G4 form): fnv,
 //                                                     top-1 vs the real next token; --tf-write saves logits_pair.f32
 //   --session NAME:PROMPT.u32:STEPS                  prefill + STEPS greedy decode steps (repeatable)
-//   --profile NAME:PROMPT.u32:STEPS                  the same with synchronised per-phase times (slower)
+//   --timing-profile NAME:PROMPT.u32:STEPS           the same with synchronised per-phase times (slower); the old
+//                                                    spelling --profile NAME:PROMPT.u32:STEPS stays accepted (notice)
+//   --profile default|fast|quality|turbo             product profile (strix-minimax-serve takes the same switch)
+//   --turbo-weights native|onfly|converted           TURBO weight source (+ --turbo-weight-bits, --turbo-weights-pack)
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfheadless | pfdensemlp | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
@@ -47,6 +51,7 @@
 //   --decode-check PROMPT.u32:K                      decode steps (true tokens) vs teacher-forced logits, last K rows
 //   --deadline SECONDS                               skip later parts once rank 0 has run this long
 //   --slots S --capacity C --max-rows R              engine sizes (defaults 8 / 8256 / 4096)
+//   --unit-chunks N                                  prefill unit cap in chunks (0 = STRIX_MM_PF_GROUP, 1 = chunk-serial)
 // --offload NAME:PROMPT.u32:STEPS RTX-prefill reference form: prefill rows
 //                                                     [0, P-1), export this rank's state rows to
 //                                                     OUT_DIR/state-NAME-rank<r>.bin, then the last prompt row as a decode
@@ -57,6 +62,8 @@
 //                                                     PORT + r; per request the layers arrive as they finish and are
 //                                                     imported at once; rank 0 returns the last row's token to the
 //                                                     sender (its TTFT clock); repeated COUNT times (one connection each)
+//   --layercut-listen NAME:PROMPT.u32:PORT:STEPS:COUNT --cut K [--cut-block C] [--cut-act relay|direct]
+//   --cut-relay HOST:PORT (rank 0) / --cut-relay-listen PORT (rank 1): activation-only relay
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/minimax/engine.hpp"
 #include "../src/minimax/model_graph.hpp"
@@ -64,6 +71,13 @@
 #include "strix/dist/communicator.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/bp_codec.hpp"
+#include "strix/pair/state_relay.hpp"
+#include "strix/minimax_layercut.hpp"
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <limits>
+#include <climits>
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
@@ -85,6 +99,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -112,6 +127,9 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
     for (std::size_t i = 0; i < bytes; ++i) h = (h ^ b[i]) * 1099511628211ULL;
     return h;
 }
+
+std::vector<std::uint32_t> read_u32(const std::string& path);
+#include "minimax_layercut.inc"
 
 // The transport shared in turn by the communicator and the exchange module (shared exchange form).
 using Borrowed = strix::xport::BorrowedTransport<
@@ -358,8 +376,15 @@ int listen_on(std::uint16_t port) {
     if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(s, 4) != 0) throw std::runtime_error("offload-listen: bind/listen");
     return s;
 }
+// relay(local, remote, seq): one symmetric host exchange with the peer rank (remote empty = not wanted).
+using RelayX = std::function<void(std::span<const std::byte>, std::span<std::byte>, std::uint64_t)>;
+
+// Frames 'MMRX' / 'MMRB' carry the rank's whole K/V/IK block; with index keys once (strix/pair/state_owners.hpp, the
+// producer's --ik-once) 'MMRI' / 'MMRJ': rank 0 gets the whole block and relays the IK part to rank 1 on the pair link
+// (strix/pair/state_relay.hpp, hash checked), rank 1 gets the K/V head only. Both ranks agree on the mode at the first
+// frame. The imported bytes are the same in both modes; "state digest" folds every imported block to show it.
 std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::string& name, const std::vector<std::uint32_t>& prompt, int steps,
-                                          const std::string& out_dir, unsigned req) {
+                                          const std::string& out_dir, unsigned req, const RelayX& relay, std::size_t relay_chunk) {
     const std::size_t rows = prompt.size() - 1;
     std::printf("rank %u offload-listen %s #%u: waiting\n", eng.rank(), name.c_str(), req);
     std::fflush(stdout);
@@ -373,29 +398,59 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
     static strix::bp_codec::WorkerPool pool(4);
     const auto t0 = Clock::now();
     double t_first = -1, t_import = 0, t_decode = 0;
-    std::uint64_t wire_bytes = 0;
+    std::uint64_t wire_bytes = 0, digest = 0, seq = 1;
     unsigned layers = 0;
+    int mode = -1;  // -1 = not agreed yet, 0 = per-rank copies, 1 = index keys once
+    double t_relay = 0;
+    const std::size_t kv = rows * 1024;
+    const auto prompt_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(prompt.data()), prompt.size() * sizeof(prompt[0]));
+    const auto name_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(name.data()), name.size());
     for (;;) {
         std::uint32_t hdr32[2];
         std::uint64_t hdr64[2];
         read_full(fd, hdr32, 8);
         read_full(fd, hdr64, 16);
-        const bool bp = hdr32[0] == 0x42524d4dU;
-        if (hdr32[0] != 0x58524d4dU && !bp) throw std::runtime_error("offload-listen: bad frame");
-        if (hdr32[1] == 0xffffffffU) break;
-        if (hdr64[0] != rows || (!bp && hdr64[1] != block.size())) throw std::runtime_error("offload-listen: row count differs from the prompt");
+        const std::uint32_t m = hdr32[0];
+        const bool bp = m == 0x42524d4dU || m == 0x4A524d4dU, once = m == 0x49524d4dU || m == 0x4A524d4dU;
+        if (m != 0x58524d4dU && m != 0x42524d4dU && !once) throw std::runtime_error("offload-listen: bad frame");
+        const bool end = hdr32[1] == 0xffffffffU;
+        if (mode < 0) {  // both ranks at their first frame: the same mode or both refuse
+            if (once && !relay) throw std::runtime_error("offload-listen: index keys once needs the pair link");
+            const std::uint64_t mine[1] = {once ? 1U : 0U};
+            std::uint64_t peer[1] = {2};
+            if (relay) relay(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)), seq++);
+            if (relay && peer[0] != mine[0])
+                throw std::runtime_error("offload-listen: the ranks got different hand-off modes (index keys once on one rank only)");
+            mode = once ? 1 : 0;
+        } else if (!end && (mode == 1) != once) {
+            throw std::runtime_error("offload-listen: hand-off mode changed inside a session");
+        }
+        if (mode == 1)
+            strix::pair::state::relay_agree({req, prompt_hash, hdr32[1], 0, hdr64[0], name_hash}, relay, seq++);
+        if (end) break;
+        // Plain bytes this rank receives: the whole block, or the K/V head on rank 1 with index keys once.
+        const std::size_t plain = once && eng.rank() == 1 ? kv : block.size();
+        if (hdr64[0] != rows || (!bp && hdr64[1] != plain)) throw std::runtime_error("offload-listen: row count differs from the prompt");
         wire_bytes += hdr64[1];
+        const std::span<std::uint8_t> dst(block.data(), plain);
         if (bp) {
             wire.resize(hdr64[1]);
             read_full(fd, wire.data(), wire.size());
             const auto d0 = Clock::now();
-            if (strix::bp_codec::decoded_size(wire) != block.size()) throw std::runtime_error("offload-listen: bp-v1 size differs");
-            strix::bp_codec::decode(wire, block, &pool);
+            if (strix::bp_codec::decoded_size(wire) != plain) throw std::runtime_error("offload-listen: bp-v1 size differs");
+            strix::bp_codec::decode(wire, dst, &pool);
             t_decode += secs(d0, Clock::now());
         } else {
-            read_full(fd, block.data(), block.size());
+            read_full(fd, dst.data(), dst.size());
         }
         if (t_first < 0) t_first = secs(t0, Clock::now());
+        if (once) {  // rank 0 -> rank 1: the IK part of the block, [rows * 1024, rows * 1280)
+            const auto r0 = Clock::now();
+            seq = strix::pair::state::relay_piece(eng.rank() == 0, true, std::span<std::uint8_t>(block.data() + kv, block.size() - kv),
+                                                  relay_chunk, relay, strix::pair::state::state_hash, seq);
+            t_relay += secs(r0, Clock::now());
+        }
+        digest = (digest * 0x100000001B3ULL) ^ strix::pair::state::state_hash(block.data(), block.size());
         const auto a = Clock::now();
         eng.import_layer(0, hdr32[1], 0, rows, block.data());
         t_import += secs(a, Clock::now());
@@ -416,11 +471,11 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
         const mm::Row row{0, gen.back(), prompt.size() + gen.size() - 1};
         gen.push_back(eng.step({&row, 1})[0]);
     }
-    std::printf("rank %u offload-listen %s #%u: %u layers, %.1f MB on the wire (%.3f of plain), first frame %.3f s, all received %.3f s "
-                "after accept, decode %.3f s, import %.3f s, last row %.3f s; tokens fnv %016llx ids:",
-                eng.rank(), name.c_str(), req, layers, static_cast<double>(wire_bytes) / 1e6,
+    std::printf("rank %u offload-listen %s #%u: %u layers, mode %s, %.1f MB on the wire (%.3f of plain), first frame %.3f s, all received "
+                "%.3f s after accept, decode %.3f s, relay %.3f s, import %.3f s, last row %.3f s; state digest %016llx; tokens fnv %016llx ids:",
+                eng.rank(), name.c_str(), req, layers, mode == 1 ? "ik-once" : "per-rank", static_cast<double>(wire_bytes) / 1e6,
                 static_cast<double>(wire_bytes) / static_cast<double>(std::max<std::size_t>(1, layers * block.size())), t_first, t_recv, t_decode,
-                t_import, t_last,
+                t_relay, t_import, t_last, static_cast<unsigned long long>(digest),
                 static_cast<unsigned long long>(fnv(gen.data(), gen.size() * 4)));
     for (auto t : gen) std::printf(" %u", t);
     std::printf("\n");
@@ -922,8 +977,65 @@ std::map<std::string, std::vector<std::uint32_t>> g_session_tokens;
 // weak, so binaries linked against a library without it still link (`--ab pftiled` then refuses).
 extern "C" void strix_trellis_lab_set_wmma_tiled(int on) __attribute__((weak));
 
+// A/B evidence is local to this engine and each completed prefill, never inferred from equal hashes.
+struct FlashKeysAB {
+    mm::Engine* eng;
+    unsigned saved;
+    bool msa_flash;
+    std::array<std::uint64_t, 7> before{};
+    FlashKeysAB(mm::Engine& engine, bool active, bool flash)
+        : eng(active || flash ? &engine : nullptr), saved(engine.prefill_flash_keys()), msa_flash(flash) {
+        if (active && eng->prefill_flash_mode() == 0)
+            throw std::invalid_argument("--ab pfflashkeys: NOT EXERCISED (flash admission disabled)");
+    }
+    void restore() {
+        if (eng != nullptr) {
+            eng->set_prefill_flash_keys(saved);
+            eng = nullptr;
+        }
+    }
+    // Unwinding restore never throws (a throw here would terminate and hide the original error); restore() still throws.
+    ~FlashKeysAB() {
+        try {
+            restore();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "--ab pfflashkeys: restoring the flash key schedule failed: %s\n", e.what());
+        }
+    }
+    void begin() { if (eng != nullptr) before = eng->prefill_flash_launches(); }
+    void finish(int arm, std::uint64_t state, std::uint64_t out) const {
+        if (eng == nullptr) return;
+        auto counts = eng->prefill_flash_launches();
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] -= before[i];
+        if (msa_flash) {
+            const unsigned mode = eng->prefill_msa_flash(), rows = eng->prefill_rg_rows();
+            const auto launches = mode == 1 ? counts[3] : mode == 2 ? counts[4] : mode == 3 ?
+                                  (rows == 4 ? counts[5] : rows == 8 ? counts[6] : counts[5] + counts[6]) : 0;
+            const bool exercised = mode == 0 || launches != 0;
+            std::printf("rank %u ab-pfmsaflash: arm %c mode=%u rows=%u launches=%llu row-groups[4,8]=%llu,%llu %s\n",
+                        eng->rank(), arm % 2 == 1 ? 'B' : 'A', mode, rows,
+                        static_cast<unsigned long long>(launches), static_cast<unsigned long long>(counts[5]),
+                        static_cast<unsigned long long>(counts[6]), mode == 0 ? "OFF" : exercised ? "EXERCISED" : "NOT EXERCISED");
+            if (!exercised) g_exact_fail = true;
+            return;
+        }
+        const unsigned expected = arm % 2 == 0 ? 0U : 2U;
+        const unsigned schedule = eng->prefill_flash_keys();
+        const unsigned mode = eng->prefill_flash_mode();
+        const bool exercised = mode != 0 && schedule == expected && counts[expected] != 0 &&
+                               counts[1] == 0 && counts[2U - expected] == 0;
+        std::printf("rank %u ab-pfflashkeys: arm %d schedule=%u flash=%u launches[0,1,2]=%llu,%llu,%llu "
+                    "state=%016llx final-rows=%016llx %s\n", eng->rank(), arm, schedule, mode,
+                    static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(state),
+                    static_cast<unsigned long long>(out), exercised ? "EXERCISED" : "NOT EXERCISED");
+        if (!exercised) g_exact_fail = true;
+    }
+};
+
 std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vector<std::uint32_t>& prompt, int block,
                       const std::vector<std::uint32_t>* reference) {
+    FlashKeysAB flash_keys(eng, flag == "pfflashkeys", flag == "pfmsaflash");
     const int pipe0 = strix::minimax::moe::opt::prefill_pipe_override();
     struct RestorePipe {
         bool active;
@@ -968,6 +1080,24 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         std::printf("pfmsarework modes A=%u B=%u\n", rework_base, rework_mode);
     }
+    // pfmsaflash: arms STRIX_MM_AB_FLASH_A / _B = MODE[rROWS] (FAST flash mode 0..3 of the flash layers, row-group rows
+    // 0 auto / 4 / 8), default A = 1 (key split), B = 3 (row groups, auto rows); restored after the A/B.
+    struct FlashArm { unsigned mode, rows; };
+    const auto flash_arm = [](const char* name, const char* dflt) {
+        const char* e = std::getenv(name);
+        const std::string t = e != nullptr ? e : dflt;
+        FlashArm x{0U, 0U};
+        if (t.empty() || t[0] < '0' || t[0] > '3' || (t.size() != 1 && t != std::string(1, t[0]) + "r4" && t != std::string(1, t[0]) + "r8" &&
+                                                     t != std::string(1, t[0]) + "r0"))
+            throw std::invalid_argument(std::string(name) + " must be MODE[r0|r4|r8], MODE 0..3");
+        x.mode = static_cast<unsigned>(t[0] - '0');
+        x.rows = t.size() == 1 ? 0U : static_cast<unsigned>(t[2] - '0');
+        return x;
+    };
+    const FlashArm fa = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_A", "1") : FlashArm{0U, 0U};
+    const FlashArm fb = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_B", "3") : FlashArm{0U, 0U};
+    const unsigned flash0 = eng.prefill_msa_flash(), rg_rows0 = eng.prefill_rg_rows();
+    if (flag == "pfmsaflash") std::printf("pfmsaflash arms A=%u r%u B=%u r%u\n", fa.mode, fa.rows, fb.mode, fb.rows);
     const std::string pipe_on = std::getenv("STRIX_MM_AB_PIPE") != nullptr ? std::getenv("STRIX_MM_AB_PIPE") : "2";  // moepipe B form
     const char* pipe_env = std::getenv("STRIX_MMX_MOE_PIPE");  // restored after the A/B
     const std::string moe_pipe0 = pipe_env != nullptr ? pipe_env : "";
@@ -1031,6 +1161,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             eng.set_prefill_tx_uncached(on);
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
+        else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
+        else if (flag == "x16fmt") eng.set_prefill_exchange_f16(on);  // TP2 prefill exchange: FP32 (A) / binary16 (B), FAST
+        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);
+        else if (flag == "pfmsaflash") {
+            eng.set_prefill_msa_flash(on ? fb.mode : fa.mode);
+            eng.set_prefill_rg_rows(on ? fb.rows : fa.rows);
+        }  // FAST flash: incumbent loads (A) / key halves (B)
+        else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
         else if (flag == "pfkvtile") eng.set_prefill_kv_tile(on ? kv_tile_b : -1);
@@ -1096,6 +1234,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "pfidx" ? eng.prefill_index_tile()
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
                          : flag == "pfmsa" ? eng.prefill_msa_batch()
+                         : flag == "x16fmt" ? eng.prefill_exchange_f16()
+                         : flag == "pfheadless" ? eng.prefill_headless()
+                         : flag == "pfdensemlp" ? eng.prefill_dense_mlp()
                          : flag == "pfattn4" ? eng.prefill_attend4()
                          : flag == "pfidxconc" ? eng.prefill_index_concurrent() != 0
                          : flag == "pfrouter" ? eng.prefill_router_batch()
@@ -1117,18 +1258,34 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "x16fmt" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsaflash" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
+    std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        flash_keys.begin();
+        const auto dense_before = eng.prefill_dense_mlp_count();
+        const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
+        dense_mlp_calls.push_back(eng.prefill_dense_mlp_count() - dense_before);
+        if (flag == "pfheadless") {
+            const auto headless_after = eng.prefill_headless_chunks();
+            const auto expected = eng.prefill_headless_expected(prompt.size());
+            const bool qualified = strix::prefill_headless::qualified_arm(r % 2 == 1, headless_before, headless_after, expected);
+            std::printf("rank %u ab-pfheadless: prefill %d arm %c cache-only chunks %llu expected %zu: %s\n",
+                        eng.rank(), r, r % 2 == 1 ? 'B' : 'A',
+                        static_cast<unsigned long long>(headless_after - headless_before), r % 2 == 1 ? expected : 0,
+                        qualified ? "activation verified" : "UNQUALIFIED (inactive or unexpected activation)");
+            if (!qualified) g_exact_fail = true;  // matching hashes alone cannot qualify this run
+        }
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
+            flash_keys.finish(r, states.back(), outs.back());
         }
     }
     // xb flags: A B A B A B A (every B bracketed), and matched replay: every block re-decodes the SAME positions with
@@ -1162,7 +1319,11 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             std::printf("\n");
         }
     }
-    if (flag == "pfmsarework") {
+    if (flag == "pfmsaflash") {
+        eng.set_prefill_msa_flash(flash0);
+        eng.set_prefill_rg_rows(rg_rows0);
+    }
+    else if (flag == "pfmsarework") {
         eng.set_prefill_msa_rework(rework0);
         eng.set_prefill_msa_batch(msa0);
         eng.set_fused_prefill_attention(fused_prefill0);
@@ -1200,6 +1361,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pfkvtile") eng.set_prefill_kv_tile(kv_tile0);
     else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(idx_conc0);
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
+    else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
+    else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
+    else if (flag == "pfflashkeys") flash_keys.restore();
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);
@@ -1261,6 +1425,17 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (!same_state || !same_out) g_exact_fail = true;
     }
     if (!same_first) g_exact_fail = true;
+    if (flag == "pfdensemlp") {
+        bool covered = true;
+        std::printf("rank %u ab-%s: candidate calls per prefill (A B A B ...):", eng.rank(), flag.c_str());
+        for (std::size_t i = 0; i < dense_mlp_calls.size(); ++i) {
+            const auto calls = dense_mlp_calls[i];
+            std::printf(" %llu", static_cast<unsigned long long>(calls));
+            covered &= i % 2 == 0 ? calls == 0 : calls > 0;
+        }
+        std::printf(" -> %s\n", covered ? "COVERED (A=0, B>0)" : "UNQUALIFIED (requires A=0 and B>0 on every prefill; fallback equality only)");
+        if (!covered) g_exact_fail = true;
+    }
     std::printf("rank %u ab-%s: decode ms/token median per block (A=off, B=on):", eng.rank(), flag.c_str());
     for (int b = 0; b < blocks; ++b) {
         // drop the block's first 2 steps (arm switch)
@@ -1316,6 +1491,52 @@ void decode_check(mm::Engine& eng, const std::string& name, const std::vector<st
         std::printf("rank 0 decode-check %s: SUMMARY rel_l2 mean %.3e max %.3e; argmax decode == tf %zu/%zu; top-1 == text: tf %zu, decode %zu\n",
                     name.c_str(), sum / static_cast<double>(k), worst, agree, k, agree_tf_text, agree_dec_text);
     std::fflush(stdout);
+}
+
+// Split-producer chunk frames A/B in one process (--split-ab PROMPT.u32:STEPS:R1,R2,...): per R, R slots (copies of the prompt's
+// prefill, one row each) and 7 blocks A B A B A B A (A = Engine::set_split_frame(0), B = 1) of STEPS R-row decode steps.
+// Block 0 decodes greedily; blocks 1..6 re-decode the SAME positions teacher-forced with block 0's tokens and must
+// reproduce its next tokens (every row). Both ranks run the same schedule, so the override flips at the same step.
+void split_ab(mm::Engine& eng, const std::vector<std::uint32_t>& prompt, int steps, const std::vector<unsigned>& rs, std::uint32_t slots) {
+    if (steps < 2 || prompt.empty()) throw std::invalid_argument("--split-ab: STEPS >= 2 and a non-empty prompt");
+    const std::size_t P = prompt.size();
+    for (unsigned R : rs) {
+        if (R == 0 || R > slots) throw std::invalid_argument("--split-ab: 1 <= R <= slots");
+        eng.set_split_frame(0);
+        const auto t0 = Clock::now();
+        const std::uint32_t first = eng.prefill(0, prompt, 0);
+        const double pf = secs(t0, Clock::now());
+        for (unsigned i = 1; i < R; ++i) eng.copy_slot(i, 0, P);
+        std::printf("rank %u split-ab R=%u: prefill %.3f s (%zu tokens)\n", eng.rank(), R, pf, P);
+        std::vector<std::vector<std::uint32_t>> gen(R, std::vector<std::uint32_t>{first});  // per row: input token, then outputs
+        std::vector<double> cell[7];
+        std::size_t diff = 0;
+        std::vector<mm::Row> rows(R);
+        for (int b = 0; b < 7; ++b) {
+            eng.set_split_frame(b % 2 == 1 ? 1 : 0);
+            for (int k = 0; k < steps; ++k) {
+                for (unsigned r = 0; r < R; ++r) rows[r] = {r, gen[r][static_cast<std::size_t>(k)], P + static_cast<std::size_t>(k)};
+                const auto a = Clock::now();
+                const auto out = eng.step(rows);
+                cell[b].push_back(secs(a, Clock::now()) * 1e3);
+                for (unsigned r = 0; r < R; ++r) {
+                    if (b == 0) gen[r].push_back(out[r]);
+                    else diff += out[r] != gen[r][static_cast<std::size_t>(k) + 1] ? 1U : 0U;
+                }
+            }
+        }
+        eng.set_split_frame(-1);
+        double m[7];
+        for (int b = 0; b < 7; ++b) m[b] = median(std::vector<double>(cell[b].begin() + 1, cell[b].end()));
+        const double a = median({m[0], m[2], m[4], m[6]}), bb = median({m[1], m[3], m[5]});
+        if (eng.rank() == 0)
+            std::printf("split-ab R=%u ctx=%zu A %.3f B %.3f delta %+.3f (%+.2f%%) A-blocks %.3f,%.3f,%.3f,%.3f B-blocks %.3f,%.3f,%.3f replay-diff %zu\n",
+                        R, P, a, bb, bb - a, (bb - a) / a * 100.0, m[0], m[2], m[4], m[6], m[1], m[3], m[5], diff);
+        std::printf("rank %u split-ab R=%u: matched replay %zu differences%s\n", eng.rank(), R, diff, diff == 0 ? " (IDENTICAL)" : " (DIFFER)");
+        if (diff != 0) g_exact_fail = true;
+        std::fflush(stdout);
+    }
+    eng.set_split_frame(-1);
 }
 
 // Batched decode: row i starts at position L - 8 i (teacher-forced first input = prompt[L - 8 i]) in slot i, whose
@@ -1662,12 +1883,15 @@ int main(int argc, char** argv) {
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
-    if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
+    try {
+    const auto cut_args = cut_arguments(argc, argv);
+    if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) {
+        std::printf("%s", cut_args.config.lines.c_str()); return 0;
+    }
     if (argc < 5) {
         std::fprintf(stderr, "usage: %s MODEL_DIR RANK TRANSPORT OUT_DIR [options] [--print-model-graph] [--print-plan]\n", argv[0]);
         return 2;
     }
-    try {
         const auto t_start = Clock::now();
         strix::minimax::session::RunOptions session_options;
         mm::Options opt;
@@ -1682,7 +1906,11 @@ int main(int argc, char** argv) {
         unsigned gate_layers = 6;
         bool tf_write = false, session_hash_only = false;
         double deadline = 1e9;
-        std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
+        std::vector<std::string> sessions, batches, split_abs, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
+        const auto& cut_cfg = cut_args.config;
+        const auto& layercut_listens = cut_args.listens;
+        const auto& cut_relay = cut_args.relay;
+        const auto cut_relay_port = cut_args.relay_port;
         std::vector<std::string> session_hash_files;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
         std::vector<std::string> dspark_heads;
@@ -1705,8 +1933,13 @@ int main(int argc, char** argv) {
             else if (a == "--offload") offloads.push_back(next());
             else if (a == "--offload-import") offload_imports.push_back(next());
             else if (a == "--offload-listen") offload_listens.push_back(next());
-            else if (a == "--profile") sessions.push_back("@" + next());  // a session with per-phase timing
+            else if (a == "--layercut-listen" || a == "--cut-relay" || a == "--cut-relay-listen" ||
+                     a == "--split" || a == "--cut" || a == "--cut-block" || a == "--cut-act") (void)next();
+            else if (std::string timing; strix::minimax::defaults::product_option(a, next, &timing)) {
+                if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
+            }
             else if (a == "--batch") batches.push_back(next());
+            else if (a == "--split-ab") split_abs.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
             else if (a == "--dspark-prior") (void)next();
@@ -1723,9 +1956,27 @@ int main(int argc, char** argv) {
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--max-rows") opt.max_rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--unit-chunks") opt.unit_chunks = static_cast<std::uint32_t>(std::stoul(next()));  // prefill unit cap (bit-neutral)
             else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (!layercut_listens.empty()) {
+            if (cut_cfg.split != lc::chain::Split::layer_cut || opt.rank >= 2 || cut_relay_port > 65535)
+                throw std::invalid_argument("--layercut-listen needs layer-cut policy, rank 0/1 and valid relay port");
+            // A chunk-dependent pair identity keeps the pair-alone chunk rows (the resolver made the block a multiple of
+            // them) and caps unit width at a block; group width may cap it further or grouping may be disabled.
+            // Units may cross block boundaries. The row-invariant FP32 identity may shrink its chunks to the block.
+            if (cut_cfg.grain != 0) {
+                if (cut_cfg.grain != opt.max_rows || cut_cfg.block % opt.max_rows != 0)
+                    throw std::logic_error("layercut: block / pair chunk identity grain mismatch");
+                opt.unit_chunks = cut_cfg.block / opt.max_rows;
+            } else {
+                opt.max_rows = std::min(opt.max_rows, cut_cfg.block);
+                opt.unit_chunks = 1;
+            }
+            std::printf("%s", cut_cfg.lines.c_str());
+        } else if (cut_cfg.split != lc::chain::Split::device_only)
+            throw std::invalid_argument("--split: pair split execution needs --layercut-listen");
         const strix::minimax::graph::Attachments graph_attachments{
             !specs.empty() || session_options.draft || !dspark_heads.empty() || !dspark_exl3.empty(),
             !dspark_exl3.empty(), static_cast<std::uint32_t>(dspark_heads.size())};
@@ -1740,23 +1991,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(warm.hits));
             return 0;
         }
-        // The ranks load at different speeds (measurement: 44 s vs 166 s under page-cache pressure): the first collective after
-        // the load must not hit the dist layer's 120 s default. An explicit value wins.
-        (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
-        (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-        // DS production host-path settings (CRC on parallel workers, CRC overlap, 1 MiB host chunks): transport
-        // only, bits unchanged; measurement ABA x3 TTFT 1K -12.8 %, decode -1 %. An explicit value wins (=0 disables each).
-        (void)::setenv("STRIX_DIST_CRC_PARALLEL", "1", 0);
-        (void)::setenv("STRIX_DIST_HOST_CRC_OVERLAP", "1", 0);
-        (void)::setenv("STRIX_DIST_HOST_CHUNK_BYTES", "1048576", 0);
-        // deferred CRC ON by default (measurement: 7 processes inline/deferred alternated, 384-step 1K
-        // sessions, tokens identical, each deferred arm below its two inline neighbours by 0.04-0.12 ms/token).
-        // STRIX_MMX_CRC: 0 = off, 1 = inline, deferred = deferred check.
-        (void)::setenv("STRIX_MMX_CRC", "deferred", 0);
-        // Prefill MoE table ring ON in this app only (qualified here, single engine owner; serve keeps it off).
-        // Measurement: exact, 1K -0.5 %, 8K not slower. An explicit value or STRIX_MM_BASELINE=1 wins.
-        if (const char* base = std::getenv("STRIX_MM_BASELINE"); base == nullptr || std::string(base) != "1")
-            (void)::setenv("STRIX_MM_PF_TABLE_RING", "1", 0);
+        // Host-path defaults (transport timeouts, prefill table ring): the one table both entry points apply
+        // (mm_defaults host_defaults(); --print-effective-config prints the rows). An explicit value wins.
+        strix::minimax::defaults::apply_host_defaults("rank");
         const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
         if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
             throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");
@@ -1824,6 +2061,9 @@ int main(int argc, char** argv) {
             const auto route_fp = strix::route::compare_ranks([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
             std::printf("rank %u: route fingerprint %016llx agreed with the peer\n", opt.rank, static_cast<unsigned long long>(route_fp));
         } catch (...) { eng.abort("route receipt: numerical-route fingerprint mismatch"); throw; }
+        try {  // FAST prefill profile rows (STRIX_MM_FAST_PREFILL and members): both ranks must resolve the same
+            strix::minimax::defaults::check_peer([&](const void* o, void* i, std::size_t n) { eng.exchange_bytes(o, i, n); });
+        } catch (...) { eng.abort("product profile: MiniMax FAST prefill profile differs between the ranks"); throw; }
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);
@@ -1966,6 +2206,16 @@ int main(int argc, char** argv) {
             }
             hs = fnv(g.data(), g.size() * 4, hs);
         }
+        // The pair link for the hand-off relay (index keys once): the communicator's host path on its own control tag
+        // space ("MI"), between engine calls, so the transport is idle. Chunks fit the communicator's buffers.
+        const std::size_t relay_chunk = std::min<std::size_t>(comm.max_bytes(), std::size_t{32} << 20);
+        const RelayX relay = [&comm](std::span<const std::byte> out, std::span<std::byte> in, std::uint64_t seq) {
+        strix::dist::Tag tag;
+        tag.kind = static_cast<std::uint32_t>(strix::dist::TagKind::control);
+        tag.layer = 0x4D490000U;  // "MI": hand-off relay
+        tag.request = seq;
+        comm.exchange_host(out, in, tag);
+        };
         for (const auto& s : offload_listens) {  // NAME:PROMPT:PORT:STEPS:COUNT
             std::vector<std::string> f;
             for (std::size_t p = 0, q; p <= s.size(); p = q + 1) {
@@ -1977,7 +2227,7 @@ int main(int argc, char** argv) {
             const auto prompt = read_u32(f[1]);
             const int lfd = listen_on(static_cast<std::uint16_t>(std::stoi(f[2]) + static_cast<int>(opt.rank)));
             for (unsigned i = 0; i < static_cast<unsigned>(std::stoi(f[4])); ++i) {
-                const auto g = listen_session(eng, lfd, f[0], prompt, std::stoi(f[3]), out_dir, i);
+                const auto g = listen_session(eng, lfd, f[0], prompt, std::stoi(f[3]), out_dir, i, relay, relay_chunk);
                 const auto it = offloaded.find(f[0]);
                 if (it != offloaded.end()) {
                     std::size_t first = 0;
@@ -1991,6 +2241,25 @@ int main(int argc, char** argv) {
                 hs = fnv(g.data(), g.size() * 4, hs);
             }
             ::close(lfd);
+        }
+        for (const auto& s : layercut_listens) {
+            const auto f = cut_fields(s);
+            const auto prompt = read_u32(f[1]);
+            const auto port = lc::number(f[2], "--layercut-listen PORT");
+            const auto steps = lc::number(f[3], "--layercut-listen STEPS");
+            const auto count = lc::number(f[4], "--layercut-listen COUNT");
+            if (port == 0 || port + opt.rank > 65535 || count == 0 || steps > INT_MAX ||
+                prompt.empty() || prompt.size() + steps > opt.capacity)
+                throw std::invalid_argument("--layercut-listen port/count/prompt/capacity");
+            strix::handoff::Listener listener(static_cast<std::uint16_t>(port + opt.rank));
+            std::unique_ptr<strix::handoff::Listener> relay_listener;
+            if (opt.rank == 1 && cut_relay_port != 0)
+                relay_listener = std::make_unique<strix::handoff::Listener>(static_cast<std::uint16_t>(cut_relay_port));
+            for (unsigned i = 0; i < count; ++i) {
+                const auto g = layercut_session(eng, listener, relay_listener.get(), cut_relay, cut_cfg, prompt,
+                    static_cast<int>(steps), f[0], out_dir, i);
+                hs = fnv(g.data(), g.size() * 4, hs);
+            }
         }
         // DSpark speculative sessions: same prompt and length as the --session of the same NAME must give the same ids.
         std::unique_ptr<ds::DraftFile> draft_file;
@@ -2107,8 +2376,22 @@ int main(int argc, char** argv) {
                 setenv("STRIX_MM_AB_WARM_O", name.substr(8).c_str(), 1);
                 name = "xbwarmo";
             }
+            // pfmsaflash=A,B: this run's arms (STRIX_MM_AB_FLASH_A / _B, several pairs in one process); unset again below
+            const bool fl_set = name.rfind("pfmsaflash=", 0) == 0;
+            if (fl_set) {
+                const std::string arms = name.substr(11);
+                const auto comma = arms.find(',');
+                if (comma == std::string::npos) throw std::invalid_argument("--ab pfmsaflash=A,B");
+                setenv("STRIX_MM_AB_FLASH_A", arms.substr(0, comma).c_str(), 1);
+                setenv("STRIX_MM_AB_FLASH_B", arms.substr(comma + 1).c_str(), 1);
+                name = "pfmsaflash";
+            }
             const std::uint64_t ah = ab_flag(eng, name, read_u32(ppath), std::stoi(b.substr(c + 1)),
                                              ref == g_session_tokens.end() ? nullptr : &ref->second);
+            if (fl_set) {
+                unsetenv("STRIX_MM_AB_FLASH_A");
+                unsetenv("STRIX_MM_AB_FLASH_B");
+            }
             if (wo_set) {
                 if (wo_env == nullptr) unsetenv("STRIX_MM_AB_WARM_O");
                 else setenv("STRIX_MM_AB_WARM_O", wo0.c_str(), 1);
@@ -2149,6 +2432,22 @@ int main(int argc, char** argv) {
             }
             const std::uint64_t bh = batch(eng, prompt, steps, ns, opt.slots);
             hs = fnv(&bh, 8, hs);
+        }
+        for (const auto& b : split_abs) {  // --split-ab PROMPT.u32:STEPS:R1,R2,...
+            if (!in_time()) {
+                std::printf("rank %u: split-ab %s skipped (deadline)\n", opt.rank, b.c_str());
+                continue;
+            }
+            const auto c1 = b.find(':'), c2 = b.find(':', c1 + 1);
+            const auto prompt = read_u32(b.substr(0, c1));
+            const int steps = std::stoi(b.substr(c1 + 1, c2 - c1 - 1));
+            std::vector<unsigned> rs;
+            for (std::size_t p = c2 + 1; p < b.size();) {
+                const auto e = b.find(',', p);
+                rs.push_back(static_cast<unsigned>(std::stoul(b.substr(p, e - p))));
+                p = e == std::string::npos ? b.size() : e + 1;
+            }
+            split_ab(eng, prompt, steps, rs, opt.slots);
         }
         // Both ranks must have produced the same tokens / residuals: compare the hashes through rank 0.
         const auto mine = static_cast<std::uint32_t>(hs ^ (hs >> 32U));

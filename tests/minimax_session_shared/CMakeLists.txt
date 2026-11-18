@@ -120,6 +120,7 @@ if(NOT MINIMAX_SESSION_BASELINE)
     target_link_libraries(minimax_replay_family PUBLIC strix_state_cache strix_session_owner)
     target_sources(minimax_replay_family PRIVATE
         "${REPO_ROOT}/src/serve/api.cpp"
+        "${REPO_ROOT}/src/serve/ollama.cpp"
         "${REPO_ROOT}/src/serve/media.cpp"
         "${REPO_ROOT}/src/serve/constraint_selection.cpp"
         "${REPO_ROOT}/src/serve/deepseek_chat.cpp"

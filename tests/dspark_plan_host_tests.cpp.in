@@ -1,0 +1,172 @@
+// Host harness for verbatim production scheduling/lifecycle blocks. Device work is
+// represented by recorded admissions/outcomes; this does not qualify GPU numerics.
+#include "strix/spec/drafting.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace sp = strix::spec;
+namespace ds { struct Draft {}; }
+struct PlannedStep {};
+void check(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
+struct Recorder {
+    sp::Arbiter real;
+    std::vector<sp::Outcome> outcomes;
+    std::vector<std::vector<std::uint32_t>> emitted;
+    void observe(const sp::Outcome& o, std::span<const std::uint32_t> ids) {
+        outcomes.push_back(o);
+        emitted.emplace_back(ids.begin(), ids.end());
+        real.observe(o, ids);
+    }
+};
+struct BatchSpeculator {
+    struct ParkedPlan;
+    std::shared_ptr<ParkedPlan> park();
+    void resume(const std::shared_ptr<ParkedPlan>& p);
+    PlannedStep plan_;
+    std::vector<ds::Draft> drafts_;
+    std::vector<std::uint32_t> window_rows_, lookup_cap_;
+    std::vector<bool> drafted_, lookup_, arbiter_used_;
+    std::vector<sp::Decision> arbiter_decision_;
+    std::uint32_t lookup_mask_ = 0, planned_drafting_ = 0, planned_decoders_ = 0, planned_total_ = 0;
+    bool planned_prompt_rows_ = false, planned_probe_ = false;
+    double plan_seconds_ = 0, planned_gap_ = 0, planned_overhead_ = 0, planned_draft_ms_ = 0;
+    std::uint64_t planned_key_ = 0;
+    struct LookupSlot { std::shared_ptr<Recorder> arbiter; sp::Proposal proposal; };
+    std::vector<LookupSlot> lookup_slots_{3};
+
+    void plan(std::uint32_t n, bool arbitrated, double draft_ms) {
+        drafts_.assign(n, {});
+        window_rows_.assign(n, 1);
+        drafted_.assign(n, arbitrated);
+        lookup_.assign(n, false);
+        arbiter_used_.assign(n, arbitrated);
+        arbiter_decision_.assign(n, sp::Decision{sp::Source::model});
+        planned_draft_ms_ = draft_ms;
+    }
+    void finish(const std::vector<std::uint32_t>& slots, std::uint64_t position,
+                const std::vector<std::uint32_t>& tokens) {
+        struct Sequence { std::uint32_t slot; };
+        std::vector<Sequence> storage;
+        for (auto slot : slots) storage.push_back({slot});
+        std::vector<Sequence*> seqs;
+        for (auto& s : storage) seqs.push_back(&s);
+        struct Seen { std::uint32_t owner, r0, count, accepted, kept; std::uint64_t context; };
+        std::vector<Seen> arbitrated;
+        for (std::uint32_t i = 0; i < slots.size(); ++i) {
+            const auto r0 = i, count = 1U, accepted = 0U, kept = 1U;
+            struct { std::uint64_t position; } s{position};
+            @COLLECT@
+        }
+        const double ss = 0.02, fs = 0.001;
+        @OBSERVE@
+    }
+};
+@PARKED@
+@PARK@
+@RESUME@
+
+bool admitted(const sp::Decision& decision, bool used, bool legacy, std::uint32_t fixed_rows,
+              std::uint32_t limit = 6, std::uint32_t budget = 6, bool allow = true) {
+    const std::uint32_t nd = 1, lookup_rows = 0;
+    const bool allow_drafts_ = allow, calib_ = false;
+    struct { std::uint32_t fixed_rows; } options_{fixed_rows};
+    const std::vector<std::uint32_t> dec{0}, slots{0}, limit1{limit}, plain_n_{0, 1}, chunks;
+    const std::vector<bool> measured_n_{false, true}, arbiter_used_{used};
+    const std::vector<sp::Decision> arbiter_decision_{decision};
+    struct Controller {
+        bool legacy;
+        std::vector<bool> plan_drafts(const std::vector<std::uint32_t>&,
+                                     const std::vector<std::uint32_t>&, std::uint32_t) const { return {legacy}; }
+    } controller_{legacy};
+    @ADMISSION@
+    return drafting[0];
+}
+
+void admission_test(bool check_probe) {
+    sp::Arbiter a;
+    for (std::uint32_t r = 1; r <= 6; ++r) a.seed_cost(r, 20.0 + 5.0 * (r - 1U));
+    sp::StepInput in;
+    in.model_max_k = 5;
+    in.model_pass_tokens = 1;
+    in.model_pass_ms = 55;
+    in.max_rows = 6;
+    const std::vector<std::uint32_t> ids{7};
+    for (std::uint32_t i = 0; i < a.config().min_model_passes; ++i) {
+        const auto d = a.decide(in);
+        check(d.source == sp::Source::model && d.probe, "expected initial model probe");
+        if (check_probe) check(admitted(d, true, false, 0), "legacy veto suppressed the model probe");
+        sp::Outcome o;
+        o.source = sp::Source::model; o.rows = 6; o.proposed = 5; o.verify_ms = 45; o.draft_ms = 10;
+        a.observe(o, ids);
+    }
+    auto d = a.decide(in);
+    check(d.source == sp::Source::serial, "one-token model yield must select serial");
+    check(!admitted(d, true, true, 6), "fixed window executed a rejected model arm");
+    check(!admitted(d, true, true, 0), "controller overrode serial");
+    check(admitted(d, false, true, 6), "legacy fixed window changed outside arbiter scope");
+    check(!admitted(d, false, false, 0), "legacy rejection changed outside arbiter scope");
+    d.source = sp::Source::lookup;
+    check(!admitted(d, true, true, 6), "lookup also admitted the model arm");
+    d.source = sp::Source::model;
+    check(admitted(d, true, false, 0), "model admission depends on legacy controller");
+    check(!admitted(d, true, false, 0, 1), "model ignored context/remaining limit");
+    check(!admitted(d, true, false, 0, 6, 1), "model ignored row budget");
+    check(!admitted(d, true, false, 0, 6, 6, false), "model ignored disabled drafts");
+}
+
+void parked_test(bool lone_first) {
+    BatchSpeculator b;
+    for (auto& slot : b.lookup_slots_) slot.arbiter = std::make_shared<Recorder>();
+    auto& lone = b.lookup_slots_[0];
+    lone.proposal.tokens = {10, 11};
+    sp::StepInput input;
+    input.lookup = &lone.proposal;
+    (void)lone.arbiter->real.decide(input);
+    sp::Arbiter oracle;
+    (void)oracle.decide(input);
+    const std::uint32_t first_n = lone_first ? 1U : 2U, second_n = lone_first ? 2U : 1U;
+    b.plan(first_n, lone_first, lone_first ? 7.5 : 0.0);
+    auto first = b.park();
+    b.plan(second_n, !lone_first, lone_first ? 0.0 : 7.5);
+    auto second = b.park();
+    const auto finish_group = [&](bool is_lone) {
+        b.finish(is_lone ? std::vector<std::uint32_t>{0} : std::vector<std::uint32_t>{1, 2},
+                 is_lone ? 100U : 900U, is_lone ? std::vector<std::uint32_t>{10} : std::vector<std::uint32_t>{90, 91});
+    };
+    b.resume(first);
+    finish_group(lone_first);
+    b.resume(second);
+    finish_group(!lone_first);
+    check(lone.arbiter->outcomes.size() == 1, "parked arbitrated pass lost observation");
+    check(b.lookup_slots_[1].arbiter->outcomes.empty() && b.lookup_slots_[2].arbiter->outcomes.empty(),
+          "unarbitrated group gained an observation");
+    const auto& o = lone.arbiter->outcomes[0];
+    check(o.context == 100 && o.draft_ms == 7.5 && o.source == sp::Source::model,
+          "parked context/source/draft timing changed");
+    check(lone.arbiter->emitted[0] == std::vector<std::uint32_t>{10}, "observed wrong group's token IDs");
+    oracle.observe(o, lone.arbiter->emitted[0]);
+    b.plan(1, true, 2.5);
+    b.finish({0}, 101, {11});
+    oracle.observe(lone.arbiter->outcomes.back(), lone.arbiter->emitted.back());
+    for (std::uint32_t depth = 1; depth <= 2; ++depth)
+        check(lone.arbiter->real.survival(sp::Source::lookup, lone.proposal.bucket(), depth) ==
+              oracle.survival(sp::Source::lookup, lone.proposal.bucket(), depth), "pending evidence misaligned");
+}
+
+int main(int argc, char** argv) {
+    try {
+        check(argc == 2, "expected test case");
+        const std::string test = argv[1];
+        if (test == "serial" || test == "probe") admission_test(test == "probe");
+        else parked_test(test == "lone-first");
+        return 0;
+    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=Strix inference server (HIP)
+Documentation=https://github.com/hyukudan/strix-halo-engine-lab/blob/main/docs/install.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=strix
+Group=strix
+# GPU access: /dev/kfd and /dev/dri/renderD* belong to these groups on ROCm systems.
+SupplementaryGroups=render video
+EnvironmentFile=@STRIX_PKG_SYSCONFDIR@/strix.env
+StateDirectory=strix
+WorkingDirectory=/var/lib/strix
+# Token 1 satisfies the CLI bootstrap contract; HTTP requests supply their own prompts.
+ExecStart=@STRIX_PKG_BINDIR@/strix-hip-decode-token ${STRIX_MODEL} 1 --http-serve $STRIX_SERVE_ARGS
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

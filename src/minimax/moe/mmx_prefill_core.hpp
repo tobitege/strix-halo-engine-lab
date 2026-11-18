@@ -12,8 +12,10 @@ template <int Bits> using Window = typename WeightDecode<Bits>::Window;
 template <int Bits> using Norm = typename WeightDecode<Bits>::Norm;
 template <int MT> using Accum = strix::moe_core::Accum<MT>;
 using Core = strix::moe_core::GroupedCore<WeightDecode, ExpertLayout, InputTransform, Epilogue>;
-template <bool Packed> using PipeCore = strix::moe_core::GroupedCore<WeightDecode, ExpertLayout, InputTransform, Epilogue,
-                                                                  MinimaxPrefillTraits<Packed>>;
+// Tail: the shared kPipeTail policy (partial blocks and tail classes on item_pipe, bitwise); off by default.
+template <bool Packed, bool Tail = false> using PipeCore = strix::moe_core::GroupedCore<WeightDecode, ExpertLayout, InputTransform, Epilogue,
+                                                                  MinimaxPrefillTraits<Packed>,
+                                                                  strix::moe_core::GroupedPrefillPolicy<false, Tail>>;
 
 __device__ __forceinline__ float codebook_mul1(std::uint32_t state) {
     return WeightDecode<3>::codebook_value(state);
@@ -65,9 +67,21 @@ __device__ __forceinline__ void item_pipe(const Item& it, unsigned bx, unsigned 
     return Core::item_pipe<Bits, MT, G, FullRows, Simplify>(it, bx, by, bz);
 }
 
-template <int Bits, int MT, int G, bool Simplify, bool Packed = false>
+template <int Bits, int MT, int G, bool Simplify, bool Packed = false, bool Tail = false, int Tiles = 2>
 __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
-    return PipeCore<Packed>::template pipe_or_tail<Bits, MT, G, Simplify>(it, bx, by, bz);
+    return PipeCore<Packed, Tail>::template pipe_or_tail<Bits, MT, G, Simplify, Tiles>(it, bx, by, bz);
+}
+
+// grouped_pipe_kernel<8, 4>'s loop on one full 128-row tile, K split 1, with the caller's epilogue for the accumulators.
+template <int Bits, bool Simplify, bool Packed, class Epi>
+__device__ __forceinline__ void pipe_run(const Item& it, unsigned bx, unsigned by, Epi epi) {
+    PipeCore<Packed>::template item_pipe_run<Bits, 8, 4, Simplify, 2>(it, bx, by, 0, epi);
+}
+
+// Tail class MT (1..7) on the pipelined loop (STRIX_MMX_PREFILL_PIPE_TAIL); same partials as item_core_v3.
+template <int Bits, int MT, bool Simplify, bool Packed>
+__device__ __forceinline__ void pipe_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+    return PipeCore<Packed, true>::template pipe_tail<Bits, MT, Simplify>(it, bx, by, bz);
 }
 
 template <int Bits, bool Simplify>
@@ -75,9 +89,9 @@ __device__ __forceinline__ void item_pipe_pair(const Item& it, unsigned bx, unsi
     return Core::item_pipe_pair<Bits, Simplify>(it, bx, by, bz, exchange);
 }
 
-template <int Bits, bool Simplify, bool Packed = false>
+template <int Bits, bool Simplify, bool Packed = false, bool Tail = false>
 __device__ __forceinline__ void pipe_pair_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
-    return PipeCore<Packed>::template pipe_pair_or_tail<Bits, Simplify>(it, bx, by, bz, exchange);
+    return PipeCore<Packed, Tail>::template pipe_pair_or_tail<Bits, Simplify>(it, bx, by, bz, exchange);
 }
 
 template <int Bits, int W, bool Simplify, bool Packed = false>
@@ -90,7 +104,7 @@ __device__ __forceinline__ void item_core8(const Item& it, unsigned bx, unsigned
     return Core::item_core8<Bits, Core8>(it, bx, by, bz, exchange);
 }
 
-template <int MT = 8, int G = 4, bool Simplify = false, bool Packed = false>
+template <int MT = 8, int G = 4, bool Simplify = false, bool Packed = false, bool Tail = false>
 __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, unsigned count) {
     unsigned lo = 0, hi = count;
     while (hi - lo > 1) {
@@ -102,15 +116,58 @@ __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, un
     const unsigned local = blockIdx.x - it.cta_begin;
     const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
     switch (it.bits) {
-        case 3: pipe_or_tail<3, MT, G, Simplify, Packed>(it, bx, by, bz); break;
-        case 4: pipe_or_tail<4, MT, G, Simplify, Packed>(it, bx, by, bz); break;
-        case 5: pipe_or_tail<5, MT, G, Simplify, Packed>(it, bx, by, bz); break;
-        case 6: pipe_or_tail<6, MT, G, Simplify, Packed>(it, bx, by, bz); break;
-        default: pipe_or_tail<8, MT, G, Simplify, Packed>(it, bx, by, bz); break;
+        case 3: pipe_or_tail<3, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
+        case 4: pipe_or_tail<4, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
+        case 5: pipe_or_tail<5, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
+        case 6: pipe_or_tail<6, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
+        default: pipe_or_tail<8, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
     }
 }
 
-template <bool Simplify = false, bool Packed = false>
+// N16 PIPE (STRIX_MMX_PREFILL_PIPE_N16): the items and grid of grouped_pipe_kernel<8, 4>, 8 waves of one output tile
+// each (item_pipe Tiles 1, half the accumulators per lane). Same partials.
+template <bool Simplify = false, bool Packed = false, bool Tail = false>
+__global__ __launch_bounds__(256) void grouped_pipe_n16_kernel(const Item* items, unsigned count) {
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: pipe_or_tail<3, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 4: pipe_or_tail<4, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 5: pipe_or_tail<5, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 6: pipe_or_tail<6, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        default: pipe_or_tail<8, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+    }
+}
+
+// Host-plan tail class MT (1..7) on the pipelined loop: the items of grouped_kernel<MT, 4>, same partials.
+template <int MT, bool Simplify = false, bool Packed = false>
+__global__ __launch_bounds__(128) void grouped_pipe_tail_kernel(const Item* items, unsigned count) {
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: pipe_tail<3, MT, Simplify, Packed>(it, bx, by, bz); break;
+        case 4: pipe_tail<4, MT, Simplify, Packed>(it, bx, by, bz); break;
+        case 5: pipe_tail<5, MT, Simplify, Packed>(it, bx, by, bz); break;
+        case 6: pipe_tail<6, MT, Simplify, Packed>(it, bx, by, bz); break;
+        default: pipe_tail<8, MT, Simplify, Packed>(it, bx, by, bz); break;
+    }
+}
+
+template <bool Simplify = false, bool Packed = false, bool Tail = false>
 __global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* items, unsigned count) {
     __shared__ Half16 exchange[128];  // 2 buffers x 4 decoded tiles x 16 columns
     unsigned lo = 0, hi = count;
@@ -123,11 +180,11 @@ __global__ __launch_bounds__(128) void grouped_pipe_pair_kernel(const Item* item
     const unsigned local = blockIdx.x - it.cta_begin;
     const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
     switch (it.bits) {
-        case 3: pipe_pair_or_tail<3, Simplify, Packed>(it, bx, by, bz, exchange); break;
-        case 4: pipe_pair_or_tail<4, Simplify, Packed>(it, bx, by, bz, exchange); break;
-        case 5: pipe_pair_or_tail<5, Simplify, Packed>(it, bx, by, bz, exchange); break;
-        case 6: pipe_pair_or_tail<6, Simplify, Packed>(it, bx, by, bz, exchange); break;
-        default: pipe_pair_or_tail<8, Simplify, Packed>(it, bx, by, bz, exchange); break;
+        case 3: pipe_pair_or_tail<3, Simplify, Packed, Tail>(it, bx, by, bz, exchange); break;
+        case 4: pipe_pair_or_tail<4, Simplify, Packed, Tail>(it, bx, by, bz, exchange); break;
+        case 5: pipe_pair_or_tail<5, Simplify, Packed, Tail>(it, bx, by, bz, exchange); break;
+        case 6: pipe_pair_or_tail<6, Simplify, Packed, Tail>(it, bx, by, bz, exchange); break;
+        default: pipe_pair_or_tail<8, Simplify, Packed, Tail>(it, bx, by, bz, exchange); break;
     }
 }
 

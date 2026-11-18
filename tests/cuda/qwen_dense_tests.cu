@@ -1,8 +1,10 @@
-// Tests of src/cuda/qwen_dense.cu (dense A8 projections + shared expert) against the literal host reference
+// Tests of src/cuda/models/qwen/qwen_dense.cu (dense A8 projections + shared expert) against the literal host reference
 // tests/cuda/qwen_dense_ref.hpp, bit for bit.
 //   qwen_dense_tests                 host-only tests (no CUDA call)
 //   qwen_dense_tests --gpu           + CUDA vs host: synthetic edge cases, real Q8_0 weights, shared expert
+//   ctest -R qwen_dense_rows16       isolated ON/OFF dispatch qualification (no model/table assets required)
 //   qwen_dense_tests --bench         GMAC/s of 8192 x 2560 x 16384 (GDN qkv||z shape)
+//   qwen_dense_tests --bench-shape M,K,N [...]  one site (M rows, K width, N outputs), best of 8, TOPS; repeatable, no model
 //   qwen_dense_tests --fixture F     list the records of a STRIX_QRTX_STEP_DUMP file (and replay when recognised)
 // Env: STRIX_QWEN_GGUF (model), STRIX_QRTX_TABLES (default qrtx-build\tables).
 #include <cuda_runtime.h>
@@ -10,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,11 +23,16 @@
 #include <thread>
 #include <vector>
 
-#include "strix/cuda_qwen_dense.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_dense_ref.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
+#ifdef STRIX_WFMT_CAPTURE
+#include "../wfmt/cuda_capture.hpp"
+static std::string wfmt_capture_directory;
+static std::size_t wfmt_capture_index = 0;
+#endif
 
 namespace qd = strix::cuda::qwen_dense;
 namespace ref = strix::qwen_dense_ref;
@@ -33,6 +41,17 @@ static int g_fail = 0, g_pass = 0;
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); std::exit(2); } } while (0)
 static void check(bool ok, const std::string& what) {
     if (ok) ++g_pass; else { ++g_fail; std::printf("FAIL %s\n", what.c_str()); }
+}
+
+static int g_rows16 = -1;
+static unsigned g_dispatches = 0;
+namespace strix::cuda::qwen_dense {
+void test_dispatch(std::uint32_t rows, bool one_pass) {
+    if (g_rows16 < 0) return;
+    ++g_dispatches;
+    std::printf("dispatch rows=%u form=%s\n", rows, one_pass ? "rp16" : "split8");
+    check(one_pass == (g_rows16 == 1), "requested dense dispatch");
+}
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -255,6 +274,21 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
         CK(qd::quantize_project(nullptr, site, rows, cs.input, in.p, width, codes.p, deltas.p, pitch));
         CK(cudaDeviceSynchronize());
     }
+#ifdef STRIX_WFMT_CAPTURE
+    std::vector<float> observed_partials;
+    std::uint32_t captured_outputs = 0;
+    if (!wfmt_capture_directory.empty()) {
+        std::vector<std::vector<std::uint8_t>> production;
+        for (const auto& out : outs) production.push_back(out->down());
+        for (const auto n : cs.outs) captured_outputs += n;
+        Dev<float> partials(static_cast<std::size_t>(width / 32U) * rows * captured_outputs);
+        CK(qd::capture_project_partials(nullptr, site, rows, codes.p, deltas.p, pitch, partials.p));
+        CK(cudaDeviceSynchronize());
+        observed_partials = partials.down();
+        for (std::size_t m = 0; m < outs.size(); ++m)
+            check(production[m] == outs[m]->down(), "diagnostic matches production output");
+    }
+#endif
     // host reference on the checked rows
     std::vector<std::int8_t> hc(static_cast<std::size_t>(rows) * width);
     std::vector<float> hd(static_cast<std::size_t>(width / 32U) * pitch);
@@ -271,6 +305,29 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
     std::string first;
     for (std::uint32_t m = 0; m < nseg; ++m) {
         const auto got = outs[m]->down();
+#ifdef STRIX_WFMT_CAPTURE
+        if (!wfmt_capture_directory.empty()) {
+            // Observe the exact production buffers, not host recomputations.
+            const auto observed_codes = codes.down();
+            const auto observed_scales = deltas.down();
+            std::uint32_t begin = 0;
+            for (std::uint32_t j = 0; j < m; ++j) begin += cs.outs[j];
+            std::vector<float> segment_partials;
+            for (std::size_t line = 0; line < static_cast<std::size_t>(width / 32U) * rows; ++line)
+                segment_partials.insert(segment_partials.end(), observed_partials.data() + line * captured_outputs + begin,
+                                         observed_partials.data() + line * captured_outputs + begin + cs.outs[m]);
+            const std::uint64_t shape[]{rows, width, cs.outs[m], static_cast<std::uint64_t>(cs.store), m};
+            const std::string name = "cuda-dense-" + std::to_string(wfmt_capture_index++);
+            check(strix::weight::test::write_cuda_capture(wfmt_capture_directory, name,
+                "cuda-qwen-imma-four-chain@1", shape,
+                {{"source", std::as_bytes(std::span(weights[m]))},
+                 {"activation_codes", std::as_bytes(std::span(observed_codes))},
+                 {"activation_scales", std::as_bytes(std::span(observed_scales))},
+                 {"sidecars", std::as_bytes(std::span(gate))},
+                 {"partials", std::as_bytes(std::span(segment_partials))},
+                 {"output", std::as_bytes(std::span(got))}}), "write " + name);
+        }
+#endif
         const std::uint32_t N = cs.outs[m], ld = N + 4U;
         const std::uint32_t row_bytes = width / 32U * 34U;
         std::vector<std::uint8_t> expect_row_ok(check_rows.size(), 1);
@@ -324,8 +381,12 @@ static void gpu_projection_synthetic() {
     for (const auto& cs : kCases) {
         std::vector<std::vector<std::uint8_t>> w;
         for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(make_q8(cs.outs[m], cs.width, 1000U * ci + m));
-        for (std::uint32_t rows : {1U, 5U, 64U, 130U, 256U, 1000U, 4096U})
+        for (std::uint32_t rows : {1U, 5U, 8U, 9U, 13U, 16U, 17U, 64U, 130U, 256U, 1000U, 1024U, 4096U}) {
+            if (g_rows16 >= 0 && rows != 9U && rows != 13U && rows != 16U) continue;
+            const auto before = g_dispatches;
             total += run_projection(cs, w, rows, 77U * rows + ci, true, 136U);
+            if (g_rows16 >= 0) check(g_dispatches == before + 1U, "eligible projection dispatched exactly once");
+        }
         ++ci;
     }
     std::printf("synthetic projection: %zu (row, output) values compared\n", total);
@@ -495,6 +556,86 @@ static void bench() {
     std::printf("bench quantize 8192 x 2560 (bf16): %.3f ms/iter\n", ms / iters);
 }
 
+// --bench-rows: decode-shaped projections (the Qwen sites, rows 1/8/9/16) with L2-cold weights: the weights rotate over
+// copies totalling >= 384 MB (the sm_120 L2 holds a whole site). STRIX_QRTX_DENSE_ROWS16=0/1 picks the 9..16 form.
+static void bench_rows() {
+    for (const auto& cs : kCases) {
+        std::size_t bytes = 0;
+        for (auto o : cs.outs) bytes += static_cast<std::size_t>(o) * (cs.width / 32U) * 34U;
+        const int copies = static_cast<int>((384ULL << 20) / bytes + 1U);
+        std::vector<std::unique_ptr<Dev<std::uint8_t>>> w;
+        for (int c = 0; c < copies; ++c)
+            for (std::size_t m = 0; m < cs.outs.size(); ++m) w.push_back(std::make_unique<Dev<std::uint8_t>>(make_q8(cs.outs[m], cs.width, 100U * c + m)));
+        const std::uint32_t rmax = 16U, width = cs.width;
+        const auto x = make_rows(rmax, width, true, 9, false);
+        Dev<std::uint16_t> in(to_bf16(x));
+        Dev<std::int8_t> codes(static_cast<std::size_t>(rmax) * width);
+        Dev<float> deltas(static_cast<std::size_t>(width / 32U) * rmax);
+        std::vector<std::unique_ptr<Dev<float>>> outs;
+        for (auto o : cs.outs) outs.push_back(std::make_unique<Dev<float>>(static_cast<std::size_t>(rmax) * o));
+        std::vector<float> g(rmax * 3U, 0.5F);
+        Dev<float> gate(g);
+        CK(qd::quantize(nullptr, rmax, width, qd::Input::bf16, in.p, width, codes.p, deltas.p, rmax));
+        std::vector<qd::Site> sites(copies);
+        for (int c = 0; c < copies; ++c) {
+            auto& site = sites[c];
+            site.store = cs.store; site.width = width; site.segments = static_cast<std::uint32_t>(cs.outs.size());
+            for (std::size_t m = 0; m < cs.outs.size(); ++m)
+                site.segment[m] = {w[c * cs.outs.size() + m]->p, cs.outs[m], outs[m]->p, cs.outs[m]};
+            if (cs.store == qd::Store::bf16_gated) { site.gate = gate.p; site.gate_stride = 3U; }
+        }
+        cudaEvent_t a, b;
+        CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+        for (std::uint32_t rows : {1U, 8U, 9U, 16U}) {
+            for (int c = 0; c < copies; ++c) CK(qd::project(nullptr, sites[c], rows, codes.p, deltas.p, rmax));
+            const int iters = 40 * copies;
+            CK(cudaEventRecord(a));
+            for (int i = 0; i < iters; ++i) CK(qd::project(nullptr, sites[i % copies], rows, codes.p, deltas.p, rmax));
+            CK(cudaEventRecord(b)); CK(cudaEventSynchronize(b));
+            float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
+            const double us = 1000.0 * ms / iters;
+            std::printf("bench-rows %-16s rows %2u: %7.2f us/call  %6.0f GB/s (weights %.1f MB)\n", cs.name, rows, us,
+                        static_cast<double>(bytes) / (us * 1e-6) / 1e9, bytes / 1e6);
+        }
+        CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+    }
+}
+
+// --bench-shape M,K,N (repeatable): one projection site of M rows x K width x N outputs (one segment), best-of iterations.
+static void bench_shape(std::uint32_t rows, std::uint32_t width, std::uint32_t outputs, int iters) {
+    const auto w = make_q8(outputs, width, 7);
+    Dev<std::uint8_t> dw(w);
+    const auto x = make_rows(rows, width, true, 3, false);
+    Dev<std::uint16_t> in(to_bf16(x));
+    Dev<std::int8_t> codes(static_cast<std::size_t>(rows) * width);
+    Dev<float> deltas(static_cast<std::size_t>(width / 32U) * rows);
+    Dev<float> o(static_cast<std::size_t>(rows) * outputs);
+    qd::Site site{};
+    site.store = qd::Store::f32_round_bf16; site.width = width; site.segments = 1;
+    site.segment[0] = {dw.p, outputs, o.p, outputs};
+    CK(qd::quantize(nullptr, rows, width, qd::Input::bf16, in.p, width, codes.p, deltas.p, rows));
+    CK(qd::project(nullptr, site, rows, codes.p, deltas.p, rows));
+    CK(cudaDeviceSynchronize());
+    cudaEvent_t a, b;
+    CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+    float best = 1e30F;
+    for (int i = 0; i < iters; ++i) {
+        CK(cudaEventRecord(a));
+        CK(qd::project(nullptr, site, rows, codes.p, deltas.p, rows));
+        CK(cudaEventRecord(b)); CK(cudaEventSynchronize(b));
+        float ms = 0; CK(cudaEventElapsedTime(&ms, a, b));
+        best = ms < best ? ms : best;
+    }
+    const double mac = static_cast<double>(rows) * width * outputs;
+    std::vector<std::uint8_t> host(o.n * sizeof(float));
+    CK(cudaMemcpy(host.data(), o.p, host.size(), cudaMemcpyDeviceToHost));
+    std::uint64_t h = 1469598103934665603ULL;   // FNV-1a over the output bytes: byte identity across kernel variants
+    for (const std::uint8_t c : host) h = (h ^ c) * 1099511628211ULL;
+    std::printf("bench-shape %u x %u x %u: best %.3f ms, %.1f TOPS (int8, 2 ops/MAC), out fnv %016llx\n", rows, width, outputs, best,
+                2.0 * mac / (best * 1e-3) / 1e12, static_cast<unsigned long long>(h));
+    CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+}
+
 static void list_fixture(const std::string& path) {
     strix::qwen_fixture::Dump dump(path);
     std::map<std::tuple<std::uint32_t, bool, std::uint32_t>, const strix::qwen_fixture::Record*> first;
@@ -559,13 +700,61 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 }
 
 int main(int argc, char** argv) {
-    bool gpu = false, do_bench = false;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the log
+#ifdef STRIX_WFMT_CAPTURE
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string_view(argv[i]) != "--wfmt-backend-capture") continue;
+        wfmt_capture_directory = argv[i + 1];
+        CK(cudaSetDevice(0));
+        // Boundary rows, output tails, even/odd Q8 group pairs and every store.
+        // Small synthetic tensors keep this a bounded pre-model GPU gate.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {17U, 129U}};
+            std::vector<std::vector<std::uint8_t>> weights;
+            for (std::size_t m = 0; m < cs.outs.size(); ++m) weights.push_back(make_q8(cs.outs[m], cs.width, 90U + m));
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
+        // A single segment starts at a tile boundary and exercises tile2;
+        // the preceding split segments exercise the raw136 fallback.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt-tile2", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {129U}};
+            const std::vector<std::vector<std::uint8_t>> weights{make_q8(129U, 256U, 92U)};
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
+        std::printf("wfmt CUDA dense: %zu production records, %d failures\n", wfmt_capture_index, g_fail);
+        return g_fail ? 1 : 0;
+    }
+#endif
+    bool gpu = false, do_bench = false, do_bench_rows = false;
+    std::vector<std::array<std::uint32_t, 3>> shapes;
     std::string fixture;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--gpu") gpu = true;
         else if (a == "--bench") do_bench = true;
+        else if (a == "--bench-rows") do_bench_rows = true;
+        else if (a == "--bench-shape" && i + 1 < argc) {
+            std::array<std::uint32_t, 3> v{};
+            if (std::sscanf(argv[++i], "%u,%u,%u", &v[0], &v[1], &v[2]) == 3) shapes.push_back(v);
+        }
         else if (a == "--fixture" && i + 1 < argc) fixture = argv[++i];
+        else if (a == "--rows16" && i + 1 < argc) {
+            const std::string arm = argv[++i];
+            if (arm != "0" && arm != "1") return 2;
+            g_rows16 = arm == "1" ? 1 : 0;
+        }
+    }
+    if (g_rows16 >= 0) {
+        CK(cudaSetDevice(0));
+        gpu_projection_synthetic();
+        return g_fail ? 1 : 0;
+    }
+    if (!shapes.empty()) {
+        CK(cudaSetDevice(0));
+        for (const auto& v : shapes) bench_shape(v[0], v[1], v[2], 8);
+        return g_fail ? 1 : 0;
     }
     host_tests();
     std::unique_ptr<strix::qwen_gguf::Model> model;
@@ -597,13 +786,14 @@ int main(int argc, char** argv) {
         std::printf("note: gguf unavailable (%s); real-weight tests skipped\n", e.what());
         model.reset();
     }
-    if (gpu || do_bench) {
+    if (gpu || do_bench || do_bench_rows) {
         CK(cudaSetDevice(0));
         cudaDeviceProp p{};
         CK(cudaGetDeviceProperties(&p, 0));
         std::printf("device: %s sm_%d%d\n", p.name, p.major, p.minor);
     }
     if (gpu) {
+        std::printf("note: --gpu inherits dispatch policy; RP16 qualification requires both qwen_dense_rows16 CTests\n");
         const auto t0 = std::chrono::steady_clock::now();
         gpu_quantize_tests();
         gpu_projection_synthetic();
@@ -618,6 +808,7 @@ int main(int argc, char** argv) {
         std::printf("gpu tests %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     if (do_bench) bench();
+    if (do_bench_rows) bench_rows();
     if (!fixture.empty()) {
         if (std::getenv("QWEN_DENSE_LIST")) list_fixture(fixture);
         if (model) {
@@ -633,3 +824,4 @@ int main(int argc, char** argv) {
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
+

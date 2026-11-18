@@ -334,6 +334,18 @@ __device__ __forceinline__ std::uint64_t qpf2k_low_band_index(std::uint32_t k, s
 // STRIX_QPF2K_HC_UPCOPY (default on with STRIX_QPF2K_HC_OUTPUT3): one device byte copy of the site's 3.5 MB of up weights per
 // call into a cached per-stream scratch, read by the output kernel; the bytes are identical.
 // STRIX_QPF2K_HC_UPCOPY_BASE=1 (with STRIX_QPF2K_HC=1): the base lane-chain output reads the copy too (attribution arm).
+// STRIX_QPF2K_HC_LOW32 (default 0 = skip): an out16 projection without low_t or the check mode stops writing the 1,280-byte
+// FP32 low tail of each row (LowMode bit 2), which nothing in that call reads (97 sites x 1.25 KiB per row: 1.02 GB per
+// 8192-row block). =1 keeps the store (rollback). STRIX_QPF2K_HC_LOW32_POISON=1 (census seam): the out16 call fills the
+// tail with NaN after the projection, so any later reader would change the final hash.
+bool qpf2k_hc_low32_skip() {
+    static const bool keep = strix::envcfg::flag("STRIX_QPF2K_HC_LOW32", false);
+    return !keep;
+}
+bool qpf2k_hc_low32_poison() {
+    static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_LOW32_POISON", false);
+    return on;
+}
 bool qpf2k_hc_upcopy() {
     static const bool on = strix::envcfg::flag("STRIX_QPF2K_HC_UPCOPY", true);
     return on;
@@ -423,6 +435,8 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRow
 // registers; its 80 VGPRs made the compiler serialize the LDS fragment loads (ds_load pair, lgkmcnt(0), 2 WMMA)
 // (t2c: 3.67 ms vs 2.94 ms).
 // LowMode (STRIX_QPF2K_HC_LOWBAND): bit 0 low_t in 512-row bands, bit 1 no low16 stores; the stored values are unchanged.
+// Bit 2 (qpf2k_hc_low32_skip(), out16 calls only): no FP32 low tail normalized[kHcwWidth + col]. Its readers are the FP32
+// outputs (lane-chain / tiled / persist) and the check snapshot, none of which an out16 call runs; low16 is unchanged.
 template <unsigned Depth, unsigned LowMode = 0U, bool Recompute = false>
 __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
@@ -564,7 +578,7 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
                 const unsigned r = row0 + 16U * t + 2U * e + lane / 16U, col = cb * kHcwProjCols + 16U * c + lane % 16U;
                 if (r >= rows.count) continue;
                 const float scaled = acc[t][c][e] / divisor, low = scaled * sigmoid(scaled);
-                wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
+                if constexpr (!(LowMode & 4U)) wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
                 if constexpr (!(LowMode & 2U)) low16[static_cast<std::uint64_t>(r) * kHcwRank + col] = static_cast<_Float16>(low);
                 if constexpr ((LowMode & 1U) != 0U) rows.low_t[qpf2k_low_band_index(col, r)] = low;
                 else if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(col) * rows.low_t_pitch + r] = low;
@@ -717,7 +731,7 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_tile_kernel(HyperWide
             const unsigned r = base + 16U * rt + 2U * e + lane / 16U, col = 16U * (cw * CT + c) + lane % 16U;
             if (r >= rows.count) continue;
             const float scaled = acc[c][e] / divisor, low = scaled * sigmoid(scaled);
-            wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
+            if constexpr (!(LowMode & 4U)) wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
             if constexpr (!(LowMode & 2U)) low16[static_cast<std::uint64_t>(r) * kHcwRank + col] = static_cast<_Float16>(low);
             if constexpr ((LowMode & 1U) != 0U) rows.low_t[qpf2k_low_band_index(col, r)] = low;
             else if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(col) * rows.low_t_pitch + r] = low;

@@ -94,12 +94,11 @@ std::uint64_t provisional_indexer_bytes_per_token(
 
 std::uint64_t gdn_matrix_state_bytes_per_layer(
     const ModelContract& model) {
-    return product({
+    return checked_mul(product({
         model.gdn_value_heads,
         model.gdn_key_head_dim,
         model.gdn_value_head_dim,
-        model.bytes_fp32,
-    });
+    }), recurrent_state_element_bytes(model.recurrent_state));  // f32: x4, identical to before
 }
 
 std::uint64_t gdn_matrix_state_bytes_per_session(

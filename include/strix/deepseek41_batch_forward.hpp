@@ -3,6 +3,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_pipeline_wire.hpp"
+#include "strix/logprob_partials.hpp"
 
 #include <array>
 #include <cstdint>
@@ -94,6 +95,7 @@ struct BatchStepStats {
     std::uint32_t rows = 0, segments = 0;
     double seconds = 0.0;           // wall time of the step, inputs to tokens on the host
     double engram_seconds = 0.0;    // Engram row reads
+    double engram_wait_seconds = 0.0;  // the step blocked on its Engram rows (asynchronous reads not there yet)
     double exchange_seconds = 0.0;  // inside the communicator (world 2)
     // per layer: the routed experts of this rank used by the step's rows (the union), and the most rows one of them
     // served; filled every step (copied asynchronously, read after the step)
@@ -175,6 +177,19 @@ public:
     void commit(std::uint32_t slot, std::uint32_t kept);
     // slice_logits: row r's logits of this rank's vocabulary slice; gather_logits: row r's full logits.
     [[nodiscard]] std::span<const float> row_logits(std::uint32_t row) const;
+    // Logprob scoring (strix/logprob_partials.hpp): from the next step on, the rows of the slots in `mask` (bit s =
+    // slot s) get raw target-row scores (top kLogprobPartialTop): each rank reduces its vocabulary slice on the device
+    // after the head, the 192-byte partials of the step's rows travel in one exchange (world 2), and the host merges
+    // them in FP64. Both ranks must set the same mask before the same step (the serve control block carries it).
+    // 0 (the default) adds no launch, byte or exchange; the tokens are those of the unscored step either way.
+    // Any nonzero mask reduces and transfers ALL step rows, even if no current row belongs to a selected slot;
+    // only host merging is selective. Serving admission must budget this full-step cost. Scratch is always reserved.
+    void set_score_slots(std::uint64_t mask) noexcept { score_slots_ = mask; }
+    [[nodiscard]] std::uint64_t score_slots() const noexcept { return score_slots_; }
+    // Row r of the last step: its score when its slot was scored, else null.
+    [[nodiscard]] const LogprobRowScore* row_score(std::uint32_t row) const noexcept {
+        return row < scored_.size() && scored_[row] != 0U ? &scores_[row] : nullptr;
+    }
     [[nodiscard]] const BatchStepStats& last_stats() const noexcept { return stats_; }
     // capture_main_hidden: the input streams of layers layers-3, layers-2, layers-1 of the last step's rows, device
     // memory [rows][hc][hidden] each in the order of the step's rows (as DeviceForward::captured_streams); valid until
@@ -228,6 +243,9 @@ private:
                                                std::vector<ds41::pipe::Boundary>* front_out);
     std::unique_ptr<Impl> impl_;
     std::vector<std::uint32_t> tokens_;
+    std::uint64_t score_slots_ = 0;
+    std::vector<LogprobRowScore> scores_;
+    std::vector<std::uint8_t> scored_;
     BatchStepStats stats_;
     double load_seconds_ = 0.0;
 };

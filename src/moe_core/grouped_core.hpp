@@ -27,8 +27,8 @@ template <template <int> class WeightDecode> struct GroupedDecodeTraits {
 };
 
 template <template <int> class WeightDecode, class ExpertLayout, class InputTransform, class Epilogue,
-          class Traits = GroupedDecodeTraits<WeightDecode>>
-struct GroupedCore : GroupedPrefillPolicy<> {
+          class Traits = GroupedDecodeTraits<WeightDecode>, class Policy = GroupedPrefillPolicy<>>
+struct GroupedCore : Policy {
     using Input = InputTransform;
     using Output = Epilogue;
 
@@ -394,10 +394,26 @@ static __device__ __forceinline__ Half16 pipe_load_a(const unsigned char* base, 
     return *(GlobalHalf16*)(base + offset);
 }
 
-template <int Bits, int MT, int G, bool FullRows = true, bool Simplify = false>
-static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsigned bz) {
-    static_assert(MT == 8 && G == 4 && FullRows);
+// MT row tiles in two A banks: bank 0 = tiles [0, G) loaded before the decode, bank 1 = [G, MT) after it.
+// FullRows = false (tail rows, partial blocks) only guards the store; the A loads stay unguarded, so the input must be
+// padded to the block's MT x 16 rows (padded rows hold stale data; WMMA rows are independent).
+// Tiles = output tiles per wave. 2 (default): 4 waves, wave w = column pair bx * 4 + w, 2 x MT accumulators, each lane
+// decodes the 16 states of tile 2 p + (lane >= 16). 1 (N16, 8 waves = 256 threads): wave w = tile bx * 8 + w, MT
+// accumulators (half the live registers), each lane decodes 8 states (lanes 16-31: k 8..15, window 2 Bits later, as
+// item_pipe_pair) and permlanex16 joins the halves; A is loaded per tile (twice the A loads per output). Same 128 columns
+// per CTA, same fragments, K-ascending chain per output from +0, split ranges and partial stores: same bits.
+// item_pipe_run: the PIPE loop of CTA (bx, by, bz), then epi(it, bz, acc0, acc1, first_row, col0, lane) in place of a store,
+// so an adapter epilogue can finish whole 128-column blocks (item_pipe passes the partial store). Tiles 2, wave w,
+// lane l: acc0[m][j] is row first_row + 16 m + 2 j + (l >> 4) at column col0 = bx 128 + 32 w + (l & 15); acc1 is
+// col0 + 16.
+template <int Bits, int MT, int G, bool Simplify, int Tiles, class Epi>
+static __device__ void item_pipe_run(const Item& it, unsigned bx, unsigned by, unsigned bz, Epi epi) {
+    static_assert(MT >= 1 && MT <= 8 && G == (MT < 4 ? MT : 4));
+    static_assert(Tiles == 1 || Tiles == 2);
+    constexpr int G1 = MT - G;  // bank 1 tiles
     using NW = typename WeightDecode<Bits>::Norm;
+    constexpr int NS = 8 * Tiles;                               // decoded states per lane
+    constexpr int kNL = Tiles == 2 ? NW::kNL : NW::g(7) + 2;   // window words for those states
     const int lane = static_cast<int>(threadIdx.x & 31U);
     const int wave = static_cast<int>(threadIdx.x >> 5U);
     const int c = lane & 15;
@@ -407,25 +423,25 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
     const int begin = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * bz / it.splits);
     const int end = static_cast<int>(static_cast<std::uint64_t>(tiles_k) * (bz + 1U) / it.splits);
     const int tile_pair = static_cast<int>(bx) * 4 + wave;
-    const int my_tile = 2 * tile_pair + (upper ? 1 : 0);
+    const int my_tile = Tiles == 2 ? 2 * tile_pair + (upper ? 1 : 0) : static_cast<int>(bx) * 8 + wave;
     const int base = 32 * (c & 7) + 4 * (c >> 3);
-    const int S = (base + 1) * Bits - 16 + 256 * Bits - 32;
+    const int S = (base + 1) * Bits - 16 + 256 * Bits - 32 + (Tiles == 1 && upper ? 2 * Bits : 0);
     const int d = S & 31, wb = (S >> 5) - (d == 0 ? 1 : 0);
     const unsigned sh = static_cast<unsigned>((32 - d) & 31);
-    std::uint32_t loff[NW::kNL];
+    std::uint32_t loff[kNL];
 #pragma unroll
-    for (int i = 0; i < NW::kNL; ++i)
+    for (int i = 0; i < kNL; ++i)
         loff[i] = static_cast<std::uint32_t>(my_tile * NW::kWords + (wb + i) % NW::kWords) * 4U;
     const std::size_t k_stride = ExpertLayout::template packed_stride<NW>(it.output / 16U);
     const auto* weights = dev::uniform(it.trellis);
     // Rebase per row tile using scalar 64-bit arithmetic, then use bounded lane offsets.
     const auto* x = dev::uniform(it.x + static_cast<std::size_t>(first_row / 16U) * tiles_k * 256U);
-    Float8 acc0[MT] = {}, acc1[MT] = {};
-    std::uint32_t ln[NW::kNL];
+    Float8 acc0[MT] = {}, acc1[Tiles == 2 ? MT : 1] = {};
+    std::uint32_t ln[kNL];
     if (begin < end) {
         const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(begin) * k_stride));
 #pragma unroll
-        for (int i = 0; i < NW::kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+        for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
     }
     for (int tile_k = begin; tile_k < end; ++tile_k) {
         Half16 a0[G];
@@ -437,12 +453,12 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
         }
         Half16 b0, b1;
         { // Decode temporaries die before the second A bank becomes live.
-            std::uint32_t nrm[NW::kNL - 1], mine[8], f0[8], f1[8];
+            std::uint32_t nrm[kNL - 1], mine[NS / 2], f0[8], f1[8];
 #pragma unroll
-            for (int i = 0; i < NW::kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
+            for (int i = 0; i < kNL - 1; ++i) nrm[i] = __builtin_amdgcn_alignbit(ln[i], ln[i + 1], sh);
             if constexpr (!Simplify && Traits::template Decode<Bits>::kPacked) {
 #pragma unroll
-                for (int r = 0; r < 16; r += 8) {
+                for (int r = 0; r < NS; r += 8) {
                     std::uint32_t st[8];
                     Half2 decoded[4];
 #pragma unroll
@@ -456,7 +472,7 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
                 }
             } else {
 #pragma unroll
-                for (int r = 0; r < 16; r += 2) {
+                for (int r = 0; r < NS; r += 2) {
                     std::uint16_t v[2];
 #pragma unroll
                     for (int i = 0; i < 2; ++i) {
@@ -470,18 +486,29 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
                     mine[r / 2] = static_cast<std::uint32_t>(v[0]) | (static_cast<std::uint32_t>(v[1]) << 16);
                 }
             }
+            if constexpr (Tiles == 2) {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const auto other = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
-                f0[i] = upper ? other : mine[i];
-                f1[i] = upper ? mine[i] : other;
+                for (int i = 0; i < 8; ++i) {
+                    const auto other = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                    f0[i] = upper ? other : mine[i];
+                    f1[i] = upper ? mine[i] : other;
+                }
+                b0 = as_half16(f0);
+                b1 = as_half16(f1);
+            } else {  // k 0..7 from the lower lane, k 8..15 from the upper one (as item_pipe_pair)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const auto peer = __builtin_amdgcn_permlanex16(mine[i], mine[i], 0x76543210U, 0xfedcba98U, false, false);
+                    f0[i] = upper ? peer : mine[i];
+                    f0[i + 4] = upper ? mine[i] : peer;
+                }
+                b0 = as_half16(f0);
+                b1 = b0;  // unused
             }
-            b0 = as_half16(f0);
-            b1 = as_half16(f1);
         }
-        Half16 a1[G];
+        Half16 a1[G1 > 0 ? G1 : 1];
 #pragma unroll
-        for (int m = 0; m < G; ++m) {
+        for (int m = 0; m < G1; ++m) {
             const auto* ab = reinterpret_cast<const unsigned char*>(dev::uniform(
                 x + (static_cast<std::size_t>(G + m) * tiles_k + static_cast<unsigned>(tile_k)) * 256U));
             a1[m] = pipe_load_a(ab, static_cast<std::uint32_t>(c) * 32U);
@@ -489,38 +516,62 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
         if (tile_k + 1 < end) {
             const auto* kb = reinterpret_cast<const unsigned char*>(dev::uniform(weights + static_cast<std::size_t>(tile_k + 1) * k_stride));
 #pragma unroll
-            for (int i = 0; i < NW::kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
+            for (int i = 0; i < kNL; ++i) ln[i] = dev::load_u32(kb, loff[i]);
         }
 #pragma unroll
         for (int m = 0; m < G; ++m) {
             acc0[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b0, acc0[m]);
-            acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
+            if constexpr (Tiles == 2) acc1[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0[m], b1, acc1[m]);
         }
 #pragma unroll
-        for (int m = 0; m < G; ++m) {
+        for (int m = 0; m < G1; ++m) {
             acc0[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b0, acc0[G + m]);
-            acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
+            if constexpr (Tiles == 2) acc1[G + m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1[m], b1, acc1[G + m]);
         }
     }
-    const unsigned col0 = static_cast<unsigned>(2 * tile_pair * 16 + c);
-#pragma unroll
-    for (int m = 0; m < MT; ++m) {
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
-            auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
-            dst[col0] = acc0[m][j];
-            dst[col0 + 16U] = acc1[m][j];
-        }
-    }
+    const unsigned col0 = static_cast<unsigned>((Tiles == 2 ? 2 * tile_pair : my_tile) * 16 + c);
+    epi(it, bz, acc0, acc1, first_row, col0, lane);
 }
 
-template <int Bits, int MT, int G, bool Simplify>
+// item_pipe's epilogue: the FP32 partial store of split bz (stateless, so item_pipe keeps its former arguments).
+template <int MT, bool FullRows, int Tiles>
+struct PipePartialStore {
+    __device__ __forceinline__ void operator()(const Item& it, unsigned bz, const Float8 (&acc0)[MT],
+                                               const Float8 (&acc1)[Tiles == 2 ? MT : 1], unsigned first_row,
+                                               unsigned col0, int lane) const {
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
+                if (!FullRows && row >= it.rows) continue;
+                auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
+                dst[col0] = acc0[m][j];
+                if constexpr (Tiles == 2) dst[col0 + 16U] = acc1[m][j];
+            }
+        }
+    }
+};
+
+template <int Bits, int MT, int G, bool FullRows = true, bool Simplify = false, int Tiles = 2>
+static __device__ __forceinline__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+    item_pipe_run<Bits, MT, G, Simplify, Tiles>(it, bx, by, bz, PipePartialStore<MT, FullRows, Tiles>{});
+}
+
+// Tiles 1 runs on 256 threads: the scalar fallback (4 waves, no barrier) runs on threads 0..127, the rest return.
+template <int Bits, int MT, int G, bool Simplify, int Tiles = 2>
 static __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
     // Uniform check includes row0 for exact-fit remainder items.
     if (it.row0 + by * 16U * static_cast<unsigned>(MT) + 16U * static_cast<unsigned>(MT) <= it.rows)
-        item_pipe<Bits, MT, G, true, Simplify>(it, bx, by, bz);
-    else item_core_v3<Bits, MT, 0, true>(it, bx, by, bz);
+        item_pipe<Bits, MT, G, true, Simplify, Tiles>(it, bx, by, bz);
+    else if constexpr (Policy::kPipeTail) item_pipe<Bits, MT, G, false, Simplify, Tiles>(it, bx, by, bz);
+    else if (Tiles == 2 || threadIdx.x < 128U) item_core_v3<Bits, MT, 0, true>(it, bx, by, bz);
+}
+
+// Tail class MT (1..7) on the pipelined loop: G = min(MT, 4), row guard on the store (Policy::kPipeTail callers).
+template <int Bits, int MT, bool Simplify>
+static __device__ __forceinline__ void pipe_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+    item_pipe<Bits, MT, (MT < 4 ? MT : 4), false, Simplify>(it, bx, by, bz);
 }
 
 

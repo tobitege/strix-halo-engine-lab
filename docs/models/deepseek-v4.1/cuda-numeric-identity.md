@@ -4,8 +4,8 @@ Status: layer-core kernels for sm_120 (`STRIX_ENABLE_CUDA_DS41`, off by default)
 on synthetic inputs and on real tensors of the pinned model. Attention and the routed experts are separate pieces
 (their CUDA kernels follow the same rules; see the end of this document).
 
-Files: `include/strix/cuda_ds41_common.hpp` (conventions, buffers, views), `include/strix/cuda_ds41_core.hpp` (sites),
-`src/cuda/ds41_core*.cu`, `src/cuda/ds41_cuda_common.{cu,cuh}`, tests and tools in `tests/cuda/`.
+Files: `include/strix/cuda/ds41_common.hpp` (conventions, buffers, views), `include/strix/cuda/ds41_core.hpp` (sites),
+`src/cuda/models/ds41/ds41_core*.cu`, `src/cuda/models/ds41/ds41_cuda_common.{cu,cuh}`, tests and tools in `tests/cuda/`.
 
 ## The identity
 

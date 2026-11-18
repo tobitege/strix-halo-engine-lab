@@ -7,21 +7,26 @@
 // per-component minima are optimistic estimates, not an end-to-end layer time. A warm pass and the last timed pass are
 // compared on every branch output and state (determinism), all finite, no flag; the process exits nonzero otherwise.
 // usage: hip_glm_pf_layer_bench C T0_DSA [C T0_DSA ...]   e.g. 1024 0 2048 6144 2048 30720
+#include "attn_core/sparse_flash_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "strix_trellis.h"
+#include "strix/env_arms.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -509,9 +514,10 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
             // Paired stage timings, independent of environment selection. Run with
             // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
-            // o-bar v10 (default exact) vs the FAST fused attn-wmma core (21: T = 16), gemm v3 on both, order reversed every rep.
-            constexpr unsigned kArms = 2;
-            const unsigned sv[kArms] = {7, 7}, ov[kArms] = {10, 21}, gv[kArms] = {3, 3};
+            // o-bar v10 (default exact) vs the FAST fused attn-wmma core (21: T = 16; 23: T = 16 on the bf16 q-tilde image),
+            // gemm v3 on all, order reversed every rep.
+            constexpr unsigned kArms = 3;
+            const unsigned sv[kArms] = {7, 7, 7}, ov[kArms] = {10, 21, 23}, gv[kArms] = {3, 3, 3};
             float stage_us[kArms][3][5]{};
             for (unsigned rep = 0; rep < 4; ++rep) {
                 // Alternate pair order to limit systematic warm-cache/clock bias.
@@ -555,7 +561,7 @@ int main(int argc, char** argv) {
             for (auto& ev : pe) hok(hipEventDestroy(ev), "ev");
             // FAST fused core vs the exact v10 path on the same inputs: o-bar and MLA output rel L2 / max |d| / cosine.
             const std::size_t nob = static_cast<std::size_t>(C) * kHeadsR * kKvLora, nmo = static_cast<std::size_t>(C) * kHeadsR * kMlaDim;
-            std::vector<float> ob_ref(nob), mo_ref(nmo), ob_f(nob), mo_f(nmo);
+            std::vector<float> ob_ref(nob), mo_ref(nmo), ob_f(nob), mo_f(nmo), ob_q32, mo_q32;
             P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, 10, 3);
             hok(hipMemcpyAsync(ob_ref.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
             hok(hipMemcpyAsync(mo_ref.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
@@ -582,6 +588,89 @@ int main(int argc, char** argv) {
                 hok(hipStreamSynchronize(g_hs), "sync");
                 cmp(ob_ref, ob_f, "o-bar", ov[f] * 10 + gv[f]);
                 cmp(mo_ref, mo_f, "out", ov[f] * 10 + gv[f]);
+                if (f == 1) {  // FP32 q-tilde arm: the bf16-image arm (f 2) must reproduce it bit for bit
+                    ob_q32 = ob_f;
+                    mo_q32 = mo_f;
+                } else if (f == 2) {
+                    const bool same = std::memcmp(ob_q32.data(), ob_f.data(), nob * 4) == 0 && std::memcmp(mo_q32.data(), mo_f.data(), nmo * 4) == 0;
+                    std::printf("   MLA attn-wmma bf16 q-tilde image (23) vs FP32 q-tilde (21): o-bar + out bitwise %s\n", same ? "equal" : "DIFFER");
+                    if (!same) {
+                        const auto require_equal = [](const std::vector<float>& ref, const std::vector<float>& got, const char* tensor) {
+                            for (std::size_t i = 0; i < ref.size(); ++i)
+                                if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0)
+                                    die("MLA arm 23 vs 21: " + std::string(tensor) + " differs at index " + std::to_string(i));
+                        };
+                        require_equal(ob_q32, ob_f, "o-bar");
+                        require_equal(mo_q32, mo_f, "out");
+                    }
+                }
+            }
+            if (kArms > 2) {  // the other STRIX_ATTN_FLASH_PF loop (pipelined loads vs single stage) on arm 23: bitwise
+                const char* had = std::getenv("STRIX_ATTN_FLASH_PF");
+                const std::optional<std::string> keep = had ? std::optional<std::string>(had) : std::nullopt;
+                const bool pf = strix::attn_core::sparse::flash_pf_enabled();
+                hipEvent_t ev0, ev1;
+                hok(hipEventCreate(&ev0), "event");
+                hok(hipEventCreate(&ev1), "event");
+                const auto run23 = [&](bool on) {  // whole fused arm 23 (absorb + flash + out), ms
+                    strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", std::string(on ? "1" : "0"));
+                    strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                    hok(hipEventRecord(ev0, g_hs), "record");
+                    P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, ov[2], gv[2]);
+                    hok(hipEventRecord(ev1, g_hs), "record");
+                    hok(hipEventSynchronize(ev1), "sync");
+                    float ms = 0.0F;
+                    hok(hipEventElapsedTime(&ms, ev0, ev1), "elapsed");
+                    return ms;
+                };
+                run23(pf);
+                run23(!pf);
+                float t_on[4], t_off[4];  // strict ABAB, 4 pairs; the last call runs the non-default loop (checked below)
+                for (unsigned rep = 0; rep < 4; ++rep) {
+                    const float a1 = run23(pf), a2 = run23(!pf);
+                    t_on[rep] = pf ? a1 : a2;
+                    t_off[rep] = pf ? a2 : a1;
+                }
+                std::printf("   flash PF ABAB arm 23 ms on:");
+                for (float x : t_on) std::printf(" %.3f", x);
+                std::printf(" off:");
+                for (float x : t_off) std::printf(" %.3f", x);
+                std::sort(t_on, t_on + 4);
+                std::sort(t_off, t_off + 4);
+                std::printf(" | median on %.3f off %.3f (%+.2f %%)\n", 0.5F * (t_on[1] + t_on[2]), 0.5F * (t_off[1] + t_off[2]),
+                            100.0F * ((t_on[1] + t_on[2]) / (t_off[1] + t_off[2]) - 1.0F));
+                hok(hipEventDestroy(ev0), "event");
+                hok(hipEventDestroy(ev1), "event");
+                hok(hipMemcpyAsync(ob_f.data(), ob, nob * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipMemcpyAsync(mo_f.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                hok(hipStreamSynchronize(g_hs), "sync");
+                strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", keep);
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                const bool same = std::memcmp(ob_q32.data(), ob_f.data(), nob * 4) == 0 && std::memcmp(mo_q32.data(), mo_f.data(), nmo * 4) == 0;
+                std::printf("   flash pipelined loads (STRIX_ATTN_FLASH_PF %d vs %d): o-bar + out bitwise %s\n", pf ? 1 : 0, pf ? 0 : 1,
+                            same ? "equal" : "DIFFER");
+                if (!same) die("STRIX_ATTN_FLASH_PF arms differ (must be bitwise)");
+                // FP16 o-bar image vs the FP32 o-bar on the explicit FAST dispatch (WMMA absorb / out): the out GEMM output
+                // must be the same bits (both round o / l to FP16 RNE); report the differing elements if not.
+                std::vector<float> mo_i(nmo);
+                for (unsigned image = 0; image < 2; ++image) {
+                    P::mla_attention_rows_selected(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, 7, 23, 3, 0,
+                                                   {P::mla_gemm::Arithmetic::wmma, image != 0, true});
+                    hok(hipMemcpyAsync(image ? mo_f.data() : mo_i.data(), mo, nmo * 4, hipMemcpyDeviceToHost, g_hs), "cp");
+                    hok(hipStreamSynchronize(g_hs), "sync");
+                }
+                const std::vector<float>& mo_ref = mo_i;
+                std::size_t nd = 0, first = nmo, last = 0;
+                double dmax = 0.0;
+                for (std::size_t i = 0; i < nmo; ++i)
+                    if (std::memcmp(&mo_ref[i], &mo_f[i], sizeof(float)) != 0) {
+                        ++nd;
+                        first = std::min(first, i);
+                        last = i;
+                        dmax = std::max(dmax, static_cast<double>(std::fabs(mo_ref[i] - mo_f[i])));
+                    }
+                std::printf("   MLA out (FAST wmma dispatch), o-bar FP16 image vs FP32: %zu / %zu elements differ (first %zu last %zu, per row %zu, max|d| %.3e)\n",
+                            nd, nmo, nd ? first : 0, nd ? last : 0, nmo / C, dmax);
             }
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,

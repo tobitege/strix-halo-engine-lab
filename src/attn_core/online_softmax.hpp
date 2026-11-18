@@ -77,10 +77,10 @@ __device__ __forceinline__ float online_step_split(const float (&s)[K], SoftmaxS
 #pragma unroll
     for (unsigned i = 0; i < K; ++i) {
         const float e = __builtin_amdgcn_exp2f(s[i] - mn);
-        hi[i] = to_operand<O>(e);
-        const float h = operand_value<O>(hi[i]);
-        lo[i] = to_operand<O>(e - h);
-        ps += h + operand_value<O>(lo[i]);
+        const Terms2 t = to_operand2<O>(e);
+        hi[i] = t.hi;
+        lo[i] = t.lo;
+        ps += operand_value<O>(t.hi) + operand_value<O>(t.lo);
     }
 #pragma unroll
     for (unsigned x = 1; x < Lanes; x <<= 1U) ps += __shfl_xor(ps, static_cast<int>(x * Stride));

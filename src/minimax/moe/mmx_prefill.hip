@@ -3,6 +3,8 @@
 #include "minimax/engine/route_identity.hpp"
 
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"  // the q image: the flash prologue's norm + RoPE
+#include "../../attn_core/wmma_types.hpp"   // and its operand rounding
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
 #include "core/trellis_codec.hpp"
@@ -14,6 +16,8 @@
 #include "core/wmma_tiled.hpp"  // shared tiled core: grouped IU4 kernel and convert_exl3_iu4 (strix_tiled_core)
 #endif
 #include "moe_core/device_plan.hpp"
+#include "moe_core/grouped_policy.hpp"
+#include "core/linear_plan.hpp"  // fixed_linear_contract: rows-free dense K chain (invariant order)
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -36,6 +40,34 @@ unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned
 }
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return route::gemm_splits(input, output, bits, rows);
+}
+// MoE numeric order contract (STRIX_MMX_PF_ORDER): invariant (default via the pf_order table item; shared
+// kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking) or adaptive (off switch and
+// baseline; former identity: S from the expert's rows in the chunk).
+// The override is for test fixtures and for the engine's one load-time decline of a defaulted invariant order
+// (require_invariant_dense, on the loading thread before any execution or planning). Change it only between
+// synchronized calls on one host thread; never mutate it during engine execution or concurrent planning.
+namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
+void set_prefill_moe_order(int invariant) {
+    if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");
+    g_order_override = invariant;
+}
+const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
+    if (g_order_override == 0) return ::strix::moe_core::kGroupedAdaptiveContract;
+    if (g_order_override == 1) return ::strix::moe_core::kGroupedSingleChainContract;
+    static const ::strix::moe_core::GroupedSplitContract c = [] {
+        return ::strix::moe_core::resolve_grouped_order(strix::envcfg::text("STRIX_MMX_PF_ORDER"));
+    }();
+    return c;
+}
+bool prefill_order_invariant() { return prefill_moe_order().invariant(); }
+// Dense v4 split: invariant binds the shared rows-free contract (one ascending K16 chain per output, S = 1 for every
+// MiniMax q/k/v/o matrix: the split the adaptive policy already picks for >= 1024-row pieces); adaptive keeps the
+// library's rows-dependent split (== strix_gemm bitwise).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+    if (prefill_order_invariant())
+        return static_cast<unsigned>(::strix::core::fixed_linear_contract(static_cast<int>(input), kDenseFixedSplits).splits);
+    return gemm_splits(input, output, bits, rows);
 }
 
 namespace {
@@ -397,8 +429,13 @@ struct DenseArgs {
     _Float16* xt[kMaxDenseJobs];
     const float* part[kMaxDenseJobs];
     float* out[kMaxDenseJobs];
+    std::uint16_t* image[kMaxDenseJobs];     // PrefillDenseJob::image (null: out)
+    std::uint16_t* image_lo[kMaxDenseJobs];
+    const float* image_w[kMaxDenseJobs];
+    const msa::RopeRow* image_rope[kMaxDenseJobs];
     unsigned n[kMaxDenseJobs], splits[kMaxDenseJobs];
     unsigned count, rows, k;
+    unsigned finish_row0;  // dense_finish_kernel's first row (rows below it were finished by dense_pipe_fused_kernel)
 };
 
 __global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, DenseArgs a) {
@@ -426,21 +463,104 @@ __global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, De
     }
 }
 
+// The stores of one finished 128-column block b of row `row` of job m (v: finish_block's lane + 32 j layout), shared by
+// dense_finish_kernel and the dense_pipe_fused_kernel epilogue.
+__device__ __forceinline__ void dense_store_block(const DenseArgs& a, unsigned m, unsigned row, unsigned b, unsigned lane,
+                                                  float (&v)[4]) {
+    if (a.image[m] != nullptr) {  // wave-uniform: block b = one 128-dim head of the row
+        // the flash prologue's layout (msa_norm_rope.hpp): lane l takes dims 4l..4l+3; dim d is on lane d & 31, slot
+        // d >> 5 = l >> 3 (moves only, no arithmetic)
+        namespace tile = strix::attn_core::tile;
+        constexpr tile::Operand O = tile::Operand::bf16;
+        float x[4];
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) {
+            const int src = static_cast<int>((4U * lane + i) & 31U);
+            const float t0 = __shfl(v[0], src, 32), t1 = __shfl(v[1], src, 32), t2 = __shfl(v[2], src, 32), t3 = __shfl(v[3], src, 32);
+            const unsigned s = lane >> 3U;
+            x[i] = s == 0U ? t0 : s == 1U ? t1 : s == 2U ? t2 : t3;
+        }
+        msa::norm_rope_lane(x, a.image_w[m], a.image_rope[m][row], lane);
+        const std::size_t at = static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane * 4U;
+        *reinterpret_cast<uint2*>(a.image[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        if (a.image_lo[m] != nullptr) {
+#pragma unroll
+            for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+            *reinterpret_cast<uint2*>(a.image_lo[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        }
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
+}
+
 __global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     unsigned q = blockIdx.x * 8U + wave, m = 0;
-    for (; m < a.count; ++m) {  // job m owns rows * n / 128 consecutive waves
-        const unsigned w = a.rows * (a.n[m] / 128U);
+    for (; m < a.count; ++m) {  // job m owns (rows - finish_row0) * n / 128 consecutive waves
+        const unsigned w = (a.rows - a.finish_row0) * (a.n[m] / 128U);
         if (q < w) break;
         q -= w;
     }
     if (m == a.count) return;
-    const unsigned nb = a.n[m] / 128U, row = q / nb, b = q % nb;
+    const unsigned nb = a.n[m] / 128U, row = a.finish_row0 + q / nb, b = q % nb;
     float v[4];
     finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+    dense_store_block(a, m, row, b, lane, v);
+}
+
+// The dense MT8 class (full 128-row tiles, K split 1) with the output transform as the PIPE epilogue: the CTA's
+// 128 x 128 accumulator tile is one 128-column block bx of 128 rows, so each sixteen-row slice goes through LDS to
+// finish_block (+0.0F + the one partial, H128, svh: the same expressions on the same values as dense_finish_kernel)
+// and dense_store_block. No FP32 partials for these rows; dense_finish_kernel takes the rows from finish_row0.
+template <bool Simplify, bool Packed>
+__global__ __launch_bounds__(128) __attribute__((flatten)) void dense_pipe_fused_kernel(const pfk::Item* items, unsigned count,
+                                                                                         DenseArgs a) {
+    __shared__ float drain[16 * 128];  // 8 KiB, reused for every sixteen-row slice
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const pfk::Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = local / it.gx;  // K split 1: gx * gy CTAs per item
+    unsigned m = 0;
+    while (m + 1U < a.count && a.part[m] != it.part) ++m;  // the item's job (its partial slot names it)
+    pfk::Accum<8> acc;  // one drain below for every bit width
+    auto keep = [&acc](const pfk::Item&, unsigned, const auto& acc0, const auto& acc1, unsigned, unsigned, int) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
-        a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
+        for (int s = 0; s < 8; ++s) acc.acc0[s] = acc0[s], acc.acc1[s] = acc1[s];
+    };
+    switch (it.bits) {
+        case 3: pfk::pipe_run<3, Simplify, Packed>(it, bx, by, keep); break;
+        case 4: pfk::pipe_run<4, Simplify, Packed>(it, bx, by, keep); break;
+        case 5: pfk::pipe_run<5, Simplify, Packed>(it, bx, by, keep); break;
+        case 6: pfk::pipe_run<6, Simplify, Packed>(it, bx, by, keep); break;
+        default: pfk::pipe_run<8, Simplify, Packed>(it, bx, by, keep); break;
+    }
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+    const unsigned col = wave * 32U + (lane & 15U);
+    const unsigned first = it.row0 + by * 128U;
+    const std::uint16_t* const svh = a.svh[m] + bx * 128U;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned r = 2U * static_cast<unsigned>(j) + (lane >> 4U);
+            drain[r * 128U + col] = acc.acc0[s][j];
+            drain[r * 128U + col + 16U] = acc.acc1[s][j];
+        }
+        __syncthreads();
+        for (unsigned r = wave; r < 16U; r += 4U) {
+            float v[4];
+            finish_block(drain, 1, 16, r, 128, 0, svh, lane, v);
+            dense_store_block(a, m, first + 16U * static_cast<unsigned>(s) + r, bx, lane, v);
+        }
+        __syncthreads();  // all rows read before the next slice overwrites LDS
+    }
 }
 
 void launched(const char* what) {
@@ -532,9 +652,10 @@ Plan make_plan(const PrefillMoeView& v) {
         g.pair_begin = static_cast<unsigned>(p.pair_row.size());
         g.tbegin = p.tpairs;
         p.tpairs += (g.n + 15U) / 16U * 16U;
-        g.s_gu = gemm_splits(kHidden, kInter, w.gate.bits, g.n);
-        g.s_dn = gemm_splits(kInter, kHidden, w.down.bits, g.n);
-        if (gemm_splits(kHidden, kInter, w.up.bits, g.n) != g.s_gu || gemm_tile_rows(kHidden, kInter, w.gate.bits, g.n) != 16 ||
+        const auto& order = prefill_moe_order();
+        g.s_gu = order.gate.resolve(gemm_splits(kHidden, kInter, w.gate.bits, g.n));
+        g.s_dn = order.down.resolve(gemm_splits(kInter, kHidden, w.down.bits, g.n));
+        if (order.up.resolve(gemm_splits(kHidden, kInter, w.up.bits, g.n)) != g.s_gu || gemm_tile_rows(kHidden, kInter, w.gate.bits, g.n) != 16 ||
             gemm_tile_rows(kHidden, kInter, w.up.bits, g.n) != 16)
             throw std::invalid_argument("minimax prefill moe: gate/up policy differs between the two matrices");
         g.part_gu = p.part_floats;
@@ -620,6 +741,7 @@ int g_mtfit_override = -1;
 int g_core8_override = -1;
 int g_pipe_override = -1;
 int g_pipe_pair_override = -1;
+int g_pipe_n16_override = -1;
 int g_dense_band_override = -1;
 int g_tail_stream_override = -1;
 int g_gufuse_override = -1;
@@ -686,6 +808,21 @@ bool prefill_pipe_pair(unsigned rows) {
     const int mode = g_pipe_pair_override < 0 ? prefill_pipe_pair_default() : g_pipe_pair_override;
     return mode == 1 || (mode == 2 && rows >= kPairMinRows);
 }
+// STRIX_MMX_PREFILL_PIPE_N16 (under PIPE): the MT8 class on 8 waves of one output tile each (item_pipe Tiles 1: 64
+// instead of 128 accumulator registers per lane, 166 VGPR / occupancy 9 against 239-247 / 6, twice the A loads, no LDS).
+// 0 (default) = off; 1 = every MT8 call, in place of the column pairs and the paired bands; auto = the calls that do
+// not take the paired bands (below kPairMinRows): whole-call ABBA T1024 -1.6 % (CI -2.3..-0.9) against the column
+// pairs, while against the paired bands it loses (T2048 +3.2, T4096 +6.1, T8192 +7.9 %: the pairs decode each weight
+// tile once per 256 rows, N16 once per 128). Same items, grids, K splits and bits (pipe-tail fixture, device plan arms).
+int prefill_pipe_n16_default() {  // 0 off, 1 on, 2 auto
+    static const int value = static_cast<int>(strix::env_choice("STRIX_MMX_PREFILL_PIPE_N16", 0, {"0", "1", "auto"}));
+    return value;
+}
+thread_local bool g_pipe_n16_pair = false;  // the paired-band decision of the call being launched (auto mode)
+bool prefill_pipe_n16() {
+    const int mode = g_pipe_n16_override < 0 ? prefill_pipe_n16_default() : g_pipe_n16_override;
+    return mode == 1 || (mode == 2 && !g_pipe_n16_pair);
+}
 // STRIX_MMX_PREFILL_DENSE_BAND (dense linears under PIPE): 0 (default) = MT8 PIPE CTAs, 4 / 8 = tall bands of that many
 // waves over 512 / 1024 rows (one weight decode per band); rows beyond the last full band keep PIPE / the tail. Same bits.
 int prefill_dense_band_default() {
@@ -697,6 +834,22 @@ unsigned prefill_dense_band() {
     if (prefill_pipe() == 0) return 0;
     return static_cast<unsigned>(g_dense_band_override < 0 ? prefill_dense_band_default() : g_dense_band_override);
 }
+
+// STRIX_MMX_PREFILL_PIPE_TAIL (v4 + mtfit items; lever pf_moe_pipe_tail): 0 (default) = tail classes on item_core_v3;
+// 1 = the tail classes MT 1..7 on the pipelined loop (= mask 254); an even mask = bit MT (2..256) per class. Bit 256
+// (the MT8 remainders on item_pipe<8, 4, false> under PIPE) fails the ISA gate (256 VGPR, spills, scratch): diagnosis
+// only, never part of 1. Same items, grids, K splits and bits (test_prefill_pipe_tail). The unguarded A loads need the
+// mtfit items (one block of ceil(rows / 16) tiles per tail), so a plan without mtfit keeps the old kernels.
+unsigned prefill_pipe_tail_mask() {  // bit c = class c (MT c + 1)
+    static const unsigned mask = [] {
+        const unsigned v = strix::envcfg::number<unsigned>("STRIX_MMX_PREFILL_PIPE_TAIL", 0U, 0U, 511U);
+        if (v > 1U && (v & 1U) != 0U)
+            throw std::invalid_argument("STRIX_MMX_PREFILL_PIPE_TAIL must be 0, 1 or an even class mask (bit MT, 2..510)");
+        return v == 1U ? 0x7FU : v >> 1U;
+    }();
+    return mask;
+}
+bool prefill_pipe_tail(unsigned cls) { return ((prefill_pipe_tail_mask() >> cls) & 1U) != 0U; }
 
 // STRIX_MMX_PREFILL_TAIL_STREAM (v4 + mtfit): 1 (default) = the tail-class launches (MT 1..7) of each stage run on a side
 // stream beside the MT8 launch, joined before the stage's consumer; 0 = every class launch on the caller's stream.
@@ -854,16 +1007,32 @@ bool prefill_p1_packed() {
     return enabled;
 }
 
-template <bool Packed>
+template <bool Packed, bool Tail = false>
 void launch_pipe_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream, bool pair, bool simplify) {
-    if (pair && simplify)
-        hipLaunchKernelGGL(pfk::grouped_pipe_pair_kernel<true>, dim3(ctas), dim3(128), 0, stream, items_d, n);
+    g_pipe_n16_pair = pair;
+    if (prefill_pipe_n16() && simplify)
+        hipLaunchKernelGGL((pfk::grouped_pipe_n16_kernel<true, false, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
+    else if (prefill_pipe_n16())
+        hipLaunchKernelGGL((pfk::grouped_pipe_n16_kernel<false, Packed, Tail>), dim3(ctas), dim3(256), 0, stream, items_d, n);
+    else if (pair && simplify)
+        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (pair)
-        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_pair_kernel<false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else if (simplify)
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, true, false, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
     else
-        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+        hipLaunchKernelGGL((pfk::grouped_pipe_kernel<8, 4, false, Packed, Tail>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+}
+
+// Host-plan tail class MT on the pipelined loop (prefill_pipe_tail), decode form as the MT8 PIPE launch.
+template <int MT>
+void launch_pipe_tail_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipStream_t stream) {
+    if (prefill_pipe() == 2)
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, true, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else if (prefill_p1_packed())
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, true>), dim3(ctas), dim3(128), 0, stream, items_d, n);
+    else
+        hipLaunchKernelGGL((pfk::grouped_pipe_tail_kernel<MT, false, false>), dim3(ctas), dim3(128), 0, stream, items_d, n);
 }
 
 template <int W>
@@ -876,14 +1045,29 @@ void launch_band_class(const pfk::Item* items_d, unsigned n, unsigned ctas, hipS
         hipLaunchKernelGGL((pfk::grouped_pipe_band_kernel<W, false, false>), dim3(ctas), dim3(W * 32), 0, stream, items_d, n);
 }
 
-void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false) {
+// tail_pipe: the items come from an mtfit plan, so prefill_pipe_tail may move their tail classes to the pipelined loop.
+void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned cls, hipStream_t stream, bool pair = false,
+                  bool tail_pipe = false) {
     if (cls == 7 && prefill_pipe() != 0) {
-        const bool simplify = prefill_pipe() == 2;
-        if (prefill_p1_packed())
-            launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
-        else
-            launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
+        // N16 takes the guarded tail on mtfit items (166 VGPR, occupancy 9); its scalar-core fallback form holds 222.
+        g_pipe_n16_pair = pair;
+        const bool simplify = prefill_pipe() == 2, tail = tail_pipe && (prefill_pipe_tail(7) || prefill_pipe_n16());
+        if (prefill_p1_packed() && tail) launch_pipe_class<true, true>(items_d, n, ctas, stream, pair, simplify);
+        else if (prefill_p1_packed()) launch_pipe_class<true>(items_d, n, ctas, stream, pair, simplify);
+        else if (tail) launch_pipe_class<false, true>(items_d, n, ctas, stream, pair, simplify);
+        else launch_pipe_class<false>(items_d, n, ctas, stream, pair, simplify);
         return;
+    }
+    if (cls < 7 && tail_pipe && prefill_pipe_tail(cls)) {
+        switch (cls) {
+            case 0: launch_pipe_tail_class<1>(items_d, n, ctas, stream); return;
+            case 1: launch_pipe_tail_class<2>(items_d, n, ctas, stream); return;
+            case 2: launch_pipe_tail_class<3>(items_d, n, ctas, stream); return;
+            case 3: launch_pipe_tail_class<4>(items_d, n, ctas, stream); return;
+            case 4: launch_pipe_tail_class<5>(items_d, n, ctas, stream); return;
+            case 5: launch_pipe_tail_class<6>(items_d, n, ctas, stream); return;
+            default: launch_pipe_tail_class<7>(items_d, n, ctas, stream); return;
+        }
     }
     if (cls == 7 && prefill_core8() != 0) {
         if (prefill_core8() == 1)
@@ -906,7 +1090,7 @@ void launch_class(const pfk::Item* items_d, unsigned n, unsigned ctas, unsigned 
 // pair = this MoE call's paired MT8 PIPE bands
 void launch_v2(const pfk::Item* items_d, const std::vector<pfk::Item>& list, unsigned ctas, unsigned cls, hipStream_t stream, bool pair) {
     if (list.empty()) return;
-    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair);
+    launch_class(items_d, static_cast<unsigned>(list.size()), ctas, cls, stream, pair, prefill_mtfit());
 }
 
 template <int MT>
@@ -1030,6 +1214,8 @@ struct DevOut {
     float* part;
     unsigned tpairs;
     bool i4=false;
+    // Bound split of the numeric order contract (0 = adaptive): gate/up and down, the same for every group.
+    unsigned bound_gu = 0, bound_dn = 0;
     unsigned grid[16];  // the launch grid of every (stage, class): a bound of its CTAs (class_grids)
     // Group-wide plan only: the chunks' router tables ([n][4] ids, then [n][4] weights, n = the chunk's rows) and the
     // per-chunk expert counts [segments][128] of seg_count_kernel.
@@ -1134,7 +1320,10 @@ template <unsigned C> struct DevPolicyT {
         route::MtFit fit{};
         if (mine) {
             w = x < kExperts ? p.out.experts[x % kReal] : p.out.shared;
-            if (C > 1 && x < kExperts) {
+            if (p.out.bound_gu != 0U) {  // invariant contract: S from the matrix only, never from rows
+                s_gu = n ? p.out.bound_gu : 0U;
+                s_dn = n ? p.out.bound_dn : 0U;
+            } else if (C > 1 && x < kExperts) {
                 s_gu = n ? kGwSplitGu[x / kReal] : 0U;
                 s_dn = n ? kGwSplitDn[x / kReal] : 0U;
             } else {
@@ -1366,17 +1555,32 @@ template <int MT> __global__ __launch_bounds__(128) void dq_v4_kernel(Queue q) {
 #undef STRIX_MMX_CALL
     });
 }
-template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+// Tail classes MT 1..7 on the pipelined loop (STRIX_MMX_PREFILL_PIPE_TAIL): the items of dq_v4_kernel<MT>, same partials.
+template <int MT, bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_tail_kernel(Queue q) {
     dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
-#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed>(it, bx, by, bz)
+#define STRIX_MMX_CALL(B) pfk::pipe_tail<B, MT, Simplify, Packed>(it, bx, by, bz)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
     });
 }
-template <bool Simplify, bool Packed> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
+template <bool Simplify, bool Packed, bool Tail = false> __global__ __launch_bounds__(128) void dq_pipe_kernel(Queue q) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed, Tail>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed, bool Tail = false> __global__ __launch_bounds__(256) void dq_pipe_n16_kernel(Queue q) {
+    dp::run_items(q, [](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
+#define STRIX_MMX_CALL(B) pfk::pipe_or_tail<B, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz)
+        STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
+#undef STRIX_MMX_CALL
+    });
+}
+template <bool Simplify, bool Packed, bool Tail = false> __global__ __launch_bounds__(128) void dq_pipe_pair_kernel(Queue q) {
     __shared__ pfk::Half16 exchange[128];  // as grouped_pipe_pair_kernel
     dp::run_items(q, [&](const pfk::Item& it, unsigned bx, unsigned by, unsigned bz) {
-#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed>(it, bx, by, bz, exchange)
+#define STRIX_MMX_CALL(B) pfk::pipe_pair_or_tail<B, Simplify, Packed, Tail>(it, bx, by, bz, exchange)
         STRIX_MMX_BITS_SWITCH(STRIX_MMX_CALL)
 #undef STRIX_MMX_CALL
     });
@@ -1391,8 +1595,40 @@ template <int Core8> __global__ __launch_bounds__(128) void dq_core8_kernel(Queu
 }
 #undef STRIX_MMX_BITS_SWITCH
 
+template <int MT> void launch_dq_pipe_tail(const Queue& q, const dim3& g, hipStream_t stream) {
+    if (prefill_pipe() == 2) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, true, false>), g, dim3(128), 0, stream, q);
+    else if (prefill_p1_packed()) hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, true>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_pipe_tail_kernel<MT, false, false>), g, dim3(128), 0, stream, q);
+}
+template <bool Tail> void launch_dq_pipe(const Queue& q, const dim3& g, hipStream_t stream, bool pair) {
+    const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
+    g_pipe_n16_pair = pair;
+    // N16: the device plan is always mtfit, so the partial blocks take the guarded tail (166 VGPR instead of 222).
+    if (prefill_pipe_n16() && simplify) hipLaunchKernelGGL((dq_pipe_n16_kernel<true, false, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16() && packed) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, true, true>), g, dim3(256), 0, stream, q);
+    else if (prefill_pipe_n16()) hipLaunchKernelGGL((dq_pipe_n16_kernel<false, false, true>), g, dim3(256), 0, stream, q);
+    else if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false, Tail>), g, dim3(128), 0, stream, q);
+    else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true, Tail>), g, dim3(128), 0, stream, q);
+    else hipLaunchKernelGGL((dq_pipe_kernel<false, false, Tail>), g, dim3(128), 0, stream, q);
+}
+
+// The device-queue plan is always mtfit (prefill_moe_device_plan), so prefill_pipe_tail applies to every class here.
 void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t stream, bool pair) {
     const dim3 g(grid);
+    if (cls < 7 && prefill_pipe_tail(cls)) {
+        switch (cls) {
+            case 0: launch_dq_pipe_tail<1>(q, g, stream); return;
+            case 1: launch_dq_pipe_tail<2>(q, g, stream); return;
+            case 2: launch_dq_pipe_tail<3>(q, g, stream); return;
+            case 3: launch_dq_pipe_tail<4>(q, g, stream); return;
+            case 4: launch_dq_pipe_tail<5>(q, g, stream); return;
+            case 5: launch_dq_pipe_tail<6>(q, g, stream); return;
+            default: launch_dq_pipe_tail<7>(q, g, stream); return;
+        }
+    }
     switch (cls) {
         case 0: hipLaunchKernelGGL(dq_v4_kernel<1>, g, dim3(128), 0, stream, q); return;
         case 1: hipLaunchKernelGGL(dq_v4_kernel<2>, g, dim3(128), 0, stream, q); return;
@@ -1405,13 +1641,8 @@ void launch_dq_class(const Queue& q, unsigned cls, unsigned grid, hipStream_t st
     }
     // Class 7: the kernel that launch_class<4> selects, from the same switches.
     if (prefill_pipe() != 0) {
-        const bool simplify = prefill_pipe() == 2, packed = prefill_p1_packed();
-        if (pair && simplify) hipLaunchKernelGGL((dq_pipe_pair_kernel<true, false>), g, dim3(128), 0, stream, q);
-        else if (pair && packed) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, true>), g, dim3(128), 0, stream, q);
-        else if (pair) hipLaunchKernelGGL((dq_pipe_pair_kernel<false, false>), g, dim3(128), 0, stream, q);
-        else if (simplify) hipLaunchKernelGGL((dq_pipe_kernel<true, false>), g, dim3(128), 0, stream, q);
-        else if (packed) hipLaunchKernelGGL((dq_pipe_kernel<false, true>), g, dim3(128), 0, stream, q);
-        else hipLaunchKernelGGL((dq_pipe_kernel<false, false>), g, dim3(128), 0, stream, q);
+        if (prefill_pipe_tail(7)) launch_dq_pipe<true>(q, g, stream, pair);
+        else launch_dq_pipe<false>(q, g, stream, pair);
         return;
     }
     if (prefill_core8() == 1) hipLaunchKernelGGL((dq_core8_kernel<1>), g, dim3(128), 0, stream, q);
@@ -1547,6 +1778,8 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
+    a.out.bound_gu = prefill_moe_order().gate.splits;
+    a.out.bound_dn = prefill_moe_order().down.splits;
     const auto grids = class_grids(T);
     for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
     mark("start", stream);
@@ -1608,6 +1841,8 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
+    a.out.bound_gu = prefill_moe_order().gate.splits;
+    a.out.bound_dn = prefill_moe_order().down.splits;
     a.out.seg_count = reinterpret_cast<unsigned*>(ws + l.seg_count);
     a.out.seg_rows = v.seg_rows;
     a.out.segments = S;
@@ -1671,6 +1906,11 @@ void set_prefill_pipe_pair(int value) {
     if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe_pair: value must be -1, 0, 1 or 2 (auto)");
     (void)prefill_pipe_pair_default();  // capture once, including at Engine startup
     g_pipe_pair_override = value;
+}
+void set_prefill_pipe_n16(int value) {
+    if (value < -1 || value > 2) throw std::invalid_argument("set_prefill_pipe_n16: value must be -1, 0, 1 or 2 (auto)");
+    (void)prefill_pipe_n16_default();  // capture once, including at Engine startup
+    g_pipe_n16_override = value;
 }
 void set_prefill_dense_band(int value) {
     if (value != -1 && value != 0 && value != 4 && value != 8)
@@ -1977,7 +2217,7 @@ DensePlan make_dense_plan(const PrefillDenseJob* jobs, unsigned count, unsigned 
             w.svh == nullptr || jobs[m].out == nullptr)
             throw std::invalid_argument("minimax prefill dense: jobs need one input width and outputs % 128 == 0");
         if (!dense_bits_supported(w.bits)) throw std::invalid_argument("minimax prefill dense: unsupported bit width");
-        p.splits[m] = gemm_splits(w.input, w.output, w.bits, rows);
+        p.splits[m] = prefill_dense_splits(w.input, w.output, w.bits, rows);
         p.off_xt[m] = off;
         off += align256(std::size_t{p.tpad} * p.k * 2);
         p.off_part[m] = off;
@@ -2025,9 +2265,18 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         throw std::invalid_argument("minimax prefill dense: null input or workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
     constexpr unsigned kBandClass = 8;  // tall bands (STRIX_MMX_PREFILL_DENSE_BAND), beside the eight row-tile classes
+    constexpr unsigned kFusedClass = 9;  // the full 128-row tiles on dense_pipe_fused_kernel
     const unsigned band = prefill_dense_band();
-    std::vector<pfk::Item> lists[kBandClass + 1];
-    unsigned ctas[kBandClass + 1] = {};
+    const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
+    // The output transform runs as the PIPE epilogue of the full tiles when the MT8 class would run
+    // grouped_pipe_kernel<8, 4> (PIPE, no tall bands, no N16; launch_class's pair is false here) and every job has
+    // K split 1 (the invariant contract's S, and adaptive's at >= 1024 rows): one partial per output, so finish_block's
+    // order is the same in both kernels. Otherwise (and for the remainder rows) the partials and dense_finish_kernel.
+    g_pipe_n16_pair = false;
+    bool fuse = prefill_pipe() != 0 && band == 0 && !prefill_pipe_n16() && fit.main != 0;
+    for (unsigned m = 0; m < count; ++m) fuse = fuse && p.splits[m] == 1;
+    std::vector<pfk::Item> lists[kFusedClass + 1];
+    unsigned ctas[kFusedClass + 1] = {};
     for (unsigned m = 0; m < count; ++m) {
         const Exl3& w = jobs[m].w;
         pfk::Item it{};
@@ -2047,20 +2296,19 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
             ctas[c] += it.gx * gy * it.splits;
             lists[c].push_back(it);
         };
-        const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
         const unsigned banded = band != 0 ? fit.main / band * band : 0U;  // 128-row tiles in full bands
         if (banded != 0) {
             it.gx = w.output / 32;
             emit(kBandClass, 0, banded / band);
             it.gx = w.output / 128;
         }
-        if (fit.main != banded) emit(7, banded * 128, fit.main - banded);
+        if (fit.main != banded) emit(fuse ? kFusedClass : 7U, banded * 128, fit.main - banded);
         if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
     }
     std::lock_guard<std::mutex> staging(g_dense_mutex);
     DenseSlot& slot = next_dense_slot();
-    unsigned at[kBandClass + 1] = {}, used = 0;
-    for (unsigned c = 0; c <= kBandClass; ++c) {
+    unsigned at[kFusedClass + 1] = {}, used = 0;
+    for (unsigned c = 0; c <= kFusedClass; ++c) {
         at[c] = used;
         for (const pfk::Item& it : lists[c]) slot.host[used++] = it;
     }
@@ -2072,6 +2320,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     a.count = count;
     a.rows = rows;
     a.k = p.k;
+    a.finish_row0 = fuse ? fit.main * 128U : 0U;
     unsigned waves = 0;
     for (unsigned m = 0; m < count; ++m) {
         a.suh[m] = jobs[m].w.suh;
@@ -2079,9 +2328,11 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         a.xt[m] = reinterpret_cast<_Float16*>(ws + p.off_xt[m]);
         a.part[m] = reinterpret_cast<const float*>(ws + p.off_part[m]);
         a.out[m] = jobs[m].out;
+        a.image[m] = jobs[m].image, a.image_lo[m] = jobs[m].image_lo, a.image_w[m] = jobs[m].image_w;
+        a.image_rope[m] = static_cast<const msa::RopeRow*>(jobs[m].image_rope);
         a.n[m] = jobs[m].w.output;
         a.splits[m] = p.splits[m];
-        waves += rows * (jobs[m].w.output / 128);
+        waves += (rows - a.finish_row0) * (jobs[m].w.output / 128);
     }
     hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
@@ -2090,11 +2341,23 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         if (band == 8) launch_band_class<8>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
         else launch_band_class<4>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
     }
+    if (!lists[kFusedClass].empty()) {  // launch_class's MT8 PIPE kernel choice (pair false, no tail items)
+        const auto n = static_cast<unsigned>(lists[kFusedClass].size());
+        const pfk::Item* const fused = items_d + at[kFusedClass];
+        if (prefill_pipe() == 2)
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<true, false>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+        else if (prefill_p1_packed())
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<false, true>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+        else
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<false, false>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+    }
     for (unsigned c = 0; c < 8; ++c)
         if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");
-    hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
-    launched("dense finish");
+    if (waves != 0) {
+        hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
+        launched("dense finish");
+    }
 }
 
 void cleanup_prefill_dense() noexcept {

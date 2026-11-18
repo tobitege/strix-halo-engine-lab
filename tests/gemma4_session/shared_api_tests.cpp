@@ -5,6 +5,8 @@
 #include "strix/serve/api.hpp"
 #include "gemma4/features/features.hpp"
 #include <thread>
+#include <fstream>
+#include <iterator>
 
 namespace {
 Writer route(e::Api& api,const char* path,const Json& b=Json::object(),const char* method="POST") {
@@ -34,6 +36,17 @@ Json terminal(const Writer& w) {
         if(j.find("strix"))last=j;
     }
     CHECK(last.find("strix"));return last;
+}
+void ratio_request(const g::ModelManifest& m,g::RopeTables rope,std::shared_ptr<const g::serve::Tokenizer> tok) {
+    // The Python benchmark checks its generated Gemma request against this same fixture.
+    std::ifstream fixture(std::filesystem::path(__FILE__).parent_path()/"../serve_cli_ratio_gemma_request.json");
+    CHECK(fixture.good());
+    const std::string text((std::istreambuf_iterator<char>(fixture)),std::istreambuf_iterator<char>());
+    const auto request=srv::parse_json_unique(text);
+    RealBackend backend(m,rope);e::Api api(backend,tok,{},e::DraftMode::off,"model");
+    const auto result=terminal(route(api,"/v1/completions",request));
+    CHECK(result.find("strix")->find("generated_ids"));
+    CHECK(!generated(result).empty());
 }
 Json converted(const Json& b,const std::string& path) {
     if(path=="/v1/chat/completions")return b;
@@ -332,6 +345,7 @@ int main(int argc,char** argv) {
     try {
         CHECK(argc==2);environment("STRIX_G4_SERVE_SLOTS","1");environment("STRIX_G4_SERVE_BATCH","1");environment("STRIX_G4_SERVE_PREFIX","0");
         auto tok=tokenizer(std::filesystem::absolute(argv[1]));auto m=http_model();identify(m);Tables tables;auto rope=tables.view();
+        ratio_request(m,rope,tok);
         legacy_hook_contract();live_stream(m,rope,tok);routes(m,rope,tok);invalid(m,rope,tok);grouped(m,rope,tok);wire_no_store(m,rope,tok);features_with_live_work(m,rope,tok);tool_stream_protocol(tok);sse_disconnects(m,rope,tok);
         // Existing independent model/cursor/cache proofs now execute through the
         // same production frontend, including failed restoration and accounting.

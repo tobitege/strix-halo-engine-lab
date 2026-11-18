@@ -4,6 +4,7 @@
 #include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
 #include "minimax/moe/mmx_moe.hpp"
+#include "xport/split_frame.hpp"
 
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "strix/minimax_msa.hpp"
@@ -76,6 +77,14 @@ struct Args {
     bool interleave_gu = true;
     unsigned down_split = 0;  // STRIX_MMX_MOE_DOWN_SPLIT mode; route::moe_down_split decides per launch
     hipEvent_t down_done = nullptr;  // host enqueue boundary only; never read on device
+    // Split-producer chunk frame (MoeView::split), appended so every earlier offset is unchanged: the down launch covers
+    // dn_half column groups from dn_cg0 (combine: tiles from dn_blk0); out is addressed through split_index().
+    unsigned dn_half = 0, dn_cg0 = 0, dn_blk0 = 0;
+    bool split_out = false;
+    PublishTarget pub_head{};
+    __device__ std::size_t split_index(unsigned r, unsigned c) const {
+        return xport::SplitLayout{rows, kHidden, kHidden / 2}.index(r, c);
+    }
     __device__ Dispatch* disp() const { return reinterpret_cast<Dispatch*>(ws); }
     __device__ float* scores() const { return reinterpret_cast<float*>(ws + kOffScores); }
     __device__ float* choice() const { return reinterpret_cast<float*>(ws + kOffChoice); }
@@ -1038,26 +1047,38 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
 
 // Shared by the last-arrival path and the stream-ordered finish launch: identical four-split sum,
 // H128/scales, ascending-expert fmaf and shared add. Each wave owns complete rows of one output tile.
-template <int W>
+template <int W, bool SplitOut = false>
 __device__ __forceinline__ void down4_combine(const Args& a, const Dispatch* dp, unsigned block) {
-    DecodeCore::down4_combine<W>(a, dp, block);
+    DecodeCore::down4_combine<W, SplitOut>(a, dp, block);
 }
 
+template <bool Split = false>
 __global__ __launch_bounds__(128) void down4_combine_kernel(Args a) {
-    down4_combine<4>(a, a.disp(), blockIdx.x);
+    if constexpr (Split) down4_combine<4, true>(a, a.disp(), a.dn_blk0 + blockIdx.x);  // tile range of this half
+    else down4_combine<4>(a, a.disp(), blockIdx.x);
     lean_publish(a.pub, a.pub.tiles);  // exactly one publisher per completed 128-output tile
 }
 
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false,
+          bool SplitOut = false>
 __device__ __forceinline__ void down4_cta(const Args& a, unsigned bx, unsigned by, _Float16* xs, WideV4* rowbuf,
                                           std::uint32_t ready = 0) {
-    DecodeCore::down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly>(a, bx, by, xs, rowbuf, ready);
+    DecodeCore::down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly, SplitOut>(a, bx, by, xs, rowbuf, ready);
 }
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
+// Split: the grid covers a.dn_half column groups starting at a.dn_cg0 (x = split * dn_half + group); bx is remapped to the
+// full-grid index (cg + groups * split), so every CTA computes exactly what it computes in the unsplit grid.
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false,
+          bool Split = false>
 __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kSplitCh];
     __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
-    down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly>(a, blockIdx.x, blockIdx.y, xs, rowbuf);
+    if constexpr (Split) {
+        constexpr unsigned groups = Wide ? kHidden / 256U : kHidden / (16U * W);
+        const unsigned bx = a.dn_cg0 + blockIdx.x % a.dn_half + groups * (blockIdx.x / a.dn_half);
+        down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly, true>(a, bx, blockIdx.y, xs, rowbuf);
+    } else {
+        down4_cta<MaxR, Depth, W, DepthBig, Wide, Single, PartialOnly>(a, blockIdx.x, blockIdx.y, xs, rowbuf);
+    }
 }
 
 // Routed gate/up and down in one launch (STRIX_MMX_MOE_PIPE, overlap form only; the shared expert's gate/up ran in the
@@ -1089,6 +1110,8 @@ Args make_args(const MoeView& v) {
     Args a{v.rows, v.h, v.part0, v.part1, v.norm_w, v.y, v.router_w, v.bias, v.experts, v.shared, v.out, v.ids, v.weights,
            static_cast<unsigned char*>(v.ws.base)};
     a.pub = v.pub;
+    a.pub_head = v.pub_head;
+    a.split_out = v.split;
     a.controlled_ids = v.controlled_ids;
     a.controlled_weights = v.controlled_weights;
     a.single_reader_counts = v.single_reader_counts;
@@ -1240,6 +1263,7 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
     // capped at 96 they spill (measured +15-19 % at N5-8 either way); at N1 two launches measured 0.1 ms/token faster.
     if constexpr (MaxR <= 4) {
         const unsigned pipe = SkipShared && a.rows >= 2 ? moe_pipe() : 0U;
+        if (pipe != 0 && a.split_out) throw std::logic_error("minimax moe: the split frame is not available with STRIX_MMX_MOE_PIPE");
         if (pipe != 0) {  // replaces the stream-ordered down split too (measured faster at N4)
             const unsigned gu_x = gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), gu_z = a.interleave_gu ? 1U : 2U;
             const unsigned dn_x = dn_groups * kDownSplits, grid = gu_x * slots * gu_z + dn_x * slots;
@@ -1261,6 +1285,33 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
                        gu_grid, dim3(32 * W), 0, stream, a);
     launched("gate_up4");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
+    if constexpr (SkipShared && W == 4) {
+        if (a.split_out) {  // split-producer chunk frame: the down (+ combine) twice on the column halves, gate/up once
+            const bool partials = route::moe_down_split(a.down_split, a.rows, Wide, W, Depth);
+            const unsigned half = dn_groups / 2;
+            for (unsigned part = 0; part < 2; ++part) {
+                Args p = a;
+                p.pub = part == 0 ? a.pub_head : a.pub;
+                p.pub.tiles = kOutBlocks / 2;  // 24 tiles per message part
+                p.dn_half = half;
+                p.dn_cg0 = part * half;
+                p.dn_blk0 = part * (kOutBlocks / 2);
+                if (partials) {  // same two launches per half as the unsplit down split
+                    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true, true>),
+                                       dim3(half * kDownSplits, slots), dim3(32 * W), 0, stream, p);
+                    launched("down4 partials (split)");
+                    hipLaunchKernelGGL(down4_combine_kernel<true>, dim3(kOutBlocks / 2), dim3(128), 0, stream, p);
+                    launched("down4 combine (split)");
+                } else {
+                    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, false, true>),
+                                       dim3(half * kDownSplits, slots), dim3(32 * W), 0, stream, p);
+                    launched("down4 (split)");
+                }
+            }
+            if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
+            return;
+        }
+    }
     if (route::moe_down_split(a.down_split, a.rows, Wide, W, Depth)) {
         // Same producers and scratch addresses, without any U-wide arrival counters or finish epilogue.
         hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>),
@@ -1268,7 +1319,7 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
         launched("down4 partials");
         if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
         // Stream ordering makes all partial stores visible; no spin, fences or producer counters needed.
-        hipLaunchKernelGGL(down4_combine_kernel, dim3(kOutBlocks), dim3(128), 0, stream, a);
+        hipLaunchKernelGGL(down4_combine_kernel<false>, dim3(kOutBlocks), dim3(128), 0, stream, a);
         launched("down4 combine");
     } else {
         hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
@@ -1433,7 +1484,15 @@ template <int Depth> void launch_overlap4_rows(const Args& a, hipStream_t stream
     else launch_overlap4<8, Depth>(a, stream, marks);
 }
 
+bool moe_split_supported(unsigned rows) {
+    // the default decode form (producer publish) with the down4 launches, two rows or more (enqueue_moe_profiled's
+    // guard); the gate/up + down pipeline (rows 2..4) is not split
+    return rows >= 2 && producer_publish_supported() && !(rows <= 4 && moe_pipe() != 0);
+}
+
 void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done) {
+    if (v.split && (v.pub.flag == nullptr || v.pub_head.flag == nullptr || v.rows < 2 || !moe_split_supported(v.rows)))
+        throw std::logic_error("minimax moe: MoeView::split needs both publish targets and the default decode form");
     if (v.pub.flag != nullptr && !(moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4))
         throw std::logic_error("minimax moe: the publish epilogue needs the decode overlap form (v4, 4 waves)");
     if (moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4) {
@@ -1540,6 +1599,7 @@ struct LinArgs {
     unsigned char* ws;
     std::size_t counter_off;
     PublishTarget pub{};  // v4 core: publish the outputs (STRIX_MM_XB_PUBLISH)
+    unsigned col_begin = 0, col_count = 0;  // v4 core, Cols instantiation only: output columns of this launch (single job)
 };
 
 __global__ __launch_bounds__(256) void linear_prepare_kernel(LinArgs a) {
@@ -1717,7 +1777,10 @@ template <bool Trace> __device__ __forceinline__ void lin_stamp(const LinArgs& a
     }
 }
 // Trace: profiling instantiation (set_linear_trace); the normal one carries no stamp code.
-template <int R, int Depth, bool Static, bool Prime = false, bool Trace = false>
+// Cols (split-producer chunk frames): the grid covers output columns [a.col_begin, a.col_begin + a.col_count) of the single
+// job (groups = col_count / 64 per split); every CTA does what it does in the full grid (same trellis stride, split,
+// partial slot, finish and sum order); y points at column col_begin. Cols = false is the unchanged kernel.
+template <int R, int Depth, bool Static, bool Prime = false, bool Trace = false, bool Cols = false>
 __global__ __launch_bounds__(128) void linear_core4_kernel(LinArgs a) {
     extern __shared__ __attribute__((aligned(16))) unsigned char lin4_smem[];  // R x xs_stride halves (dynamic)
     auto* xs = reinterpret_cast<_Float16*>(lin4_smem);
@@ -1725,8 +1788,8 @@ __global__ __launch_bounds__(128) void linear_core4_kernel(LinArgs a) {
     unsigned ji = 0;
     while (ji + 1 < a.count && blockIdx.x >= a.job[ji + 1].cta_begin) ++ji;
     const LinJob& j = a.job[ji];
-    const unsigned local = blockIdx.x - j.cta_begin, groups = j.w.output / 64U;
-    const unsigned split = local / groups, group = local % groups;
+    const unsigned local = blockIdx.x - j.cta_begin, groups = Cols ? a.col_count / 64U : j.w.output / 64U;
+    const unsigned split = local / groups, group = (Cols ? a.col_begin / 64U : 0U) + local % groups;
     const unsigned rows = Static ? static_cast<unsigned>(R) : a.rows;
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const unsigned kt = j.w.input / 16, k0 = kt * split / j.splits, k1 = kt * (split + 1) / j.splits;
@@ -1795,7 +1858,8 @@ __global__ __launch_bounds__(128) void linear_core4_kernel(LinArgs a) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const unsigned i = block * 128 + lane + 32U * static_cast<unsigned>(q);
-            j.y[static_cast<std::size_t>(r) * j.y_stride + i] = v[q] * d::half_bits(j.w.svh[i]);
+            if constexpr (Cols) j.y[static_cast<std::size_t>(r) * j.y_stride + (i - a.col_begin)] = v[q] * d::half_bits(j.w.svh[i]);
+            else j.y[static_cast<std::size_t>(r) * j.y_stride + i] = v[q] * d::half_bits(j.w.svh[i]);
         }
     }
     lean_publish(a.pub, a.pub.tiles);  // the finisher of each 128-output tile counts once (STRIX_MM_XB_PUBLISH)
@@ -2386,9 +2450,16 @@ LinPlan plan_linears(const LinearJob* jobs, unsigned count, unsigned rows) {
         j.splits = std::min(d::vector_splits(w.input, w.output), w.input / 16);
         j.cta_begin = p.ctas;
         j.block_begin = blocks;
+        if (jobs[i].col_count != 0 || jobs[i].col_begin != 0) {  // column range: single job, 128-aligned, inside the output
+            if (count != 1 || jobs[i].col_count == 0 || jobs[i].col_begin % 128 || jobs[i].col_count % 128 ||
+                jobs[i].col_begin + jobs[i].col_count > w.output)
+                throw std::invalid_argument("minimax linears: column range needs one job and 128-aligned columns inside the output");
+            p.args.col_begin = jobs[i].col_begin;
+            p.args.col_count = jobs[i].col_count;
+        }
         j.xt_off = xt;
         j.part_off = part;
-        p.ctas += (w.output / 64) * j.splits;
+        p.ctas += (p.args.col_count != 0 ? p.args.col_count / 64 : w.output / 64) * j.splits;
         blocks += w.output / 128;
         xt += (std::size_t{kMaxRows} * w.input + 127) & ~std::size_t{127};
         part += (std::size_t{j.splits} * kMaxRows * w.output + 63) & ~std::size_t{63};
@@ -2439,8 +2510,12 @@ template <int Depth> void launch_linear3(const LinPlan& p, unsigned blocks, hipS
     else if (p.args.rows <= 4) launch_linear3_r<4, Depth>(p, blocks, stream);
     else launch_linear3_r<8, Depth>(p, blocks, stream);
 }
-template <int Depth, bool Prime = false, bool Trace = false> void launch_linear_core4(const LinPlan& p, hipStream_t stream) {
-    if constexpr (!Trace) {
+template <int Depth, bool Prime = false, bool Trace = false, bool Cols = false> void launch_linear_core4(const LinPlan& p, hipStream_t stream) {
+    if constexpr (!Trace && !Cols) {
+        if (p.args.col_count != 0) {  // column range (split-producer chunk frame): the Cols instantiations, never traced
+            launch_linear_core4<Depth, false, false, true>(p, stream);
+            return;
+        }
         if (p.args.trace != nullptr) {
             launch_linear_core4<Depth, Prime, true>(p, stream);
             return;
@@ -2449,12 +2524,12 @@ template <int Depth, bool Prime = false, bool Trace = false> void launch_linear_
     const unsigned R = p.args.rows == 1 ? 1U : (p.args.rows == 2 ? 2U : (p.args.rows <= 4 ? 4U : 8U));
     const std::size_t lds = std::size_t{R} * p.args.xs_stride * 2;
     const bool exact = p.args.rows == R;
-    if (R == 1) hipLaunchKernelGGL((linear_core4_kernel<1, Depth, true, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 2) hipLaunchKernelGGL((linear_core4_kernel<2, Depth, true, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 4 && exact) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, true, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (R == 4) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, false, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else if (exact) hipLaunchKernelGGL((linear_core4_kernel<8, Depth, true, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
-    else hipLaunchKernelGGL((linear_core4_kernel<8, Depth, false, Prime, Trace>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    if (R == 1) hipLaunchKernelGGL((linear_core4_kernel<1, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 2) hipLaunchKernelGGL((linear_core4_kernel<2, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 4 && exact) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (R == 4) hipLaunchKernelGGL((linear_core4_kernel<4, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else if (exact) hipLaunchKernelGGL((linear_core4_kernel<8, Depth, true, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
+    else hipLaunchKernelGGL((linear_core4_kernel<8, Depth, false, Prime, Trace, Cols>), dim3(p.ctas), dim3(128), lds, stream, p.args);
     launched("linear core4");
 }
 template <int R, int Depth, bool Static, int V> void launch_lin56_rs(const LinPlan& p, std::size_t lds, unsigned grid, hipStream_t stream) {
@@ -2608,8 +2683,10 @@ void enqueue_linears_impl(const LinearJob* jobs, unsigned count, unsigned rows, 
         if (v != 4) throw std::logic_error("minimax linears: the publish epilogue needs the v4 core (STRIX_MMX_LINEAR_V=4)");
         p.args.pub = *pub;
         p.args.pub.tiles = 0;
-        for (unsigned i = 0; i < count; ++i) p.args.pub.tiles += jobs[i].w.output / 128U;
+        for (unsigned i = 0; i < count; ++i) p.args.pub.tiles += (jobs[i].col_count != 0 ? jobs[i].col_count : jobs[i].w.output) / 128U;
     }
+    if (p.args.col_count != 0 && v != 4)
+        throw std::logic_error("minimax linears: an output column range needs the v4 core (STRIX_MMX_LINEAR_V=4)");
     if (prepared && (v == 3 || v == 5 || v == 6))
         throw std::logic_error("minimax linears: inputs_prepared needs a two-launch form (STRIX_MMX_LINEAR_V 1, 4, 7..10)");
     if (v == 3) {

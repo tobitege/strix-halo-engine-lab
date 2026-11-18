@@ -1,0 +1,9 @@
+{
+ "class": "prose",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Explain how a transformer language model produces its next token, in plain prose without bullet points, about 500 words."
+  }
+ ]
+}

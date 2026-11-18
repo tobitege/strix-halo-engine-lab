@@ -37,32 +37,41 @@
                 if constexpr (Streams == 2U)
                     b[t] = GEMV_ROWS_LOAD_CHUNK(uptr[t], start);
             }
+            // Rows > 8 run in groups of 8 rows with a scheduling barrier between the groups: the whole row set hoisted
+            // at once needs 64 VGPRs of activations and spilled to scratch at 16 rows (256 VGPR, 132-492 B/lane).
+            // Every accumulator still visits its elements in the same ascending order, so the bits do not change.
+            constexpr unsigned RG = Rows > 8U ? (Streams == 2U ? 4U : 8U) : Rows;
 #pragma unroll
             for (unsigned g = 0; g < 4; ++g) {
-                float4 input[Rows];
 #pragma unroll
-                for (unsigned r = 0; r < Rows; ++r)
-                    input[r] = *reinterpret_cast<const float4*>(x + std::size_t(r) * inputs + start + 4U * g);
+                for (unsigned r0 = 0; r0 < Rows; r0 += RG) {
+                    float4 input[RG];
 #pragma unroll
-                for (unsigned k = 0; k < 4; ++k) {
-                    const unsigned e = 4U * g + k;
+                    for (unsigned r = 0; r < RG; ++r)
+                        input[r] = *reinterpret_cast<const float4*>(x + std::size_t(r0 + r) * inputs + start + 4U * g);
 #pragma unroll
-                    for (unsigned t = 0; t < T; ++t) {
-                        const float v = a[t].at(e);
-                        float u = 0.0F;
-                        if constexpr (Streams == 2U)
-                            u = b[t].at(e);
+                    for (unsigned k = 0; k < 4; ++k) {
+                        const unsigned e = 4U * g + k;
 #pragma unroll
-                        for (unsigned r = 0; r < Rows; ++r) {
-                            const float in = k == 0   ? input[r].x
-                                             : k == 1 ? input[r].y
-                                             : k == 2 ? input[r].z
-                                                      : input[r].w;
-                            acc[t][r] = acc[t][r] + v * in;
+                        for (unsigned t = 0; t < T; ++t) {
+                            const float v = a[t].at(e);
+                            float u = 0.0F;
                             if constexpr (Streams == 2U)
-                                uacc[t][r] = uacc[t][r] + u * in;
+                                u = b[t].at(e);
+#pragma unroll
+                            for (unsigned r = 0; r < RG; ++r) {
+                                const float in = k == 0   ? input[r].x
+                                                 : k == 1 ? input[r].y
+                                                 : k == 2 ? input[r].z
+                                                          : input[r].w;
+                                acc[t][r0 + r] = acc[t][r0 + r] + v * in;
+                                if constexpr (Streams == 2U)
+                                    uacc[t][r0 + r] = uacc[t][r0 + r] + u * in;
+                            }
                         }
                     }
+                    if constexpr (Rows > 8U)
+                        __builtin_amdgcn_sched_barrier(0);
                 }
             }
         }

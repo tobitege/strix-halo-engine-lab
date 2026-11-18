@@ -38,6 +38,16 @@ int main() try {
     expect(policy({"--prefix-cache-mb", "32"}, false).prefix_cache_mb == 32, "explicit rows conflict reaches validation");
     const auto off = policy({"--cache-profile", "off"});
     expect(off.prefix_cache_mb == 0 && !off.prefix_inrun && !off.prefix_session, "off alone is baseline");
+    {   // DAYAUDIT 1: a prefill that cannot resume a stored state turns every tier off, explicit flags included
+        ds::ServeCachePolicy p;
+        p.parse("--prefix-cache-mb", "64"), p.parse("--prefix-inrun-snapshots"), p.parse("--prefix-cache-dir", "dir");
+        p.parse("--prefix-before-tail"), p.parse("--prefix-session-snapshots");
+        p.continuation_decline = "FAST attention ds41-attn-bf16flash-v1 runs only from position 0";
+        p.resolve(true, false, false, "cache-env", "home");
+        expect(p.prefix_cache_mb == 0 && p.prefix_disk_mb == 0 && p.prefix_dir.empty() && !p.prefix_inrun && !p.prefix_session &&
+                   !p.prefix_before_tail, "continuation decline: no prefix tier");
+        expect(policy().prefix_cache_mb == 512, "no decline: the agent bundle is unchanged");
+    }
     const auto explicit_off = policy({"--cache-profile", "off", "--prefix-cache-mb", "64", "--prefix-inrun-snapshots"});
     expect(explicit_off.prefix_cache_mb == 64 && explicit_off.prefix_inrun, "profile off preserves explicit features");
     for (const bool reverse : {false, true}) {

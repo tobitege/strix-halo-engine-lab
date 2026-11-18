@@ -1,11 +1,15 @@
 #include "strix/model_contract.hpp"
 
+#include "strix/recurrent_state_policy.hpp"
+
 #include <cmath>
 
 namespace strix {
 
 ModelContract ModelContract::qwen38_flash_next() {
-    return {};
+    ModelContract model;
+    model.recurrent_state = recurrent_state_policy().type;  // STRIX_RECURRENT_STATE: the one resolver, read at plan time
+    return model;
 }
 
 std::string ModelContract::validate() const {

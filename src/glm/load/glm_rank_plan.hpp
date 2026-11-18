@@ -9,6 +9,7 @@
 //   plain tensor, rows [ranges]: leading-dim rows of the ranges in order; replicate: whole.
 // Ranges with several entries (KDA qkv_proj q|k|v head ranges, conv1d rows) keep the order of the split JSON. This is
 // the layout MiniMax's Lib::stage_out / stage_in build (gate D validated it on GLM rank slices) and test_split.py slices.
+#include "strix/weight/admission.hpp"
 #include <cstdint>
 #include <map>
 #include <string>
@@ -34,8 +35,10 @@ public:
     [[nodiscard]] const std::map<std::string, TensorInfo>& tensors() const noexcept { return tensors_; }
     [[nodiscard]] const std::vector<std::string>& files() const noexcept { return files_; }
     [[nodiscard]] const TensorInfo* find(const std::string& name) const;
+    const weight::WeightMap& weight_map() const noexcept { return weights_; }
 
 private:
+    weight::WeightMap weights_;
     std::vector<std::string> files_;
     std::map<std::string, TensorInfo> tensors_;
 };

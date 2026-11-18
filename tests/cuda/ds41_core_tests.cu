@@ -1,8 +1,8 @@
 // deepseek41 CUDA layer core: every kernel bitwise against its host reference (ds41_layer.hpp / ds41_moe.hpp /
 // ds41_formats.hpp) on synthetic inputs. Short: runs in seconds and allocates a few hundred MB at most.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
 
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_layer.hpp"

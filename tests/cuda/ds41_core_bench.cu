@@ -4,9 +4,9 @@
 //   STRIX_DS41_FIXTURE_GGUF=ds41-dense-0-1-2-20.gguf strix-cuda-ds41-core-bench [rows] [layer] [iterations] [tiled]
 // The L2 is rewritten (256 MB) before every timed iteration; "tiled": the tensor-core Q8_0 form.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_weights.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_weights.hpp"
 
 #include "strix/ds41_layer.hpp"
 

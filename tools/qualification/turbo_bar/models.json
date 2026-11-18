@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "note": "Per-model E/R/T declarations for the TURBO quality bar. Paths come from the deploy declaration at run time; shas are frozen by manifest.py. R is chosen and frozen before any T lever is tuned; one R per model version.",
+  "models": {
+    "qwen3.8-flash-next": {
+      "E": {"identity": "qwen38-udq4kxl-exact", "weights": "UD-Q4_K_XL merged GGUF", "arithmetic": "exact (default bitwise route)"},
+      "R": {"identity": "qwen38-udq4kxl-R-exps3-v1", "status": "producible",
+            "recipe": "rpack_kquant.py build --bits 3 (ffn_{gate,up,down}_exps: Q4_K/Q5_K/Q5_1/Q8_0 rewritten inside their own blocks); per-layer embedding (IQ4_NL) and dense tensors unchanged",
+            "arithmetic": "controlled: same kernels as E, only weight values differ"},
+      "T": {"variants": ["fast (--profile fast --allow-pending) until the named turbo profile lands"], "arithmetic": "turbo"}
+    },
+    "deepseek-v4.1-flash": {
+      "E": {"identity": "ds41-q2-c-u6-cb4", "weights": "Q2 GGUF + c-u6 overlay (STRIX_DS41_OVERLAY, STRIX_DS41_CB4=1)", "arithmetic": "exact (production identity)"},
+      "R": {"identity": "ds41-q2-dense-u4-v1", "status": "producible",
+            "recipe": "tools/ds41_requant/requant.py SRC OUT --spec attn=u4,sh=u4,head=u6 (Q8_0-embeddable overlay, 4.5 bpw dense)",
+            "arithmetic": "controlled: the exact A8 x Q8_0 kernels run the emulated blocks"},
+      "T": {"variants": ["named turbo profile (replay R128, Engram FP16, MoE relaxed, ...) as listed in TURBO.md"], "arithmetic": "turbo"}
+    },
+    "glm-5.3-flash": {
+      "E": {"identity": "glm-exl3-4.05-exact", "weights": "EXL3 4.05 bpw", "arithmetic": "exact"},
+      "R": {"identity": "pending", "status": "PENDING: no smaller local pack; needs the onfly/converted low-bit path (--turbo-weights) to produce one from our weights"},
+      "T": {"variants": ["named turbo profile"], "arithmetic": "turbo"}
+    },
+    "minimax-m3.1-flash": {
+      "E": {"identity": "minimax-exl3-3.06-exact", "weights": "EXL3 3.06 bpw", "arithmetic": "exact"},
+      "R": {"identity": "pending", "status": "PENDING: no smaller local pack; candidate = the I4 (fast_i4) requant of our weights run on the exact route, once it is a frozen pack"},
+      "T": {"variants": ["named turbo profile"], "arithmetic": "turbo"}
+    }
+  }
+}

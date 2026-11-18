@@ -12,6 +12,7 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
+#include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
@@ -145,6 +146,7 @@ struct HipMtpRuntime::Impl {
     // STRIX_MTP_PRIME_ROWS (default on; "0" restores one row at a time): per-row scratch of the batched prompt priming.
     std::unique_ptr<unsigned char,void(*)(unsigned char*)> prime_scratch{nullptr,[](unsigned char* p){(void)hipFree(p);}};
     std::uint64_t prime_slot=0;
+    std::uint32_t prime_capacity=0;
     bool prime_unavailable=false;
     // Multi-session draft batch: the batch stream carrying this chain's steps (null outside a batch) and the
     // entry/exit events ordering it with the owner stream.
@@ -577,12 +579,12 @@ struct HipMtpRuntime::Impl {
             first_cache_reusable=true;candidates=tokens;return tokens;
         } catch(...) {failure();throw;}
     }
-    // Batched prompt priming (STRIX_MTP_PRIME_ROWS): up to 8 rows per launch on the production draft branch, each row
+    // Batched prompt priming (STRIX_MTP_PRIME_ROWS): up to STRIX_MTP_PRIME_BATCH rows per launch on the production draft branch, each row
     // with the one-row kernels' arithmetic (embedding row load, draft input fusion, draft attention HC mix, exact
     // cache rows), row t in its own scratch slot and reading its target hidden in place. Only the owner's KV/raw-index
     // rows, pool frontier and status word are shared with the one-row path; its staging buffers are not written.
     bool prime_rows_admitted() const {
-        static const bool on=[]{const char* v=std::getenv("STRIX_MTP_PRIME_ROWS");return !v || (v[0]=='1' && !v[1]);}();
+        static const bool on=[]{const char* v=envcfg::text("STRIX_MTP_PRIME_ROWS");return !v || (v[0]=='1' && !v[1]);}();
         if(!on || !draft || draft_exact || !hc_inject || owner->model().hc_count!=4U || !hip_mtp_hyper_mix_draft_rows_supported() ||
            owner->view(HipMtpBuffer::hyper_workspace).address%16U)return false;
         return hip_mtp_draft_q4(reinterpret_cast<const void*>(owner->tensors().eh_projection.runtime->address))!=nullptr;
@@ -598,24 +600,35 @@ struct HipMtpRuntime::Impl {
         l.index_key=take(m.indexer_head_dim*4U);l.key=take(m.kv_heads*m.head_dim*4U);l.value=take(m.kv_heads*m.head_dim*4U);
         l.bytes=at;return l;
     }
-    // The scratch is allocated on first use; when that fails the one-row loop runs instead.
+    // Scratch bytes = P * prime_layout().bytes (each field and slot is 256-byte aligned).
+    // H2560/HC4/rank320/index128/KV512: 129024 bytes/slot; P64 = 8257536 bytes.
+    // Allocate once; retry eight slots on pressure, then retain the one-row fallback.
     bool prime_rows_ready() {
         if(prime_scratch) return true;
         if(prime_unavailable) return false;
+        static const auto batch=static_cast<std::uint32_t>(std::clamp(envcfg::integer("STRIX_MTP_PRIME_BATCH",64),8,128));
         const auto l=prime_layout();unsigned char* raw=nullptr;
-        if(hipMalloc(reinterpret_cast<void**>(&raw),8U*l.bytes)!=hipSuccess || !raw) {(void)hipGetLastError();prime_unavailable=true;return false;}
-        prime_scratch.reset(raw);prime_slot=l.bytes;return true;
+        auto capacity=batch;
+        if(hipMalloc(reinterpret_cast<void**>(&raw),capacity*l.bytes)!=hipSuccess || !raw) {
+            (void)hipGetLastError();raw=nullptr;capacity=8U;
+            if(batch==8U || hipMalloc(reinterpret_cast<void**>(&raw),capacity*l.bytes)!=hipSuccess || !raw) {
+                (void)hipGetLastError();prime_unavailable=true;return false;
+            }
+        }
+        prime_scratch.reset(raw);prime_slot=l.bytes;prime_capacity=capacity;return true;
     }
     void prime_rows(std::uint64_t position,std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> tokens,void* stream) {
         const auto n=hidden.size();const auto l=prime_layout();
-        require(prime_scratch && prime_slot==l.bytes && n && n<=8U,"MTP batched priming scratch/rows are invalid");
+        require(prime_scratch && prime_slot==l.bytes && n && n<=prime_capacity,"MTP batched priming scratch/rows are invalid");
         const auto base=reinterpret_cast<std::uintptr_t>(prime_scratch.get());
         const auto at=[&](std::size_t t,std::uint64_t offset){return base+t*prime_slot+offset;};
         const auto c=context(position);
-        std::array<std::uint16_t*,8> embedding{};
-        for(std::size_t t=0;t<n;++t) embedding[t]=reinterpret_cast<std::uint16_t*>(at(t,l.embedding));
-        launch_hip_mtp_embedding_rows_to(c,tokens,std::span<std::uint16_t* const>(embedding.data(),n),stream);
-        std::array<HipMtpInputFusionRequest,8> requests{};const auto one=fusion();
+        if(n<=8U) {
+            std::array<std::uint16_t*,8> embedding{};
+            for(std::size_t t=0;t<n;++t) embedding[t]=reinterpret_cast<std::uint16_t*>(at(t,l.embedding));
+            launch_hip_mtp_embedding_rows_to(c,tokens,std::span<std::uint16_t* const>(embedding.data(),n),stream);
+        } else launch_hip_mtp_embedding_prime_rows(c,tokens,{at(0,l.embedding),prime_slot},stream);
+        std::array<HipMtpInputFusionRequest,hip_mtp_prime_rows_max> requests{};const auto one=fusion();
         for(std::size_t t=0;t<n;++t) {
             auto& r=requests[t];r=one;
             r.embedding={at(t,l.embedding),one.embedding.bytes,1U};
@@ -623,7 +636,21 @@ struct HipMtpRuntime::Impl {
             r.normalized_scratch={at(t,l.normalized),one.normalized_scratch.bytes,1U};
             r.output={at(t,l.fused),one.output.bytes,1U};
         }
-        launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest>(requests.data(),n),stream);
+        const auto input=std::span<const HipMtpInputFusionRequest>(requests.data(),n);
+        if(n<=8U) launch_hip_mtp_input_fusion_draft_rows(input,stream);
+        else {
+            launch_hip_mtp_input_fusion_prime_rows(input,stream);
+            const auto& t=owner->tensors();
+            const HipMtpHyperPrimeRows mix{{at(0,l.fused),prime_slot},{at(0,l.hidden),prime_slot},
+                {at(0,l.hyper),prime_slot},{at(0,l.injection),prime_slot}};
+            enqueue_hip_mtp_hyper_mix_q8_prime_rows(mix,static_cast<std::uint32_t>(n),
+                reinterpret_cast<const float*>(t.attention_hc_norm.runtime->address),
+                reinterpret_cast<const void*>(t.attention_hc_down.runtime->address),hc_inject.get(),
+                reinterpret_cast<const void*>(t.attention_hc_up.runtime->address),owner->model().rms_norm_epsilon,stream);
+            const HipMtpCachePrimeRows cache{{at(0,l.hidden),prime_slot},{at(0,l.index_key),prime_slot},
+                {at(0,l.key),prime_slot},{at(0,l.value),prime_slot}};
+            launch_hip_mtp_cache_prime_rows(c,cache,static_cast<std::uint32_t>(n),stream);return;
+        }
         HipMtpHyperDraftRows mix{};
         for(std::size_t t=0;t<n;++t) {
             mix.input[t]=reinterpret_cast<const std::uint16_t*>(at(t,l.fused));mix.output[t]=reinterpret_cast<std::uint16_t*>(at(t,l.hidden));
@@ -751,11 +778,11 @@ bool HipMtpRuntime::prime_hidden_rows_submit(const QualifiedMtpDraftPlan& plan,c
     try {
         void* stream=p.owner->stream();
         std::size_t i=0;
-        // STRIX_MTP_PRIME_ROWS: rows in batches of up to 8; the last row stays on the one-row path below so the
+        // STRIX_MTP_PRIME_ROWS: rows in batches of up to prime_capacity; the last row stays on the one-row path below so the
         // owner's staging buffers end holding it, as before.
         if(hidden.size()>1U && p.prime_rows_admitted() && p.prime_rows_ready())
             for(;i+1U<hidden.size();) {
-                const auto n=std::min<std::size_t>(hidden.size()-1U-i,8U);
+                const auto n=std::min<std::size_t>(hidden.size()-1U-i,p.prime_capacity);
                 p.prime_rows(p.next_source+i,hidden.subspan(i,n),next_tokens.subspan(i,n),stream);i+=n;
             }
         for(;i<hidden.size();++i) {
@@ -849,6 +876,32 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
             }
         }
         hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
+    }
+    if(envcfg::flag("STRIX_MTP_WEIGHT_LOG",false)) {
+        const auto& t=p.owner->tensors();const auto& binding=p.owner->shared_target();
+        const auto target_sha=model_content_identity_hex(binding.target_model_content_identity);
+        const auto sidecar_sha=model_content_identity_hex(binding.sidecar_model_content_identity);
+        const auto log=[&](const char* group,const MtpTensorView& v,const char* special=nullptr) {
+            if(!v.manifest || !v.runtime)return;
+            const bool shared=binding.target_runtime && std::any_of(binding.target_runtime->tensors.begin(),binding.target_runtime->tensors.end(),
+                [&](const auto& r){return r.address==v.runtime->address && r.bytes==v.runtime->bytes;});
+            const bool q4=hip_mtp_draft_q4(reinterpret_cast<const void*>(v.runtime->address))!=nullptr;
+            std::fprintf(stderr,"mtp-weight path=draft group=%s tensor=%s source=%s source_sha256=%s ggml=%u effective=%s bytes=%llu\n",
+                group,v.manifest->name.c_str(),shared?"shared-target":"sidecar",shared?target_sha.c_str():sidecar_sha.c_str(),
+                v.manifest->ggml_type,special?special:(q4?"q4_0-draft-v1":"native"),static_cast<unsigned long long>(v.runtime->bytes));
+        };
+        log("embedding",t.embedding);log("input_norm",t.enorm);log("hidden_norm",t.hnorm);log("input_projection",t.eh_projection);
+        log("attention_hyper_norm",t.attention_hc_norm);log("attention_hyper_down",t.attention_hc_down);log("attention_hyper_up",t.attention_hc_up);
+        log("attention_hyper_inject",t.attention_hc_inject,exact?"native":"native-q8-dequant-fp32");
+        log("query",t.query);log("key",t.key);log("value",t.value);log("attention_output",t.attention_output);
+        log("query_norm",t.query_norm);log("key_norm",t.key_norm);log("index_query",t.index_query);log("index_key",t.index_key);
+        log("index_query_norm",t.index_query_norm);log("index_key_norm",t.index_key_norm);
+        log("mlp_hyper_norm",t.mlp_hc_norm);log("mlp_hyper_down",t.mlp_hc_down);log("mlp_hyper_up",t.mlp_hc_up);
+        log("mlp_hyper_inject",t.mlp_hc_inject,exact?"native":"native-q8-dequant-fp32");
+        log("router",t.router);log("expert_gate",t.expert_gate);log("expert_up",t.expert_up);log("expert_down",t.expert_down);
+        log("shared_gate",t.shared_gate);log("shared_up",t.shared_up);log("shared_down",t.shared_down);log("shared_scalar_gate",t.shared_scalar_gate);
+        log("head_norm",t.head_norm);log("head_down",t.head_down);log("head_up",t.head_up);
+        log("lm_head",t.lm_head,config.q4?"q4_0-head-gather-v1":(config.full?"native-full":"native-subset-gather"));
     }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
 }

@@ -172,6 +172,12 @@ ModelManifest load_safetensors_model(const std::filesystem::path& directory) {
     std::size_t frozen = 0;
     for (const auto& shard : shards) {
         auto file = read_safetensors(directory / shard);
+        auto namespace_status = weight::namespace_index(file.index,shard);
+        if (!namespace_status) throw std::runtime_error(namespace_status.detail);
+        weight::WeightMap admitted;
+        auto status = weight::bind_gemma4(file.index, admitted);
+        if (!status) throw std::runtime_error("gemma4 admission: " + status.detail);
+        m.weights.insert(m.weights.end(), admitted.begin(), admitted.end());
         const auto digest = hash_bytes(file.storage->data(), file.storage->size());
         model_hash.update({reinterpret_cast<const std::byte*>(digest.data()), digest.size()});
         for (const auto& t : file.tensors) {

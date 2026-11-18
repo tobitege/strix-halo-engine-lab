@@ -1,4 +1,5 @@
 #include "strix/serve/run.hpp"
+#include "strix/serve/serve_config.hpp"
 
 #include <charconv>
 #include <filesystem>
@@ -71,6 +72,17 @@ void serve(const HttpServerConfig& config, HttpHandler handler, SessionRuntime& 
 int run(int argc, char** argv, const ServiceFactories& factories, std::ostream& out,
         std::ostream& error, const ServeShell& shell) {
     try {
+        // --serve-config FILE: the shell options below, validated and expanded in front of the command line
+        using config_file::Kind;
+        static constexpr config_file::Option shell_options[] = {
+            {"model", "--model", Kind::value}, {"registry_root", "--registry-root", Kind::path}, {"registry", "--registry", Kind::path},
+            {"description", "--description", Kind::value}, {"bind", "--bind", Kind::value}, {"port", "--port", Kind::value}};
+        auto file = config_file::expand(argc, argv, shell_options);
+        if (file.print) { out << file.effective; return 0; }
+        std::vector<char*> expanded;
+        for (auto& arg : file.argv) expanded.push_back(arg.data());
+        argc = static_cast<int>(expanded.size());
+        argv = expanded.data();
         std::string root = ".", registry = "models/registry.toml", model, description;
         std::vector<std::string> family_args;
         HttpServerConfig config;

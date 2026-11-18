@@ -1,0 +1,11 @@
+# Arguments of the Strix server started by strix-start.ps1 (%ProgramData%\Strix\serve.args).
+# One option per line: "--flag value" (the value is the rest of the line, spaces allowed) or "--flag".
+# Lines starting with # are comments. The first non-comment line may be "binary NAME" to choose the server.
+# Options of strix-cuda-qwen-serve: docs/models/qwen3.8/rtx-serve.md; strix-cuda-ds41-replica:
+# docs/models/deepseek-v4.1/rtx-standalone.md. Pick the GPU with --device-id or --devices (docs/discrete-gpu.md).
+# The installed backend metadata selects the binary unless explicitly overridden above.
+# --model D:\models\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00003.gguf
+# --tables D:\models\qwen-tables
+# --rope-table D:\models\qwen-rope.bin
+# Qwen HTTP defaults to 127.0.0.1:8090; override with --bind / --port.
+# DeepSeek uses --serve SPOOL_DIR (not HTTP); supply its required receipt/state/reference assets.

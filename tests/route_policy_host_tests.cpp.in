@@ -5,11 +5,15 @@
 #include "strix/decode_numerical_profile.hpp"
 #include "core/layer_set.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
+#include "minimax/engine/route_identity.hpp"
+#include "moe_core/grouped_policy.hpp"
+#include "xport/exchange_format.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 #include "glm/xfer/glm_seqpar.hpp"
 #include "apps/glm_route_levers.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +26,7 @@
 #endif
 
 namespace rr = strix::route;
+using strix::glm::serve_prefill_interleave;  // apps/glm_route_levers.hpp (the server binds the same definition)
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -51,10 +56,17 @@ void dispatch_receipt(unsigned rows, unsigned input = 128) {
 }
 namespace mmoe {
 int g_iu4_override = -1;
+int g_order_override = -1;
+@MINIMAX_ORDER@
 @IU4_RESOLVER@
 }
+namespace defaults {
+@MINIMAX_FLASH_DECLINE@
+}
+namespace route = strix::minimax::route;
 namespace fast_i4 = strix::minimax::engine::fast_i4;
 struct MiniMaxPolicies {
+    strix::xport::ExchangeFormat pf_fmt = strix::xport::ExchangeFormat::f32;
     static constexpr unsigned kFirstMoe = 3, kLayers = 62;
     struct { unsigned rank = 0; } opt;
     bool model_fast_i4 = true, fp32_prefill = false, moe_opt = true;
@@ -64,6 +76,11 @@ struct MiniMaxPolicies {
     strix::core::LayerSet i4_exl3_layers = strix::core::parse_layer_set(fast_i4::kQualityExl3Layers, kFirstMoe, kLayers, "kept");
     strix::core::LayerSet i4_a8_layers = strix::core::parse_layer_set("!", kFirstMoe, kLayers, "a8");
     strix::core::LayerSet pf_msa_flash_layers = strix::core::parse_layer_set("50-61", 0, kLayers, "flash");
+    bool attn_prefill_fused = true, index_attn = true, index_tiled = true, index_decode = true;
+    std::string pf_msa_flash_asked = "default";
+    bool pf_idx_wmma = false;
+    std::string pf_idx_wmma_asked = "default";
+    strix::core::LayerSet pf_idx_wmma_layers = strix::core::parse_layer_set("40-59", 0, kLayers, "idx");
 @MINIMAX_LEVERS@
     std::uint64_t fingerprint() const { rr::reset(); route_levers(); return rr::fingerprint(); }
 };
@@ -93,11 +110,15 @@ std::uint64_t qwen_fingerprint(const strix::decode_cli::Options& options, const 
 void minimax() {
     env("STRIX_MMX_MODEL_FORMAT", "fast_i4");
     env("STRIX_MMX_PF_IU4", nullptr);
+    mmoe::set_prefill_moe_order(0);  // fixture's adaptive reference, independent of the launching environment
     MiniMaxPolicies p;
     const auto on = p.fingerprint();
     env("STRIX_MMX_PF_IU4", "0");
     different(on, p.fingerprint());
-    require(rr::levers().front().effective == "exl3", "disabled IU4 must report exact format");
+    bool exact_format = false;
+    for (const auto& lever : rr::levers())
+        if (lever.name == "minimax.moe_prefill_format") exact_format = lever.effective == "exl3";
+    require(exact_format, "disabled IU4 must report exact format");
     env("STRIX_MMX_PF_IU4", "1");
     rr::require_same_route(on, p.fingerprint());
     mmoe::g_iu4_override = 0;
@@ -108,8 +129,24 @@ void minimax() {
     const auto a8 = p.fingerprint();
     p.i4_a8_layers = strix::core::parse_layer_set("!3-38", 3, 62, "a8");
     rr::require_same_route(a8, p.fingerprint());
+    // These dependencies are extracted or included from the real host policies.
+    // Check them so fixture stand-ins cannot silently mask a changed receipt.
+    mmoe::set_prefill_moe_order(1);
+    different(a8, p.fingerprint());
+    mmoe::set_prefill_moe_order(0);
+    rr::require_same_route(a8, p.fingerprint());
+    p.pf_idx_wmma = true;
+    const auto index_on = p.fingerprint();
+    different(a8, index_on);
+    p.index_attn = p.index_tiled = false;
+    rr::require_same_route(a8, p.fingerprint());
+    p.index_attn = p.index_tiled = true;
+    p.pf_idx_wmma = false;
     p.pf_msa_flash = 1;
     const auto flash1 = p.fingerprint();
+    p.attn_prefill_fused = false;
+    rr::require_same_route(a8, p.fingerprint());
+    p.attn_prefill_fused = true;
     different(a8, flash1);
     p.pf_msa_flash = 2;
     different(flash1, p.fingerprint());
@@ -129,6 +166,39 @@ void glm_equivalent() {
     const auto defaults = glm_fingerprint();
     env("STRIX_GLM_PF_KDA_WMMA", "1");
     rr::require_same_route(defaults, glm_fingerprint(1));
+    {  // FAST indexer projections: the value equal to the default resolves to the same route, the other one differs
+        constexpr bool with_fast = strix::glm::pf::idxproj_wmma::kWithFast;
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", with_fast ? "1" : "0");
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", with_fast ? "0" : "1");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", nullptr);
+    }
+    {  // FAST fused attention core and its o-bar image: the server pairs on this fingerprint alone, so both must enter it
+        const auto rearm = [] { strix::env_arms::generation_ref().fetch_add(1); };  // switches resolved once per arm
+        env("STRIX_GLM_PF_ATTN_WMMA", "1");
+        env("STRIX_GLM_PF_ATTN_WMMA_T", "16");
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_ATTN_WMMA_T", "32");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA_T", nullptr);
+        env("STRIX_GLM_PF_ATTN_WMMA", "0");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA", nullptr);
+        env("STRIX_GLM_PF_MLA_OB16", "0");
+        rearm();
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_MLA_OB16", "1");
+        rearm();
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA", "0");  // without the fused core there is no o-bar image to store
+        const auto no_core = glm_fingerprint();
+        env("STRIX_GLM_PF_MLA_OB16", nullptr);
+        rearm();
+        rr::require_same_route(no_core, glm_fingerprint(1));
+        env("STRIX_GLM_PF_ATTN_WMMA", nullptr);
+        rr::require_same_route(defaults, glm_fingerprint(1));
+    }
     // FAST WMMA selected: the auto floor is 32 rows; the exact route's is 64 (glm_pf_dense_policy.hpp).
     env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32");
     rr::require_same_route(defaults, glm_fingerprint(1));
@@ -203,6 +273,96 @@ void glm_serve_chunk() {
         const auto http = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096, "gemv");
         rr::require_same_route(cli_fp, http_fp);
         require(same(cli, http), "server and CLI resolve the same serving chunk");
+        {   // --print-effective-config of the server (dry run): the app-set values are pending, not applied, yet the
+            // printed interleave is the live one (same route identity per call size, same description).
+            const auto live = serve_prefill_interleave("gemv", 4096, 2);
+            env("STRIX_GLM_PF_EXACT_X", nullptr);
+            env("STRIX_GLM_PF_PIPELINE", nullptr);
+            const strix::glm::PendingEnv pending([](const auto& set) {
+                set("STRIX_GLM_PF_EXACT_X", "auto");
+                set("STRIX_GLM_PF_PIPELINE", "2");
+            });
+            const unsigned pipeline = strix::glm::xfer::prefill_pipeline(1, pending("STRIX_GLM_PF_PIPELINE"));
+            require(pipeline == 2, "dry run sees the app-set pipeline");
+            const auto dry = serve_prefill_interleave("gemv", 4096, pipeline, pending);
+            require(std::getenv("STRIX_GLM_PF_EXACT_X") == nullptr, "dry run applies nothing");
+            const auto unapplied = serve_prefill_interleave("gemv", 4096, 2, [](const char* n) { return static_cast<const char*>(std::getenv(n)); });
+            require(live.route_identity && dry.route_identity, "gemv interleave keeps routes");
+            require(dry.describe(512) == live.describe(512), "dry-run interleave description equals the live one");
+            for (std::size_t tokens : {1U, 31U, 32U, 63U, 64U, 100U, 129U, 512U, 1024U, 2048U, 4096U, 4097U, 4200U, 8192U, 12000U})
+                require(dry.route_identity(tokens) == live.route_identity(tokens), "dry-run route identity equals the live one");
+            require(unapplied.route_identity(4096) != live.route_identity(4096),
+                    "discriminating: the unapplied environment would resolve another route");
+            require(serve_prefill_interleave("ref", 4096, 2, pending).route_identity == nullptr, "reference prefill: no route identity");
+            env("STRIX_GLM_PF_EXACT_X", "0");  // an explicit value wins over the pending default (set if unset)
+            const strix::glm::PendingEnv explicit_off([](const auto& set) { set("STRIX_GLM_PF_EXACT_X", "auto"); });
+            require(serve_prefill_interleave("gemv", 4096, 2, explicit_off).route_identity(4096) == std::optional<unsigned>(dp::kTm),
+                    "explicit STRIX_GLM_PF_EXACT_X wins in the dry run");
+            env("STRIX_GLM_PF_EXACT_X", "auto");
+            env("STRIX_GLM_PF_PIPELINE", "2");
+        }
+        {   // The decode-cohort grouping of that chunk (serving only: named in the effective config). Without a decode
+            // cohort (the CLI, an idle server) the prompt is one call; a grouped chunk keeps the base chunk's route.
+            namespace sv = strix::serve;
+            const auto il = serve_prefill_interleave("gemv", 4096, 2);
+            require(il.select == sv::PrefillInterleave::Select::automatic && il.max_scale == 4, "interleave defaults");
+            const auto whole = il.plan(http.tokens, 8192, 0, 4096, 1.0);
+            require(whole.tokens == 8192 && whole.decode_rounds == 0, "no decode cohort: whole prompt, as in the CLI");
+            const auto first = il.plan(http.tokens, 8192, 1, 4096, 0.0);
+            require(first.tokens == http.tokens && first.decode_rounds == 1, "first chunk of a prompt stays at the resolved chunk");
+            const auto grown = il.plan(http.tokens, 8192 - 512, 1, 4096, 1.0);
+            require(grown.tokens == 4U * http.tokens && grown.decode_rounds == 4, "small cohort: 4 chunks grouped, 4 decode rounds kept");
+            require(il.plan(http.tokens, 8192, 3, 4096, 1.0).tokens == 2U * http.tokens, "cohort of 3-4: 2 chunks grouped");
+            require(il.plan(http.tokens, 8192, 5, 4096, 1.0).tokens == http.tokens, "cohort above 4: the base chunk");
+            require(il.plan(http.tokens, 8192, 1, 4096, 2.0).tokens == 2U * http.tokens, "decode stall bound halves the group");
+            require(il.plan(http.tokens, 8192, 1, 1024, 1.0).tokens == 1024, "engine call bound");
+            require(il.plan(http.tokens, 700, 1, 4096, 1.0).tokens == 700 && il.plan(http.tokens, 700, 1, 4096, 1.0).decode_rounds == 2,
+                    "prompt tail");
+            const auto grouped = strix::glm::record_prefill_chunk("http", true, static_cast<unsigned>(grown.tokens), 2, 4096, "gemv");
+            require(grouped.route == http.route && grouped.wmma == http.wmma && !grouped.declined, "grouped chunk keeps the resolved route");
+            require(il.describe(http.tokens).find("preserves base and tail arithmetic routes") != std::string::npos,
+                    "effective config describes the route guard");
+            // Short explicit bases must not grow across the auto threshold (FAST: 32 rows per half).
+            // Check the entire 80-token prompt, not just a full default chunk.
+            std::size_t remaining = 80;
+            double cost = 0;
+            unsigned calls = 0;
+            while (remaining != 0) {
+                const auto p = il.plan(16, remaining, 1, 4096, cost);
+                const auto c = strix::glm::record_prefill_chunk("http", true, static_cast<unsigned>(p.tokens), 2, 4096, "gemv");
+                require(c.route == dp::kTm && !c.wmma && !c.mixed, "small-base grouping preserves TM arithmetic");
+                remaining -= p.tokens;
+                cost = 1.0;
+                ++calls;
+            }
+            require(calls == (fast ? 3U : 2U), "only threshold-crossing 16+64 grouping was declined");
+            // Grouping a short tail into a large call must not upgrade that tail's arithmetic.
+            require(il.plan(512, 530, 1, 4096, 1.0).tokens == 512, "short TM tail remains a separate call");
+            require(il.plan(512, 640, 1, 4096, 1.0).tokens == 640, "same-route tail may still group");
+            const auto mixed = serve_prefill_interleave("gemv", 500, 2);
+            require(mixed.plan(512, 1024, 1, 4096, 1.0).tokens == 512, "mixed base declines grouping");
+            // Engine splitting is still required for base/whole-prompt calls exceeding the grouping cap.
+            require(il.plan(512, 8192, 1, 128, 1.0).tokens == 512, "cap does not truncate base");
+            require(il.plan(0, 8192, 1, 128, 1.0).tokens == 8192, "cap does not truncate unchunked calls");
+            require(il.describe(http.tokens).find("serving only") != std::string::npos, "effective config names the serving-only lever");
+            env("STRIX_SERVE_PREFILL_INTERLEAVE", "0");
+            require(sv::PrefillInterleave::from_env(strix::envcfg::text).plan(http.tokens, 8192, 1, 4096, 1.0).tokens == http.tokens,
+                    "off switch: one base chunk per decode round");
+            env("STRIX_SERVE_PREFILL_INTERLEAVE", nullptr);
+        }
+        {
+            strix::serve::PrefillDecodeDebt debt;
+            const auto il = serve_prefill_interleave("gemv", 4096, 2);
+            debt.charge(il.plan(512, 2048, 1, 4096, 1.0));
+            for (unsigned round = 0; round < 4; ++round) {
+                require(!debt.ready(), "final grouped chunk retains all four rounds for a queued successor");
+                debt.decoded();
+            }
+            require(debt.ready(), "successor prefill admitted after four decode rounds");
+            debt.charge(il.plan(512, 2048, 1, 4096, 1.0));
+            debt.clear();
+            require(debt.ready(), "no decoder: stale debt cleared");
+        }
         // Default chunk: 512 tokens are two 256-row calls on the pair, and they keep the large-call core.
         require(http.tokens == 512 && http.rows == 256 && !http.declined && http.route == dp::kX3r8, "default chunk keeps the X3 route");
         require(http.wmma == (fast != nullptr), "default chunk keeps the FAST WMMA core when it is selected");

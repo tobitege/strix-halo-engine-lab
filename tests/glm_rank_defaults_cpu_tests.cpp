@@ -66,6 +66,7 @@ bool same_values(const rd::Effective& a, const rd::Effective& b, std::string* wh
     d = diff("decode-xch", a.decode_xch.value, b.decode_xch.value) || d;
     d = diff("xch", a.xch, b.xch) || d;
     d = diff("max-rows", a.max_rows.value, b.max_rows.value) || d;
+    d = diff("split-frame", a.split_frame.value, b.split_frame.value) || d;
     for (const auto& it : rd::env_items()) d = diff(it.env, a.env.at(it.env).value, b.env.at(it.env).value) || d;
     return !d;
 }
@@ -213,6 +214,22 @@ void test_item_off_switches() {
     CHECK(m1.mtp.value == "1" && m1.prefill == "ref");
     CHECK(resolve(cat(plain, {"--decode-xch", "comm"}), {}).decode_xch.value == "comm");
     CHECK(resolve(plain, {{"STRIX_GLM_DECODE_XCH", "comm"}}).decode_xch.value == "comm");
+    {   // glm_split_frame (xport/split_frame.hpp): pending route stays OFF, one resolution for CLI and serve
+        const auto sf = resolve(plain, {});
+        CHECK(sf.split_frame.source == "default" && sf.split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        CHECK(!sf.split_policy.on(1) && !sf.split_policy.on(3) && !sf.split_policy.on(4) && !sf.split_policy.on(8));
+        CHECK(resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "0"}}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        const auto forced = resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "1"}});
+        CHECK(forced.split_frame.source == "explicit" && forced.split_policy.on(2) && !forced.split_policy.on(1));
+        CHECK(resolve(cat(plain, {"--baseline"}), {}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        bool threw = false;
+        try { (void)resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "maybe"}}); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        const rd::EnvGet none = [](const char*) -> const char* { return nullptr; };  // the serve resolver: same policy for the same request
+        const auto served = rd::resolve_serve(plain, false, none);
+        CHECK(served.split_frame.value == sf.split_frame.value && served.split_policy.mode == sf.split_policy.mode &&
+              served.split_policy.crossover == sf.split_policy.crossover);
+    }
     // auto-prefill exclusions (unchanged rules)
     CHECK(resolve(cat(plain, {"--spec", "1"}), {}).prefill == "ref");
     CHECK(resolve(cat(plain, {"--idcheck", "32"}), {}).prefill == "ref");
@@ -564,6 +581,27 @@ void test_startup_agreement() {
         kda[1] |= rd::kPfKdaWmmaConfig;
         pair(kda, kda, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
         pair(kda, fast, false, false, true);
+        auto mla = kda;  // the FAST MLA GEMMs (glm-pf-mla-wmma-v1, FAST default): a rank without them is refused
+        mla[1] |= rd::kPfMlaWmmaConfig;
+        pair(mla, mla, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(mla, kda, false, false, true);
+        auto idxproj = kda;  // the FAST indexer projections: one rank without them is refused
+        idxproj[1] |= rd::kPfIdxProjWmmaConfig;
+        pair(idxproj, idxproj, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(idxproj, kda, false, false, true);
+        auto router = kda;  // the FAST router product (opt-in): one rank with it and one without is refused
+        router[1] |= rd::kPfRouterWmmaConfig;
+        pair(router, router, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(router, kda, false, false, true);
+        CHECK(rd::kPfIdxProjWmmaConfig == (1U << 18));
+        CHECK(rd::kPfRouterWmmaConfig == (1U << 20));
+        auto both = idxproj;
+        both[1] |= rd::kPfRouterWmmaConfig;
+        pair(both, both, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(both, idxproj, false, false, true);
+        pair(both, router, false, false, true);
+        CHECK((rd::kPfRouterWmmaConfig & (rd::kPfIdxProjWmmaConfig | rd::kPfKdaWmmaConfig | rd::kPfAttnWmmaConfig | rd::kPfWmmaConfig | rd::kFastI4Config |
+                                          rd::kAutoRowsConfig | (3U << rd::kIdxWmmaShift))) == 0);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {
@@ -591,13 +629,22 @@ void test_startup_agreement() {
     CHECK(exchanges == 0);
     CHECK(!rd::has_startup_handshake(2, "comm", false, false));
     CHECK(!rd::has_startup_handshake(2, "comm", true, true));
-    // --tf adds a config-only agreement on two comm ranks; other reference gates and xfer/world 1 stay exchange-free.
+    // --tf and --pf-ttft (both set reference_gate) add a config-only agreement on two comm ranks; other reference gates
+    // and xfer/world 1 stay exchange-free, and the rows stay on the fixed fallback (no startup handshake).
     CHECK(rd::has_config_agreement(2, "comm", false, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, false, false));
     CHECK(!rd::has_config_agreement(2, "comm", true, true, false));
     CHECK(!rd::has_config_agreement(2, "xfer", false, true, true));
     CHECK(!rd::has_config_agreement(1, "comm", false, true, true));
+    {
+        rd::Effective pf;
+        pf.max_rows = {"8192", "auto-8192"};
+        const bool comm = true, handshake = rd::has_startup_handshake(2, "comm", false, true);
+        CHECK(rd::has_config_agreement(2, "comm", false, true, true) && !handshake);
+        rd::fallback_without_handshake(pf, comm, handshake);
+        CHECK(pf.max_rows.value == "4096");
+    }
 }
 
 void test_no_handshake_fallback() {

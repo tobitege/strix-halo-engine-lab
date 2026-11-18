@@ -119,7 +119,7 @@ void run(unsigned position, bool timing, bool packed) {
     }
     const void* operand = packed ? static_cast<const void*>(packed_keys.p) : keys.p;
     const auto score = [&](unsigned arm) {
-        if (arm == 0U) qpf2k_stage_score_launch(descriptors[arm].p, operand, packed, ranges.p, dim, blocks, 0U, T / 64U, nullptr);
+        if (arm == 0U) qpf2k_stage_score_launch(descriptors[arm].p, operand, packed, ranges.p, dim, blocks, 0U, T / 64U, nullptr, false);
         else qsa_flash::launch_index_score_wmma<64U, true>(QsaRowsScoreViews<64U>{}, operand, packed, blocks,
             nullptr, 0U, descriptors[arm].p, T / 64U, nullptr);
         check(hipGetLastError());

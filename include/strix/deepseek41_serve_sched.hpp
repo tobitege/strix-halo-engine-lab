@@ -2,6 +2,7 @@
 
 #include "strix/serve/prompt_service.hpp"
 #include "strix/serve/short_first.hpp"
+#include "strix/session/prefill_session.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -297,22 +298,9 @@ UnitResult apply_unit(Task& task, std::uint32_t end, std::uint32_t budget, bool 
 // stepped by the same commands, so its collectives run in the same order on both ranks). The default implementation
 // is the serve's (SlotPrefill::Task): one unit = one DevicePrefill run of [at, end) rows, end chosen by rank 0
 // (next_unit_end) and sent to rank 1; `budget` is passed through for a resumable DevicePrefill (0: the whole piece).
-// Contract for an implementation:
-//  - step() returns with no collective of the prefill in flight (a decode step's collectives follow it);
-//  - the prefill's state, scratch and row buffers are its own (DevicePrefill's), never the BatchForward's slot or
-//    workspace; the request's BatchForward slot is written only by finish() (BatchForward::import_state);
-//  - the bits of every row and of the final state do not depend on how the prompt was cut into units.
-class PrefillTask {
-public:
-    virtual ~PrefillTask() = default;
-    // Advances the prefill to row `end` (a unit; resumable implementations may stop earlier inside the piece within
-    // `budget` and return false with rows() unchanged); true when rows() == the prompt's length.
-    virtual bool step(std::uint32_t end, std::uint32_t budget) = 0;
-    [[nodiscard]] virtual std::uint32_t rows() const noexcept = 0;   // rows of the prompt done (at)
-    [[nodiscard]] virtual std::uint32_t total() const noexcept = 0;  // the prompt's length
-    [[nodiscard]] virtual bool done() const noexcept { return rows() == total(); }
-    [[nodiscard]] virtual bool mid_piece() const noexcept { return false; }  // a resumable unit stopped inside a piece
-    [[nodiscard]] virtual std::uint32_t piece_end() const noexcept { return rows(); }  // mid_piece: the end the piece runs to
-};
+// The contract (no collective in flight on return; own state, scratch and row buffers - the request's BatchForward
+// slot is written only by finish(), BatchForward::import_state; bits independent of the cut) is the shared one:
+// strix/session/prefill_session.hpp, where this type now lives unchanged (units_done / units_total stay 0 / 0).
+using PrefillTask = strix::session::PrefillSession;
 
 }  // namespace strix::deepseek41::sched

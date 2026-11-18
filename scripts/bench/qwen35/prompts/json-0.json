@@ -1,0 +1,9 @@
+{
+ "class": "json",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Convert this CSV to a JSON array of objects (numbers as numbers, booleans as booleans). Output only the JSON.\n\nid,name,city,age,score,active\n1,Lena1,Porto,20,57.5,false\n2,Goran2,Bern,65,0.3,true\n3,Fatou3,Lyon,57,19.4,true\n4,Goran4,Leeds,65,33.7,false\n5,Bruno5,Graz,20,18.7,true\n6,Bruno6,Turin,32,14.0,false\n7,Jun7,Bern,24,23.8,false\n8,Emil8,Lyon,60,50.2,true\n9,Emil9,Bern,31,85.1,false\n10,Emil10,Leeds,50,83.6,true\n11,Lena11,Graz,54,70.8,true\n12,Dalia12,Porto,48,62.2,true\n13,Dalia13,Cork,38,31.3,true\n14,Chen14,Porto,43,91.0,true\n15,Fatou15,Leeds,28,77.1,true\n16,Chen16,Bern,21,59.4,false\n17,Jun17,Lyon,32,28.7,true\n18,Bruno18,Bern,41,33.7,true\n19,Goran19,Leeds,28,0.8,false\n20,Dalia20,Leeds,64,32.9,false\n21,Hana21,Graz,22,25.0,true\n22,Jun22,Lyon,62,81.4,true\n23,Ada23,Bern,52,9.5,false\n24,Bruno24,Kyoto,37,67.3,false\n25,Lena25,Graz,63,54.2,false\n26,Fatou26,Porto,49,35.3,false\n27,Lena27,Bern,37,81.7,false\n28,Dalia28,Leeds,51,75.1,true\n29,Dalia29,Graz,24,31.5,false\n30,Kai30,Kyoto,66,41.2,false\n31,Emil31,Cork,34,2.9,true\n32,Bruno32,Bern,52,4.2,true\n33,Hana33,Leeds,68,26.9,true\n34,Bruno34,Kyoto,67,25.0,false\n35,Ivo35,Cork,57,95.2,false\n36,Emil36,Lyon,29,66.0,true\n37,Hana37,Porto,23,79.2,true\n38,Ivo38,Graz,61,65.3,true\n39,Bruno39,Lyon,65,23.3,true\n40,Ivo40,Turin,49,34.7,true"
+  }
+ ]
+}

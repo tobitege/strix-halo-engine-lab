@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('window', ROOT/'src/glm/rtxpf/producer/qualification_window.py')
+spec = importlib.util.spec_from_file_location('window', ROOT/'src/cuda/models/glm/producer/qualification_window.py')
 window = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(window)
 

@@ -1,5 +1,8 @@
 #include "strix/vision/embed_cache.hpp"
 
+#include "strix/vision/image.hpp"
+
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
@@ -86,7 +89,8 @@ CachedEncode encode_cached(VisionAdapter& adapter, EncoderBackend& backend, cons
     if (cache)
         if (auto rows = cache->find(identity, digest)) return {std::move(rows), true};
     const EncoderConfig config = adapter.config();
-    EncoderOutput hidden = backend.encode(grid, adapter.positions(config, weights, grid));
+    const PositionInputs pos = adapter.positions(config, weights, grid);
+    EncoderOutput hidden = adapter.device_resident_hidden() ? backend.encode_for_projection(grid, pos) : backend.encode(grid, pos);
     ProjectedRows projected;
     adapter.project(hidden, grid, backend, projected);
     if (projected.bf16.size() != std::size_t{projected.rows} * projected.width) throw std::logic_error("vision adapter: projected row shape");
@@ -94,6 +98,29 @@ CachedEncode encode_cached(VisionAdapter& adapter, EncoderBackend& backend, cons
         if (d.size() != projected.bf16.size()) throw std::logic_error("vision adapter: deepstack row shape");
     if (cache) return {cache->insert(identity, digest, std::move(projected)), false};
     return {std::make_shared<const ProjectedRows>(std::move(projected)), false};
+}
+
+PrepareReport prepare_backend(VisionAdapter& adapter, EncoderBackend& backend, const EncoderWeights& weights, bool warm_up) {
+    using clock = std::chrono::steady_clock;
+    PrepareReport r;
+    const auto t0 = clock::now();
+    for (const auto& [w, b] : adapter.projector_linears()) {
+        backend.prepare_linear(w, b);
+        ++r.linears;
+    }
+    r.reserved_rows = adapter.max_encoder_rows();
+    if (r.reserved_rows) backend.reserve(r.reserved_rows, 1U);
+    r.prepare_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    if (!warm_up) return r;
+    const auto t1 = clock::now();
+    Image grey;
+    grey.width = grey.height = 64;
+    grey.rgb.assign(grey.pixels() * 3U, 128U);
+    const PatchGrid grid = adapter.patches(grey);
+    r.warmup_rows = grid.rows;
+    (void)encode_cached(adapter, backend, weights, nullptr, Digest{}, grid);
+    r.warmup_ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
+    return r;
 }
 
 }  // namespace strix::vision

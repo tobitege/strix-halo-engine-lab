@@ -17,6 +17,9 @@ namespace strix::glm::xfer {
 // `peer` == nullptr: the peer partial is view.payload and every block waits in-kernel for it (recv_view()).
 void post_expand(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
                  float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride = 0);
+// Same, for a payload (local and peer / folded slot) in the split chunk-major layout, SplitLayout{rows, 4096, 2048}.
+void post_expand_split(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
+                       float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride = 0);
 void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipStream_t s);
 void post_expand_bracket(const float* B, const float* mix, const float* local, const float* peer, const RxView& view,
                          unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride = 0);

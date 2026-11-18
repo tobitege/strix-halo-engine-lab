@@ -52,6 +52,10 @@ inline unsigned split() {
     return v >= 1U && v <= 8U ? v : 2U;
 }
 
+// Shared expert rows sliced by 128 on the 128-row core (default) instead of 64-row slices: STRIX_GLM_PF_WMMA_SHARED128=0
+// restores the 64-row slices. Each weight tile is decoded once per 128 rows instead of per 64. Same bits.
+inline bool shared128() { return envcfg::flag("STRIX_GLM_PF_WMMA_SHARED128", true); }
+
 // Ragged tiles skip the WMMA chains of row fragments that hold no row (default; STRIX_GLM_PF_WMMA_LIVE_FRAG=0 computes
 // them as before). Stored bits are the same in both forms. Returns the kernels' all_fragments argument.
 inline unsigned all_fragments() { return envcfg::flag("STRIX_GLM_PF_WMMA_LIVE_FRAG", true) ? 0U : 1U; }

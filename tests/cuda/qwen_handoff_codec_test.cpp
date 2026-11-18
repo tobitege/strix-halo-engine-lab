@@ -1,4 +1,4 @@
-// Producer-side test of the hand-off chunk codec (host only, no GPU): src/cuda/qwen_handoff.cpp + src/bp_codec.cpp.
+// Producer-side test of the hand-off chunk codec (host only, no GPU): src/cuda/models/qwen/qwen_handoff.cpp + src/bp_codec.cpp.
 //
 //   qwen_handoff_codec_test                         loopback: every chunk body the sender builds, bp-v1 encoded, decodes to
 //                                                   the plain body byte for byte (random, edge-case and BF16/FP32-like pieces)
@@ -9,7 +9,7 @@
 //                                                   (a CPU test server: strix-rtx-state-import-tests --serve-file PORT FILE)
 //                                                   and checks GET <origin>/take (the parked payload equals the file's)
 // Build (x64 Native Tools): cl /O2 /std:c++20 /EHsc /utf-8 /Iinclude /Isrc\cuda tests\cuda\qwen_handoff_codec_test.cpp
-//   src\cuda\qwen_handoff.cpp src\bp_codec.cpp src\serve\json.cpp src\model_content_hash.cpp ws2_32.lib
+//   src\cuda\models\qwen\qwen_handoff.cpp src\bp_codec.cpp src\serve\json.cpp src\model_content_hash.cpp ws2_32.lib
 #include "qwen_handoff.hpp"
 #include "qwen_http.hpp"
 #include "strix/bp_codec.hpp"

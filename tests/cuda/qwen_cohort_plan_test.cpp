@@ -1,5 +1,5 @@
-// Host test of the cohort window packing (include/strix/cuda_qwen_cohort_plan.hpp); no GPU.
-#include "strix/cuda_qwen_cohort_plan.hpp"
+// Host test of the cohort window packing (include/strix/cuda/qwen_cohort_plan.hpp); no GPU.
+#include "strix/cuda/qwen_cohort_plan.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -142,6 +142,21 @@ int main() {
         edge.wide_ms = 55.0;
         EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, edge) == 8);
     }
+    // cap-16 cohort table (wide_measured, 50 ms) with the live acceptance: high-acceptance classes widen at C4 / C8 (edit
+    // p ~0.95, json p ~0.87), low acceptance (prose p ~0.5) stays at 8; the 0.65 prior (no live p) widens at C8 only
+    {
+        auto at = [](double p) { qc::WideModel m = qc::wide_measured(16); m.accept = p; return m; };
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 16);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 16);
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.87)) == 16);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.87)) == 16);
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.65)) == 16);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.65)) == 8);
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.5)) == 8);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.5)) == 8);
+        EXPECT(qc::choose_budget(1, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 8);  // one session: copy windows decide
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, qc::wide_measured(8)) == 8);
+    }
     // randomized invariants
     std::mt19937 rng(12345);
     for (int t = 0; t < 20000; ++t) {
@@ -150,6 +165,19 @@ int main() {
         std::vector<std::uint32_t> want(n);
         for (auto& w : want) w = rng() % 10;
         check_invariants(want, budget);
+    }
+    // wide copy window rule: measured sm_120 costs (wide 62.5 ms) -> off; a decode-shaped wide form (26 ms) -> on at 16
+    // rows, still off at 9 rows (9 / 26 < 8 / 17.35); <= 8 rows never
+    {
+        const qc::CopyWideModel measured{}, decode16{8.55, 1.1, 26.0};
+        EXPECT(!qc::copy_wide_pays(16, measured));
+        EXPECT(!qc::copy_wide_pays(8, decode16));
+        EXPECT(qc::copy_wide_pays(16, decode16));
+        EXPECT(!qc::copy_wide_pays(9, decode16));
+        // the measured table by decode row cap: cap 8 -> 62.5 off, cap 16 -> 29.2 on at 16 only
+        EXPECT(!qc::copy_wide_pays(16, qc::copy_wide_measured(8)));
+        EXPECT(qc::copy_wide_pays(16, qc::copy_wide_measured(16)));
+        EXPECT(!qc::copy_wide_pays(12, qc::copy_wide_measured(16)));
     }
     std::printf("%s (%d failures)\n", failures == 0 ? "COHORT PLAN PASS" : "COHORT PLAN FAIL", failures);
     return failures == 0 ? 0 : 1;

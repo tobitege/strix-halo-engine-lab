@@ -240,6 +240,35 @@ void identical_bytes(std::uint64_t align, bool short_reads, unsigned workers, st
     require(up.live_bytes == 0, "all staging returned");
 }
 
+// Budget full, mixed ticket sizes: an idle larger pooled buffer serves a small ticket instead of free + allocate.
+void staging_reuse_larger() {
+    MemorySource s(std::size_t{4} << 20, 4096, 5);
+    for (const bool reuse : {false, true}) {
+        HostUploader up;
+        WeightLoadOptions o{1, std::uint64_t{3} << 20, nullptr, false};
+        o.reuse_larger_staging = reuse;
+        WeightLoadStats st;
+        {
+            WeightLoadQueue q(up, o);
+            for (unsigned i = 0; i < 8; ++i) {
+                const std::uint64_t n = i % 2 ? 500000 : 2500000, off = i * 4096U;  // classes 1 MiB / 3 MiB
+                WeightLoadManifest m;
+                const std::uint64_t at = m.read(s, off, n);
+                m.hold();
+                m.output(at, n);
+                const auto t = q.submit(std::move(m));
+                const std::uint8_t* bytes = q.take(t);
+                require(std::memcmp(bytes + at, s.bytes() + off, n) == 0, "staging reuse: held bytes are identical");
+                q.release(t);
+            }
+            st = q.stats();
+        }
+        require(up.live_bytes == 0, "staging reuse: all staging returned");
+        require(reuse ? st.staging_allocations == 1 && st.staging_reused_larger == 4 : st.staging_allocations == 8 && st.staging_reused_larger == 0,
+            reuse ? "staging reuse: one allocation, small tickets on the larger buffer" : "staging reuse off: free + allocate per class change");
+    }
+}
+
 void held_in_order() {
     MemorySource s(std::size_t{4} << 20, 4096, 3);
     HostUploader up;
@@ -465,6 +494,7 @@ int main() {
         identical_bytes(512, false, 4, std::uint64_t{3} << 20);
         identical_bytes(4096, true, 6, std::uint64_t{1} << 20);
         held_in_order();
+        staging_reuse_larger();
         failure_cancels();
         allocation_failures();
         worker_start_failure();

@@ -51,6 +51,9 @@ struct IU4GroupedOperands {
     uint32_t a_mul = 1, a_add = 0, o_mul = 1, o_add = 0;
     int group = 64;
 };
+// Q8_0 rows (N x K, 34-byte blocks) -> IU4 g64 copy with N padded to 64 (core/iu4_onfly.hpp): wq = packed_bytes,
+// ws = scale_bytes (FP16 bits [padded][K/64]); both zero-filled first. Device pointers; stream-ordered.
+hipError_t convert_q8_0_iu4(const uint8_t* q8, int inputs, int outputs, uint8_t* wq, uint16_t* ws, hipStream_t stream, int scale_rule = 0);
 // EXL3 -> IU4 g64 pack of one matrix per expert (the engines' iu4_convert_kernel, moved here
 // with shared load-time rounding). trellis[e] = expert e's tiles (nullptr =
 // skip). Both nibbles and scales are built at load time; source widths are 2..8.

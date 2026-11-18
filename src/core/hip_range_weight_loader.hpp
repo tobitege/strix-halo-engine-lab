@@ -43,11 +43,12 @@ inline std::string weight_load_line(const WeightLoadStats& s, std::uint64_t peak
     char line[512];
     std::snprintf(line, sizeof(line),
                   "weight load queue: %llu tickets, %.3f GiB read, wall %.2f s (%.2f GiB/s), read %.2f s + convert %.2f s over %u workers, "
-                  "staging wait %.2f s, peak pinned %.1f MiB of %.1f MiB budget, %llu staging allocations",
+                  "staging wait %.2f s, peak pinned %.1f MiB of %.1f MiB budget, %llu staging allocations (%llu tickets on a larger pooled buffer)",
                   static_cast<unsigned long long>(s.tickets), static_cast<double>(s.read_bytes) / 1073741824.0, s.wall_seconds,
                   s.wall_seconds > 0 ? static_cast<double>(s.read_bytes) / 1073741824.0 / s.wall_seconds : 0.0, s.read_seconds,
                   s.convert_seconds, o.workers, s.admit_wait_seconds, static_cast<double>(peak_pinned) / 1048576.0,
-                  static_cast<double>(o.staging_budget_bytes) / 1048576.0, static_cast<unsigned long long>(s.staging_allocations));
+                  static_cast<double>(o.staging_budget_bytes) / 1048576.0, static_cast<unsigned long long>(s.staging_allocations),
+                  static_cast<unsigned long long>(s.staging_reused_larger));
     return line;
 }
 

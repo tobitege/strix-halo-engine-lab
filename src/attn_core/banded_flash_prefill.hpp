@@ -1,6 +1,10 @@
 #pragma once
 // Cooperative paired-key flash schedule. Key decoding, row access, scale and final combine are supplied by P.
 // The schedule retains quarter-score reduction, f16 exponent bands and the two ordered PV rescale forms.
+// chunkinv-attn-state-v1 (src/core/chunk_contract.hpp): bound as is. One work-group = one query row; its chunks and
+// Cpb blocks are cut from that row's own visible keys [0, n) (n from P::visible, absolute), the combine runs in block
+// order, and keys past n load as zero (P::load, both K and V, so the WMMA K pair of section 4 stays exact). Nothing
+// depends on neighbouring queries or on the call's rows; Cpb is a fixed FAST lever, not a per-call choice.
 #include "flash_core.hpp"
 
 namespace strix::attn_core {

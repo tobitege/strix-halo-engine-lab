@@ -5,9 +5,9 @@
 // block tile, wider strides, accumulate); the shared-expert entry against enqueue_shared_expert.
 // With --bench: device ms of the sites at 2K / 8K / 32K rows in chunks of 1024 rows (as the prefill driver calls them).
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_prefill_q8.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_prefill_q8.hpp"
 
 #include <algorithm>
 #include <cmath>

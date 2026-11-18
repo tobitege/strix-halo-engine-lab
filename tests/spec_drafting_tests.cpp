@@ -3,9 +3,12 @@
 // A simulated greedy target checks that whatever the arbiter picks, the emitted ids equal the serial ids.
 #include "strix/spec/drafting.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -255,12 +258,81 @@ void arbiter_tests() {
     SP_CHECK(st.lookup_us_quantile(0.5) <= 4.0 && st.lookup_us_quantile(0.999) >= 256.0, "lookup quantiles");
     SP_CHECK(st.json().find("\"lookup_us\":{\"count\":100") != std::string::npos, "lookup_us json");
 }
+// One chat copying its prompt, priced like the DeepSeek pair (verify 28.6 ms + 5.5 ms per extra row) against a black-box
+// learned drafter with the same committed tokens per pass as a perfect copy window of `model_rows` and a 9.6 ms draft:
+// the copy proposal (same survival, no draft cost) must win, and its expected tokens must not be shrunk per depth.
+struct CopyRun { std::uint64_t passes = 0, lookup_passes = 0; double last_expected = 0.0; std::uint32_t last_k = 0; };
+CopyRun ds_copy_run(std::uint32_t max_rows, std::uint32_t model_rows, std::uint32_t lookup_len) {
+    std::vector<std::uint32_t> prompt(400);
+    std::uint32_t x = 12345;
+    for (auto& t : prompt) { x = x * 1103515245U + 12345U; t = 100 + (x >> 8) % 50000; }
+    sp::ArbiterConfig config;
+    config.windows.clear();
+    for (std::uint32_t w = 1; w <= max_rows; ++w) config.windows.push_back(w);
+    sp::Arbiter a(config);
+    for (std::uint32_t w = 1; w <= max_rows; ++w) a.seed_cost(w, 28.6 + 5.5 * double(w - 1));
+    sp::ContextProposer proposer;
+    proposer.commit(prompt);
+    sp::Proposal proposal;
+    CopyRun run;
+    std::size_t at = 0;  // the output copies the prompt
+    while (at + 1 < prompt.size()) {
+        proposer.propose(proposal, {}, lookup_len);
+        sp::StepInput in;
+        in.lookup = &proposal;
+        in.model_max_k = model_rows - 1;
+        in.model_pass_tokens = double(model_rows);
+        in.model_pass_ms = 28.6 + 5.5 * double(model_rows - 1) + 9.6;
+        in.remaining = std::uint32_t(prompt.size() - at);
+        const auto d = a.decide(in);
+        std::uint32_t accepted = 0;
+        if (d.source == sp::Source::lookup)
+            while (accepted < d.k && proposal.tokens[accepted] == prompt[at + accepted]) ++accepted;
+        else if (d.source == sp::Source::model)
+            accepted = std::min<std::uint32_t>(d.k, std::uint32_t(prompt.size() - at - 1));
+        const std::uint32_t kept = std::min<std::uint32_t>(accepted + 1, std::uint32_t(prompt.size() - at));
+        const std::span<const std::uint32_t> emitted(prompt.data() + at, kept);
+        sp::Outcome o;
+        o.source = d.source;
+        o.bucket = std::min(proposal.bucket(), sp::lookup_buckets - 1);
+        o.proposed = d.k;
+        o.accepted = accepted;
+        o.rows = d.rows;
+        o.verify_ms = 28.6 + 5.5 * double(d.rows - 1);
+        o.draft_ms = d.source == sp::Source::model ? 9.6 : 0.0;
+        a.observe(o, emitted);
+        proposer.commit(emitted);
+        at += kept;
+        ++run.passes;
+        if (d.source == sp::Source::lookup) {
+            ++run.lookup_passes;
+            if (in.remaining > lookup_len + 1) run.last_expected = d.expected_tokens, run.last_k = d.k;  // not budget-bound
+        }
+    }
+    return run;
+}
+
+void ds_arbiter_tests() {
+    // 6 rows, the learned drafter as good as a perfect copy window: the copy (no draft) wins almost every pass
+    const auto r6 = ds_copy_run(6, 6, 5);
+    SP_CHECK(r6.lookup_passes * 10 >= r6.passes * 8, "copy lost to an equal drafter: %llu of %llu passes",
+             static_cast<unsigned long long>(r6.lookup_passes), static_cast<unsigned long long>(r6.passes));
+    SP_CHECK(r6.last_k == 5 && r6.last_expected >= 5.5, "6-row copy window predicts %.2f tokens (k %u)", r6.last_expected, r6.last_k);
+    // 8-row copy windows beside the 6-row drafter: copy passes are deeper, fewer passes in total
+    const auto r8 = ds_copy_run(8, 6, 7);
+    SP_CHECK(r8.last_k == 7 && r8.passes < r6.passes, "8-row copy: k %u, %llu vs %llu passes", r8.last_k,
+             static_cast<unsigned long long>(r8.passes), static_cast<unsigned long long>(r6.passes));
+    // a perfect 16-candidate bucket predicts >= 15 committed tokens (cumulative survival bounded once)
+    const auto r16 = ds_copy_run(16, 6, 15);
+    SP_CHECK(r16.last_k == 15 && r16.last_expected >= 15.0, "16-row copy window predicts %.2f tokens (k %u)", r16.last_expected, r16.last_k);
+}
 } // namespace
 
 int main() {
     index_tests();
     copy_tests();
     arbiter_tests();
+    ds_arbiter_tests();
     std::printf("PASS strix-spec-drafting-tests\n");
     return 0;
 }

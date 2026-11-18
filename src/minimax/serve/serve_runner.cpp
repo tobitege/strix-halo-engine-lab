@@ -169,7 +169,8 @@ int paired_state_probe(mm::Engine& eng, Runner& run, const mm::Options& options,
         }
         std::printf("rank %u input-witness cycle=%zu physical=%zu logits=%s rows=%s next=",eng.rank(),cursor,rows.size(),
             hex(fnv(logits.data(),logits.size()*sizeof(float))).c_str(),hex(fnv(image.data(),image.size())).c_str());
-        for(auto token:next)std::printf("%u,",token);std::printf("\n");
+        for(auto token:next)std::printf("%u,",token);
+        std::printf("\n");
         if(ticket!="input" && !injected && cursor==fault_cursor) {
             injected=true;
             if(eng.rank()==(ticket=="fault0"?0U:1U))throw std::runtime_error("operator native fault AFTER row/logit writes");
@@ -229,7 +230,7 @@ int paired_state_probe(mm::Engine& eng, Runner& run, const mm::Options& options,
         adapter.prefill(std::vector<std::uint32_t>{123},c);auto bystander=store.capture(c);
         std::array<ss::PrefillItem,2> fill{{{x,a},{y,b}}};adapter.prefill_batch(fill);
         const auto check_candidate=[&](auto h,const ss::StepResult& result) {
-            const auto snapshot=store.capture(h);const auto image=std::static_pointer_cast<const RankImage>(snapshot.ranks[0].owner)->image;
+            const auto captured=store.capture(h);const auto image=std::static_pointer_cast<const RankImage>(captured.ranks[0].owner)->image;
             need(result.tokens.size()==1 && !result.rng_draws && result.tokens[0]==image->frontier.retained,"MiniMax retained decode frontier");
         };
         ss::SamplerState live;live.max_tokens=8;

@@ -1,4 +1,7 @@
 #include "strix/env_flags.hpp"
+#include "strix/ds41_fast_profile.hpp"
+#include "strix/ds41_decode_xport.hpp"
+#include <map>
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
@@ -11,6 +14,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
@@ -179,7 +183,8 @@ const char* app_name(App app) {
 }
 
 const strix::profile::Engine& profile_engine() {
-    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false};
+    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false,
+                                              "ds41-turbo-v1"};
     return engine;
 }
 
@@ -225,6 +230,11 @@ std::span<const strix::profile::DefaultItem> default_items() {
         {"attn_tile_f16", "STRIX_DS41_ATTN_TILE_F16", "", "0", ""},
         {"serve_warm", "STRIX_DS41_SERVE_WARM", "", "0", ""},
         {"dspark_calib", "STRIX_DS41_DSPARK_CALIB", "", "0", ""},
+        // 2026-11-14 DS41 prefill schedule (bitwise): window drain arm 1 (ABAB -239 ms at 11,594, -85 at 2,952)
+        {"window_drain", "STRIX_DS41_PREFILL_WINDOW_DRAIN", "", "0", ""},
+        // 2026-11-14 DS41 prefill schedule (bitwise): one MoE window per pass, cap 8192 (ABAB -218 ms at 11,594, hashes equal)
+        {"moe_pass_window", "STRIX_DS41_PREFILL_MOE_PASS_WINDOW", "", "0", ""},
+        {"decode_xport", "STRIX_DS41_DECODE_XPORT", "", "0", ""},
     };
     return items;
 }
@@ -249,27 +259,47 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     }
     // Product profile first: its switches are environment for everything below (an explicit one wins).
     strix::profile::Inputs profile_inputs;
-    profile_inputs.env = raw_env;
+    // Resolve the bundle before admission, reporting and rank agreement. An explicit
+    // component OFF wins. Canonical strings are also exported for execution/cache readers.
+    // Shared bundle rules (strix/fast_profile.hpp); the dense row threshold is DS41's own auxiliary row.
+    namespace fp = strix::fast_profile;
+    auto fast_env = fp::expand(strix::ds41::fast_profile::kBundle, raw_env);
+    if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
+        fp::set(value) || fp::switch_on(raw_env("STRIX_DS41_FAST_PREFILL")) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
+        fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
+            strix::ds41::fast_profile::dense_min_rows_value(value)));
+    // The explicit Engram lever (not a bundle member): canonical value exported when set, like the members.
+    if (const auto& e = strix::ds41::fast_profile::kEngram; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
+    if (const auto& e = strix::ds41::fast_profile::kShared; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
+    if (const auto& e = strix::ds41::fast_profile::kMoeF16; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
+    profile_inputs.env = fp::lookup(fast_env, raw_env);
     strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
-    std::vector<std::pair<std::string, std::string>> profile_env;
-    for (const auto& e : r.profile->entries)
-        if (!e.lever->env.empty() && strix::profile::applied(e.status))
-            profile_env.emplace_back(std::string(e.lever->env), e.value);
+    const auto profile_env = strix::profile::exports(*r.profile, fast_env);
     r.set_env = profile_env;
     if (auto extra = strix::profile::profile_args(*r.profile); !extra.empty())
         user.insert(user.begin() + (!user.empty() && !user[0].empty() && user[0][0] != '-' ? 1 : 0), extra.begin(), extra.end());
     for (auto& n : r.profile->notices()) r.notices.push_back(std::move(n));
     const Getenv env = [&](const char* name) -> const char* {
         for (const auto& [k, v] : profile_env) if (k == name) return v.c_str();
-        return raw_env(name);
+        const char* value = raw_env(name);
+        // The transport selector treats empty as automatic; baseline must also
+        // export its rollback over an inherited empty value.
+        if (name == strix::ds41::decode_xport_lever.env && !set(value)) return nullptr;
+        return value;
     };
     const auto put = [&](const char* name, std::string value) {
         if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
     };
     const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
-
     const bool baseline = set(env("STRIX_DS41_BASELINE")) && !zero(env("STRIX_DS41_BASELINE"));
+    {
+        // The engine reads the variable after the app applied set_env: STRIX_DS41_BASELINE=1 puts the communicator there.
+        const char* value = env(strix::ds41::decode_xport_lever.env.data());
+        const auto xport = strix::ds41::decode_xport_choice(baseline && !set(value) ? "0" : value);
+        r.decode_xport = std::string(strix::ds41::decode_xport_name(xport.on)) + " (" +
+                         (baseline && !set(value) ? "baseline" : strix::lever::origin_name(xport.origin)) + ")";
+    }
     if (baseline) {
         for (const auto& row : default_items()) {
             const auto value = strix::profile::resolve_default(row, true, env);
@@ -335,7 +365,9 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     std::vector<std::string> def;
     const auto transport = last_value(user, "--transport");
     const bool two_ranks = !transport.empty() && transport != "single";
-    if (app == App::rank || app == App::batch) {
+    // One set for every two-rank entry point (rank, batch and the server): the server's built-in values are the same, so
+    // the resolved arguments and the parity gate (tests/serve_cli_parity_tests.cpp) show them for both.
+    if (app == App::rank || app == App::batch || app == App::serve) {
         if (two_ranks && !has(user, "--no-tp-attention")) def.emplace_back("--tp-attention");
         if (!has(user, "--engram-mapped")) def.emplace_back("--engram-direct");
     }
@@ -401,9 +433,11 @@ std::string describe(App app, const Resolved& r) {
     std::ostringstream o;
     o << "app " << app_name(app) << '\n';
     if (r.profile) o << r.profile->describe();
+    o << strix::weight::family_plan_notice(r.weight_plans);
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
+    o << "decode_xport " << r.decode_xport << '\n';
     o << "session cache " << (r.session.enabled ? "on" : "off") << "\n"
       << "session ram_bytes " << r.session.ram_bytes << "\n"
       << "session max_parked " << r.session.max_parked << "\n"
@@ -413,6 +447,14 @@ std::string describe(App app, const Resolved& r) {
       << "session reason " << r.session.reason << "\n";
     for (const auto& n : r.notices) o << "notice " << n << '\n';
     return o.str();
+}
+
+DsparkSettings resolve_dspark_settings() {
+    const char* raw = ::strix::envcfg::text("STRIX_DS41_COPY_ROWS");
+    const bool copy_rows8 = raw != nullptr && std::strcmp(raw, "8") == 0;  // anything else: six rows
+    // Report the row count rather than the raw text.
+    ::strix::envcfg::record("STRIX_DS41_COPY_ROWS", raw, copy_rows8 ? "8" : "6");
+    return {copy_rows8, ::strix::envcfg::flag("STRIX_DS41_SPEC_ARBITER", false)};
 }
 
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
@@ -459,11 +501,14 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         return out;
     };
     auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    if (!r.print_only && r.profile) r.profile->weights.require_honoured();
     for (const auto& [k, v] : r.set_env) {
 #ifdef _WIN32
         _putenv_s(k.c_str(), v.c_str());
 #else
-        ::setenv(k.c_str(), v.c_str(), 0);
+        const bool governed = std::any_of(profile_table.begin(), profile_table.end(),
+            [&](const auto& row) { return row.env == k; });
+        ::setenv(k.c_str(), v.c_str(), governed ? 1 : 0);
 #endif
     }
     for (const auto& k : r.unset_env) {
@@ -476,6 +521,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     profile_json_storage() = r.profile ? r.profile->json() : std::string();
     profile_storage() = r.profile;
     if (r.print_only) {
+        (void)resolve_dspark_settings();
         std::cout << describe(app, r) << ::strix::envcfg::describe();
         std::cout.flush();
         std::exit(0);

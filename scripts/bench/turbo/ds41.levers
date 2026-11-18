@@ -1,0 +1,7 @@
+# ds41-turbo-v1 lever manifest (pair). Same columns as qwen.levers.
+fast_attn|attn|STRIX_DS41_FAST_ATTN=2||ds41-attn-bf16flash-v1|main|BF16 one-pass sparse attention|STRIX_DS41_FAST_ATTN=0
+fast_moe|moe|STRIX_DS41_FAST_MOE=1||ds41-moe-relaxed-v1|main|relaxed MoE order|STRIX_DS41_FAST_MOE=0
+fast_dense|dense|STRIX_DS41_FAST_DENSE=1||ds41-dense-f16-v1|main|FP16 dense (rows >= STRIX_DS41_FAST_DENSE_MIN_ROWS 128)|STRIX_DS41_FAST_DENSE=0
+engram_wmma|engram|STRIX_DS41_FAST_ENGRAM=1||ds41-engram-f16wmma|pending|#636 (stack branch); env name set by that PR|STRIX_DS41_FAST_ENGRAM=0
+replay_r256|replay|STRIX_DS41_REPLAY_R=256||replay-r256|pending|#605 alternative kept|STRIX_DS41_REPLAY_R=0
+replay_r128|replay|STRIX_DS41_REPLAY_R=128||replay-r128-turbo|pending|new TURBO identity, admitted only under turbo|STRIX_DS41_REPLAY_R=0

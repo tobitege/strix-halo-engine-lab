@@ -1,0 +1,6 @@
+# glm-turbo-v1 lever manifest (pair).
+pf_wmma|wmma|STRIX_GLM_PF_WMMA=1||glm-pf-wmma-x|main|WMMA dense and MoE prefill cores (umbrella; attn and KDA default to it)|STRIX_GLM_PF_WMMA=0
+attn_wmma|attn|STRIX_GLM_PF_ATTN_WMMA=1||glm-pf-attn-wmma|main|fused bf16 MLA/DSA flash core|STRIX_GLM_PF_ATTN_WMMA=0
+kda_wmma|kda|STRIX_GLM_PF_KDA_WMMA=1||glm-pf-kda-wmma-v1|main|KDA projections on FP16 WMMA|STRIX_GLM_PF_KDA_WMMA=0
+router_wmma|router|STRIX_GLM_PF_ROUTER_INDEXER_WMMA=1||glm-router-wmma|pending|router + indexer projections (selection-changing)|STRIX_GLM_PF_ROUTER_INDEXER_WMMA=0
+kda_state16|state|STRIX_GLM_PF_KDA_STATE16=1||glm-kda-state16|pending|KDA recurrent state in 16 bits|STRIX_GLM_PF_KDA_STATE16=0

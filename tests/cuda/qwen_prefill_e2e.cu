@@ -7,7 +7,7 @@
 // gate compares attention-kv.raw (rows [0, N) of each of the 12 slices; the export holds the whole context per slice),
 // sparse-index.raw, recurrent-matrix.raw, gdn-convolution.raw, ple-convolution.raw and prints the first difference
 // per component. Block schedule: STRIX_QWEN_BLOCKS (comma list of rows), default the Config default.
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
 
 #include <cstdio>

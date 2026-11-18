@@ -4,6 +4,14 @@
 
 #include <hip/hip_runtime.h>
 
+// HIP's non-Clang host definitions leave __noinline__ as an empty macro.
+// libstdc++ 16 uses that spelling in [[__gnu__::__noinline__]], including
+// through <chrono>. Do not leak the host-only marker into standard headers.
+// HIP/Clang device annotations are deliberately left unchanged.
+#if defined(__GNUC__) && !defined(__clang__) && defined(__noinline__)
+#undef __noinline__
+#endif
+
 #include <string>
 
 // What the HIP runtime exposes to this process. Properties only: no allocation is made on any device.

@@ -1,8 +1,10 @@
 #include "device.hpp"
 #include "attention.hpp"
 #include <hip/hip_runtime.h>
+#include "strix/env_flags.hpp"
 #include "../../attn_core/dense_flash_prefill.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
@@ -424,6 +426,7 @@ bool attention_split_enabled() {
     static const bool enabled = [] { const auto* p = std::getenv("STRIX_G4_PREFILL_ATTN_SPLIT"); return !p || std::string_view(p) != "0"; }();
     return enabled;
 }
+constexpr unsigned kAbsSegTiles = max_positions / 16U / 8U; // 512 tiles = 8192 keys
 std::size_t flash_workspace_bytes(unsigned rows, unsigned heads, unsigned dim) {
     return attn_core::dense::workspace_floats(rows, heads, dim, 8U) * sizeof(float);
 }
@@ -523,10 +526,26 @@ void attention_flash(const float* q, const gpu::KvRead* reads, unsigned rows, un
         splits = forced ? forced : std::max(1U, std::min({8U, (160U + groups - 1U) / groups, tiles / 32U}));
         while (splits > 1 && attn_core::dense::workspace_floats(rows, heads, dim, splits) * sizeof(float) > workspace_bytes) --splits;
     }
+    // STRIX_G4_PREFILL_FLASH_ABSSEG=1 (opt-in, identity dense-flash-absseg-v1/s512, bit-changing against the block share):
+    // split boundaries from absolute key tiles (chunk_contract.hpp). Arbitrary transaction cuts also require
+    // open-row carry/replay through every layer; the dense fixture's replay does not qualify this engine path.
+    // 8 segments of 512 tiles cover max_positions; a call that cannot hold its segments fails closed.
+    unsigned seg_tiles = 0;
+    static const bool absseg = [] {
+        const bool on = envcfg::flag("STRIX_G4_PREFILL_FLASH_ABSSEG", false, EnvFlagMatch::exact);
+        if (on) std::fprintf(stderr, "G4 flash split identity dense-flash-absseg-v1/s%u (opt-in)\n", kAbsSegTiles);
+        return on;
+    }();
+    if (absseg && context) {
+        seg_tiles = kAbsSegTiles;
+        splits = std::max(1U, (context + 16U * seg_tiles - 1U) / (16U * seg_tiles));
+        if (splits > 1U && (!workspace || attn_core::dense::workspace_floats(rows, heads, dim, splits) * sizeof(float) > workspace_bytes))
+            throw std::runtime_error("dense-flash-absseg-v1: workspace below the absolute segment count");
+    }
     auto* ws = static_cast<float*>(workspace);
     switch (dim) {
-    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream, ws, splits); break;
-    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream, ws, splits); break;
+    case 256: attn_core::dense::launch<FlashPolicy<256>>(a, heads, stream, ws, splits, seg_tiles); break;
+    case 512: attn_core::dense::launch<FlashPolicy<512>>(a, heads, stream, ws, splits, seg_tiles); break;
     default: throw std::invalid_argument("flash attention head dimension");
     }
     if (const auto e = hipGetLastError(); e != hipSuccess) throw std::runtime_error(hipGetErrorString(e));

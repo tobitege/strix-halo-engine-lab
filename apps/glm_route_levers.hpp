@@ -6,12 +6,16 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 
@@ -40,6 +44,20 @@ inline std::uint64_t record_route_levers(std::string_view entry, unsigned rank, 
     rr::lever("glm.identity", identity, identity);
     rr::lever("glm.pf_wmma", wmma, wmma_on ? "f16_wmma" : "exact", wmma_on ? rr::Reason::selected : rr::Reason::disabled);
     rr::lever("glm.pf_kda_wmma", kda, pf::kda_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_mla_wmma", asked("STRIX_GLM_PF_MLA_WMMA"), pf::mla_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_mla_gemm_heads", asked("STRIX_GLM_PF_MLA_GEMM_HEADS"), pf::mla_gemm::heads_mid() ? "1" : "0");
+    // The fused MLA/DSA core (glm-pf-attn-wmma, its own bits; the key block orders the online softmax) and the FP16 o-bar
+    // image it can store for the WMMA out GEMM (STRIX_GLM_PF_MLA_OB16, measured not bitwise) change the prefill
+    // arithmetic: the server's hello pairs on this fingerprint alone (the rank CLI also votes kPfAttnWmmaConfig).
+    const bool attn_on = pf::attn_wmma::enabled();
+    rr::lever("glm.pf_attn_wmma", asked("STRIX_GLM_PF_ATTN_WMMA") + ":t=" + asked("STRIX_GLM_PF_ATTN_WMMA_T"),
+              attn_on ? "1:t=" + std::to_string(pf::attn_wmma::block_keys()) : std::string("0"));
+    rr::lever("glm.pf_mla_ob16", asked("STRIX_GLM_PF_MLA_OB16"),
+              attn_on && pf::mla_wmma::enabled() && pf::mla_wmma::ob16() ? "1" : "0");
+    rr::lever("glm.pf_idxproj_wmma", asked("STRIX_GLM_PF_IDXPROJ_WMMA"), pf::idxproj_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_x16", asked("STRIX_GLM_PF_X16"), pf::kda_wmma::x16_enabled() ? "1" : "0", rr::Reason::selected, false);
+    rr::lever("glm.pf_router_wmma", asked("STRIX_GLM_PF_ROUTER_WMMA"),
+              pf::router_wmma::enabled() ? "1" : "0", rr::Reason::selected, true);
     rr::lever("glm.pf_exact_x", x + ":min_rows=" + asked("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), x_effective, rr::Reason::selected, true,
               "auto takes the X3 route (and the WMMA identity when on) only for calls of at least min_rows rows");
     rr::lever("glm.max_rows", std::to_string(max_rows), std::to_string(max_rows), rr::Reason::selected, false);
@@ -68,17 +86,53 @@ inline pf::dense_policy::Chunk record_prefill_chunk(std::string_view entry, bool
 }
 
 
-// Dry run (--print-effective-config of either entry point): the same resolver over an environment that is resolved
-// but not applied. `apply_pending(set)` calls set(name, value) for every value the app would set if unset.
+// Dry run (--print-effective-config of either entry point): an environment that is resolved but not applied.
+// `apply_pending(set)` calls set(name, value) for every value the app would set if unset; lookups see those values
+// first, then the process environment (an explicit value always wins, as in the applied run).
+class PendingEnv {
+public:
+    template<class ApplyPending>
+    explicit PendingEnv(ApplyPending&& apply_pending) {
+        apply_pending([this](const char* name, const char* value) { if (std::getenv(name) == nullptr) pending_[name] = value; });
+    }
+    const char* operator()(const char* name) const {
+        const auto it = pending_.find(name);
+        return it != pending_.end() ? it->second.c_str() : static_cast<const char*>(std::getenv(name));
+    }
+
+private:
+    std::map<std::string, std::string> pending_;
+};
+
 template<class ApplyPending>
 inline pf::dense_policy::Chunk pending_prefill_chunk(bool explicit_request, unsigned requested, unsigned world, unsigned max_rows,
                                                      std::string_view prefill, ApplyPending&& apply_pending) {
-    std::map<std::string, std::string> pending;
-    apply_pending([&](const char* name, const char* value) { if (std::getenv(name) == nullptr) pending[name] = value; });
-    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, prefill, [&](const char* name) {
-        const auto it = pending.find(name);
-        return it != pending.end() ? it->second.c_str() : static_cast<const char*>(std::getenv(name));
-    });
+    const PendingEnv env(std::forward<ApplyPending>(apply_pending));
+    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, prefill, env);
+}
+
+// The server's prefill interleave (strix/serve/prefill_interleave.hpp) with the GLM route identity: on the chunked exact
+// route, grouping base chunks into one call is admitted only when every dense call keeps the base calls' core
+// (pf::dense_policy::choose / call_rows). One definition for the live server and its --print-effective-config dry run,
+// so the printed policy is the one that admits prompts. `env` is read once here, never inside the callback.
+template<class Env>
+inline strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline,
+                                                                Env&& env) {
+    auto policy = strix::serve::PrefillInterleave::from_env(env);
+    if (mode == "gemv") {
+        namespace dp = pf::dense_policy;
+        const auto choice = dp::choose(0, env);
+        policy.route_identity = [choice, max_rows, pipeline](std::size_t tokens) -> std::optional<unsigned> {
+            const auto rows = dp::call_rows(static_cast<unsigned>(tokens), max_rows, pipeline);
+            if (!choice.automatic) return choice.route;
+            if (rows.min < choice.min_rows && rows.max >= choice.min_rows) return std::nullopt;
+            return rows.min >= choice.min_rows ? dp::kX3r8 : dp::kTm;
+        };
+    }
+    return policy;
+}
+inline strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline) {
+    return serve_prefill_interleave(mode, max_rows, pipeline, strix::envcfg::text);
 }
 
 }  // namespace strix::glm

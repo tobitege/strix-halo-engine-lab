@@ -27,6 +27,11 @@ ranks agree. [Implementation contract](../../minimax-grouped-prefill.md#draft-fa
 
 ## Run
 
+**Weights:** [hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw-mirror) (mirror of
+`Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw`, used as published; our EXL3 4-bit draft packs under
+`minimax-drafts/`) and [hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror](https://huggingface.co/hyukudan/MiniMax-M3.1-Flash-DFlash2-mirror) (draft source). Files and revisions:
+[reproduce](../../reproduce.md#models-and-provenance).
+
 Run once per node with `R` set to 0 or 1 and matching EXL3 assets:
 
 ```sh
@@ -90,6 +95,9 @@ grouped calls whose every member has at least 2048 rows. Balanced 7940-token pro
 
 | Mode | Prompt / context | Measured result | Build / exactness |
 |---|---|---|---|
+| Combined prefill | 8K, defaults (exact), warm second session in the process, 3 runs | **12.24-12.25 s = 669 tok/s** (first run 13.30 s); 3.40 M GPU clocks per token per GPU. Measured before #626; fresh-process figures with the current defaults in the next rows | main `ae06f9466`; state hashes equal on both ranks in every run |
+| Prefill, exact defaults, fresh process (cold): MoE tail rows on the pipelined kernel (default; `STRIX_MMX_PREFILL_PIPE_TAIL=0` turns it off, same bits) | 8K / 32K, pair, first prefill of a fresh process, valid runs only | **12.47 s = 657 tok/s / 50.91 s = 644 tok/s** vs 12.68 / 51.81 s with the tail rows off (-213 / -901 ms) | #626; logits identical on/off (768 rows at 8K, 256 at 32K), state digests equal on both ranks |
+| Prefill, FAST profile `STRIX_MM_FAST_PREFILL=1` (opt-in; BF16 flash attention on layers 40-59, `msa-flash-bf16-l40-v1`) | 8K / 32K, same method, 1-2 valid runs | **11.92 s = 687 tok/s / 48.06 s = 682 tok/s** (-6.0 / -7.2 % vs exact) | #626; gate PASS at 8K (KL 0.0012, top-1 99.7 %) and 32K (KL 0.0029, top-1 99.6 %); layers 30-59 pass at 8K only (fail at 32K), explicit only |
 | Greedy decode | 1K / 8K benchmark prompts, cold | **43.30 / 45.06 ms/token** (23.10 / 22.19 tok/s); 44.57 / 46.10 ms/token on `8cc30ac0` (256 tokens) | public tree of PR #59; ranks agree, reference IDs equal |
 | Combined prefill | 8K benchmark prompt | **14.04 s**, 583 tok/s (alternating arms in one process, 13.85–14.29 s); **45–50 %** of the calculated 6.3–7.0 s kernel floor; 17.731 s on `e0bad3d1` (baseline 21.874 s) | #334 `c225cdaa2`; both ranks' state/final rows equal the references |
 | Fresh combined prefill | 32K benchmark prompt | **63.48 s**, 516 tok/s (three runs per arm, both orders); **41–46 %** of the calculated 26–29 s kernel floor; 91.508 s on `e0bad3d1` | #334 `c225cdaa2`; result hash equal in all six runs, ranks agree |

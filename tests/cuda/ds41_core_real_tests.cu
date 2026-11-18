@@ -5,9 +5,9 @@
 // The file needs the dense tensors of layers 0-2, the embedding and the head (the model or a subset). Engram rows are
 // synthetic (the tables are not needed). Skips (exit 0) without the variable.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_weights.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_weights.hpp"
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_formats.hpp"

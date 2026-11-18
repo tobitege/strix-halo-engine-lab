@@ -1,23 +1,25 @@
 #include <cstdlib>
+#include <source_location>
+#include <string>
 #include <iostream>
 
 #include "glm/rtxpf/import/glm_import_socket.hpp"
 using namespace strix::glm::import;
 namespace {
 unsigned checks = 0;
-void check(bool ok) {
+void check(bool ok, std::source_location at = std::source_location::current()) {
     ++checks;
-    if (!ok) throw std::runtime_error("CPU assertion failed");
+    if (!ok) throw std::runtime_error("CPU assertion failed at line " + std::to_string(at.line()));
 }
 template <class F>
-void rejects(F f) {
+void rejects(F f, std::source_location at = std::source_location::current()) {
     bool threw = false;
     try {
         f();
     } catch (const std::exception&) {
         threw = true;
     }
-    check(threw);
+    check(threw, at);
 }
 Bytes frame(const Component& c, std::uint64_t row = 0, std::uint64_t rows = 0) {
     if (!rows) rows = c.rows;
@@ -91,6 +93,90 @@ void units() {
                 check(kept == want);  // the producer's filter of the full export == rank 1's v2 layout
             }
     }
+    // Versions 3 / 4 (index tail): ikey / igate carry only the open pool block [P - P % 4, P); everything else is v1 / v2.
+    {
+        namespace st = strix::state;
+        check(wire_version(false, false) == 1 && wire_version(true, false) == 2 && wire_version(false, true) == 3 &&
+              wire_version(true, true) == 4);
+        check(!index_tail(1) && !index_tail(2) && index_tail(3) && index_tail(4) && dsa_once(2) && dsa_once(4) && !dsa_once(3));
+        for (unsigned layers : {45u, 46u})
+            for (std::uint64_t n : {1ULL, 2ULL, 3ULL, 4ULL, 5ULL, 6ULL, 7ULL, 8ULL, 2047ULL, 2048ULL, 2049ULL, 2050ULL, 2051ULL})
+                for (unsigned rank : {0u, 1u})
+                    for (bool once : {false, true}) {
+                        auto full = b, tail = b;
+                        full.layers = tail.layers = layers;
+                        full.frontier = tail.frontier = n;
+                        full.total = tail.total = n + 1;
+                        full.rank = tail.rank = rank;
+                        full.version = wire_version(once, false);
+                        tail.version = wire_version(once, true);
+                        const auto f = layout(full), t = layout(tail);
+                        std::vector<Component> want;  // the full layout with the index rows cut to the open tail
+                        for (const auto& c : f) {
+                            if (c.id != 3 && c.id != 4) { want.push_back(c); continue; }
+                            check(c.rows == n && c.first == 0);
+                            if (n % 4) want.push_back({c.layer, c.id, n % 4, c.stride, n - n % 4});
+                        }
+                        bool same = want.size() == t.size();
+                        for (std::size_t i = 0; same && i < t.size(); ++i)
+                            same = t[i].layer == want[i].layer && t[i].id == want[i].id && t[i].rows == want[i].rows &&
+                                   t[i].stride == want[i].stride && t[i].first == want[i].first;
+                        check(same);
+                        // the producer's filter of its v3 export == the rank's v4 layout (DSA once composes with the tail)
+                        if (once) {
+                            auto v3 = tail;
+                            v3.version = 3;
+                            std::vector<std::pair<unsigned, unsigned>> kept, got;
+                            for (const auto& c : layout(v3))
+                                if (!omitted(tail.version, rank, c.id)) kept.push_back({c.layer, c.id});
+                            for (const auto& c : t) got.push_back({c.layer, c.id});
+                            check(kept == got);
+                        }
+                        // shared descriptor: the cut equals open_tail_saving per DSA layer
+                        std::uint64_t fb = 0, tb = 0;
+                        for (const auto& c : f) fb += c.rows * c.stride;
+                        for (const auto& c : t) tb += c.rows * c.stride;
+                        const unsigned dsa_layers = omitted(tail.version, rank, 3) ? 0U : (layers == 46 ? 12U : 11U);
+                        check(fb - tb == dsa_layers * st::open_tail_saving(strix::glm::state_layout::kDsaIndex, n));
+                    }
+        // Every frame of a v4 rank-0 layout stages; the tail frames start at row 0 of their component.
+        for (std::uint64_t n : {6ULL, 8ULL}) {
+            auto v4 = b;
+            v4.version = 4;
+            v4.frontier = n;
+            v4.total = n + 1;
+            Staging s(v4);
+            std::uint64_t expect = 0;
+            for (const auto& c : layout(v4)) {
+                add(s, frame(c));
+                expect += c.rows * c.stride;
+            }
+            check(s.raw_bytes == expect);
+        }
+        // MINSTATE GLM pair totals (both ranks, MTP, N = P + 1): v2 806,920,192 / v4 605,618,176 B at 32K,
+        // v4 1,964,572,672 B at 128K (13,824 N + Fg for N multiple of 4; Fg = 152,633,344).
+        auto pair_bytes = [&](unsigned version, std::uint64_t N) {
+            std::uint64_t total = 0;
+            for (unsigned rank : {0u, 1u}) {
+                auto q = b;
+                q.version = version;
+                q.rank = rank;
+                q.layers = 46;
+                q.frontier = N - 1;
+                q.total = N;
+                for (const auto& c : layout(q)) total += c.rows * c.stride;
+            }
+            return total;
+        };
+        check(pair_bytes(2, 32768) == 806920192ULL && pair_bytes(4, 32768) == 605618176ULL);
+        check(pair_bytes(4, 131072) == 1964572672ULL && pair_bytes(2, 131072) - pair_bytes(4, 131072) == 805281792ULL);
+        auto v5 = b;
+        v5.version = 5;
+        rejects([&] { Staging s(v5); });
+        auto v4 = b;
+        v4.version = 4;
+        check(hash(v4.encode(true)) != hash(b.encode(true)));  // the version is in the ranks' binding digest
+    }
     // The same helpers size/reset/serialize/restore the engine's actual allocations.
     // Exercise all pool boundaries, including a capacity different from the frontier.
     namespace sl = strix::glm::state_layout;
@@ -129,7 +215,7 @@ void units() {
     invalid.rank = 2;
     rejects([&] { Staging s(invalid); });
     invalid = b;
-    invalid.version = 3;
+    invalid.version = 0;  // 1..4 are known (3 / 4: the index tail)
     rejects([&] { Staging s(invalid); });
     for (unsigned field = 0; field < 9; ++field) {
         auto x = b;

@@ -9,7 +9,8 @@
 // The embedded reference materializes all T score/maxima rows and uses one
 // whole-call select_batch_kernel; split uses two leased multi-group slots and one
 // select_batch_kernel per slice. Both invoke the actual shared production
-// stage-score launcher. This tests the score/selection lifetime boundary;
+// stage-score launcher with band disabled (qsa_index_band.hip gates that route).
+// This tests the legacy score/selection lifetime boundary;
 // norm/store/pool publication and complete-engine outputs require engine gates.
 // Reference above 65536 deliberately bypasses embedded admission only in this
 // standalone fixture. At T8192/262144 allow ~21 GiB combined host/device memory
@@ -137,7 +138,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
         }
     }
     const void* pool=packed?static_cast<void*>(pk.p):static_cast<void*>(dk.p);
-    qpf2k_stage_score_launch(embedded.p,pool,packed,ranges.p,dim,blocks,0U,groups,stream);
+    qpf2k_stage_score_launch(embedded.p,pool,packed,ranges.p,dim,blocks,0U,groups,stream,false);
     if(edges) hipLaunchKernelGGL(selector_edges,dim3((blocks+1023U)/1024U,64U,groups),dim3(256),0,stream,embedded.p,0U,groups);
     check(hipGetLastError(),"embedded score");check(hipStreamSynchronize(stream),"embedded score completion");
     // Snapshot exactly the bytes live at selection, before the whole-call selector.
@@ -174,7 +175,7 @@ static void run(unsigned T,unsigned blocks,bool packed,bool edges,unsigned ring_
                     sc.maxima+static_cast<std::size_t>(r)*sc.maxima_stride,refsel.p[row].visible,0U};
             }
         }
-        qpf2k_stage_score_launch(split.p,pool,packed,ranges.p,dim,blocks,first,count,stream);
+        qpf2k_stage_score_launch(split.p,pool,packed,ranges.p,dim,blocks,first,count,stream,false);
         if(edges) hipLaunchKernelGGL(selector_edges,dim3((blocks+1023U)/1024U,64U,count),dim3(256),0,stream,split.p,first,count);
         for(unsigned g=first;g<first+count;++g) trace(split.p[g],splitsel.p,g,0U,splithash.p);
         check(hipGetLastError(),"split score");check(hipStreamSynchronize(stream),"split pre snapshot");

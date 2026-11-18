@@ -1,6 +1,7 @@
 #include "strix/rtx_state_import.hpp"
 
 #include "strix/model_content_hash.hpp"
+#include "strix/recurrent_state_policy.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -163,9 +164,12 @@ RtxStateStaging::RtxStateStaging(std::shared_ptr<const RtxStateLayout> layout, R
     const PrefixCacheAllocator& allocate)
     : layout_(std::move(layout)), request_(std::move(request)), id_(std::move(id)) {
     if (!layout_) throw std::invalid_argument("rtx state import has no layout");
+    // A matching byte count/echoed consumer identity cannot identify the producer
+    // codec. Until v1 negotiates it, typed receivers must reject before allocation.
+    require_f32_recurrent_state(recurrent_state_policy().type, "node import (no producer state contract)");
     const auto& l = *layout_;
     if (request_.layout_identity != l.layout_identity)
-        throw std::invalid_argument("rtx state layout identity differs from this engine's (" + rtx_hex_u64(l.layout_identity) + ")");
+        throw std::invalid_argument("rtx state layout identity differs from this engine's (the recurrent state contract, STRIX_RECURRENT_STATE, is part of it: no f32/f16/bf16 conversion on import) (" + rtx_hex_u64(l.layout_identity) + ")");
     if (request_.rotary && *request_.rotary != l.rotary)
         throw std::invalid_argument("rtx state rotary identity mismatch (mode, factor or table SHA256)");
     if (request_.context_tokens && *request_.context_tokens != l.context_tokens)

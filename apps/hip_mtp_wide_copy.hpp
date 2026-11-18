@@ -88,28 +88,28 @@ public:
         for(std::size_t i=1;i<steps.size();++i)
             if(steps[i].op==SerialOp::final_hyper_mix && steps[i-1U].op==SerialOp::mlp_inject) tap_=i-1U;
         if(tap_==SIZE_MAX) throw std::logic_error("MTP wide copy verify has no wide hidden tap step");
-        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&hidden_),static_cast<std::size_t>(width_*rows_)),"MTP wide hidden rows");
-        // The in-place components a forward overwrites: everything but the position-indexed KV and sparse index.
-        for(const auto& a:resources_.session_state_layout->allocations) {
-            if(a.component==SessionStateComponent::attention_kv || a.component==SessionStateComponent::sparse_index) continue;
-            Saved s;s.view=resolve_session_state(*resources_.session_state_layout,*resources_.session_state_memory,a.component);
-            if(s.view.storage==SessionStateStorage::device)
-                strix::hip_check(hipMalloc(reinterpret_cast<void**>(&s.device),static_cast<std::size_t>(s.view.bytes)),"MTP wide state snapshot");
-            else s.host.resize(static_cast<std::size_t>(s.view.bytes));
-            saved_.push_back(std::move(s));
+        try {
+            strix::hip_check(hipMalloc(reinterpret_cast<void**>(&hidden_),static_cast<std::size_t>(width_*rows_)),"MTP wide hidden rows");
+            // The in-place components a forward overwrites: everything but the position-indexed KV and sparse index.
+            for(const auto& a:resources_.session_state_layout->allocations) {
+                if(a.component==SessionStateComponent::attention_kv || a.component==SessionStateComponent::sparse_index) continue;
+                saved_.emplace_back();
+                auto& s=saved_.back();s.view=resolve_session_state(*resources_.session_state_layout,*resources_.session_state_memory,a.component);
+                if(s.view.storage==SessionStateStorage::device)
+                    strix::hip_check(hipMalloc(reinterpret_cast<void**>(&s.device),static_cast<std::size_t>(s.view.bytes)),"MTP wide state snapshot");
+                else s.host.resize(static_cast<std::size_t>(s.view.bytes));
+            }
+            logits_.resize(static_cast<std::size_t>(vocab_));
+            greedy_bytes_=hip_greedy_rows_scratch_bytes(hip_greedy_rows_max,static_cast<std::uint32_t>(vocab_));
+            strix::hip_check(hipMalloc(reinterpret_cast<void**>(&greedy_scratch_),static_cast<std::size_t>(greedy_bytes_)),"MTP wide greedy scratch");
+            strix::hip_check(hipHostMalloc(reinterpret_cast<void**>(&replies_),sizeof(HipGreedyRowsReply)*rows_,hipHostMallocMapped|hipHostMallocCoherent),
+                "MTP wide greedy replies");
+        } catch(...) {
+            release_allocations();
+            throw;
         }
-        logits_.resize(static_cast<std::size_t>(vocab_));
-        greedy_bytes_=hip_greedy_rows_scratch_bytes(hip_greedy_rows_max,static_cast<std::uint32_t>(vocab_));
-        strix::hip_check(hipMalloc(reinterpret_cast<void**>(&greedy_scratch_),static_cast<std::size_t>(greedy_bytes_)),"MTP wide greedy scratch");
-        strix::hip_check(hipHostMalloc(reinterpret_cast<void**>(&replies_),sizeof(HipGreedyRowsReply)*rows_,hipHostMallocMapped|hipHostMallocCoherent),
-            "MTP wide greedy replies");
     }
-    ~MtpWideCopyCycle() {
-        if(hidden_)(void)hipFree(hidden_);
-        if(greedy_scratch_)(void)hipFree(greedy_scratch_);
-        if(replies_)(void)hipHostFree(replies_);
-        for(auto& s:saved_) if(s.device)(void)hipFree(s.device);
-    }
+    ~MtpWideCopyCycle() {release_allocations();}
     MtpWideCopyCycle(const MtpWideCopyCycle&)=delete;
     MtpWideCopyCycle& operator=(const MtpWideCopyCycle&)=delete;
     // The largest configured size.
@@ -232,6 +232,12 @@ public:
         } catch(...) {greedy.fail_cycle();throw;}
     }
 private:
+    void release_allocations() noexcept {
+        if(hidden_)(void)hipFree(hidden_);
+        if(greedy_scratch_)(void)hipFree(greedy_scratch_);
+        if(replies_)(void)hipHostFree(replies_);
+        for(auto& s:saved_) if(s.device)(void)hipFree(s.device);
+    }
     struct Saved {SessionStateAddress view;std::byte* device=nullptr;std::vector<std::byte> host;};
     [[nodiscard]] MtpDeviceView view(std::uint32_t row) const {
         return MtpDeviceView{reinterpret_cast<std::uintptr_t>(hidden_+static_cast<std::size_t>(row)*width_),width_,1U};

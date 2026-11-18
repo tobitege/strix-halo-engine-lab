@@ -164,6 +164,17 @@ void run(unsigned factor, unsigned capacity, unsigned count, const ModelManifest
     }
     validate_effective_options(effective.options,model);
     require(yarn_environment_refusal(effective.environment,factor).empty(),"effective environment classification");
+    for (const auto* value : {"0", "1", "2"}) {
+        auto projection = effective.environment;
+        projection["STRIX_QPF2K_GLU_PAIR"] = value;
+        require(yarn_environment_refusal(projection, factor).empty(), "paired GLU control adds no rotary work");
+    }
+    for (const auto* value : {"", "3", "-1", "invalid"}) {
+        auto invalid = effective.environment;
+        invalid["STRIX_QPF2K_GLU_PAIR"] = value;
+        require(yarn_environment_refusal(invalid, factor).find("STRIX_QPF2K_GLU_PAIR") != std::string::npos,
+            "invalid paired GLU control refuses by name");
+    }
     for (const auto* value : {"0","1"}) {
         auto diagnostic=effective.environment;diagnostic["STRIX_STARTUP_MARKERS"]=value;
         require(yarn_environment_refusal(diagnostic,factor).empty(),"startup markers are a no-rotary diagnostic control");

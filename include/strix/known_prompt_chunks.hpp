@@ -27,6 +27,24 @@ inline bool known_prompt_full_t_prefix(std::span<const KnownPromptChunkUnit> tra
     }
     return boundary && pos==boundary;
 }
+// A two-stage pipeline carries one seam frame per tiled unit (full, partial, merged or tail block, owner_rows >= 16).
+// A serial row (owner_rows 1) has no seam: each rank would run its own whole model for it. The frame count, the rows
+// of each frame and the identity both ranks exchange come from the cursor's own cold plan, never from ceil(P / T).
+struct KnownPromptPipelinePlan {
+    std::uint64_t units=0,rows=0,serial_rows=0,identity=1469598103934665603ULL;
+    std::vector<std::uint64_t> unit_rows;
+};
+inline KnownPromptPipelinePlan known_prompt_pipeline_plan(std::span<const KnownPromptChunkUnit> trace) {
+    KnownPromptPipelinePlan plan;
+    for(const auto& u:trace) {
+        const auto rows=u.end-u.begin;
+        if(u.owner_rows<=1U) {plan.serial_rows+=rows;continue;}
+        ++plan.units;plan.rows+=rows;plan.unit_rows.push_back(rows);
+        for(const auto v:{u.begin,u.end,std::uint64_t{u.owner_rows},std::uint64_t{u.merged}})
+            plan.identity=(plan.identity^v)*1099511628211ULL;
+    }
+    return plan;
+}
 struct KnownPromptChunkRequest {
     // Borrowed immutable known inputs, including any literal interior EOS.
     // Both backends must retain and use the same actual target session/owners.
@@ -108,6 +126,15 @@ struct KnownPromptChunkFrontier {
 // is sticky, is called only between chunks and does not destroy those owners.
 // On a backend error the cursor cannot resume; its counters describe only
 // completed calls, not rollback of an opaque possibly poisoned target.
+// One stage's cursor frontier (pair interleaved virtual stages: one cursor per rank, a frontier per stage).
+struct KnownPromptChunkStageView {
+    KnownPromptChunkProgress progress;
+    KnownPromptChunkUnit last_unit;
+    int balanced = -1;
+    std::vector<float> logits;
+    std::optional<std::uint32_t> selection;
+    bool has_logits = false;
+};
 class KnownPromptChunkCursor final {
 public:
     KnownPromptChunkCursor(KnownPromptChunkRequest request,
@@ -135,6 +162,10 @@ public:
     [[nodiscard]] const SerialGreedyRequestResult& finish_greedy();
     [[nodiscard]] const KnownPromptChunkProgress& progress() const noexcept { return progress_; }
     [[nodiscard]] KnownPromptChunkFrontier frontier() const noexcept;
+    // Thin per-stage accessors: a copy of this cursor's frontier (a stage's starting view) and an exchange of the
+    // frontier with a stage's view around each (stage, chunk) step. Never while a deferred block is pending.
+    [[nodiscard]] KnownPromptChunkStageView stage_view() const;
+    void swap_stage(KnownPromptChunkStageView& view);
     [[nodiscard]] const std::optional<SerialGreedyRequestResult>& generation() const noexcept { return generation_; }
 private:
     KnownPromptChunkRequest request_;

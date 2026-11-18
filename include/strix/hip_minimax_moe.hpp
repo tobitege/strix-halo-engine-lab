@@ -32,9 +32,15 @@ struct PostExchangeView {
     // STRIX_MM_XB_POSTILP: issue every load of h / part0 / part1 before the first store (h must not overlap a partial;
     // checked at enqueue). Same arithmetic, same bits.
     unsigned ilp = 0;  // 0 plain, 1 loads-first, 2 partials staged through LDS with 16-byte loads (same bits)
+    // STRIX_TP2_EXCHANGE_FMT=f16 (prefill, xport/exchange_format.hpp): part0 / part1 point at binary16 rows (R x 6144
+    // halves each), widened exactly to FP32 at the load; false: FP32 partials (every other path, bitwise unchanged).
+    bool half_parts = false;
     unsigned prep_jobs = 0;
     const std::uint16_t* prep_suh[4] = {nullptr, nullptr, nullptr, nullptr};
     void* prep_xt[4] = {nullptr, nullptr, nullptr, nullptr};  // _Float16 rows
+    // Split-producer chunk frame (xport/split_frame.hpp SplitLayout{rows, 6144, split_head}): when nonzero, part0 / part1
+    // (or the folded slot) hold columns [0, split_head) row-major then the rest row-major; 0 = plain R x 6144 rows.
+    unsigned split_head = 0;
 };
 void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream);
 
@@ -46,5 +52,16 @@ void enqueue_router_batch(std::uint32_t rows, const float* y, const float* route
 inline constexpr std::size_t router_tiled_scratch_floats(std::uint32_t rows) { return std::size_t{rows} * 2 * kExperts; }
 void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* router_w, const float* bias,
                           std::uint32_t* ids, float* weights, float* scratch, hipStream_t stream);
+// FAST identity mm-pf-router-wmma-v1: the same routes with the router product on the shared dense FP16 WMMA core
+// (core/f16_dense_tall.hpp: y rounded to FP16 in registers, w16 = the router weights rounded to FP16 once by
+// convert_router_f16, FP32 accumulation in hardware order); sigmoid, bias and the selection unchanged. A row whose
+// product is not finite (FP16 overflow) is recomputed with the exact chain of enqueue_router_tiled (FP32 router_w).
+// flags: rows uint32 of device memory, zeroed once (every call leaves them zero). form: 0 plan, 1 narrow4, 2 wide16,
+// other = automatic (STRIX_F16_MATRIX_FORM, else narrow4).
+void convert_router_f16(const float* router_w, std::uint16_t* w16, hipStream_t stream);  // [kExperts][kHidden]
+void enqueue_router_wmma(std::uint32_t rows, const float* y, const float* router_w, const std::uint16_t* w16, const float* bias,
+                         std::uint32_t* ids, float* weights, float* scratch, std::uint32_t* flags, hipStream_t stream,
+                         unsigned form = ~0U);
+const char* router_wmma_form();  // the automatic launch form (identity receipts)
 
 }  // namespace strix::minimax::moe::hip

@@ -317,13 +317,30 @@ __device__ __forceinline__ MArgs member(const Args& a, unsigned m) { return m ==
 template <class G0, class G1, int R, unsigned SG, unsigned TPW>
 constexpr std::size_t kGroupSmem = smem_bytes<G0, R, SG, TPW>() > smem_bytes<G1, R, SG, TPW>() ? smem_bytes<G0, R, SG, TPW>()
                                                                                               : smem_bytes<G1, R, SG, TPW>();
-template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, bool Prime, unsigned TPW>
+// Part: 0 = every output column group (all other callers, code unchanged); 1 / 2 = the first / second half of the column
+// groups (split-producer chunk frames, single-member o_proj launches only): the grid has half the CTAs per split and
+// CTA i runs the member CTA of column group (i % (Cg / 2)) (+ Cg / 2 for part 2) of split i / (Cg / 2). Per-block work
+// is unchanged.
+template <class G, unsigned TPW, unsigned Part>
+__device__ __forceinline__ unsigned part_local(unsigned i) {
+    if constexpr (Part == 0) {
+        return i;
+    } else {
+        constexpr unsigned Cgh = G::template cg<TPW>() / 2U;
+        return (i / Cgh) * G::template cg<TPW>() + (i % Cgh) + (Part == 2 ? Cgh : 0U);
+    }
+}
+template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, bool Prime, unsigned TPW, unsigned Part = 0>
 __global__ __launch_bounds__(128) void group_kernel(Args a) {
     __shared__ alignas(16) unsigned char smem[kGroupSmem<G0, G1, R, SG, TPW>];
-    constexpr unsigned n0 = G0::template ctas<SG, TPW>(), n1 = G1::template ctas<SG, TPW>();
+    static_assert(Part == 0 || (M0 == 1 && M1 == 0), "column-part launches are single-member o_proj launches");
+    constexpr unsigned n0 = G0::template ctas<SG, TPW>() / (Part == 0 ? 1U : 2U), n1 = G1::template ctas<SG, TPW>();
     const unsigned b = blockIdx.x;
     if (b < M0 * n0) {
-        const unsigned finished = member_cta<G0, R, SG, Prime, TPW>(member(a, b / n0), b % n0, a.rows, smem);
+        // Part 0 passes b % n0 itself: an inlined part_local() call, even an identity one, changed the default DSA b
+        // kernels' code (16 of 240 group_kernel instances); the constant condition emits only the live arm.
+        const unsigned finished = member_cta<G0, R, SG, Prime, TPW>(
+            member(a, b / n0), Part == 0 ? b % n0 : part_local<G0, TPW, Part>(b % n0), a.rows, smem);
         if constexpr (M0 == 1 && M1 == 0) {  // single-member launches (o_proj): the producer may publish its partial
             if (a.pub.on() && finished != 0) strix::pair::producer_publish(a.pub, a.pub_blocks, finished);
         } else {
@@ -341,41 +358,42 @@ void check_launch(const char* what) {
 }
 
 // query != nullptr: no launch; *query = the instantiation's private (scratch) bytes per lane.
-template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, bool Prime, unsigned TPW>
+template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, bool Prime, unsigned TPW, unsigned Part = 0>
 void launch4(const Args& a, hipStream_t s, std::size_t* query) {
     if (query != nullptr) {
         hipFuncAttributes fa{};
-        const hipError_t e = hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(&group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW>));
+        const hipError_t e = hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(&group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW, Part>));
         if (e != hipSuccess) throw std::runtime_error(std::string("glm attn tierb: attributes: ") + hipGetErrorString(e));
         *query = fa.localSizeBytes;
         return;
     }
-    const unsigned grid = M0 * G0::template ctas<SG, TPW>() + M1 * G1::template ctas<SG, TPW>();
-    group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW><<<grid, 128, 0, s>>>(a);
+    const unsigned grid = Part == 0 ? M0 * G0::template ctas<SG, TPW>() + M1 * G1::template ctas<SG, TPW>()
+                                    : G0::template ctas<SG, TPW>() / 2U;
+    group_kernel<G0, M0, G1, M1, R, SG, Prime, TPW, Part><<<grid, 128, 0, s>>>(a);
     check_launch("group");
 }
-template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG>
+template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned SG, unsigned Part = 0>
 void launch3(const Args& a, Knobs k, hipStream_t s, std::size_t* q) {
     const bool p = k.prime != 0;
-    if (k.tpw == 2) p ? launch4<G0, M0, G1, M1, R, SG, true, 2>(a, s, q) : launch4<G0, M0, G1, M1, R, SG, false, 2>(a, s, q);
-    else p ? launch4<G0, M0, G1, M1, R, SG, true, 4>(a, s, q) : launch4<G0, M0, G1, M1, R, SG, false, 4>(a, s, q);
+    if (k.tpw == 2) p ? launch4<G0, M0, G1, M1, R, SG, true, 2, Part>(a, s, q) : launch4<G0, M0, G1, M1, R, SG, false, 2, Part>(a, s, q);
+    else p ? launch4<G0, M0, G1, M1, R, SG, true, 4, Part>(a, s, q) : launch4<G0, M0, G1, M1, R, SG, false, 4, Part>(a, s, q);
 }
-template <class G0, unsigned M0, class G1, unsigned M1, int R>
+template <class G0, unsigned M0, class G1, unsigned M1, int R, unsigned Part = 0>
 void launch2(const Args& a, Knobs k, hipStream_t s, std::size_t* q) {
     switch (k.sg) {
-    case 2: launch3<G0, M0, G1, M1, R, 2>(a, k, s, q); break;
-    case 4: launch3<G0, M0, G1, M1, R, 4>(a, k, s, q); break;
-    default: launch3<G0, M0, G1, M1, R, 1>(a, k, s, q); break;
+    case 2: launch3<G0, M0, G1, M1, R, 2, Part>(a, k, s, q); break;
+    case 4: launch3<G0, M0, G1, M1, R, 4, Part>(a, k, s, q); break;
+    default: launch3<G0, M0, G1, M1, R, 1, Part>(a, k, s, q); break;
     }
 }
-template <class G0, unsigned M0, class G1, unsigned M1>
+template <class G0, unsigned M0, class G1, unsigned M1, unsigned Part = 0>
 void launch(const Args& a, Knobs k, hipStream_t s, std::size_t* q = nullptr) {
     if (k.sg != 1 && k.sg != 2 && k.sg != 4) throw std::invalid_argument("glm attn tierb: SG must be 1, 2 or 4");
     if (k.tpw != 2 && k.tpw != 4) throw std::invalid_argument("glm attn tierb: TPW must be 2 or 4");
-    if (a.rows == 1) launch2<G0, M0, G1, M1, 1>(a, k, s, q);
-    else if (a.rows == 2) launch2<G0, M0, G1, M1, 2>(a, k, s, q);
-    else if (a.rows <= 4) launch2<G0, M0, G1, M1, 4>(a, k, s, q);
-    else launch2<G0, M0, G1, M1, 8>(a, k, s, q);
+    if (a.rows == 1) launch2<G0, M0, G1, M1, 1, Part>(a, k, s, q);
+    else if (a.rows == 2) launch2<G0, M0, G1, M1, 2, Part>(a, k, s, q);
+    else if (a.rows <= 4) launch2<G0, M0, G1, M1, 4, Part>(a, k, s, q);
+    else launch2<G0, M0, G1, M1, 8, Part>(a, k, s, q);
 }
 
 bool shape_ok(const Mat& m, unsigned in, unsigned out) {
@@ -556,6 +574,51 @@ void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float
         a.pub_blocks = GDo::Out / 128U;
     }
     launch<GDo, 1, GDo, 0>(a, resolve(k, Group::DsaO, rows), s);
+}
+
+// Split-producer chunk frame: the o projection as two launches on the column halves [0, 2048) and [2048, 4096). Output
+// SplitLayout{rows, 4096, 2048}: y_head = the head part (rows x 2048), y_tail = the tail part (rows x 2048), both
+// stride 2048; head / tail publish their own half (pub_blocks 16); mid() runs on the host between the two launches
+// (Channel::split_head). The finish of a 128-column block (sum, Hadamard128, svh) is the same code: same bits.
+namespace {
+template <class G>
+void o_parts(Group g, const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y_head, float* y_tail, void* ws,
+             hipStream_t s, Knobs k, const strix::pair::ProducerPublish& head, const strix::pair::ProducerPublish& tail,
+             void (*mid)(void*), void* mid_ctx) {
+    constexpr unsigned kHalf = G::Out / 2U;
+    if (!supported(g, &m, 1)) throw std::invalid_argument("glm attn tierb: split o shape");
+    check_rows(rows, x, x_stride, G::In, ws);
+    if (y_head == nullptr || y_tail == nullptr ||
+        ((reinterpret_cast<std::uintptr_t>(y_head) | reinterpret_cast<std::uintptr_t>(y_tail)) & 3U) != 0)
+        throw std::invalid_argument("glm attn tierb: split output");
+    if (!head.on() || !tail.on() || mid == nullptr)
+        throw std::invalid_argument("glm attn tierb: split o needs both publishers and mid()");
+    const Knobs kn = resolve(k, g, rows);
+    Args a{};
+    a.m0 = margs(m, x, x_stride, y_head, kHalf, ws, 0);
+    a.m1 = a.m2 = a.m0;
+    a.rows = rows;
+    a.pub = head;
+    a.pub_blocks = kHalf / 128U;
+    launch<G, 1, G, 0, 1>(a, kn, s);
+    mid(mid_ctx);
+    // The block finish addresses y + row * y_stride + block * 128 with the GLOBAL block index: the tail base is shifted
+    // back by the head's width so that block 16 lands on column 0 of the tail part.
+    a.m0.y = y_tail - kHalf;
+    a.m1 = a.m2 = a.m0;
+    a.pub = tail;
+    launch<G, 1, G, 0, 2>(a, kn, s);
+}
+}  // namespace
+void kda_o_split(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y_head, float* y_tail, void* ws, hipStream_t s,
+                 Knobs k, const strix::pair::ProducerPublish& head, const strix::pair::ProducerPublish& tail, void (*mid)(void*),
+                 void* mid_ctx) {
+    o_parts<GQkv>(Group::KdaO, m, x, x_stride, rows, y_head, y_tail, ws, s, k, head, tail, mid, mid_ctx);
+}
+void dsa_o_split(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y_head, float* y_tail, void* ws, hipStream_t s,
+                 Knobs k, const strix::pair::ProducerPublish& head, const strix::pair::ProducerPublish& tail, void (*mid)(void*),
+                 void* mid_ctx) {
+    o_parts<GDo>(Group::DsaO, m, x, x_stride, rows, y_head, y_tail, ws, s, k, head, tail, mid, mid_ctx);
 }
 
 void set_table_enabled(bool on) { g_table.store(on ? 1 : 0); }

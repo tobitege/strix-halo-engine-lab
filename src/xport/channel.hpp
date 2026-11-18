@@ -160,6 +160,19 @@ public:
         fold_next_ = op;
     }
     [[nodiscard]] const void* last_folded() const noexcept { return last_folded_; }
+    // Split-producer chunk frame (opt-in; multi-row decode). The next send()'s message is produced in two parts: the
+    // first `head` bytes of the TX slot by the producers enqueued before split_head(), the rest by those enqueued after
+    // it. split_head(head, how) publishes the head (per `how`; Publish::producer: the head producer's own last block
+    // publishes through head_target()). The progress thread moves the head as soon as it is published, while the GPU
+    // still computes the tail, then the tail with the trailer; the RX flag (consumers) is raised only after both, so
+    // consumers see exactly the unsplit message (same bytes, same sums: bitwise). Both ranks must split the same
+    // messages at the same head (the resolver decides it once for the pair; the trailer carries kTrailerSplit, so a
+    // rank that splits facing one that does not fails the identity check). Costs one more transport round per message:
+    // worth it only when the tail's compute time exceeds that round (multi-row decode, see xport/split_frame.hpp).
+    [[nodiscard]] ProducerTarget head_target();
+    void split_head(std::size_t head, Publish how);
+    static constexpr std::uint16_t kTrailerSplit = 0x8000;
+    static_assert(((Traits::kDeferred | Traits::kPrevious) & kTrailerSplit) == 0);
     // CPU: waits until every posted exchange is complete, then check(). Between steps / requests only.
     void drain();
     // Throws with the cause if an exchange failed (the stream was released with garbage).
@@ -178,6 +191,7 @@ private:
         const std::byte* direct_tx = nullptr;
         std::byte* direct_rx = nullptr;
         RowFold fold = RowFold::none;
+        std::size_t head = 0;  // split-producer frame: bytes moved on the head flag before the tail (0 = one frame)
     };
     struct RxTrace { std::uint64_t sequence, kind, bytes, tx_seen_ns, wire_done_ns, rx_published_ns; };
     class CrcWorker;
@@ -222,6 +236,7 @@ private:
     std::byte* fx_dev_ = nullptr;
     std::size_t fx_stride_ = 0;
     RowFold fold_next_ = RowFold::none;
+    std::size_t head_next_ = 0;  // caller side: split_head() of the next send
     std::vector<std::uint8_t> folded_;  // per slot: the exchange in it was folded (caller only)
     const void* last_folded_ = nullptr;
     // <ENV>RX_TRACE=<path>: the progress thread records per exchange when it saw the producer, when the wire call

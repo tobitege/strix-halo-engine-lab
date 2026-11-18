@@ -12,6 +12,7 @@
 // Two launches per layer instead of five, and N independent sequences (users) in the same two launches. All
 // per-step values (positions, RoPE rows, cache tables) are read from device memory and the grids depend only on the
 // view's shape, so a captured graph can be replayed step after step.
+#include <array>
 #include <cstdint>
 
 #include <hip/hip_runtime.h>
@@ -82,6 +83,11 @@ struct DecodeView {
     // block [grid][4].
     std::uint64_t* phase = nullptr;
     std::uint64_t* phase_index = nullptr;
+    // Prefill FAST flash (modes 11 / 12) only, when non-null: the q projection finish's BF16 image of q after norm +
+    // RoPE (same layout as q; mmx_prefill.hip dense_finish_kernel) and, mode 12, its lo terms. The flash core reads
+    // them through query_op with the bits of its own prologue; q is then not written.
+    const std::uint16_t* q16 = nullptr;
+    const std::uint16_t* q16_lo = nullptr;
 };
 
 // Single sequence, consecutive positions. Scratch has scratch_windows independent 16-row regions.
@@ -96,10 +102,22 @@ struct PrefillView {
     bool index_tile = false;
     std::uint32_t index_rows = 32;  // 16/32/64; 64 reuses 32 KiB LDS across four 16-query subtiles
     std::uint32_t msa_rework = 0;  // 0 = original; 1 = shared selection/HPW2/separate combine; 2 = 16-key K/V tiles; 3 = direct sparse mapping + visible tiles; 4 = R16 shared K/V tiles; 5 = mode 3 with packed probabilities; 6 = mode 5 with the tile corrections in the packed exp lanes; 7 = mode 6 with the combine fused into the last chunk block (ticket); 8/9 = mode 7 with the exact lane-tree tile max (8 swizzle, 9 DPP); 10 = opt-in mode-8 chunk loop with LDS scalar partials, scratch numerators and in-block combine
+    // FAST flash (msa_rework 11/12) load schedule, attn_core sparse_flash_keysplit Opt: 0 = incumbent (one key fragment
+    // load per QK step), 1 = keys first (diagnostic), 2 = key halves (default, STRIX_MM_PF_FLASH_KEYS). Output bits identical in every mode.
+    std::uint32_t flash_keys = 2;
+    // Row-group flash (msa_rework 13) rows per work-group, attn_core RowGroup<..., Rows>: 0 = auto (8 on dense windows,
+    // 4 on sparse rows, measured 16-11), 4 or 8 = both (STRIX_MM_PF_MSA_RG_ROWS). Output bits identical in every value.
+    std::uint32_t rg_rows = 0;
 };
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);
 void enqueue_prefill(const PrefillView& v, hipStream_t stream,
-                     PrefillStageMarker marker = nullptr, void* user = nullptr);
+                     PrefillStageMarker marker = nullptr, void* user = nullptr,
+                     std::array<std::uint64_t, 7>* flash_launches = nullptr);
+// Cache-only stage of a headless chunk (strix/prefill_headless.hpp): the same view contract and the same prep launch as
+// enqueue_prefill (K / V / index-key cache rows, same bits), no index scoring, selection or attention; the view's
+// attention outputs are not written.
+void enqueue_prefill_cache_only(const PrefillView& v, hipStream_t stream,
+                                PrefillStageMarker marker = nullptr, void* user = nullptr);
 // Score the prepared cache for [first_window, ceil(rows/16)); scratch is not rebased.
 // Exposed for index-only timing and byte comparisons; single sequence, two index heads.
 void enqueue_prefill_index(const PrefillView& v, hipStream_t stream);

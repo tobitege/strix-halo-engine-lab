@@ -36,8 +36,8 @@
 #include <unistd.h>
 #endif
 
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_weights.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_weights.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_pipeline_multi.hpp"
 #include "strix/ds41_pipeline_wire.hpp"

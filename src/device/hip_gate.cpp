@@ -46,11 +46,14 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
     return *state.bound;
 }
 
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt) {
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load) {
+    eager_code_load_or_restart(argv, code_load);  // before anything touches the device: the restart repeats the process
+    if (receipt && code_load == CodeLoad::shared) std::fprintf(receipt, "%s\n", code_load_receipt(code_load).c_str());
     try {
         const auto cli = take_command_line(argc, argv);
         Request request;
         request.select = cli.select;
+        request.profile = cli.profile;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());

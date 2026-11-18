@@ -66,6 +66,10 @@ inline void product(const ds41::Q8A8View& v, dist::ProducerStage stage, hipStrea
     const auto status = hipGetLastError();
     if (status != hipSuccess) throw std::runtime_error(std::string("publish ready: ") + hipGetErrorString(status));
 }
+inline bool reads_only() {
+    static const bool on = enabled_default("STRIX_DS41_READY_READS_ONLY", lean());
+    return on;
+}
 template <bool ReadsOnly, bool Lean>
 __global__ void add_halves_ready(const float* a, const float* b, float* __restrict__ out, std::uint32_t n,
                                  dist::StagedReady* flag, std::uint64_t token, unsigned* counter) {
@@ -85,10 +89,57 @@ __global__ void add_halves_ready(const float* a, const float* b, float* __restri
 }
 template <bool Lean>
 inline void launch_add(const float* a, const float* b, float* out, std::uint32_t n, dist::ConsumerStage peer, hipStream_t stream) {
-    static const bool reads_only = enabled_default("STRIX_DS41_READY_READS_ONLY", lean());
     const dim3 grid((n + 255U) / 256U);
-    if (reads_only) add_halves_ready<true, Lean><<<grid, 256, 0, stream>>>(a, b, out, n, peer.flag, peer.token, peer.counter);
+    if (reads_only()) add_halves_ready<true, Lean><<<grid, 256, 0, stream>>>(a, b, out, n, peer.flag, peer.token, peer.counter);
     else add_halves_ready<false, Lean><<<grid, 256, 0, stream>>>(a, b, out, n, peer.flag, peer.token, peer.counter);
+}
+// Strided halves through the ready views (the Engram output-row exchange): `rows` rows of `half` floats, row r at
+// base[r * stride + first], packed contiguous into the TX view by the kernel that publishes it, and the peer's rows
+// written back from the RX view by the kernel that releases it. Plain copies: the same bits as pack + copies + scatter.
+__global__ void gather_publish_kernel(const float* __restrict__ base, float* tx, std::uint32_t rows, std::uint32_t stride, std::uint32_t half,
+                                      std::uint32_t first, dist::ProducerStage stage) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * half) tx[i] = base[std::size_t{i / half} * stride + first + i % half];
+    dist::publish_staged_view(stage, gridDim.x);
+}
+inline void gather_publish(const float* base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half, std::uint32_t first,
+                           dist::ProducerStage stage, hipStream_t stream) {
+    gather_publish_kernel<<<(rows * half + 255U) / 256U, 256, 0, stream>>>(base, static_cast<float*>(stage.data), rows, stride, half, first,
+                                                                           kernel_view(stage));
+    const auto status = hipGetLastError();
+    if (status != hipSuccess) throw std::runtime_error(std::string("ready gather: ") + hipGetErrorString(status));
+}
+template <bool ReadsOnly, bool Lean>
+__global__ void scatter_ready_kernel(const float* rx, float* __restrict__ base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half,
+                                     std::uint32_t first, dist::StagedReady* flag, std::uint64_t token, unsigned* counter) {
+    if constexpr (Lean) dist::staged_acquire_lean();
+    else dist::staged_acquire(flag, token);
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * half) base[std::size_t{i / half} * stride + first + i % half] = rx[i];
+    // the scattered rows stay GPU-owned on this stream, as the add's output
+    if constexpr (Lean) {
+        if constexpr (ReadsOnly) dist::publish_staged_reads_block_lean(flag, counter, token, gridDim.x);
+        else dist::publish_staged_block_lean(flag, counter, token, gridDim.x);
+    } else {
+        if constexpr (ReadsOnly) dist::publish_staged_reads_block(flag, token, gridDim.x);
+        else dist::publish_staged_block(flag, token, gridDim.x);
+    }
+}
+inline void scatter(dist::ConsumerStage peer, float* base, std::uint32_t rows, std::uint32_t stride, std::uint32_t half, std::uint32_t first,
+                    hipStream_t stream) {
+    const dim3 grid((rows * half + 255U) / 256U);
+    const auto* rx = static_cast<const float*>(peer.data);
+    if (lean() && !peer.counter) throw std::logic_error("STRIX_DS41_READY_LEAN: consumer view without its block counter");
+    if (lean() && reads_only())
+        scatter_ready_kernel<true, true><<<grid, 256, 0, stream>>>(rx, base, rows, stride, half, first, peer.flag, peer.token, peer.counter);
+    else if (lean())
+        scatter_ready_kernel<false, true><<<grid, 256, 0, stream>>>(rx, base, rows, stride, half, first, peer.flag, peer.token, peer.counter);
+    else if (reads_only())
+        scatter_ready_kernel<true, false><<<grid, 256, 0, stream>>>(rx, base, rows, stride, half, first, peer.flag, peer.token, peer.counter);
+    else
+        scatter_ready_kernel<false, false><<<grid, 256, 0, stream>>>(rx, base, rows, stride, half, first, peer.flag, peer.token, peer.counter);
+    const auto status = hipGetLastError();
+    if (status != hipSuccess) throw std::runtime_error(std::string("ready scatter: ") + hipGetErrorString(status));
 }
 inline void add(const float* a, const float* b, float* out, std::uint32_t n, dist::ConsumerStage peer, hipStream_t stream) {
     if (lean()) {

@@ -44,7 +44,7 @@ cmake --build build-rtx --target strix-cuda-qwen-serve
 | `--max-queue N` | 64 | Requests waiting for a slot; beyond it the server answers busy. |
 | `--prefill-chunk N\|auto` | 1024 | Prefill rows of a new request per chunk, run between the decode steps of the other sessions. `auto` fits the chunk to the decode step time. |
 | `--cohort-depth fair\|max` | `fair` | How MTP depth is shared when several sessions decode in one step. |
-| `--block-rows N` | 1024 | Prefill block rows (multiple of 16, at least 1024). |
+| `--block-rows N` | flat 8192 | Prefill block rows (multiple of 16, at least 1024). Untyped: one repeating block of 8192 rows (lever `qwen_cuda_flat_blocks`, bitwise; `STRIX_QRTX_FLAT_BLOCKS=0` or `--blocks 1024,2048,4096,8192` restores the ramp). See [prefill scheduling](../../engine/serving/qwen-cuda-prefill.md#flat-blocks-on-the-serve-entry). |
 
 Every response carries the `strix.rtx` receipt: emitted ids, prefill and decode timings and slot occupancy.
 
@@ -110,3 +110,24 @@ host RAM, LRU-evicted; row segments are shared between checkpoints of the same p
 (multi-session equality and window packing), `qwen_qsa_multi_test`, `qwen_quant_host_test` and
 `qwen_quant_device_test` (GGUF decoders against the host reference), and the `qwen_decode_bench` timing bench. Prefix cache: `qwen_prefix_cache_host_test` (planner, identity,
 store, slab pool, batched capture) and `qwen_prefix_cache_e2e`.
+
+Profiles: `--profile exact|default|fast|quality` and the lever options (`--hc-mma`, `--mtp-mma`, `--qsa-mma`, `--moe-mma`,
+`--prefill-moe-route-bf16`; env `STRIX_QRTX_HC_MMA` / `_MTP_MMA` / `_QSA_MMA` / `_MOE_MMA`) are parsed by one shared parser
+(`include/strix/cuda/qwen_options.hpp`) and resolved by the shared Qwen profile resolver over the CUDA rows in
+`include/strix/profiles/qwen_cuda.hpp`; `--print-effective-config` prints the result, with the serve-only values named and
+explained. FAST quality gate kit: `scripts/bench/cuda/qwen_fast/README.md` (`qwen_tf_logits`, `gate.sh`); host test `qwen_cuda_profile_host_test`.
+
+FAST prefill forms (`--profile fast`, each with its own off switch; the exact path is byte-identical when a form is off):
+the HC projection/output and the MTP fused projection on FP16 tensor cores (quantised codes are exact in FP16, FP32
+accumulation, per-32-K-block FP32 scale), QSA attention scores/softmax/values on BF16 tensor cores (the KV cache is
+BF16), and the MoE prefill project/down GEMMs with one FMA scale chain per output on int8 tensor cores. Shared tile
+code: `src/cuda/core/mma_tile.cuh`, `src/cuda/core/attention_tile.cuh`, `src/cuda/core/imma_tile.cuh`. Gate receipt:
+`gate.sh` run `fast-20261116015045` (12 prompts at 2K/8K/32K, 128 teacher-forced rows each): pooled KL 0.0091,
+top-1 0.986, dNLL +0.0026. Exact lever: the dense projection runs `project_tile2_kernel` (same FP32 chain per output,
+bitwise) by default; `STRIX_QRTX_DENSE_TILE2=0` restores the first tiled kernel. Its weight loader is the remapped one
+(`qwen_dense_t2_remap`, bitwise, default on: 16 lanes per weight row, stage-invariant addresses, one CTA per SM without
+the 128-register cap; `STRIX_QRTX_DENSE_T2_REMAP=0` restores the first loader). Site microbench
+(`qwen_dense_tests --bench-shape M,K,N`, 8192 rows, 2.6 GHz, equal output hashes): 2560 x 16384 3.148 -> 2.267 ms,
+2560 x 13312 2.570 -> 1.837, 6144 x 2560 1.227 -> 0.838, 2560 x 1280 0.282 -> 0.207, 640 x 2560 0.162 -> 0.131 ms
+(218 -> 303 TOPS on the largest site). Without any load the same kernel runs 1.529 ms and without the FP32 chain
+3.040 ms: the stage is bound by the weight loader, not by the chain.

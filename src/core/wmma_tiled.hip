@@ -10,6 +10,7 @@
 #include "wmma_tiled.hpp"
 #include "trellis_codec.hpp"
 #include "hadamard.hpp"
+#include "iu4_onfly.hpp"
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -361,6 +362,21 @@ __global__ __launch_bounds__(256) void quantise_activations(
     }
     if (lane == 0) scales[index] = scale;
 }
+// Q8_0 -> IU4 g64 (TURBO+ onfly weights): one thread per (output column, K64 group); the arithmetic is
+// core/iu4_onfly.hpp quantise_group, the host-tested reference. The caller zero-fills the padded copy first.
+__global__ __launch_bounds__(256) void q8_0_iu4_convert_kernel(const uint8_t* q8, int inputs, int outputs, int padded,
+    uint8_t* wq, uint16_t* ws, int scale_rule) {
+    const int groups = inputs / 64;
+    const size_t item = size_t(blockIdx.x) * 256U + threadIdx.x;
+    if (item >= size_t(outputs) * size_t(groups)) return;
+    const int n = int(item / size_t(groups)), g = int(item % size_t(groups));
+    float w[64];
+    int q[64];
+    onfly::dequant_q8_group(q8 + size_t(n) * onfly::q8_row_bytes(size_t(inputs)), unsigned(g), w);
+    ws[size_t(n) * size_t(groups) + size_t(g)] = onfly::quantise_group(w, scale_rule, q);
+    for (int j = 0; j < 64; j += 2)
+        wq[iu4_weight_byte(g * 64 + j, n, padded)] = uint8_t((uint32_t(q[j]) & 15U) | ((uint32_t(q[j + 1]) & 15U) << 4U));
+}
 } // namespace wmma_tiled
 
 hipError_t query_wmma_iu4_resources(int tile, IU4Resources* resources, bool full_rows, int group) {
@@ -443,10 +459,19 @@ hipError_t launch_wmma_tiled_iu4_grouped(const IU4GroupedOperands& o,
         return hipErrorInvalidValue;
     return launch_grouped_bits(o, tiles, ntiles, max_tiles, output, inputs, outputs, stream, tile);
 }
+hipError_t convert_q8_0_iu4(const uint8_t* q8, int inputs, int outputs, uint8_t* wq, uint16_t* ws, hipStream_t stream, int scale_rule) {
+    if (!q8 || !wq || !ws || inputs <= 0 || inputs % 64 || outputs <= 0 || !iu4_scale_rule_valid(scale_rule)) return hipErrorInvalidValue;
+    const size_t padded = onfly::padded_outputs(size_t(outputs));
+    if (hipError_t e = hipMemsetAsync(wq, 0, onfly::packed_bytes(padded, size_t(inputs)), stream); e != hipSuccess) return e;
+    if (hipError_t e = hipMemsetAsync(ws, 0, onfly::scale_bytes(padded, size_t(inputs)), stream); e != hipSuccess) return e;
+    const size_t items = size_t(outputs) * size_t(inputs / 64);
+    wmma_tiled::q8_0_iu4_convert_kernel<<<unsigned((items + 255U) / 256U), 256, 0, stream>>>(q8, inputs, outputs, int(padded), wq, ws, scale_rule);
+    return hipGetLastError();
+}
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,
     uint8_t* wq, _Float16* ws, size_t wq_expert, size_t ws_expert, hipStream_t stream, int scale_rule) {
     if (!trellis || bits < 2 || bits > 8 || experts <= 0 || inputs <= 0 || inputs % 64 || outputs <= 0 || outputs % 16 || !ws ||
-        !iu4_scale_rule_valid(scale_rule))
+        !iu4_scale_rule_valid(scale_rule) || scale_rule == iu4_scale_rule_mse)  // MSE search: Q8_0 onfly converter only
         return hipErrorInvalidValue;
     const size_t items = size_t(inputs / 64) * size_t(outputs / 16);
     const dim3 grid(unsigned((items + 7U) / 8U), unsigned(experts));

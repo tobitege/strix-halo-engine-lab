@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/lever_cache.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -23,7 +25,7 @@ inline void set_engram_tp(int mode) { engram_tp_override().store(mode, std::memo
 inline bool engram_tp(std::uint32_t rows) {
     int mode = engram_tp_override().load(std::memory_order_relaxed);
     if (mode < 0) {
-        static const int env = [] {
+        static ::strix::lever_cache<int> env_cache{[] {
             const char* v = std::getenv("STRIX_DS41_ENGRAM_TP");
             if (v == nullptr || *v == '\0') return -1;
             if (std::strcmp(v, "0") == 0) return 0;
@@ -31,8 +33,8 @@ inline bool engram_tp(std::uint32_t rows) {
             if (std::strcmp(v, "r1") == 0) return 2;
             std::fprintf(stderr, "STRIX_DS41_ENGRAM_TP=%s ignored (0, 1 or r1): default\n", v);
             return -1;
-        }();
-        mode = env;
+        }};
+        mode = env_cache.get();
     }
     if (mode == 0) return false;
     return mode == 2 ? rows == 1U : rows <= 8U;

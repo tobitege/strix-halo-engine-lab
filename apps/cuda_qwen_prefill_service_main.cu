@@ -1,4 +1,4 @@
-// strix-cuda-qwen-prefill-service: the bit-exact CUDA Qwen prefill (include/strix/cuda_qwen_prefill.hpp) resident behind a
+// strix-cuda-qwen-prefill-service: the bit-exact CUDA Qwen prefill (include/strix/cuda/qwen_prefill.hpp) resident behind a
 // small HTTP/1.1 server. One request at a time on the GPU, in arrival order.
 //
 //   GET  /health      {"status":"ok"|"failed","busy":bool,"queued":n,"model":"qwen3.8-flash-next","max_positions":n,...}
@@ -17,11 +17,14 @@
 //
 // Hand-off flags: --handoff-codec bp-v1|identity (default bp-v1 when the node's layout lists it, else plain chunks;
 // docs/rtx-state-import.md "Chunk encoding"), --handoff-encode-threads N (4), --handoff-connections N (default 2: chunk
-// POSTs in flight), --handoff-chunk-mib N (32). Release per layer (default; --no-release-by-layer: after each block):
+// POSTs in flight), --handoff-chunk-mib N (32), --handoff-link 1gbe|2.5gbe|10gbe|usb4|oculink|MB/s (declares the link
+// for `--handoff-codec auto` / `--handoff-encode-threads auto`; all four resolve through strix/handoff_policy.hpp). Release per layer (default; --no-release-by-layer: after each block):
 // every block's rows and the last block's GDN recurrent/conv slices are sent per layer while the next layers compute.
 #include "strix/device/cuda_enumerator.hpp"
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_options.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/handoff_policy.hpp"
 
 #include "qwen_handoff.hpp"
 #include "qwen_http.hpp"
@@ -45,6 +48,7 @@
 
 namespace qp = strix::cuda::qwen_prefill;
 namespace qh = strix::qwen_handoff;
+namespace qo = strix::cuda::qwen_options;
 namespace http = strix::qwen_http;
 using strix::serve::Json;
 using Clock = std::chrono::steady_clock;
@@ -59,7 +63,8 @@ constexpr std::uint64_t fnv(const char* s) {
     while (*s) { h ^= static_cast<unsigned char>(*s++); h *= 1099511628211ULL; }
     return h;
 }
-constexpr std::uint64_t kNumerical = fnv("strix-cuda-qwen-prefill:a8-single-profile:hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
+// The exact CUDA arithmetic keeps this id; FAST forms / route storage fold their contract in (qo::handoff_numerical_id).
+constexpr const char* kNumericalName = "strix-cuda-qwen-prefill:a8-single-profile:hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
 constexpr std::uint64_t kReduction = fnv("strix-cuda-qwen-prefill:hip-gfx1151-order-v1");
 constexpr std::uint64_t kStateUpdate = fnv("strix-cuda-qwen-prefill:state-v1");
 
@@ -127,6 +132,7 @@ public:
         j.set("model", Json("qwen3.8-flash-next"));
         j.set("max_positions", Json(static_cast<std::uint64_t>(max_positions_)));
         j.set("served", Json(served_));
+        j.set("arithmetic_contract", Json(qo::cp::arithmetic_contract(qo::choice_of(config_))));
         j.set("block_schedule", Json(config_.tail_large ? "tail-large" : "default"));
         j.set("final_block_rows", Json(static_cast<std::uint64_t>(config_.final_block_rows)));
         j.set("block_capacity", Json(static_cast<std::uint64_t>(*std::max_element(config_.block_schedule.begin(), config_.block_schedule.end()))));
@@ -186,7 +192,7 @@ private:
                 return {413, R"({"error":"prompt does not fit the node context"})"};
             const std::vector<std::uint32_t> prefix(job.tokens.begin(), job.tokens.begin() + static_cast<std::ptrdiff_t>(position));
             if (job.local_rows >= position) return {400, R"({"error":"local_rows must be below the prompt length - 1"})"};
-            sender.begin(prefix, position, kNumerical, kReduction, kStateUpdate, job.local_rows);
+            sender.begin(prefix, position, qo::handoff_numerical_id_config(kNumericalName, config_), kReduction, kStateUpdate, job.local_rows);
             // Cooperative: the node prefills prompt[0, q] itself meanwhile (its prefix cache keeps the checkpoint at q).
             std::future<std::pair<int, std::string>> node_prefix;
             double node_prefix_s = 0;
@@ -338,57 +344,73 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
 }  // namespace
 
 int main(int argc, char** argv) {
+    // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
+    {
+        if (strix::device::wants_help(argc, argv)) {
+            std::printf("usage: strix-cuda-qwen-prefill-service --model FILE.gguf --tables DIR --rope-table FILE\n"
+                        "         [--mtp-sidecar FILE] [--max-positions N] [--bind ADDR] [--port N]\n"
+                        "         [--devices FILE | --device-id ID]\n"
+                        "Exact CUDA Qwen prefill for a node (state hand-off). Protocol and options:\n"
+                        "docs/engine/serving/qwen-cuda-prefill.md\n");
+            return 0;
+        }
+    }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
-    qp::Config c;
-    c.model_gguf = "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
+    strix::device::CommandLine device_cli;
+    try { device_cli = strix::device::take_command_line(argc, argv); }
+    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+    qo::Request request;  // common engine + profile options (shared with serve and the gate tools)
     std::string bind = "127.0.0.1", port = "8096", api_key, handoff_key;
     qh::Options handoff;
     // Defaults (measured net2 2026-10-24: exact and faster at every length 1K-32K): bp-v1 chunks when the node lists the
     // codec (else plain), 2 connections. --handoff-codec identity --handoff-connections 1 restores the plain stream.
-    handoff.codec = "bp-v1";
-    handoff.connections = 2;
+    // The values resolve through the shared hand-off resolver (strix/handoff_policy.hpp): CLI > STRIX_HANDOFF_* > these
+    // family defaults; --handoff-link CLASS|MB/s declares the link so `auto` can choose codec and encode threads.
+    const strix::handoff::Choice handoff_family{strix::handoff::Codec::bp_v1, 2, 4, 1};
+    strix::handoff::Request handoff_req;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(1); } return argv[++i]; };
-        if (a == "--model") c.model_gguf = next();
-        else if (a == "--mtp-sidecar") c.mtp_sidecar_gguf = next();
-        else if (a == "--tables") c.tables_dir = next();
-        else if (a == "--rope-table") c.rope_table = next();
-        else if (a == "--max-positions") c.max_positions = static_cast<std::uint32_t>(std::atoi(next().c_str()));
-        else if (a == "--block-schedule") {
-            const auto v = next();
-            if (v != "default" && v != "tail-large") { std::fprintf(stderr, "invalid block schedule\n"); return 1; }
-            c.tail_large = v == "tail-large";
-        }
-        else if (a == "--final-block-rows") {
-            const auto v = next();
-            long long n = -1;
-            try { std::size_t used = 0; n = std::stoll(v, &used); if (used != v.size()) n = -1; } catch (const std::exception&) { n = -1; }
-            if (n < 0 || n > qp::kMaxBlockRows) { std::fprintf(stderr, "invalid final block rows\n"); return 1; }
-            c.final_block_rows = static_cast<std::uint32_t>(n);
-        }
-        else if (a == "--blocks") {
-            c.block_schedule.clear();
-            std::string v = next();
-            for (std::size_t at = 0; at < v.size();) {
-                const auto comma = v.find(',', at);
-                c.block_schedule.push_back(static_cast<std::uint32_t>(std::atoi(v.substr(at, comma - at).c_str())));
-                at = comma == std::string::npos ? v.size() : comma + 1;
-            }
-        }
-        else if (a == "--release-by-layer") c.release_by_layer = true;
-        else if (a == "--no-release-by-layer") c.release_by_layer = false;
+        bool mine = false;
+        try { mine = qo::take(argc, argv, i, request); }
+        catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
+        if (mine) continue;
         else if (a == "--bind") bind = next();
         else if (a == "--port") port = next();
         else if (a == "--api-key-file") { std::FILE* f = std::fopen(next().c_str(), "rb"); char b[256] = {}; if (f) { std::fread(b, 1, 255, f); std::fclose(f); } api_key = b; while (!api_key.empty() && (api_key.back() == '\n' || api_key.back() == '\r')) api_key.pop_back(); }
         else if (a == "--handoff-api-key-file") { std::FILE* f = std::fopen(next().c_str(), "rb"); char b[256] = {}; if (f) { std::fread(b, 1, 255, f); std::fclose(f); } handoff_key = b; while (!handoff_key.empty() && (handoff_key.back() == '\n' || handoff_key.back() == '\r')) handoff_key.pop_back(); }
-        else if (a == "--handoff-codec") handoff.codec = next();
-        else if (a == "--handoff-encode-threads") handoff.encode_threads = static_cast<unsigned>(std::atoi(next().c_str()));
-        else if (a == "--handoff-connections") handoff.connections = static_cast<unsigned>(std::max(1, std::atoi(next().c_str())));
+        else if (a == "--handoff-codec") handoff_req.codec = next();
+        else if (a == "--handoff-encode-threads") handoff_req.encode_threads = next();
+        else if (a == "--handoff-connections") handoff_req.streams = next();
+        else if (a == "--handoff-link") handoff_req.link = next();
         else if (a == "--handoff-chunk-mib") handoff.chunk_bytes = static_cast<std::uint64_t>(std::max(1, std::atoi(next().c_str()))) << 20;
         else { std::fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
+    }
+    qo::Resolved resolved;
+    try { resolved = qo::resolve(request, qo::Entry::prefill_service, "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf"); }
+    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
+    if (request.print_effective_config) { std::printf("%s\n", qo::effective_config_json(resolved).c_str()); return 0; }
+    try {
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
+    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+    const qp::Config c = resolved.config;
+    for (const auto& n : resolved.resolution.notices()) std::fprintf(stderr, "%s\n", n.c_str());
+    std::fprintf(stderr, "arithmetic: %s\n", resolved.contract.c_str());
+    try {
+        // HTTP chunk POSTs: the connection count is not the shared-lib stream model (a POST waits for its reply), so it
+        // keeps the family value unless given explicitly.
+        const auto r = strix::handoff::resolve(handoff_family, handoff_req, {}, 16, {false, false});
+        handoff.codec = strix::handoff::codec_name(r.choice.codec);
+        handoff.connections = r.choice.streams;
+        handoff.encode_threads = r.choice.encode_threads;
+        for (const auto& line : r.lines)
+            if (line.rfind("handoff encode_batch", 0) != 0) std::fprintf(stderr, "qwen prefill service: %s\n", line.c_str());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 1;
     }
     if (c.tables_dir.empty() || c.rope_table.empty()) { std::fprintf(stderr, "--tables and --rope-table are required\n"); return 1; }
     if (c.block_schedule.empty() ||

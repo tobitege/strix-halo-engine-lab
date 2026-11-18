@@ -106,6 +106,17 @@ struct MoeView {
 // marks (optional, profiling): enqueue_moe records 2 events (after launch 1, after launch 2), enqueue_experts 1.
 void enqueue_moe(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
 void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
+// Split-producer chunk frame (xport/split_frame.hpp, SplitLayout{rows, 4096, 2048}): enqueue_experts with the down projection
+// as two launches on the column-group halves. v.out / v.publish = the head part (rows x 2048) and its publisher, tail_out /
+// tail = the tail part (rows x 2048) and its publisher; mid(mid_ctx) runs on the host between the launches. Default
+// (non-pipe, non-core, non-fast_i4) kernels, rows 2..8; same bits as enqueue_experts.
+struct MoeSplit {
+    strix::pair::ProducerPublish tail{};
+    float* tail_out = nullptr;
+    void (*mid)(void*) = nullptr;
+    void* mid_ctx = nullptr;
+};
+void enqueue_experts_split(const MoeView& v, hipStream_t stream, const MoeSplit& split);
 
 // Scheduling-only opt-in variants. Existing entrypoints always launch the old kernels.
 // The engine selects these only for decode when STRIX_GLM_MOE_PIPE=1 (read once).

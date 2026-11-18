@@ -9,6 +9,10 @@
 #include <vector>
 
 namespace strix {
+// Sessions one wide cohort step may span (each with 2, 4 or 8 rows, at most 32 rows in all). Every wide launcher's
+// segment table holds this many entries and the window admits a wide step only up to it, so a served joint group of
+// 9..16 requests (kMtpJointGroupLanesMax) reads the weights once instead of throwing in the launcher.
+inline constexpr std::uint32_t kCohortWideMaxSessions = 16U;
 struct CohortRowLaunch {
     std::size_t offset = 0;
     std::size_t rows = 0;

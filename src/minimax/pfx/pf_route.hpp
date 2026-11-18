@@ -30,6 +30,11 @@ public:
             ? backend_.post_publish(tag, bytes, Publication::kernel)
             : backend_.post_copy(tag, source, bytes);
     }
+    // STRIX_TP2_EXCHANGE_FMT=f16: the copy route's pack form (FP32 device source rounded to binary16 in the TX slot).
+    Ticket post_pack_f16(const float* source, std::size_t elems, const TagType& tag) {
+        runtime_.exchanger.send_pack_f16(source, elems, tag);
+        return Ticket{runtime_.exchanger.sent()};
+    }
     auto wait(Ticket ticket) {
         return backend_.wait_view(ticket, runtime_.options().stream);
     }

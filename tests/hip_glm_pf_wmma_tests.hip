@@ -109,9 +109,10 @@ __global__ void dot64_kernel(const _Float16* t, const float* w, unsigned K, unsi
 // of 65..127 rows on a 128-row tile), 3 the same with those remainders on the 64-row tail kernel, 4 default with each
 // group's 128-row tiles in one CTA instead of two (the default), 5 default with one output tile per wave (CP 1).
 // Arm 6: default with the WMMA chains of row fragments past a ragged tile's rows computed (LIVE_FRAG=0).
-// Arms 1-6: same bits. Every arm sets every knob explicitly (arm 0 sets WMMA=0), so inherited settings cannot
+// Arm 7: default with the shared expert on 64-row slices (SHARED128=0) instead of 128-row slices.
+// Arms 1-7: same bits. Every arm sets every knob explicitly (arm 0 sets WMMA=0), so inherited settings cannot
 // collapse two arms into one.
-constexpr unsigned kArms = 7;
+constexpr unsigned kArms = 8;
 void arm_env(unsigned arm) {
     env("STRIX_GLM_PF_WMMA", arm ? "1" : "0");
     env("STRIX_GLM_PF_WMMA_ROWS", arm == 1 ? "64" : "128");
@@ -119,6 +120,7 @@ void arm_env(unsigned arm) {
     env("STRIX_GLM_PF_WMMA_SPLIT", arm == 4 ? "1" : "2");
     env("STRIX_GLM_PF_WMMA_CP", arm == 5 ? "1" : "2");
     env("STRIX_GLM_PF_WMMA_LIVE_FRAG", arm == 6 ? "0" : "1");
+    env("STRIX_GLM_PF_WMMA_SHARED128", arm == 7 ? "0" : "1");
     env("STRIX_GLM_PF_EXACTMOE_TM", nullptr);
     env("STRIX_GLM_PF_EXACTMOE_PLAN", nullptr);
     env("STRIX_GLM_PF_AUX_COMBINE", "1");  // pinned: the shared pair slot is only meaningful with the separate combine
@@ -419,6 +421,9 @@ void moe(std::mt19937& rng, hipStream_t s, unsigned reps, bool classes_only) {
             const double c6 = std::min(t[6][0], t[6][1]);
             std::printf("TIME %s rows/expert %u live-fragments %.3f ms all-fragments %.3f ms ratio %.4f (pairs %.4f %.4f)\n", name.c_str(),
                         mode == 3 ? R / 36U : 0U, c8, c6, c8 / c6, t[2][0] / t[6][0], t[2][1] / t[6][1]);
+            const double c7 = std::min(t[7][0], t[7][1]);
+            std::printf("TIME %s shared-128 %.3f ms shared-64 %.3f ms ratio %.4f (pairs %.4f %.4f)\n", name.c_str(), c8, c7, c8 / c7,
+                        t[2][0] / t[7][0], t[2][1] / t[7][1]);
         }
         arm_env(0);
         env("STRIX_GLM_PF_EXACTMOE_V", nullptr);

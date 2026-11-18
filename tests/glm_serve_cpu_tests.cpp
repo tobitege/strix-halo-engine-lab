@@ -1,6 +1,7 @@
 // strix-glm5-serve host-only tests: control block encode/decode, hello / row checks, finish decisions, the slot table,
 // and the lead + follower protocol over an in-process loopback with a deterministic fake engine (batched streams must
 // equal their alone runs; serial mode; world 1; context limit; a cross-rank token mismatch aborts both ranks).
+#include "strix/session/prefill_session.hpp"
 #include "glm/serve/glm_serve_control.hpp"
 #include "glm/serve/glm_serve_lead.hpp"
 #include "glm/serve/glm_serve_import.hpp"
@@ -59,10 +60,15 @@ bool throws_with(F&& f, const std::string& needle) {
 struct Pipe {
     std::mutex m;
     std::condition_variable cv;
+    bool corrupt_dsa = false;  // one payload chunk, after successful prepare/header exchanges
     std::deque<std::vector<std::byte>> q[2];  // q[r]: blocks sent by rank r, not yet taken
     void xchg(unsigned rank, std::span<const std::byte> local, std::span<std::byte> remote) {
         std::unique_lock<std::mutex> l(m);
         q[rank].emplace_back(local.begin(), local.end());
+        if (corrupt_dsa && rank == 0 && local.size() == 64) {
+            q[rank].back()[0] ^= std::byte{1};
+            corrupt_dsa = false;
+        }
         cv.notify_all();
         if (!cv.wait_for(l, std::chrono::seconds(10), [&] { return !q[1 - rank].empty(); }))
             throw std::runtime_error("pipe: the peer never exchanged");
@@ -223,6 +229,7 @@ struct FakeEng {
     }
     std::uint32_t prefill(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0) {
         plain_call();
+        if (units_open) throw std::runtime_error("fake prefill: another prompt's prefill units session is open");
         if (!ready.at(s) || pos0 != frontier[s]) throw std::runtime_error("fake prefill: not at the slot frontier / without reset");
         for (const auto x : t) h[s] = fold(h[s], x);
         frontier[s] = pos0 + t.size();
@@ -346,6 +353,7 @@ struct FakeEng {
                 frontier[s] = t.size();
             },
             [&]() -> std::uint32_t {
+                if (mtp && units_open) throw std::runtime_error("fake import suffix: prefill session still open");
                 if (pipe) {  // the engine's argmax over both ranks: a rank alone here would wait for its peer forever
                     const std::uint32_t mine = tok(h[s]);
                     std::uint32_t peer = 0;
@@ -372,6 +380,7 @@ struct FakeEng {
         if (expected_id == id) expected_status = static_cast<std::uint32_t>(gs::ImportStatus::failed);
     }
     std::uint32_t prefill_mtp(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool last) {
+        if (units_open) throw std::runtime_error("fake prefill: prefill session still open");
         const auto y0 = prefill(s, t, pos0);
         log.back() += last ? " mtp last" : " mtp";
         if (last) {
@@ -379,6 +388,45 @@ struct FakeEng {
             seed_spec(s);
         }
         return y0;
+    }
+    // Prefill units (the engine's prefill_mtp session): the whole-prompt call runs when the last unit arrives, so the
+    // tokens equal the idle run by construction; while a session is open no other prompt may prefill (the engine's
+    // row buffers hold the paused piece).
+    std::uint32_t unit_rows = 0, unit_layers = 0;
+    std::vector<std::uint32_t> units_tokens, unit_calls;
+    std::uint32_t units_slot = 0;
+    std::uint64_t units_pos = 0, units_done = 0, units_total = 0;
+    bool units_open = false;
+    unsigned units_cancelled = 0, units_delay_us = 0;
+    std::function<void()> units_advanced;
+    std::uint32_t prefill_units(std::uint32_t s, std::span<const std::uint32_t> t, std::uint64_t pos0, bool start, std::uint32_t n) {
+        if (n == 0) {
+            if (!units_open) throw std::runtime_error("fake units: cancel without a session");
+            units_open = false;
+            ++units_cancelled;
+            log.push_back("units cancel " + std::to_string(s));
+            return gs::kPrefillPending;
+        }
+        if (start) {
+            if (units_open) throw std::runtime_error("fake units: a session is already open");
+            units_open = true;
+            units_tokens.assign(t.begin(), t.end());
+            units_slot = s;
+            units_pos = pos0;
+            units_done = 0;
+            units_total = strix::session::LayerUnits{t.size(), unit_rows, unit_layers}.total();
+            if (units_total == 0) throw std::runtime_error("fake units: no unit geometry");
+        } else if (!units_open || s != units_slot || pos0 != units_pos) {
+            throw std::runtime_error("fake units: resume without its session");
+        }
+        unit_calls.push_back(n);
+        log.push_back("units " + std::to_string(s) + " +" + std::to_string(n));
+        if (units_delay_us) std::this_thread::sleep_for(std::chrono::microseconds(units_delay_us));
+        units_done = std::min<std::uint64_t>(units_done + n, units_total);
+        if (units_advanced) units_advanced();
+        if (units_done < units_total) return gs::kPrefillPending;
+        units_open = false;
+        return prefill_mtp(units_slot, units_tokens, units_pos, true);
     }
     void mtp_enter(std::uint32_t r, const gs::WireRow& w, bool from_seed) {
         if (from_seed) {
@@ -527,6 +575,8 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     lc.mtp = mtp;
     lc.mtp_cycles = 2;
     lc.prefill_chunk = chunk;
+    // These levels assert the base interleave (one chunk per decode round); the grouped form has its own case below.
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
     lc.g2 = g2;
     if (import_min != 0) {  // route on: the fake ranks stage at import_expect, the 'RTX' always accepts
         lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
@@ -585,9 +635,268 @@ PairRun run_pair(unsigned n, std::uint32_t slots, bool batch, std::uint32_t toke
     return out;
 }
 
+void queued_successor_interleave() {
+    // Final grouped chunks must pay their debt before a queued successor prefills (also when slots are reused).
+    for (const bool grouped : {false, true}) {
+        FakeEng e(4);
+        e.stops = false;
+        gs::Channel ch({}, 0);
+        ch.hello(hello_for(4, 4096, 1));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 4096;
+        lc.prefill_chunk = 512;
+        lc.prefill_chunk_cap = 4096;
+        lc.interleave.select = grouped ? sv::PrefillInterleave::Select::automatic : sv::PrefillInterleave::Select::off;
+        lc.interleave.max_stall_ms = 1e9;
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::vector<std::shared_ptr<sv::GenerationTicket>> tickets;
+        // Queue everything before running, so prompt completion cannot race successor submission.
+        for (unsigned i = 0; i < 4; ++i) {
+            sv::GenerationJob j;
+            j.prompt.assign(i == 0 ? 8U : 2560U, 5U);
+            j.max_tokens = i == 0 ? 100U : 1U;
+            tickets.push_back(queue.submit(std::move(j)));
+        }
+        std::thread runner([&] { lead.loop(); });
+        for (const auto& ticket : tickets) {
+            bool done = false;
+            while (!done) (void)ticket->wait(std::chrono::milliseconds(100), done);
+        }
+        stop.store(true);
+        runner.join();
+        unsigned chunks = 0, steps = 0, owed = 0, violations = 0, successors = 0;
+        for (const auto& line : e.log) {
+            if (line.rfind("step", 0) == 0) ++steps;
+            if (line.rfind("prefill 1 ", 0) != 0) continue;
+            if (chunks != 0) {
+                if (steps != owed) ++violations;
+                if (line.find(" @0 ") != std::string::npos) ++successors;
+            }
+            owed = grouped && line.find(" +2048") != std::string::npos ? 4U : 1U;
+            steps = 0;
+            ++chunks;
+        }
+        CHECK(chunks == (grouped ? 6U : 15U) && successors == 2 && violations == 0);
+        std::printf("queued-successor interleave (%s): %u chunks, %u successors, %u debt violations\n",
+                    grouped ? "grouped" : "single", chunks, successors, violations);
+    }
+
+}
+
 }  // namespace
 
+// Host protocol regressions: geometry decline and imports ready inside/between pieces.
+// These checks cover ordering/accounting, not native residual/logit/state equality.
+void audit601_regressions(bool imports) {
+    const unsigned cases = imports ? 2U : 4U;
+    for (unsigned variant = 0; variant < cases; ++variant) {
+        Loopback lb;
+        FakeEng e(4), e1(4);
+        e.stops = e1.stops = false;
+        e.delay_us = e1.delay_us = 500;
+        e.unit_rows = e1.unit_rows = imports ? 256U : 8192U;
+        e.unit_layers = e1.unit_layers = imports ? 4U : 45U;
+        std::atomic<bool> hold{true};
+        std::atomic<unsigned> ready_ranks{0};
+        if (imports) {
+            e.hold = e1.hold = &hold;
+            const auto hook = [&](FakeEng& f) {
+                // One unit: inside a piece; four units: exactly between pieces, still active.
+                if (f.unit_calls.size() == (variant == 0 ? 1U : 4U) && ready_ranks.fetch_add(1) == 1)
+                    hold.store(false);
+            };
+            // Callbacks outlive this block: retain the hook by value.
+            e.units_advanced = [&, hook] { hook(e); };
+            e1.units_advanced = [&, hook] { hook(e1); };
+        }
+        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
+        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 32768, 2), 4, 32768); });
+        ch.hello(hello_for(4, 32768, 2));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 32768;
+        lc.mtp = true;
+        lc.short_first = false;
+        lc.prefill_chunk = imports ? 64U : 512U;
+        lc.prefill_units_rows = e.unit_rows;
+        lc.prefill_units_layers = e.unit_layers;
+        lc.prefill_units_admit = [&](std::uint64_t rows) {
+            const strix::session::LayerUnits lu{rows, e.unit_rows, e.unit_layers};
+            // Pipeline 2: seqpar pauses only even pieces; disabled seqpar cannot pause any.
+            return lu.all_pieces_pausable([&](std::uint32_t r) { return imports || (variant != 2 && r >= 2 && r % 2 == 0); });
+        };
+        if (imports) {
+            lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
+            lc.import_min_tokens = 100;
+            lc.import_listen_grace_s = 0;
+        }
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::thread runner([&] { lead.loop(); });
+        auto submit = [&](std::size_t rows, std::uint32_t token, std::uint32_t count) {
+            sv::GenerationJob j;
+            j.prompt.assign(rows, token);
+            j.max_tokens = count;
+            return queue.submit(std::move(j));
+        };
+        auto a = submit(16, 3, 400);
+        bool done_a = false;
+        auto tokens_a = a->wait(std::chrono::milliseconds(100), done_a);
+        while (tokens_a.empty() && !done_a) tokens_a = a->wait(std::chrono::milliseconds(100), done_a);
+        auto b = imports ? submit(300, 7, 6) : nullptr;
+        // Odd single piece; odd multi-piece tail; seqpar disabled on even rows; supported control.
+        const std::size_t rows = imports ? 640U : variant == 0 ? 8191U : variant == 1 ? 16383U : 8192U;
+        auto c = submit(rows, 9, 6);
+        auto drain = [](const auto& ticket) {
+            std::vector<std::uint32_t> tokens;
+            bool done = false;
+            while (!done) {
+                auto next = ticket->wait(std::chrono::milliseconds(100), done);
+                tokens.insert(tokens.end(), next.begin(), next.end());
+            }
+            return tokens;
+        };
+        const auto tokens_c = drain(c);
+        const auto tokens_b = b ? drain(b) : std::vector<std::uint32_t>{};
+        const auto rest_a = drain(a);
+        tokens_a.insert(tokens_a.end(), rest_a.begin(), rest_a.end());
+        stop.store(true);
+        runner.join();
+        follower.join();
+        auto plain = [](std::size_t n, std::uint32_t token, std::size_t count) {
+            FakeEng f(1);
+            f.stops = false;
+            f.reset(0);
+            const std::vector<std::uint32_t> prompt(n, token);
+            std::vector<std::uint32_t> out{f.prefill(0, prompt, 0)};
+            while (out.size() < count) {
+                const gs::WireRow row{0, out.back(), f.frontier[0]};
+                out.push_back(f.step({&row, 1})[0]);
+            }
+            return out;
+        };
+        CHECK(tokens_a == plain(16, 3, 400));
+        CHECK(tokens_c == plain(rows, 9, 6));
+        CHECK(e.log == e1.log && !e.units_open && !e1.units_open);
+        if (imports) {
+            CHECK(ready_ranks.load() == 2 && !hold.load());
+            CHECK(tokens_b == plain(300, 7, 6));
+            CHECK(b->stats().imported_tokens == 299 && lead.stats().imports == 1);
+            CHECK(!e.unit_calls.empty() && e.dropped.empty() && e1.dropped.empty());
+            std::size_t last_unit = 0, imported = 0;
+            unsigned decode_between = 0;
+            for (std::size_t i = 0; i < e.log.size(); ++i) {
+                if (e.log[i].rfind("units ", 0) == 0) last_unit = i;
+                if (e.log[i].rfind("import ", 0) == 0) imported = i;
+                if (last_unit != 0 && imported == 0 && e.log[i].rfind("step", 0) == 0) ++decode_between;
+            }
+            CHECK(imported > last_unit && decode_between > 0);
+        } else {
+            CHECK(e.unit_calls.empty() == (variant != 3));
+        }
+        std::printf("audit601 %s variant %u: completed both ranks\n", imports ? "import deferral" : "geometry admission", variant);
+    }
+}
+
+void import_route_receipts() {
+    // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback
+    for (const int variant : {0, 1, 2, 3, 4}) {  // success, staging failure, relay success, unavailable, corrupt payload
+        const bool fail = variant == 1, dsa = variant >= 2, relay_fail = variant >= 3;
+        Loopback lb;
+        FakeEng e(4), e1(4);
+        Pipe pipe;
+        e.stops = e1.stops = false;
+        e.fail_expect = fail;
+        e.pipe = e1.pipe = &pipe;
+        e1.rank = 1;
+        e1.relay_fail = variant == 3;
+        pipe.corrupt_dsa = variant == 4;
+        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
+        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 4096, 2), 4, 4096); });
+        ch.hello(hello_for(4, 4096, 2));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 4096;
+        lc.heartbeat_seconds = 0.01;
+        lc.prefill_chunk = 64;
+        lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
+        lc.import_min_tokens = 100;
+        lc.state_digest = true;
+        lc.import_dsa_once = dsa;
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::thread runner([&] { lead.loop(); });
+        sv::GenerationJob j;
+        j.prompt.assign(300, 9U);
+        j.max_tokens = 4;
+        auto t = queue.submit(std::move(j));
+        if (variant == 4) {
+            bool completed = false;
+            while (!completed) (void)t->wait(std::chrono::milliseconds(100), completed);
+        }
+        sv::GenerationJob k;
+        k.prompt = prompts(1)[0];  // short: never routed
+        k.max_tokens = 4;
+        auto u = queue.submit(std::move(k));
+        bool done = false, done_u = false;
+        while (!done) (void)t->wait(std::chrono::milliseconds(100), done);
+        while (!done_u) (void)u->wait(std::chrono::milliseconds(100), done_u);
+        stop.store(true);
+        runner.join();
+        follower.join();
+        const auto st = t->stats(), su = u->stats();
+        std::string route;
+        for (const auto& [name, value] : st.engine_extra)
+            if (name == "prefill_route") route = value;
+        if (!fail && !relay_fail) CHECK(st.imported_tokens == 299 && route.find("\"route\":\"rtx\"") != std::string::npos && lead.stats().imported_tokens == 299);
+        if (fail) {  // the fallback drops the hand-off on both ranks at once (import_drop)
+            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"rank0_staging_failed\"") != std::string::npos);
+            CHECK(!e.dropped.empty() && e.dropped == e1.dropped);
+        }
+        if (dsa && !relay_fail) {  // both ranks relayed inside import_state's replay; rank 1 restored its full state
+            CHECK(route.find("\"dsa_once\":true") != std::string::npos && route.find("\"relay_bytes\":407") != std::string::npos);
+            CHECK(e1.relayed == relay_full(1) && e1.last_relay.chunks == 7);
+            bool logged = false;
+            for (const auto& line : e1.log) logged = logged || (line.rfind("import ", 0) == 0 && line.find(" dsa") != std::string::npos);
+            CHECK(logged);
+        }
+        if (relay_fail) {  // header or checksum failure: both abort, then local prefill and later requests remain usable
+            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"both_restore_failed\"") != std::string::npos);
+            CHECK(lead.stats().imports == 0 && lead.stats().import_fallbacks == 1);
+            bool aborted0 = false, aborted1 = false;
+            for (const auto& line : e.log) aborted0 = aborted0 || line.find("(import abort)") != std::string::npos;
+            for (const auto& line : e1.log) aborted1 = aborted1 || line.find("(import abort)") != std::string::npos;
+            CHECK(aborted0 && aborted1);
+            CHECK(e.suffix_collectives == 0 && e1.suffix_collectives == 0);
+            CHECK(t->error().empty() && u->error().empty());
+        }
+        CHECK(su.imported_tokens == 0 && su.engine_extra.empty());
+        const auto dg = lead.take_digests();  // one per request, right after its prefill, rank 1's gathered by rank 0
+        CHECK(dg.size() == 2 && dg[0].rank0.size() == 4 && dg[0].rank0 == dg[0].rank1 && dg[1].rank0 == dg[1].rank1);
+        CHECK(!route.empty() && sv::parse_json(route).is_object());
+        static const char* names[] = {"imported", "staging fails", "imported, DSA once", "DSA once, rank 1 cannot relay", "DSA once, corrupt payload"};
+        std::printf("route receipt (%s): %s\n", names[variant], route.c_str());
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--audit656-import") {
+        import_route_receipts();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && (std::string(argv[1]) == "--audit601-geometry" || std::string(argv[1]) == "--audit601-import")) {
+        audit601_regressions(std::string(argv[1]) == "--audit601-import");
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--interleave-only") {
+        queued_successor_interleave();
+        return failures == 0 ? 0 : 1;
+    }
     const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
     // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
     // from the shared queue with this selection; off keeps FIFO
@@ -675,6 +984,13 @@ int main(int argc, char** argv) {
                                        nullptr, 1, false, false, 0, true);
         CHECK(imported.lead_error.empty() && imported.follow_error.empty() && imported.driver_error.empty());
         CHECK(imported.stats.imports > 0 && imported.stats.prefix_hits == 0 && imported.stats.prefix_stores == 0);
+        // Nor may the opt-in reply-end store keep an imported slot under the native identity: a later native-route
+        // request (import_route false, e.g. while another import is in flight) would restore FAST import rows.
+        const auto reply = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                                    nullptr, 1, false, false, 0, true, false, 1ULL << 20, true);
+        CHECK(reply.lead_error.empty() && reply.follow_error.empty() && reply.driver_error.empty());
+        CHECK(reply.stats.imports > 0 && reply.stats.prefix_hits == 0 && reply.stats.prefix_stores == 0 &&
+              reply.stats.prefix_stores_reply == 0 && reply.stats.prefix_reply_skipped > 0);
     }
     // Missing peer key and a local restore exception must be observed on BOTH ranks before suffix collectives.
     for (const bool missing : {false, true}) {
@@ -1014,13 +1330,13 @@ int main(int argc, char** argv) {
         }
         // a peer with the previous (v5) block layout is refused at the version check, before any later field is read
         {
-            gs::Control c;
-            c.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
-            auto blk = gs::encode(c);
+            gs::Control old_peer;
+            old_peer.cmd = static_cast<std::uint32_t>(gs::Cmd::heartbeat);
+            auto blk = gs::encode(old_peer);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
-            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 7"));
-            CHECK(gs::decode(gs::encode(c)).version == gs::kControlVersion);
+            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 8"));
+            CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
         std::vector<gs::WireRow> rows = {{0, 1, 3}, {1, 1, 3}, {2, 1, 9}};
@@ -1381,8 +1697,12 @@ int main(int argc, char** argv) {
         const auto r = run_pair(3, 4, true, 40, 0, hello_for(8, 4096, 2), false, 100, 3);
         CHECK(r.lead_error.empty() && r.follow_error.empty() && r.driver_error.empty() && r.result.exact && r.log0 == r.log1);
     }
+    queued_successor_interleave();
+
     // ---- decode-first: a running stream gets one decode round between consecutive prefill chunks of a new prompt
-    {
+    // (interleave off), or the same rounds per prompt token around grouped chunks (the shared PrefillInterleave policy:
+    // 64, then 4 x 64 while one request decodes)
+    for (const bool grouped : {false, true}) {
         FakeEng e(4);
         e.stops = false;
         gs::Channel ch({}, 0);
@@ -1393,6 +1713,9 @@ int main(int argc, char** argv) {
         lc.capacity = 4096;
         lc.heartbeat_seconds = 0.01;
         lc.prefill_chunk = 64;
+        lc.interleave.select = grouped ? sv::PrefillInterleave::Select::automatic : sv::PrefillInterleave::Select::off;
+        lc.interleave.max_stall_ms = 1e9;
+        lc.prefill_timeline = grouped ? 1 : 0;
         std::atomic<bool> stop{false};
         gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
         std::thread runner([&] { lead.loop(); });
@@ -1416,95 +1739,27 @@ int main(int argc, char** argv) {
         while (!done) (void)ta->wait(std::chrono::milliseconds(100), done);
         stop.store(true);
         runner.join();
-        // between two chunk calls of the big prompt there is exactly one step
-        int last_chunk = -1, violations = 0, chunks = 0;
+        // between two chunk calls of the big prompt there is exactly one step; grouped: 64 + 256 + 256 + 64 tokens with
+        // 1, 4 and 4 steps after the first three chunks (the same 9 steps the 10 single chunks get)
+        int last_chunk = -1, violations = 0, chunks = 0, steps_between = 0;
+        const int want_grouped[3] = {1, 4, 4};
         for (std::size_t i = 0; i < e.log.size(); ++i) {
             if (e.log[i].rfind("prefill 1 ", 0) == 0) {
                 if (last_chunk >= 0) {
                     int st = 0;
                     for (std::size_t j = static_cast<std::size_t>(last_chunk) + 1; j < i; ++j) st += e.log[j].rfind("step", 0) == 0 ? 1 : 0;
-                    if (st != 1) ++violations;
+                    if (st != (grouped ? want_grouped[std::min(chunks - 1, 2)] : 1)) ++violations;
+                    steps_between += st;
                 }
                 last_chunk = static_cast<int>(i);
                 ++chunks;
             }
         }
-        CHECK(chunks == 10 && violations == 0);
-        std::printf("decode-first interleave: %d chunks of the 640-token prompt, one step between consecutive chunks: %s\n", chunks,
+        CHECK(chunks == (grouped ? 4 : 10) && violations == 0 && steps_between == 9);
+        std::printf("decode-first interleave (%s, %d steps between chunks): %d chunks of the 640-token prompt, expected step pattern: %s\n", grouped ? "grouped" : "single", steps_between, chunks,
                     violations == 0 ? "yes" : "NO");
     }
-    // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback
-    for (const int variant : {0, 1, 2, 3}) {  // imported / staging fails / imported 'DSA once' / 'DSA once', rank 1 cannot relay
-        const bool fail = variant == 1, dsa = variant >= 2, relay_fail = variant == 3;
-        Loopback lb;
-        FakeEng e(4), e1(4);
-        Pipe pipe;
-        e.stops = e1.stops = false;
-        e.fail_expect = fail;
-        e.pipe = e1.pipe = &pipe;
-        e1.rank = 1;
-        e1.relay_fail = relay_fail;
-        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
-        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 4096, 2), 4, 4096); });
-        ch.hello(hello_for(4, 4096, 2));
-        sv::GenerationQueue queue(8);
-        gs::LeadConfig lc;
-        lc.slots = 4;
-        lc.capacity = 4096;
-        lc.heartbeat_seconds = 0.01;
-        lc.prefill_chunk = 64;
-        lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
-        lc.import_min_tokens = 100;
-        lc.state_digest = true;
-        lc.import_dsa_once = dsa;
-        std::atomic<bool> stop{false};
-        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
-        std::thread runner([&] { lead.loop(); });
-        sv::GenerationJob j;
-        j.prompt.assign(300, 9U);
-        j.max_tokens = 4;
-        auto t = queue.submit(std::move(j));
-        sv::GenerationJob k;
-        k.prompt = prompts(1)[0];  // short: never routed
-        k.max_tokens = 4;
-        auto u = queue.submit(std::move(k));
-        bool done = false, done_u = false;
-        while (!done) (void)t->wait(std::chrono::milliseconds(100), done);
-        while (!done_u) (void)u->wait(std::chrono::milliseconds(100), done_u);
-        stop.store(true);
-        runner.join();
-        follower.join();
-        const auto st = t->stats(), su = u->stats();
-        std::string route;
-        for (const auto& [name, value] : st.engine_extra)
-            if (name == "prefill_route") route = value;
-        if (!fail && !relay_fail) CHECK(st.imported_tokens == 299 && route.find("\"route\":\"rtx\"") != std::string::npos && lead.stats().imported_tokens == 299);
-        if (fail) {  // the fallback drops the hand-off on both ranks at once (import_drop)
-            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"rank0_staging_failed\"") != std::string::npos);
-            CHECK(!e.dropped.empty() && e.dropped == e1.dropped);
-        }
-        if (dsa && !relay_fail) {  // both ranks relayed inside import_state's replay; rank 1 restored its full state
-            CHECK(route.find("\"dsa_once\":true") != std::string::npos && route.find("\"relay_bytes\":407") != std::string::npos);
-            CHECK(e1.relayed == relay_full(1) && e1.last_relay.chunks == 7);
-            bool logged = false;
-            for (const auto& line : e1.log) logged = logged || (line.rfind("import ", 0) == 0 && line.find(" dsa") != std::string::npos);
-            CHECK(logged);
-        }
-        if (relay_fail) {  // the relay failed on both ranks at its header: import_abort on both, the prompt prefilled itself
-            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"both_restore_failed\"") != std::string::npos);
-            CHECK(lead.stats().imports == 0 && lead.stats().import_fallbacks == 1);
-            bool aborted0 = false, aborted1 = false;
-            for (const auto& line : e.log) aborted0 = aborted0 || line.find("(import abort)") != std::string::npos;
-            for (const auto& line : e1.log) aborted1 = aborted1 || line.find("(import abort)") != std::string::npos;
-            CHECK(aborted0 && aborted1);
-        }
-        CHECK(su.imported_tokens == 0 && su.engine_extra.empty());
-        const auto dg = lead.take_digests();  // one per request, right after its prefill, rank 1's gathered by rank 0
-        CHECK(dg.size() == 2 && dg[0].rank0.size() == 4 && dg[0].rank0 == dg[0].rank1 && dg[1].rank0 == dg[1].rank1);
-        CHECK(!route.empty() && sv::parse_json(route).is_object());
-        static const char* names[] = {"imported", "staging fails", "imported, DSA once", "DSA once, rank 1 cannot relay"};
-        std::printf("route receipt (%s): %s\n", names[variant], route.c_str());
-    }
+    import_route_receipts();
     // ---- a prompt waiting for its RTX state does not hold the admission: a short prompt behind it is served meanwhile
     {
         Loopback lb;
@@ -1663,6 +1918,110 @@ int main(int argc, char** argv) {
         std::printf("arrival during MTP: A %zu tokens, B %zu tokens, mtp rounds %llu enters %llu leaves %llu, steps %llu\n", a.size(),
                     b.size(), static_cast<unsigned long long>(st.mtp_rounds), static_cast<unsigned long long>(st.mtp_enters),
                     static_cast<unsigned long long>(st.mtp_leaves), static_cast<unsigned long long>(st.steps));
+    }
+    // ---- prefill units (a long MTP prompt beside a decoding request, cut by LAYERS): one engine session paused at layer
+    // boundaries of its 256-row pieces; every call carries the 64-token base chunk's work in layer units of the current
+    // piece (LayerUnits::base_units; grouping capped at one base-equivalent), a decode round separates the calls, the
+    // tokens equal the idle run; a cancelled request closes the session on the engine and the next prompt prefills
+    {
+        namespace ss = strix::session;
+        static_assert(ss::LayerUnits{640, 256, 45}.total() == 135 && ss::LayerUnits{640, 256, 45}.pieces() == 3);
+        static_assert(ss::LayerUnits{640, 256, 45}.piece_rows_at(89) == 256 && ss::LayerUnits{640, 256, 45}.piece_rows_at(90) == 128);
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 0) == 12);    // 64 x 45 / 256 = 11.25, rounded up
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 96) == 23);   // the 128-row piece: 22.5
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(64, 130) == 5);   // the units left
+        static_assert(ss::LayerUnits{640, 256, 45}.base_units(0, 3) == 132 && ss::LayerUnits{640, 256, 45}.base_units(64, 135) == 0);
+        static_assert(ss::LayerUnits{0, 256, 45}.total() == 0 && ss::LayerUnits{1, 4096, 45}.base_units(512, 0) == 45);
+        for (const bool cancel : {false, true}) {
+            FakeEng e(4);
+            e.stops = false;
+            e.unit_rows = 256;
+            e.unit_layers = 45;
+            if (cancel) e.units_delay_us = 20000;
+            gs::Channel ch({}, 0);
+            ch.hello(hello_for(4, 4096, 1));
+            sv::GenerationQueue queue(8);
+            gs::LeadConfig lc;
+            lc.slots = 4;
+            lc.capacity = 4096;
+            lc.heartbeat_seconds = 0.01;
+            lc.mtp = true;
+            lc.prefill_chunk = 64;
+            lc.prefill_units_rows = 256;
+            lc.prefill_units_layers = 45;
+            lc.prefill_units_admit = [](std::uint64_t) { return true; };
+            lc.prefill_timeline = 1;
+            std::atomic<bool> stop{false};
+            gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+            std::thread runner([&] { lead.loop(); });
+            auto job = [&](std::vector<std::uint32_t> p, std::uint32_t max) {
+                sv::GenerationJob j;
+                j.prompt = std::move(p);
+                j.max_tokens = max;
+                return queue.submit(std::move(j));
+            };
+            const auto pa = prompts(3)[0], pd = prompts(3)[2];
+            auto ta = job(pa, 400);
+            std::vector<std::uint32_t> a, b, d;
+            bool done = false;
+            while (a.size() < 5 && !done) {
+                auto g = ta->wait(std::chrono::milliseconds(100), done);
+                a.insert(a.end(), g.begin(), g.end());
+            }
+            std::vector<std::uint32_t> big(640);
+            for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint32_t>(3 + i % 97);
+            auto tb = job(big, 6);
+            bool done_b = false;
+            if (cancel) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(70));
+                tb->cancel();
+            }
+            while (!done_b) {
+                auto g = tb->wait(std::chrono::milliseconds(100), done_b);
+                b.insert(b.end(), g.begin(), g.end());
+            }
+            auto td = job(pd, 8);
+            bool done_d = false;
+            while (!done_d) {
+                auto g = td->wait(std::chrono::milliseconds(100), done_d);
+                d.insert(d.end(), g.begin(), g.end());
+            }
+            while (!done) {
+                auto g = ta->wait(std::chrono::milliseconds(100), done);
+                a.insert(a.end(), g.begin(), g.end());
+            }
+            stop.store(true);
+            runner.join();
+            auto plain = [](const std::vector<std::uint32_t>& p, std::size_t n) {
+                FakeEng f(1);
+                f.stops = false;
+                f.reset(0);
+                std::vector<std::uint32_t> t{f.prefill(0, p, 0)};
+                while (t.size() < n) {
+                    const gs::WireRow r{0, t.back(), f.frontier[0]};
+                    t.push_back(f.step({&r, 1})[0]);
+                }
+                return t;
+            };
+            CHECK(a == plain(pa, 400));
+            CHECK(d == plain(pd, 8));
+            int back_to_back = 0;
+            for (std::size_t i = 1; i < e.log.size(); ++i)
+                if (e.log[i].rfind("units 1 +", 0) == 0 && e.log[i - 1].rfind("units 1 +", 0) == 0) ++back_to_back;
+            if (!cancel) {
+                const std::vector<std::uint32_t> want{12, 12, 12, 12, 12, 12, 12, 12, 23, 16};
+                CHECK(b == plain(big, 6));
+                CHECK(e.unit_calls == want);
+                CHECK(back_to_back == 0 && e.units_cancelled == 0);
+            } else {
+                CHECK(e.units_cancelled == 1 && !e.units_open && e.unit_calls.size() < 10);
+            }
+            std::string calls;
+            for (const auto u : e.unit_calls) calls += (calls.empty() ? "" : " ") + std::to_string(u);
+            std::printf("prefill units%s: %zu calls (%s), decode between every call: %s, tokens == idle run: %s\n",
+                        cancel ? " (cancelled)" : "", e.unit_calls.size(), calls.c_str(),
+                        back_to_back == 0 ? "yes" : "NO", a == plain(pa, 400) && d == plain(pd, 8) ? "yes" : "NO");
+        }
     }
     // ---- world 1, context limit, rejected prompt, max_tokens
     {

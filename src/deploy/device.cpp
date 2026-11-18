@@ -1,5 +1,7 @@
 #include "strix/deploy/device.hpp"
 
+#include "strix/device/process_budget.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -230,9 +232,21 @@ std::vector<DeviceFacts> probe_devices(const std::string& root, const std::strin
     return result;
 }
 
+void apply_budget(DeviceFacts& facts, std::uint64_t device_bytes) {
+    if (!device_bytes || !facts.mem_total_bytes || device_bytes >= facts.mem_total_bytes) return;
+    const std::uint64_t used = facts.mem_total_bytes - std::min(facts.mem_free_bytes, facts.mem_total_bytes);
+    facts.mem_free_bytes = used < device_bytes ? device_bytes - used : 0;
+    facts.mem_total_bytes = device_bytes;
+    facts.source += "+budget";
+}
+
 DeviceFacts probe_device(const std::string& root, const std::string& override_device) {
     auto all = probe_devices(root, override_device);
-    if (all.size() == 1) return all.front();
+    if (all.size() == 1) {
+        // The bound device's declared budget (--device-profile / profile / memory_gib) is what every plan sees.
+        apply_budget(all.front(), device::process_device_budget_bytes().load());
+        return all.front();
+    }
     DeviceFacts d;
     if (all.size() > 1) d.source = "ambiguous-device-selection";
     // The test override also permits host-only deploy-check without a physical GPU.

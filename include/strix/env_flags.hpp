@@ -14,6 +14,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -136,12 +137,29 @@ struct Entry {
 
 inline std::mutex& registry_mutex() { static std::mutex m; return m; }
 inline std::vector<Entry>& registry_entries() { static std::vector<Entry> v; return v; }
+// Values a defaults applier exported into this process's environment (name -> value). A later read that sees the
+// same value is that default, not a user setting: the effective config and the receipts' "set" list stay what the
+// user asked for (a FAST arm reading an exported default must not differ from an exact run that never read it).
+inline std::map<std::string, std::string>& exported_defaults() { static std::map<std::string, std::string> m; return m; }
+inline bool user_set(const std::string& name, const char* raw) {  // registry_mutex held
+    if (raw == nullptr) return false;
+    const auto it = exported_defaults().find(name);
+    return it == exported_defaults().end() || it->second != raw;
+}
 
 inline void record(const char* name, const char* raw, std::string resolved) {
     std::lock_guard<std::mutex> lock(registry_mutex());
     for (auto& e : registry_entries())
-        if (e.name == name) { e.value = std::move(resolved); e.set = raw != nullptr; return; }
-    registry_entries().push_back(Entry{name, std::move(resolved), raw != nullptr});
+        if (e.name == name) { e.value = std::move(resolved); e.set = user_set(e.name, raw); return; }
+    registry_entries().push_back(Entry{name, std::move(resolved), user_set(name, raw)});
+}
+
+// A defaults applier exported `value` for `name` (the user had not set it): later reads of that value record as default.
+inline void note_default_export(const char* name, const char* value) {
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    exported_defaults()[name] = value;
+    for (auto& e : registry_entries())
+        if (e.name == name && e.set) e.set = user_set(e.name, value);
 }
 
 // Snapshot of every switch read so far, in first-read order.

@@ -46,6 +46,8 @@ def generate(source, output):
                     "\nunsigned x_auto_rows();\nRoute route(unsigned rows);\nunsigned tile_rows();\n}\n", encoding="utf-8")
     minimax = read("src/minimax/engine/engine.hip")
     iu4 = read("src/minimax/moe/mmx_prefill_iu4.inc")
+    mm_prefill = read("src/minimax/moe/mmx_prefill.hip")
+    mm_defaults = read("src/minimax/engine/mm_defaults.cpp")
     qwen = read("apps/hip_decode_token_main.cpp")
     qwen_start = qwen.rfind("    {", 0, qwen.index("// Shared route receipt: the prefill route"))
     options = read("apps/hip_decode_options.hpp")
@@ -57,6 +59,9 @@ def generate(source, output):
         "GLM_PIPELINE_HALF": re.search(r", A = (.*);", pipeline)[1],
         "GLM_SEQPAR_BLOCK": re.search(r"const unsigned block = (.*);", seqpar)[1],
         "GLM_HOOK": selected + "    const unsigned tm = 16;\n" + hook,
+        "MINIMAX_ORDER": "\n".join(block(mm_prefill, mm_prefill.index(start)) for start in
+            ("void set_prefill_moe_order(", "const ::strix::moe_core::GroupedSplitContract& prefill_moe_order(", "bool prefill_order_invariant(")),
+        "MINIMAX_FLASH_DECLINE": block(mm_defaults, mm_defaults.index("const char* msa_flash_decline_reason(")),
         "IU4_RESOLVER": block(iu4, iu4.index("bool prefill_iu4() {")),
         "MINIMAX_LEVERS": block(minimax, minimax.index("    void route_levers() const {")),
         "QWEN_LEVERS": block(qwen, qwen_start),

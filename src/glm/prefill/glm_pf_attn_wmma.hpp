@@ -15,6 +15,7 @@
 #include <stdexcept>
 
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "strix/env_flags.hpp"
 
 namespace strix::glm::pf::attn_wmma {
 inline bool enabled() {
@@ -30,5 +31,10 @@ inline unsigned block_keys() {
     if (std::strcmp(p, "32") == 0) return 32U;
     throw std::invalid_argument("STRIX_GLM_PF_ATTN_WMMA_T must be 16 or 32");
 }
+// q-tilde as a bf16 image (default; STRIX_GLM_PF_MLA_QT16=0 restores FP32 q-tilde): the absorb GEMM (v3) keeps its FP32
+// chains and stores tile::to_bf16 of each result, which is what the fused core made of the FP32 value; the core reads
+// those operand bits directly (attn_core query_op hook). Same bits, half the q-tilde bytes (written + read): 268 MB
+// less per 4096-row launch. Scheduling only, so not part of the startup agreement.
+inline bool qt16() { return envcfg::flag("STRIX_GLM_PF_MLA_QT16", true); }
 inline std::atomic<std::uint64_t> calls{0};  // fused-core launches (identity witness)
 }  // namespace strix::glm::pf::attn_wmma

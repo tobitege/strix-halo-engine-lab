@@ -110,7 +110,15 @@ feed-forward hyperconnection mix instead of the attention mix, and the sequence 
 layer N stays with stage A in the handoff. Logits and the tokens generated after the handoff
 are bitwise equal to the whole-layer cuts. Measured at 32K: 22.5: 11.82/11.85 s, 23:
 11.61-11.69 s, 23.5: 11.84 s, 22: 12.08 s, so the default stays 23; the half step is for
-prompts and models whose layer costs put the balance point inside a layer. A costs file
+prompts and models whose layer costs put the balance point inside a layer. Since the length
+chunk policy and the faster QSA kernels the half cut 23.5 wins below 64K and loses at 128K
+(stage B holds 7 of the 12 QSA layers; the attention block it hands over, ~0.3 s at 32K and
+~1.65 s at 128K, is smaller than the stage gap below 64K and larger at 128K), so without an
+explicit cut or a costs file `qwen.pair_half_cut` (`STRIX_QWEN_PAIR_HALF_CUT`, auto: on below
+65,537 context tokens; `0` keeps 23, `1` forces 23.5) picks it per prompt (`cut-source=
+measured-default-half`). Measured exact / FAST ms, 23 vs 23.5: 8K 3,320 / 3,051 vs 3,285 / 3,003;
+32K 11,176 / 10,111 vs 11,105 / 10,023; 64K 21,604 / 19,634 vs 21,512 / 19,369; 128K 42,489 /
+38,123 vs 42,714 / 38,404; logits identical. A costs file
 (`STRIX_QWEN_PF_PIPE_COSTS`) may add an `attention` object next to `layers` (per-layer cost
 of the attention sub-block, same units); only then does the cost model also offer half-layer
 cuts. The cut type and the half-layer balance are shared code (`strix/pair/pipe.hpp`,
@@ -168,3 +176,24 @@ chooser, the `--rank/--peer/--transport` handling with the link setup, and the p
 `include/strix/pair/` (`pipe.hpp`, `balance.hpp`, `link.hpp`, `regime.hpp`) and `src/xport/hip_pipe_staging.hpp`.
 Qwen binds them with its seam-header validator; the Nemotron (gemma4) pair route (`STRIX_G4_PAIR=1`, see the model
 README) uses the same modules with its own seam layout.
+
+`regime.hpp` also carries an unbound host planning API; there is no stage-pipe executor or
+MiniMax, GLM or DeepSeek layout adapter bound to it yet. `interleaved_wall_ms` simulates C chunks x 2v
+virtual stages (stage s on rank s % 2, depth-first per rank, one FIFO link per direction) and equals the two-stage
+rule at v = 1; `choose_pipeline(..., virtual_stages, legal_v, LayoutDecl)` keeps a split-weight (tensor) pair on its
+resident route when the whole stage layers do not fit next to the decode layout, and otherwise pipelines only when
+it beats the alternative (tensor route or one node) by `min_gain` (3 %, run noise). `effective_line` prints
+`pair.pipeline mode=.. chunk=.. virtual=.. candidate_pipeline_ms=.. alt_ms=.. reason=..`.
+The candidate estimate is printed even when rejected in favor of single/tensor mode. Simulation
+rejects invalid shapes and caps storage/work at 1,048,576 stage/chunk events before allocating.
+Host analytical equality and route tests do not establish device token/logit/state equality.
+Changed tiles, tails, profiles and cuts still require native qualification; alternate cuts and
+layer-only cost files use the fixed cut-23 calibration without incorporating stage imbalance,
+so their performance crossover remains unqualified.
+
+For Qwen, `--baseline` or `STRIX_BASELINE=1` disables both automatic pair defaults
+(chunk policy and single-node tiles). Explicit pair lever switches retain precedence.
+`stage_map.hpp` holds the interleaved seam: `StageMap` (2v stages, stage s on rank s % 2, text `0,12,24,36,48`),
+`balance_map` (whole-layer cuts minimising the slowest stage) and `StagePipes` (one two-slot pipe per direction, each on
+its own ordered transport; execution order = groups of at most 4 chunks, depth-first inside a group, so both
+directions stay live with two slots). Wire v4 (`[43]` boundary, `[44]` map FNV) only when v > 1; v = 1 stays wire v3.

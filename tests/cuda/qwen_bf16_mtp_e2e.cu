@@ -1,7 +1,7 @@
 // Actual production proposer + FAST target diagnostic. No qualification claim.
 // MODEL SIDECAR TABLES ROPE PROMPT_IDS N G CAP NEW_OUTPUT ARM
 // ARM real | correct | early | late | reject | zero | partial | stop | budget
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

@@ -43,6 +43,9 @@ inline constexpr std::array yarn_environment_rules{
     YarnEnvironmentRule{"HIP_ENABLE_DEFERRED_LOADING", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_PROJ_WMMA", YarnEnvironmentClass::nonrotary, ""},
     YarnEnvironmentRule{"STRIX_PREFILL_INDEX_SCORE_WMMA", YarnEnvironmentClass::nonrotary, ""},
+    // Candidate ON paths have not been audited for YaRN; OFF preserves existing arithmetic.
+    YarnEnvironmentRule{"STRIX_PREFILL_PLE_ROWS_F16", YarnEnvironmentClass::off_switch, "0"},
+    YarnEnvironmentRule{"STRIX_PREFILL_GDN_GATES_F16", YarnEnvironmentClass::off_switch, "0"},
     // STRIX_QWEN_ALLON (include/strix/qwen_allon.hpp) only fills the per-lever variables that are still unset, before
     // main; it has no execution effect of its own. Each variable it exports is classified by its own row, so a lever
     // this table refuses is named in the refusal instead of the profile switch.
@@ -51,6 +54,7 @@ inline constexpr std::array yarn_environment_rules{
     // Q4_K routed MoE direct-B fragments (STRIX_QPF2K_MOE_DIRECT_B): prepared planes from the mapped file and a different B-operand read (src/hip_moe_direct_b.inc);
     // routed experts hold no rotary work. Its route policy admits plain YaRN prefill only (apps/qwen_moe_direct_b.hpp), never the MTP verifier windows.
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_DIRECT_B", YarnEnvironmentClass::nonrotary, "0|1"},
+    YarnEnvironmentRule{"STRIX_QPF2K_GLU_PAIR", YarnEnvironmentClass::nonrotary, "0|1|2"},
     // OFF arms of levers this route does not admit, so a leave-one-out arm of the composition profile (STRIX_QWEN_ALLON=1 STRIX_X=0) is not itself refused.
     // STRIX_PREFILL_MOE_ROUTE_I8: FAST storage that needs the BF16 route; not qualified for YaRN.
     // STRIX_QPF2K_QSA_UNION_CAP: FAST pruning of the selected set (changes attention). STRIX_QPF2K_QSA_UNION_STATS: device-side counters not audited for YaRN.
@@ -69,6 +73,9 @@ inline constexpr std::array yarn_environment_rules{
     // (src/hip_qsa_fast_prefill_kv_pair.inc, src/hip_indexed_attention_launcher.hip:6087). It reads keys and queries that the table-bound norm/RoPE
     // launches already rotated (the rotary sites of the QSA group are listed in yarn_environment_path); the attend files carry no rotary token.
     YarnEnvironmentRule{"STRIX_QSA_FAST_KV_PAIR", YarnEnvironmentClass::nonrotary, "0|1"},
+    // One softmax per wave pair in the occ attend (STRIX_QSA_ATTEND_SHARED_SOFTMAX, src/attn_core/selected_flash_prefill.hpp): it reads the same
+    // rotated keys and queries as the default attend and changes no value (bitwise); no rotary token.
+    YarnEnvironmentRule{"STRIX_QSA_ATTEND_SHARED_SOFTMAX", YarnEnvironmentClass::nonrotary, "0|1"},
     // MoE 64x64 register tile (STRIX_QPF2K_MOE_TILE64, its own arm: declined while the tier split is active, src/hip_moe_prefill_tile64.inc:332);
     // routed experts hold no rotary work.
     YarnEnvironmentRule{"STRIX_QPF2K_MOE_TILE64", YarnEnvironmentClass::nonrotary, "0|1"},
@@ -199,10 +206,16 @@ inline constexpr std::array yarn_environment_rules{
     // WMMA_PIN, HC_UPCOPY and ROUTER_SELECT reorganize the MoE merge, dense WMMA registers, HC up-weight
     // reads and router selection.
     YarnEnvironmentRule{"STRIX_QSA_UNION_MERGE", YarnEnvironmentClass::off_switch, "0|1"},
+    // Changes only index scoring/selection over already-rotated Q/K; exact selected set.
+    YarnEnvironmentRule{"STRIX_QSA_INDEX_BAND", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QSA_SCORE_ROWS64", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFILL_MOE_MERGE_VEC", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QPF2K_WMMA_PIN", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QPF2K_HC_UPCOPY", YarnEnvironmentClass::off_switch, "0|1"},
+    // HC_LOW32=1 keeps the FP32 low tail store an out16 projection skips by default (no reader; same bits either way);
+    // HC_LOW32_POISON=1 fills that tail with NaN after the projection (census seam: the final hash must not move).
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_LOW32", YarnEnvironmentClass::off_switch, "0|1"},
+    YarnEnvironmentRule{"STRIX_QPF2K_HC_LOW32_POISON", YarnEnvironmentClass::diagnostic, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFILL_ROUTER_SELECT", YarnEnvironmentClass::off_switch, "0|1"},
     // Unset is stage mode 2 and "1" a different split, so only the OFF arm is classified.
     YarnEnvironmentRule{"STRIX_ROUTER_STAGE_ACT", YarnEnvironmentClass::off_switch, "0"},

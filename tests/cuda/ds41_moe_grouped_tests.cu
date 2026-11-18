@@ -7,9 +7,9 @@
 // at the smaller row counts. With STRIX_DS41_EXPERTS_GGUF: the real layers (STRIX_DS41_LAYERS, default "2,20"),
 // all 384 experts resident (~4 GB), routed by STRIX_DS41_ROUTES (p8-routes format) where given.
 
-#include "strix/cuda_ds41_common.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_moe.hpp"
+#include "strix/cuda/ds41_common.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_moe.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/gguf_reader.hpp"

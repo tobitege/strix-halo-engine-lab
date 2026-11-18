@@ -218,7 +218,7 @@ The drafter is a versioned model asset, resolved beside the model:
 
 Copy [the distill-g recipe](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json) to
 `MODEL.gguf.mtp-bundle.json`; the same file serves the native and the YaRN route. `--mtp-bundle FILE` names
-another bundle. The distill-g sidecar is not downloaded by the fetcher: it is the distilled draft registered in
+another bundle. The distill-g sidecar is published at [hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-MTP-distillG-Q8_0) and the Qwen fetch recipe downloads and verifies it. It is the distilled draft registered in
 `include/strix/mtp_draft_profiles.hpp` (round 2 of the draft distillation, see
 [draft profiles](decode-defaults.md#draft-profiles-includestrixmtp_draft_profileshpp)); the base draft published with
 the model is a different file and must not be renamed.

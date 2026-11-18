@@ -1,5 +1,6 @@
 // CPU-only client exercising the production sender against the actual receiver.
-#include "glm/rtxpf/producer/sender.hpp"
+#include "cuda/models/glm/producer/sender.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 using namespace strix::glm::rtxpf::producer;
@@ -7,7 +8,10 @@ int main(int argc,char** argv){try{
     wire::require(argc==6||argc==7,"sender ENDPOINT KEY PROMPT_SHA MODEL_SHA CASE [RANK]");SocketRuntime runtime;
     wire::Begin b;b.rank=0;b.layers=46;b.frontier=5;b.total=6;b.node="r1";b.producer="glm-pf-rtx-native-v1";b.prompt=wire::unhex(argv[3]);b.model=wire::unhex(argv[4]);b.transaction=wire::unhex(std::string(64,'3'));
     if(argc==7)b.rank=unsigned(std::stoul(argv[6]));
-    if(const char* v=std::getenv("GLM_TEST_WIRE_VERSION"))b.version=unsigned(std::stoul(v)); // 2 = DSA once
+    if(const char* v=std::getenv("GLM_TEST_WIRE_VERSION"))b.version=unsigned(std::stoul(v)); // 2 = DSA once, 3/4 = index tail
+    // Wire timing at a real frontier (kit scripts/bench/handoff/glm_wire_versions.sh): P rows, prompt N = P + 1.
+    if(const char* p=std::getenv("GLM_TEST_FRONTIER")){b.frontier=std::stoull(p);b.total=b.frontier+1;}
+    const auto t0=std::chrono::steady_clock::now();
     Sender sender(argv[1],wire::read_key(argv[2]),b);std::string mode=argv[5];
     if(mode=="abort"){sender.abort();return 0;}
     // Raw packets past the sender's own checks: a DSA frame (layer 3, id 2) as the first frame, or a commit before any frame.
@@ -24,5 +28,6 @@ int main(int argc,char** argv){try{
         }
         sender.frame(c.layer,c.id,payload);
     }
-    sender.commit();std::cout<<"LOCALLY_SEALED raw="<<sender.raw_bytes()<<" wire="<<sender.wire_bytes()<<"\n";return 0;
+    sender.commit();const double sec=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+    std::cout<<"LOCALLY_SEALED raw="<<sender.raw_bytes()<<" wire="<<sender.wire_bytes()<<" version="<<b.version<<" rank="<<b.rank<<" frontier="<<b.frontier<<" seconds="<<sec<<"\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

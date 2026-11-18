@@ -45,6 +45,8 @@
 {"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
 // src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
+// src/minimax/engine/engine.hip: dense_mlp; mm_defaults.cpp: pf_dense_mlp; apps/minimax_rank_main.cpp: ab_flag
+{"prefill-dense-mlp", 'a', "STRIX_MM_PF_DENSE_MLP default ON, baseline/OFF=0; layers 0-2, 4096 rows, supported raw weights+workspace; fixed WMMA chain and ordered split finish", "hip_mmx_moe_bench.hip test_dense_mlp_chain bitwise intermediates/output; --ab pfdensemlp state/final rows plus every A=0/B>0 candidate-call coverage; minimax_ab_qualify_host rejects fallback/stale/contaminated/partial coverage; minimax_route_identity_tests.cpp default/baseline/override checks (host checks are not native qualification)", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
 // src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
@@ -83,7 +85,7 @@
 {"rtx-tile", 'a', "F32 identity version+matrix+input order", "fp32_identity_device.inc f32_core_body; hip-mm-fp32id-tests; mm_fp32_identity_tests.cu", ""},
 // src/minimax/rtxpf/fp32_identity.hpp: resolve_core_version; cuda/fp32_identity.cu
 {"rtx-core", 'a', "FP32 identity+matrix+input order; v3/v3.1 decode", "mm_fp32_identity_tests.cu default/env/explicit and all 65536 mul1 states vs host; full-model gate at 1K/8K code prompts, both ranks", ""},
-// src/minimax/rtxpf/cuda/mm_rtx_prefill_main.cu:635
+// src/cuda/models/minimax/mm_rtx_prefill_main.cu:635
 {"io-cache", 'a', "model tensor content+dtype+rank slices", "weight loader sizes/format validation; actual dependency notices preserved", ""},
 // src/minimax/dspark/hip_minimax_dspark.hip:755
 {"draft-native-linears", 'a', "drafter model dtype+matrix+reduction contract", "hip_minimax_dspark_tests.hip linears/attention bitwise gates; mm_defaults.cpp draft linears contract", ""},
@@ -107,6 +109,8 @@
 {"model-layout", 'b', "model tensor hashes+TP2 partition+rank order", "G3/G4 model gates; pack validation; F32 model fidelity remains draft pending all gates", ""},
 // src/minimax/moe/mmx_prefill.hip:476
 {"prefill-routed-split", 'c', "BLOCKED until matrix+arithmetic-version fixed S (no expert occupancy)", "UNCOVERED: known failed identity; existing core/mtfit receipts hold S fixed", "L3 routed gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
+// src/minimax/moe/mmx_prefill.hip: prefill_moe_order (STRIX_MMX_PF_ORDER: invariant is the pf_order table default; adaptive = off switch / baseline; a defaulted invariant whose route is unmet declines to adaptive at startup with a printed reason, an explicit one is rejected)
+{"prefill-moe-order-invariant", 'b', "named identity mmx-pf-linear-s1-v1 (MoE part mmx-pf-moe-s1-v1): routed+shared gate/up/down fixed S=1 (moe_core::kGroupedSingleChainContract), no expert occupancy; prefill-only dense q/k/v/o core::fixed_linear_contract S=1 (v4 core wherever strix_gemm's split differs); startup requires resident supported weights and workspace, mandatory routes reject fallback; cache field prefill_order", "chunk_order_contract_tests.cpp host order reference + chunk 256/1024/4096/whole and 1..17 tails; pr665_host engine startup/resource/decode/route regressions; hip-mmx-moe-bench --test chunk-invariance device bytes; differs from adaptive for experts < 97 rows", ""},
 // src/minimax/moe/mmx_prefill.hip:477
 {"prefill-shared-split", 'c', "BLOCKED until shared matrix+arithmetic-version fixed S", "UNCOVERED: known failed max_rows identity", "L3 shared gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
 // src/minimax/engine/engine.hip:227
@@ -119,7 +123,7 @@
 {"draft-append", 'c', "BLOCKED until draft append absolute-position plan fixed or pin vector per row", "UNCOVERED append32 vs8 intermediate/cache byte identity", "draft append FC GEMM32 vs GEMV8, then K/V projected context (first library core op opaque)"},
 // src/minimax/moe/mmx_prefill.hip:881
 {"diagnostic-cores", 'c', "BLOCKED in production; diagnostic-only plan", "UNCOVERED for production by design; expected-wrong-output timing APIs", "first skipped A/weight load or attention compute in diagnostic producer"},
-// src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:601
+// src/cuda/models/minimax/mm_rtx_kernels.cu:601
 {"rtx-attention", 'c', "BLOCKED handoff until MSA cache/output bytes match exact producer plan", "UNCOVERED full native/CUDA MSA model fidelity for all positions/cuts", "RTX MSA index score or attention QK/PV legacy vs shared (first op needs CUDA byte gate)"},
 // src/minimax/engine/engine.hip: park_task / resume_parked; src/minimax/serve/minimax_lead.hpp: nested_candidate
 {"prefill-nest", 'a', "model+profile+original ordered chunk/group rows+positions+slot generation; sequential bank ownership", "GPU covered on both ranks, check-only resume-check: 512-token child in 7-layer units with 4608-token parent parked at layers 7/31 beside a decoder, 10/10 IDENTICAL; whole 511-token child with parent parked at layer 17, 6/6 IDENTICAL; complete 128-token continuations, all prompt outputs, committed state, first/continuation logits, frozen groups and standalone B1/mixed decode; HTTP token IDs identical policy ON/OFF; timing evidence in serving documentation", ""},
@@ -149,8 +153,21 @@
 {"decode-xport-row-fold", 'a', "STRIX_MMX_FOLD=rows fold slots on the exchange module (default 0 = off)+rows <= slots; the pair sum p0 + p1 moves from the consumer kernel to the channel's progress thread, one IEEE binary32 addition per element", "row_fold.hpp sum_f32 contract (one addition, no contraction); rank --ab xbfold matched replay; UNCOVERED native decode-logit receipt in this census", ""},
 // src/minimax/engine/engine.hip: pf_msa_flash / pf_msa_flash_layers; src/minimax/attn/msa_flash_policy.hpp
 {"prefill-msa-flash", 'b', "STRIX_MM_PF_MSA_FLASH=1|2 (default 0 = off)+STRIX_MM_PF_MSA_FLASH_LAYERS; prefill MSA windows > 8 rows on the BF16 WMMA key-split form", "FAST, lossy, opt-in: a different identity from the exact prefill, never selected by default; msa_fused_tests.hip STRIX_MSA_TEST_FLASH arm; UNCOVERED engine-level quality gate", ""},
+// src/minimax/engine/engine.hip: enqueue_post (STRIX_MM_PF_ROUTER_WMMA=1 -> enqueue_router_wmma on the layers of its set)
+{"prefill-router-wmma", 'b', "STRIX_MM_PF_ROUTER_WMMA=1 (default 0 = off)+STRIX_MM_PF_ROUTER_WMMA_LAYERS; router product on the FP16 WMMA core (FP16 y and weights, FP32 accumulation), non-finite rows on the exact tiled chain; same sigmoid, bias and top-4 scan", "FAST, lossy, opt-in: a different identity from the exact prefill, never selected by default; hip_mm_router_wmma_tests.hip forms bytes + overflow rows == tiled bits; UNCOVERED engine-level quality gate", ""},
 // src/minimax/engine/engine.hip: pf_moe_group (strix/pair/prefill_group.hpp moe_width)
 {"prefill-moe-group", 'a', "STRIX_MM_PF_MOE_GROUP (0 = automatic, 1 = one call per chunk)+group members+start-up buffer cap; chunks per group-wide EXL3 MoE call", "per-row arithmetic independent of the call width (same kernels, row-local chains); UNCOVERED native width-vs-width prefill state receipt in this census", ""},
 // src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
 // boolean is read once per call and passed to the shared plan policy.
 {"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},
+
+// Reviewed selectors added since the previous source receipts. Host checks do not qualify native identity.
+{"prefill-pipe-tail", 'a', "STRIX_MMX_PREFILL_PIPE_TAIL: resolver default 1, baseline 0; 1 = MT1..7, even masks 2..510; mtfit required", "test_prefill_pipe_tail partial/output bytes; config_receipts and refreshed_selector_proofs; MT8 mask is diagnostic only", ""},
+{"prefill-pipe-n16", 'a', "STRIX_MMX_PREFILL_PIPE_N16=0|1|auto, raw default 0; under PIPE, auto only without paired bands; same splits and per-row chain", "test_prefill_pipe_tail device-plan N16 arms; refreshed_selector_proofs source admission contract; no new native qualification", ""},
+{"prefill-msa-flash-l30", 'b', "STRIX_MM_PF_MSA_FLASH=1, STRIX_MM_PF_MSA_FLASH_LAYERS=30-59: msa-flash-bf16-l30-v1; bundle remains l40", "minimax_defaults_tests test_fast_prefill_profile; refreshed_selector_proofs; lossy opt-in, 8K quality gate only, 32K failed", ""},
+{"serve-conversation", 'b', "STRIX_MM_SERVE_CONVERSATION exactly 1, default OFF; both prefix and conversation votes; unaligned reply frontier plus original prompt int4 regime", "minimax_lead_tests conversation vote/replay tests; session runtime resident claim tests; refreshed_selector_proofs; distinct from cold prefill", ""},
+{"serve-token-memo", 'a', "STRIX_SERVE_TOKEN_MEMO default ON; STRIX_SERVE_TOKEN_MEMO_MB=64 (1..4096), STRIX_SERVE_TOKEN_MEMO_ENTRIES=32 (1..1024); marked tokenizer tail restart", "token_memo_tests and minimax_tokenizer_tests marked encode equality; refreshed_selector_proofs wiring", ""},
+{"route-receipt", 'a', "STRIX_ROUTE_RECEIPT=0 disables counters/printing only; peer numerical-route and FAST profile agreement remain required", "route_receipt_tests; minimax_defaults_tests peer profile agreement; refreshed_selector_proofs rank/serve wiring", ""},
+{"serve-cycle-pack", 'a', "STRIX_SERVE_CYCLE_PACK default OFF, restart-cached experimental shared declaration; identical status records and checks", "cycle_pack_tests host ownership/failure contracts; refreshed_selector_proofs declaration; native qualification remains pending", ""},
+// include/strix/pinned_host.hpp; src/minimax/pfx/pf_exchange.hip; src/dist_communicator.cpp
+{"host-anon-pin", 'a', "STRIX_HOST_ANON_PIN=0/1; automatic integrated GPU only; cached at startup; >=2 MiB anonymous locked long-term-pinned mapped buffers, small/refused pin falls back to hipHostMalloc; matching release; no arithmetic change", "minimax_route_identity_tests.cpp host_pin_selector automatic/override/invalid source contracts; source audit edit/removal negatives; UNCOVERED native pair complete token/logit/state equality under pin success, refusal and OFF", ""},

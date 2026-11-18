@@ -1,0 +1,42 @@
+schema = "strix-model/v1"
+name = "qwen3.8-27b"
+
+# Descriptive assertions only (dense hybrid GDN + gated full attention, Qwen3_5ForConditionalGeneration text model).
+# The qwen35 family (include/strix/qwen35/config.hpp) owns the GGUF contract; see docs/models/qwen3.8-27b/README.md.
+[graph]
+adapter = "qwen35-dense-v1"
+attention_pattern = "gdn,gdn,gdn,attn"
+ffn_pattern = "dense:0-63"
+
+[dims]
+hidden = 5120
+layers = 64
+vocab = 248320
+intermediate = 17408
+
+[attention]
+kind = "gdn+gated-attn"
+
+[attention.gdn]
+key_heads = 16
+value_heads = 48
+head_dim = 128
+conv_kernel = 4
+value_head_order = "tiled"
+
+[attention.full]
+heads = 24
+kv_heads = 4
+head_dim = 256
+rope_dim = 64
+rope_theta = 1e7
+output_gate = "sigmoid"
+
+[extras.mtp]
+layer = 64
+heads = 1
+
+[arithmetic]
+rms_eps = 1e-6
+l2_eps = 1e-6
+norm_gain = "1+w"

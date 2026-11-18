@@ -3,6 +3,7 @@
 // Nothing here waits unless asked to (wait / drain), and nothing uses the legacy stream, so weight copies never
 // order themselves against the engine's kernels.
 #include "weight_load_queue.hpp"
+#include "strix/pinned_host.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -34,14 +35,16 @@ public:
     std::uint8_t* allocate(std::uint64_t bytes) override {
         bind();
         void* p = nullptr;
-        ok(hipHostMalloc(&p, static_cast<std::size_t>(bytes), hipHostMallocDefault), "pinned staging");
+        // Shared host allocator (STRIX_HOST_ANON_PIN): staging pages out of compaction / reclaim while the load's
+        // device allocations drive both (rank load under a full page cache: hundreds of queue evictions).
+        ok(strix::host_pin::allocate(&p, static_cast<std::size_t>(bytes), hipHostMallocDefault), "pinned staging");
         std::lock_guard<std::mutex> lock(m_);
         pinned_ += bytes;
         peak_pinned_ = std::max(peak_pinned_, pinned_);
         return static_cast<std::uint8_t*>(p);
     }
     void release(std::uint8_t* staging, std::uint64_t bytes) noexcept override {
-        (void)hipHostFree(staging);
+        (void)strix::host_pin::release(staging);
         std::lock_guard<std::mutex> lock(m_);
         pinned_ -= bytes;
     }

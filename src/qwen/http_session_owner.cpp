@@ -72,7 +72,8 @@ serve::SessionHooks HttpSessionOwner::owner_hooks() {
 HttpSessionOwner::HttpSessionOwner(serve::GenerationQueue& q, std::uint64_t context,
     std::uint32_t capacity, Native native)
     : queue_(q), context_(context), native_(std::move(native)), engine_(context, capacity),
-      leases_(capacity, 1, logical_hooks()), runtime_(q, engine_, leases_, no_retention(), owner_hooks()) {
+      leases_(capacity, 1, logical_hooks()), runtime_(q, engine_, leases_, no_retention(), owner_hooks()),
+      protection_(serve::queued_prefix_protection_policy_from_env(), native_.queue_protection) {
     if (!native_.add_slot || !native_.has_free_slot || !native_.active || !native_.submit ||
         !native_.service_admission || !native_.step || !native_.fail_requests || !native_.abandon)
         throw std::invalid_argument("Qwen owner requires the native runner binding");
@@ -125,18 +126,22 @@ void HttpSessionOwner::named(serve::SessionLease lease) {
 void HttpSessionOwner::admit(const Submit& submit) {
     const auto* reserved = runtime_.reservation();
     if (!reserved) throw std::logic_error("Qwen admission without owner reservation");
+    // The reference taken while this job waited; held until its restore lookup has run (first output or end).
+    // Empty when the protection is off, missed, or the job is refused below (the reference is dropped then).
+    auto hold = std::make_shared<serve::RestoreHold>(protection_.take(reserved->ticket));
     if (reserved->job.prompt.empty() || reserved->job.prompt.size() >= context_) {
         runtime_.refuse({}, "prompt is empty or fills the context"); return;
     }
     auto lease = runtime_.activate(0, true);
     if (!lease.taken.job.session_id.empty()) { named(lease); return; }
     Callbacks callbacks;
-    callbacks.tokens = [this, h=lease.state](auto ids) { return runtime_.publish(h, ids, true, true); };
+    callbacks.tokens = [this, h=lease.state, hold](auto ids) { hold->release(); return runtime_.publish(h, ids, true, true); };
     callbacks.progress = [this, h=lease.state](auto p) { runtime_.publish_progress(h, p); };
     callbacks.cancelled = [this, h=lease.state] {
         return runtime_.ticket_cancelled(h) || (native_.stop_requested && native_.stop_requested());
     };
-    callbacks.finish = [this, h=lease.state](auto stats, auto error) {
+    callbacks.finish = [this, h=lease.state, hold](auto stats, auto error) {
+        hold->release();
         runtime_.complete_native(h, std::move(stats), std::move(error));
     };
     callbacks.before_submit = [this] {
@@ -152,6 +157,8 @@ void HttpSessionOwner::pump(const Submit& prepare, const std::function<bool()>& 
     // successful arrivals are bounded by free physical slots. Bound refusing
     // candidates too, so a producer continuously replacing refused requests
     // cannot monopolize a parked native service boundary.
+    // Bounded: protect the states the still-waiting prompts will restore before this turn captures more.
+    protection_.scan(queue_);
     auto remaining = queue_.snapshot().queued;
     const auto slots = engine_.caps().max_slots;
     remaining = remaining > UINT64_MAX - slots ? UINT64_MAX : remaining + slots;
@@ -164,6 +171,8 @@ void HttpSessionOwner::pump(const Submit& prepare, const std::function<bool()>& 
     }
 }
 void HttpSessionOwner::turn() {
+    // Protect/release waiting states even when native nested admission is disabled.
+    protection_.scan(queue_);
     // One candidate per common-owner turn. Preserve the two native growth
     // points across these bounded turns; yielding never adds native calls.
     if (turn_ == Turn::growth) {
@@ -174,6 +183,7 @@ void HttpSessionOwner::turn() {
         if (native_.has_free_slot() && !(runtime_.reservation() && native_.active())) {
             if (!runtime_.reserve_fifo() && !native_.active() && !queue_.stopping()) {
                 runtime_.wait_for(std::chrono::seconds(1), true);
+                protection_.scan(queue_);
                 (void)runtime_.reserve_fifo();
             }
             if (runtime_.reservation() && (runtime_.reservation()->job.session_id.empty() || !native_.active())) {

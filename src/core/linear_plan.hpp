@@ -19,6 +19,11 @@ struct LinearContract {
     int boundary(int s) const { return int(int64_t(k16) * s / splits); }
     static constexpr unsigned reduction_order = 1; // ascending partitions
 };
+// Rows-free contract: the K chain depends only on the matrix (input width) and a bound split count. Chunk-invariant by
+// construction; the rows-dependent linear_contract below stays the frozen v1 identity for engines that bind it.
+inline LinearContract fixed_linear_contract(int input, int splits) {
+    return {input / 16, std::max(1, std::min(splits, input / 16)), 2U, 1U};
+}
 template<class W> LinearContract linear_contract(const W& w, int rows) {
     int requested = 1;
     if (rows > 8) {

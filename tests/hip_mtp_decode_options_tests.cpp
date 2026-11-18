@@ -342,6 +342,38 @@ void campaign_defaults_contract(){
         "(--known-prefix-tail-rows including it, below --known-prefix-prefill-rows)","explicit tails must include the wide rows");
     auto with_tail=wide32;with_tail.insert(with_tail.end(),{"--known-prefix-tail-rows","128,32"});
     require(parse(with_tail).known_prefix_tail_rows==std::vector<std::uint32_t>{128U,32U},"explicit tails including 32 are kept");
+    // One resolver: the same request through the CLI route and the --http-batch route resolves the same wide setting
+    // (explained difference only: STRIX_MTP_SERVE_WIDE=0 forces the serve route off).
+    {
+        auto cli_args=both;for(auto& value:cli_args)if(value=="--mtp-ngram-draft=copy")value="--mtp-ngram-draft=wide";
+        const auto cli=parse(cli_args);
+        const auto cli_rows=mtp_wide_copy_rows_effective(cli);
+        require(cli_rows==std::vector<std::uint32_t>{32U,16U},"the CLI route resolves the listed wide sizes");
+        auto serve=cli;serve.http_serve=true;serve.http_batch_explicit=true;serve.http_batch_cap=4U;
+        serve.mtp.window_prefix=true;serve.mtp.draft_chain=true;serve.mtp.window_rows_set={2U,4U,8U};
+        resolve_http_route(serve);
+        require(serve.http_batch==4U && serve.http_slot_reason.find("copy-wide")==std::string::npos,
+            "--http-batch admits the wide copy route");
+        require(mtp_wide_copy_rows_effective(serve)==cli_rows,"the serve route resolves the CLI's wide sizes");
+        require(mtp_wide_copy_rows_effective(serve,false).empty() && mtp_wide_copy_rows_effective(cli,false)==cli_rows,
+            "only STRIX_MTP_SERVE_WIDE=0 differs, and only on the serve route");
+        // tail sizes added only for the wide cycle never tile prompts under a split prefill profile (prompt cut as without the flags)
+        require(!cli.known_prefix_wide_only_tail_rows.empty(),"wide-only tail exclusion is exercised");
+        for(const auto rows:cli.known_prefix_wide_only_tail_rows)
+            require(!known_prefix_tail_tiles_prompts(cli,rows,true) && known_prefix_tail_tiles_prompts(cli,rows,false),
+                "a wide-only tail size stays out of split-profile prompt tiling");
+        for(const auto rows:cli.known_prefix_tail_rows)
+            if(std::find(cli.known_prefix_wide_only_tail_rows.begin(),cli.known_prefix_wide_only_tail_rows.end(),rows)==
+               cli.known_prefix_wide_only_tail_rows.end())
+                require(known_prefix_tail_tiles_prompts(cli,rows,true),"a requested tail size still tiles prompts");
+        {   // the real command line: --http-serve --http-batch with the wide flags parses (tails resolved with the prefill)
+            auto line=cli_args;line.insert(line.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
+            const auto served=parse(line);
+            require(served.http_batch==2U && mtp_wide_copy_rows_effective(served)==cli_rows,"--http-batch parses with the wide flags");
+        }
+        auto plain_serve=parse(wide);plain_serve.http_serve=true;
+        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"without the flags the serve route stays off");
+    }
 }
 
 int main(){try{
@@ -507,8 +539,39 @@ int main(){try{
     auto selected=parse(wide);selected.context_tokens=8192;
     bool failed=false;try{strix::decode_cli::validate_resolved_mtp_cli(selected);}catch(const std::invalid_argument&){failed=true;}
     require(failed,"MTP target windows cannot silently enable D1 or paired GDN optimizations");
+    {
+        // The refusal names exactly the flags still off, so the user can add them (issue 758 docs promise).
+        auto partial=selected;partial.deferred_moe_status=partial.virtual_q8_gdn_input=partial.prefetch_q8_gdn_input=
+            partial.virtual_q8_gdn_output=true;
+        std::string message;
+        try{strix::decode_cli::validate_resolved_mtp_cli(partial);}catch(const std::invalid_argument& e){message=e.what();}
+        require(message=="MTP target windows require resolved D1 and explicit paired wave8 GDN configuration; "
+            "missing --wave8-q8-gdn-input --wave8-q8-gdn-output","the D1/wave8 window refusal names the missing flags only");
+    }
     selected.deferred_moe_status=selected.virtual_q8_gdn_input=selected.prefetch_q8_gdn_input=selected.virtual_q8_gdn_output=
         selected.wave8_q8_gdn_input=selected.wave8_q8_gdn_output=true;
+    // Issue 758: the greedy window rows run only on the virtual Q8 LM head, which the resolved decode profile (or
+    // --virtual-q8-lm-head) supplies; a resolved route without it is refused before any model load.
+    bool head_rejected=false;
+    try{strix::decode_cli::validate_resolved_mtp_cli(selected);}catch(const std::invalid_argument& e){
+        head_rejected=std::string(e.what()).starts_with("MTP target windows require resolved --virtual-q8-lm-head");
+    }
+    require(head_rejected,"MTP target windows without the virtual Q8 LM head are refused, naming the flag");
+    // A golden dump and a fixed single-request session build no window (hip_mtp_decode_bridge.hpp allocate_window):
+    // the two window-only refusals (greedy head rows, window hyper-mix) must not reach them; the server still builds.
+    {
+        auto no_window=selected;no_window.mtp.window_hyper_mix=true;
+        no_window.mtp.golden_dump="window-free.dump";no_window.mtp.golden.clear();no_window.mtp.golden_sha256.clear();
+        require(!strix::decode_cli::mtp_builds_target_windows(no_window),"a golden dump builds no target window");
+        strix::decode_cli::validate_resolved_mtp_cli(no_window);
+        auto fixed=selected;fixed.mtp.window_hyper_mix=true;fixed.session_mtp_fixed=true;
+        require(!strix::decode_cli::mtp_builds_target_windows(fixed),"a fixed single-request session builds no target window");
+        strix::decode_cli::validate_resolved_mtp_cli(fixed);
+        fixed.http_serve=true;
+        require(strix::decode_cli::mtp_builds_target_windows(fixed),"a fixed session under the server builds its windows");
+        require(strix::decode_cli::mtp_builds_target_windows(selected),"an ordinary window request builds its windows");
+    }
+    selected.virtual_q8_lm_head=true;
     strix::decode_cli::validate_resolved_mtp_cli(selected);
     // The union is a separate opt-in target-window consumer, never an implicit
     // prerequisite-completing optimization or a known-prefix alias.
@@ -528,13 +591,14 @@ int main(){try{
             !options.q4k_a8g32_gate_up && !options.grouped_exact_q51_down && !options.q51_slot_parallel_down &&
             !options.deferred_moe_status,
             "real parser preserves explicit union budget and leaves all execution prerequisites unchanged");
-        options.context_tokens=8192;
+        options.context_tokens=8192;options.virtual_q8_lm_head=true;
         options.deferred_moe_status=options.virtual_q8_gdn_input=options.prefetch_q8_gdn_input=
             options.virtual_q8_gdn_output=options.wave8_q8_gdn_input=options.wave8_q8_gdn_output=true;
         bool missing_prerequisites=false;
         try{strix::decode_cli::validate_resolved_mtp_cli(options);}catch(const std::invalid_argument& e){
             missing_prerequisites=std::string(e.what())==
-                "MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1";
+                "MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1; "
+                "missing --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down";
         }
         require(missing_prerequisites,"resolved union rejects absent A8/grouped/slot prerequisites specifically");
         options.q4k_a8g32_gate_up=options.grouped_exact_q51_down=options.q51_slot_parallel_down=true;

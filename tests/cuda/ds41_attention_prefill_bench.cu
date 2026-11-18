@@ -3,7 +3,7 @@
 // (device ms summed over the windows). Kinds: win (window only), r2 (ratio-2 index source, plain pool), r1src (layer
 // 20: ratio 1, candidate source), r1user (ratio-1 candidate user). Users of a source's selection cost its attention.
 //   strix-cuda-ds41-attention-prefill-bench [T=8192] [reps=3]   (per window and phase the minimum over the repetitions)
-#include "strix/cuda_ds41_attention.hpp"
+#include "strix/cuda/ds41_attention.hpp"
 
 #include <array>
 #include <cstdio>

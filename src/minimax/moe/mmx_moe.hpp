@@ -126,7 +126,15 @@ struct MoeView {
     const float* controlled_weights = nullptr;
     // Optional diagnostic device counters [gate/up, down], caller-zeroed; count actual reader invocations.
     std::uint32_t* single_reader_counts = nullptr;
+    // Split-producer chunk frame (xport/split_frame.hpp; LNKS2): `out` is written as SplitLayout{rows, 6144, 3072}
+    // (columns [0, 3072) row-major first, then [3072, 6144) row-major), down + combine run twice on the two column
+    // halves (tiles 0..23, 24..47), the first publishing through pub_head, the second through pub (24 tiles each).
+    // Needs the decode overlap form and neither STRIX_MMX_MOE_PIPE (rows 2..4); see moe_split_supported(). Same sums.
+    bool split = false;
+    PublishTarget pub_head{};
 };
+// True when enqueue_moe can honour MoeView::split for this row count (STRIX_MM_XB_PUBLISH forms, no down/gate pipeline).
+bool moe_split_supported(unsigned rows);
 // Throws std::invalid_argument on unsupported shapes (bits other than 3/5 for experts/shared, rows outside 1..8).
 void enqueue_moe(const MoeView& v, hipStream_t stream);
 // Profiling only: marks[0..1] after router/shared (or prepare), after routed gate/up. Optional down_done after
@@ -157,6 +165,11 @@ struct LinearJob {
     std::uint32_t x_stride = 0;  // floats between rows
     float* y = nullptr;
     std::uint32_t y_stride = 0;
+    // Output column range [col_begin, col_begin + col_count) (multiples of 128; col_count 0 = the whole output): y then
+    // points at column col_begin (y[r * y_stride + (c - col_begin)]); the weights are read through the full-matrix
+    // trellis stride as always. Single job, linear v4 only (split-producer chunk frames); other forms throw.
+    std::uint32_t col_begin = 0;
+    std::uint32_t col_count = 0;
 };
 inline constexpr unsigned kMaxJobs = 4;
 std::size_t linear_workspace_bytes(const LinearJob* jobs, unsigned count);  // for 8 rows

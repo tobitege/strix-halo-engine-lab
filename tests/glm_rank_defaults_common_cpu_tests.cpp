@@ -374,7 +374,33 @@ void test_kv_shard_speed_contract() {
     CHECK(rejected);
 }
 
+void test_weight_only_requests() {
+    const Env absent;
+    CHECK(!rd::resolve(rd::scan({}), lookup(absent)).product);
+    const auto verify = [&](const std::vector<std::string>& args, const Env& env) {
+        const auto effective = rd::resolve(rd::scan(args), lookup(env));
+        CHECK(effective.product.has_value());
+        if (effective.product) CHECK(!effective.product->weights.honoured());
+        bool refused = false;
+        try { rd::apply_env(effective, [](const char*, const char*) {}); }
+        catch (const std::invalid_argument&) { refused = true; }
+        CHECK(refused);
+    };
+    verify({"--turbo-weights", "onfly"}, absent);
+    verify({}, {{"STRIX_TURBO_WEIGHTS", "onfly"}});
+    verify({"--turbo-weight-bits=4"}, absent);
+    verify({}, {{"STRIX_TURBO_WEIGHT_BITS", "4"}});
+    verify({"--turbo-weights-pack", "pack.bin"}, absent);
+    verify({}, {{"STRIX_TURBO_WEIGHTS_PACK", "pack.bin"}});
+    const Env inherited{{"STRIX_TURBO_WEIGHTS", "onfly"}};
+    const auto native = rd::resolve(rd::scan({"--turbo-weights", "native"}), lookup(inherited));
+    CHECK(native.product && native.product->weights.honoured());
+    const Env empty{{"STRIX_TURBO_WEIGHTS", ""}};
+    CHECK(!rd::resolve(rd::scan({}), lookup(empty)).product);
+}
+
 int main() {
+    test_weight_only_requests();
     test_kv_shard_draft();
     test_kv_shard_speed_contract();
     test_common_default_rows();

@@ -1,0 +1,158 @@
+# Generated from src/device/profiles.cpp (strix::device::catalogue_toml); do not edit by hand.
+# Peaks are dense TFLOPS / TOPS; 0 = no tensor path or not stated. `measured` lists the fields read on our
+# own devices; everything else is the vendor's public specification.
+schema = "strix-device-profiles-v1"
+
+[profiles.rtx-pro-6000-blackwell-96]
+display = "NVIDIA RTX PRO 6000 Blackwell (96 GB)"
+vendor = "nvidia"
+arch = "sm_120"
+memory_bytes = 102641958912
+memory_gbytes_ps = 1792
+peaks = { fp32 = 125, fp16 = 500, bf16 = 500, fp8 = 1000, fp4 = 2000, int8 = 1000 }
+units = 188
+unit_kind = "SM"
+pcie = { gen = 5, width = 16 }
+host_link = "pcie5x16"
+unified = false
+measured = "memory_bytes,units"
+note = "our card; memory_bytes and units read from the runtime, peaks public spec"
+
+[profiles.rtx-5090-32]
+display = "NVIDIA GeForce RTX 5090 (32 GB)"
+vendor = "nvidia"
+arch = "sm_120"
+memory_bytes = 34190917632
+memory_gbytes_ps = 1792
+peaks = { fp32 = 104.8, fp16 = 419, bf16 = 209.5, fp8 = 838, fp4 = 1676, int8 = 838 }
+units = 170
+unit_kind = "SM"
+pcie = { gen = 5, width = 16 }
+host_link = "pcie5x16"
+unified = false
+measured = ""
+note = "same SM generation as the RTX PRO 6000 with 170 of its 188 SMs: about 10 % less compute at equal memory speed"
+
+[profiles.rtx-5080-16]
+display = "NVIDIA GeForce RTX 5080 (16 GB)"
+vendor = "nvidia"
+arch = "sm_120"
+memory_bytes = 17094934528
+memory_gbytes_ps = 960
+peaks = { fp32 = 56.3, fp16 = 225.1, bf16 = 112.6, fp8 = 450.2, fp4 = 900.5, int8 = 450.2 }
+units = 84
+unit_kind = "SM"
+pcie = { gen = 5, width = 16 }
+host_link = "pcie5x16"
+unified = false
+measured = ""
+
+[profiles.rtx-4090-24]
+display = "NVIDIA GeForce RTX 4090 (24 GB)"
+vendor = "nvidia"
+arch = "sm_89"
+memory_bytes = 25757220864
+memory_gbytes_ps = 1008
+peaks = { fp32 = 82.6, fp16 = 330.3, bf16 = 165.2, fp8 = 660.6, fp4 = 0, int8 = 660.6 }
+units = 128
+unit_kind = "SM"
+pcie = { gen = 4, width = 16 }
+host_link = "pcie4x16"
+unified = false
+measured = ""
+note = "profile only (planning); no FP4 tensor path on sm_89"
+
+[profiles.strix-halo-128]
+display = "AMD Ryzen AI Max+ 395 / Radeon 8060S (128 GB)"
+vendor = "amd"
+arch = "gfx1151"
+memory_bytes = 125829120000
+memory_gbytes_ps = 256
+peaks = { fp32 = 29.7, fp16 = 59.4, bf16 = 59.4, fp8 = 0, fp4 = 0, int8 = 59.4 }
+units = 40
+unit_kind = "CU"
+pcie = { gen = 0, width = 0 }
+host_link = "integrated"
+unified = true
+measured = "memory_bytes"
+note = "our nodes; memory_bytes = GPU-visible memory as configured there (depends on the GTT setting); HIP reports 20 compute units (WGPs); measured stream read about 243 GB/s; WMMA FP16 = BF16 = IU8 rate"
+
+[profiles.dgx-spark-gb10-128]
+display = "NVIDIA DGX Spark GB10 (128 GB)"
+vendor = "nvidia"
+arch = "sm_121"
+memory_bytes = 137438953472
+memory_gbytes_ps = 273
+peaks = { fp32 = 0, fp16 = 125, bf16 = 125, fp8 = 250, fp4 = 500, int8 = 250 }
+units = 48
+unit_kind = "SM"
+pcie = { gen = 0, width = 0 }
+host_link = "nvlink-c2c"
+unified = true
+measured = ""
+note = "unified LPDDR5X shared with the CPU; usable GPU memory is lower than 128 GiB"
+
+[profiles.rx-9070-xt-16]
+display = "AMD Radeon RX 9070 XT (16 GB, RDNA4)"
+vendor = "amd"
+arch = "gfx1201"
+memory_bytes = 17179869184
+memory_gbytes_ps = 640
+peaks = { fp32 = 48.7, fp16 = 195, bf16 = 195, fp8 = 389, fp4 = 0, int8 = 389 }
+units = 64
+unit_kind = "CU"
+pcie = { gen = 5, width = 16 }
+host_link = "pcie5x16"
+unified = false
+measured = ""
+note = "RDNA4 discrete; WMMA FP8 and IU8 at 2x FP16"
+
+[profiles.custom]
+display = "custom device (every value from the declaration entry)"
+vendor = ""
+arch = ""
+memory_bytes = 0
+memory_gbytes_ps = 0
+peaks = { fp32 = 0, fp16 = 0, bf16 = 0, fp8 = 0, fp4 = 0, int8 = 0 }
+units = 0
+unit_kind = ""
+pcie = { gen = 0, width = 0 }
+host_link = ""
+unified = false
+measured = ""
+note = "set memory_gib (and optionally bandwidth_gbytes_ps, units) in the entry"
+
+# Interconnect classes for `count = N` shapes: nominal one-direction GB/s and round trip (us).
+[interconnects."pcie5x16"]
+gbytes_ps = 50
+rtt_us = 5
+[interconnects."pcie4x16"]
+gbytes_ps = 25
+rtt_us = 5
+[interconnects."pcie4x4"]
+gbytes_ps = 7
+rtt_us = 5
+[interconnects."oculink4x4"]
+gbytes_ps = 7
+rtt_us = 5
+[interconnects."pcie3x4"]
+gbytes_ps = 3.2
+rtt_us = 5
+[interconnects."usb4"]
+gbytes_ps = 4.58
+rtt_us = 30
+[interconnects."100gbe"]
+gbytes_ps = 11.5
+rtt_us = 20
+[interconnects."25gbe"]
+gbytes_ps = 2.8
+rtt_us = 60
+[interconnects."10gbe"]
+gbytes_ps = 1.1
+rtt_us = 100
+[interconnects."2.5gbe"]
+gbytes_ps = 0.29
+rtt_us = 150
+[interconnects."1gbe"]
+gbytes_ps = 0.118
+rtt_us = 200

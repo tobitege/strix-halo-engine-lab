@@ -29,8 +29,8 @@ def load(name, path):
     return module
 
 
-cache = load('cache', 'src/glm/rtxpf/producer/cache.py')
-dw = load('decode_window', 'src/glm/rtxpf/producer/decode_qualification_window.py')
+cache = load('cache', 'src/cuda/models/glm/producer/cache.py')
+dw = load('decode_window', 'src/cuda/models/glm/producer/decode_qualification_window.py')
 CHAT_ALL = len(dw.CHAT_KINDS)
 
 
@@ -1054,10 +1054,10 @@ class WindowTests(unittest.TestCase):
             dw.arguments(['--build', '.', '--model', 'M', '--prompt-dir', 'P', '--dsa-short-skip', '2'])
         # Host-only wiring check: no CUDA compilation. Both decode MTP sites carry the
         # option; ordinary prefill constructs calls without opting in.
-        runtime = (ROOT/'src/glm/rtxpf/producer/runtime.cu').read_text()
+        runtime = (ROOT/'src/cuda/models/glm/producer/runtime.cu').read_text()
         self.assertIn('v.short_skip=dopt.dsa_short_skip;', runtime)
         self.assertEqual(runtime.count('m1.dsa_short_skip=dopt.dsa_short_skip;'), 2)
-        dsa = (ROOT/'src/glm/rtxpf/dsa.cu').read_text()
+        dsa = (ROOT/'src/cuda/models/glm/dsa.cu').read_text()
         self.assertIn('d.short_skip=v.dsa_short_skip;', dsa)
         self.assertIn('dsa_short_skip_eligible(v.short_skip,v.rows,v.first)', dsa)
         self.assertIn('!v.compare_tokens&&!v.compare2_tokens&&!v.diagnostics&&!v.diagnostics2', dsa)
@@ -1399,7 +1399,7 @@ class WindowTests(unittest.TestCase):
             self.assertIn('export_dir', sent[0])
 
 
-census = load('glm_route_census', 'src/glm/rtxpf/producer/glm_route_census.py')
+census = load('glm_route_census', 'src/cuda/models/glm/producer/glm_route_census.py')
 
 
 class TileCompareTests(unittest.TestCase):

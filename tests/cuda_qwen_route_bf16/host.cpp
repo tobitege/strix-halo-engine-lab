@@ -1,4 +1,4 @@
-#include "strix/cuda_qwen_route_bf16.hpp"
+#include "strix/cuda/qwen_route_bf16.hpp"
 #include <array>
 #include <bit>
 #include <cstdio>

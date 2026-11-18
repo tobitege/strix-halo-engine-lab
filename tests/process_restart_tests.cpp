@@ -34,8 +34,8 @@ bool restarted() {
 // Returns only when the restart failed.
 int run_again(char** argv) {
     if (!strix::process_environment::set(marker, "set-before-restart", true)) return 3;
-    const auto failure = strix::process_restart::run_again(argv);
-    std::cerr << "restart failed: " << failure << '\n';
+    const int error = strix::process_restart::run_again(argv);
+    std::cerr << "restart failed: " << strix::process_restart::failure_text(error) << '\n';
     return 3;
 }
 

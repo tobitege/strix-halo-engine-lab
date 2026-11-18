@@ -11,6 +11,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include "strix/lever_cache.hpp"
+
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -132,8 +134,8 @@ void enqueue_build_routes_wide_serial(const BuildRoutesView& view, void* stream)
 }
 
 bool routes_fast_enabled() {
-    static const bool on = strix::envcfg::flag("STRIX_DS41_ROUTES_FAST", true);
-    return on;
+    static strix::lever_cache<bool> on{[] { return strix::envcfg::flag("STRIX_DS41_ROUTES_FAST", true); }};
+    return on.get();
 }
 
 void enqueue_build_routes_fast(const BuildRoutesView& view, void* stream) {

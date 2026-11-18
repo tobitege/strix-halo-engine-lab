@@ -1,4 +1,5 @@
 #include "strix/handoff.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <deque>
 #include <exception>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -42,6 +44,7 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // ---- sockets ---------------------------------------------------------------------------------------------------
 #ifdef _WIN32
 using sock_t = SOCKET;
+using sock_count_t = int;
 constexpr sock_t kBad = INVALID_SOCKET;
 void close_sock(sock_t s) { ::closesocket(s); }
 // Winsock does not wake a recv()/send() blocked on another thread on shutdown(); CancelIoEx does (the call then
@@ -61,6 +64,7 @@ void net_init() { static NetInit once; }
 int last_error() { return WSAGetLastError(); }
 #else
 using sock_t = int;
+using sock_count_t = std::size_t;
 constexpr sock_t kBad = -1;
 void close_sock(sock_t s) { ::close(s); }
 void shutdown_sock(sock_t s) { ::shutdown(s, SHUT_RDWR); }
@@ -111,17 +115,22 @@ void set_timeout(sock_t s, std::chrono::milliseconds t, bool send_side) {
 void send_all(sock_t s, const void* p, std::size_t n) {
     const char* b = static_cast<const char*>(p);
     while (n) {
-        const auto k = ::send(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
+        const auto k = ::send(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
         if (k <= 0) throw std::runtime_error("handoff: send failed (error " + std::to_string(last_error()) + ")");
         b += k;
         n -= static_cast<std::size_t>(k);
     }
 }
 
+// MSG_WAITALL: one wake-up per request instead of one per arriving segment burst. Without it a receiver at 1 GbE
+// burned ~1 core for 118 MB/s (8.5 s CPU per GB; 0.1-0.3 s per GB on loopback, where bursts are large). A timeout or a
+// cancel still returns the partial count or an error, which the loop handles as before.
+// Rollback: STRIX_HANDOFF_RECV_WAITALL=0 (recorded for --print-effective-config).
 void recv_all(sock_t s, void* p, std::size_t n) {
+    static const int flags = envcfg::flag("STRIX_HANDOFF_RECV_WAITALL", true) ? MSG_WAITALL : 0;
     char* b = static_cast<char*>(p);
     while (n) {
-        const auto k = ::recv(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), 0);
+        const auto k = ::recv(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
         if (k == 0) throw std::runtime_error("handoff: connection closed by the peer");
         if (k < 0) throw std::runtime_error("handoff: receive failed, cancelled or timed out (error " + std::to_string(last_error()) + ")");
         b += k;
@@ -510,6 +519,7 @@ struct Sender::Impl {
         Frame f;
         std::vector<bp_codec::Region> regions;
         Release release;
+        bool identity = false;  // uncoded even in a bp-v1 session
     };
     struct Output {
         Frame f;
@@ -524,6 +534,7 @@ struct Sender::Impl {
     std::deque<std::deque<Output>> outputs;  // deque: MSVC deque moves are not noexcept, a vector would copy
     bool closed = false, aborted = false, encoder_finished = false;
     std::exception_ptr error;
+    std::function<void(std::exception_ptr)> failure_notify;
     std::size_t queued_wire = 0;
     std::uint32_t next_seq = 0;
     std::uint64_t wire_total = 0, plain_total = 0, pieces = 0;
@@ -543,9 +554,10 @@ struct Sender::Impl {
 
     // First failure: latch, wake every thread, and cut the sockets so a writer blocked in send() returns too.
     void fail(std::exception_ptr e) {
+        std::function<void(std::exception_ptr)> notify;
         {
             std::lock_guard<std::mutex> g(m);
-            if (!error) error = e;
+            if (!error) { error = e; notify = failure_notify; }
             aborted = true;
             cv.notify_all();
         }
@@ -555,57 +567,118 @@ struct Sender::Impl {
             pcv.notify_all();
         }
         shutdown_all();
+        if (notify) notify(e);
+        // Workers own their in-flight pieces; queued pieces can be released now, outside m.
+        drop_queues();
+    }
+
+    // Hash + encode one piece (identity: hash only, the bytes stay the caller's). Runs on the encoder thread or, for a
+    // batch, on a pool worker (bp_codec::encode then nests its block tasks in the same pool).
+    void prepare(Input& in, Output& out) {
+        out.f = in.f;
+        std::uint64_t plain = 0;
+        for (const auto& r : in.regions) plain += r.bytes;
+        out.f.plain_bytes = plain;
+        Xxh64 h;
+        hash_descriptor(h, out.f);
+        for (const auto& r : in.regions) h.update(r.data, r.bytes);
+        out.f.hash = h.digest();
+        if (codec == Codec::bp_v1 && plain > 0 && !in.identity) {
+            out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
+            out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
+            out.f.wire_bytes = out.wire.size();
+            in.release.run();
+        } else {
+            out.f.codec = static_cast<std::uint8_t>(Codec::identity);
+            out.f.wire_bytes = plain;
+            out.regions = std::move(in.regions);
+            out.release = std::move(in.release);
+        }
+    }
+
+    std::size_t encode_reservation(const Input& in) const {
+        if (codec != Codec::bp_v1 || std::none_of(in.regions.begin(), in.regions.end(),
+            [](const bp_codec::Region& r) { return r.bytes != 0; })) return 0;
+        // bp-v1 has <=11 bits/symbol, <=4 plane headers per block, a 16-byte
+        // directory entry, and <2 KiB BlockPlan objects. 8 KiB/block covers
+        // metadata plus vector growth (old and new plans coexist); 2x plain
+        // bounds even an explicitly permitted expanding Huffman encoding.
+        // Fixed worker stacks and allocator bookkeeping are outside this budget.
+        std::size_t bytes = 16;
+        const auto add = [&](std::size_t n, std::size_t scale) {
+            if (n > (std::numeric_limits<std::size_t>::max() - bytes) / scale)
+                throw std::length_error("handoff: encoding reservation overflow");
+            bytes += n * scale;
+        };
+        for (const auto& r : in.regions) {
+            const std::size_t w = r.width == 2 || r.width == 4 ? r.width : 1;
+            const auto step = std::max(w, std::min(opt.encode.block_bytes, std::size_t{1} << 30) / w * w);
+            add(r.bytes, 2);
+            add(r.bytes / step + (r.bytes % step != 0), 8192);
+        }
+        return bytes;
     }
 
     void encode_loop() {
         try {
+#ifdef STRIX_HANDOFF_TESTING
+            if (opt.before_encode) opt.before_encode();
+#endif
             for (;;) {
-                Input in;
+                // bp-v1 with encode_batch > 1: every queued piece (up to encode_batch) is encoded side by side on the
+                // pool, so pieces of one codec block (<= 1 MiB) no longer encode on one thread; output order and the
+                // bytes of every frame are the same as one at a time.
+                std::vector<Input> batch;
+                std::vector<std::size_t> reservations;
                 {
                     std::unique_lock<std::mutex> g(m);
                     cv.wait(g, [&] { return aborted || !inputs.empty() || closed; });
-                    if (aborted) return;  // `in` and the queues release their callbacks on destruction
+                    if (aborted) return;  // `batch` and the queues release their callbacks on destruction
                     if (inputs.empty()) return;
-                    in = std::move(inputs.front());
-                    inputs.pop_front();
+                    const bool wide = codec == Codec::bp_v1 && pool && pool->threads() > 0 && opt.encode_batch > 1;
+                    const std::size_t take = wide ? std::min<std::size_t>(inputs.size(), opt.encode_batch) : 1;
+                    for (std::size_t i = 0; i < take; ++i) {
+                        const auto reserve = encode_reservation(inputs.front());
+                        const auto fits = [&] { return reserve == 0 || (queued_wire == 0 && batch.empty()) ||
+                            (queued_wire <= opt.max_queued_wire_bytes && reserve <= opt.max_queued_wire_bytes - queued_wire); };
+                        if (!batch.empty() && !fits()) break;
+                        cv.wait(g, [&] { return aborted || fits(); });
+                        if (aborted) return;
+                        reservations.push_back(reserve);
+                        batch.push_back(std::move(inputs.front()));
+                        inputs.pop_front();
+                        queued_wire += reserve;
+                    }
+#ifdef STRIX_HANDOFF_TESTING
+                    if (opt.observe_batch) opt.observe_batch(batch.size(), queued_wire);
+#endif
                 }
                 const auto t0 = Clock::now();
-                Output out;
-                out.f = in.f;
-                std::uint64_t plain = 0;
-                for (const auto& r : in.regions) plain += r.bytes;
-                out.f.plain_bytes = plain;
-                Xxh64 h;
-                hash_descriptor(h, out.f);
-                for (const auto& r : in.regions) h.update(r.data, r.bytes);
-                out.f.hash = h.digest();
-                if (codec == Codec::bp_v1 && plain > 0) {
-                    out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
-                    out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
-                    out.f.wire_bytes = out.wire.size();
-                    in.release.run();
-                } else {
-                    out.f.codec = static_cast<std::uint8_t>(Codec::identity);
-                    out.f.wire_bytes = plain;
-                    out.regions = std::move(in.regions);
-                    out.release = std::move(in.release);
-                }
+                std::vector<Output> outs(batch.size());
+                if (batch.size() == 1) prepare(batch[0], outs[0]);
+                else pool->run(batch.size(), [&](std::size_t i) { prepare(batch[i], outs[i]); });
                 const double dt = secs(t0, Clock::now());
-                std::unique_lock<std::mutex> g(m);
-                encode_s += dt;
-                // Back-pressure on encoded bytes only (identity bytes are the caller's memory, bounded by submit()).
-                cv.wait(g, [&] { return aborted || queued_wire == 0 || queued_wire + out.wire.size() <= opt.max_queued_wire_bytes; });
-                if (aborted) {
-                    g.unlock();
-                    return;
+                for (std::size_t i = 0; i < outs.size(); ++i) {
+                    Output& out = outs[i];
+#ifdef STRIX_HANDOFF_TESTING
+                    if (opt.observe_frame) opt.observe_frame(out.f.seq,
+                        {reinterpret_cast<const std::uint8_t*>(&out.f), sizeof(out.f)}, out.wire);
+#endif
+                    std::unique_lock<std::mutex> g(m);
+                    if (i == 0) encode_s += dt;
+                    if (aborted) {
+                        g.unlock();
+                        return;
+                    }
+                    if (out.wire.capacity() > reservations[i]) throw std::logic_error("handoff: encoding exceeded reservation");
+                    queued_wire -= reservations[i] - out.wire.capacity();
+                    plain_total += out.f.plain_bytes;
+                    wire_total += out.f.wire_bytes;
+                    ++pieces;
+                    fold.update(&out.f.hash, 8);
+                    outputs[out.f.seq % socks.size()].push_back(std::move(out));
+                    cv.notify_all();
                 }
-                queued_wire += out.wire.size();
-                plain_total += plain;
-                wire_total += out.f.wire_bytes;
-                ++pieces;
-                fold.update(&out.f.hash, 8);
-                outputs[out.f.seq % socks.size()].push_back(std::move(out));
-                cv.notify_all();
             }
         } catch (...) {
             fail(std::current_exception());
@@ -638,7 +711,9 @@ struct Sender::Impl {
                 out.release.run();
                 std::lock_guard<std::mutex> g(m);
                 last_byte = secs(t_open, Clock::now());
-                queued_wire -= out.wire.size();
+                const auto capacity = out.wire.capacity();
+                std::vector<std::uint8_t>().swap(out.wire);  // release storage before returning its credit
+                queued_wire -= capacity;
                 cv.notify_all();
             }
         } catch (...) {
@@ -711,7 +786,8 @@ Sender::~Sender() {
     if (impl_ && !impl_->finished && !impl_->finishing) abort("sender destroyed before finish()");
 }
 
-void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release) {
+void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release,
+                    bool identity) {
     auto& I = *impl_;
     std::size_t bytes = 0;
     for (const auto& r : regions) bytes += r.bytes;
@@ -744,6 +820,7 @@ void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region>
     in.f.seq = I.next_seq++;
     in.regions.assign(regions.begin(), regions.end());
     in.release = std::move(rel);
+    in.identity = identity;
     I.inputs.push_back(std::move(in));
     I.cv.notify_all();
 }
@@ -808,25 +885,24 @@ Reply Sender::finish() {
 
 void Sender::abort(std::string_view why) noexcept {
     auto& I = *impl_;
-    {
-        std::lock_guard<std::mutex> g(I.m);
-        if (!I.error) I.error = std::make_exception_ptr(std::runtime_error("handoff: sender aborted: " + std::string(why)));
-        I.aborted = true;
-        I.closed = true;
-        I.cv.notify_all();
-    }
-    I.dead = true;
-    {
-        std::lock_guard<std::mutex> g(I.pm);
-        I.pcv.notify_all();
-    }
     // A writer may be inside a frame: cutting the sockets makes the receiver fail on a short frame instead of ever
     // accepting a partial piece. It also wakes a finish() waiting for the reply on another thread.
-    I.shutdown_all();
+    I.fail(std::make_exception_ptr(std::runtime_error("handoff: sender aborted: " + std::string(why))));
     if (I.finishing.exchange(true)) return;  // finish() is running elsewhere: it joins, releases and rethrows
     I.join_all();
     I.drop_queues();
     I.finished = true;
+}
+
+void Sender::on_failure(std::function<void(std::exception_ptr)> notify) {
+    auto& I = *impl_;
+    std::exception_ptr error;
+    {
+        std::lock_guard<std::mutex> g(I.m);
+        I.failure_notify = notify;
+        error = I.error;
+    }
+    if (error && notify) notify(error);
 }
 
 SenderStats Sender::stats() const {

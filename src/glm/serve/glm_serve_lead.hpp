@@ -15,6 +15,8 @@
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/serve/glm_serve_import.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/serve/prefill_interleave.hpp"
+#include "strix/session/prefill_session.hpp"
 #include "glm/serve/glm_session_owner.hpp"
 #include "strix/serve/glm_chat.hpp"
 
@@ -107,6 +109,21 @@ struct LeadConfig {
     // `prefill_chunk` tokens (Engine::prefill at pos0 > 0), one chunk per iteration after the decode step; with nothing
     // decoding the whole remaining prompt goes in one call (small calls are slower). 0: always the whole prompt.
     unsigned prefill_chunk = 512;
+    // Grouping of those chunks by the decode cohort (shared policy, strix/serve/prefill_interleave.hpp): after a first
+    // chunk of `prefill_chunk` tokens, larger chunks while few requests decode, each followed by as many decode rounds
+    // as base chunks it holds, including across prompt completion. `prefill_chunk_cap`: grouping cap (0 = no bound);
+    // base/whole-prompt calls can exceed it and the engine must split them internally.
+    strix::serve::PrefillInterleave interleave;
+    unsigned prefill_chunk_cap = 0;
+    // Prefill units (STRIX_GLM_SERVE_PREFILL_UNITS=1; 0 rows = token chunks): an MTP prompt chunked beside decoding
+    // requests runs as one engine session paused at layer boundaries of its pieces of `prefill_units_rows` rows (the
+    // engine's max_rows), `prefill_units_layers` units per piece (strix/session/prefill_session.hpp LayerUnits).
+    std::uint32_t prefill_units_rows = 0;
+    std::uint32_t prefill_units_layers = 45;
+    // Engine admission for all pieces of the remaining prompt; absent means token chunks.
+    std::function<bool(std::uint64_t)> prefill_units_admit;
+    // 1: one `prefill-timeline` line per chunked prompt on stderr.
+    unsigned prefill_timeline = 0;
     bool prefill_chunk_mtp = true;   // false: MTP-bootstrap prompts are prefilled whole (only plain prompts chunk)
     // Batched self-speculation (G2): with MTP on and more than one request decoding (or one while a prompt is in
     // prefill), every decoding slot verifies a window (anchor + adaptive drafts) in ONE verify call of <= 8 rows; window
@@ -298,6 +315,15 @@ private:
         std::uint32_t import_id = 0;
         Clock::time_point import_t0, import_t_req;
         bool import_requested = false;  // the RTX was asked to send
+        // decode-cohort interleave: cost of this prompt's latest chunk,
+        // decode rounds / time since its last chunk, and the timeline receipt
+        double ms_per_token = 0, decode_ms = 0;
+        unsigned decode_rounds = 0;
+        strix::serve::PrefillTimeline timeline;
+        // prefill units (LeadConfig::prefill_units_rows): one engine session over [done, n), its layer units
+        bool units = false;
+        std::uint64_t units_done = 0, units_total = 0;
+        double ms_per_unit = 0;
     };
 
     void control_turn() {
@@ -337,6 +363,7 @@ private:
             }
         }
         const unsigned decoding = decoding_count();
+        if (decoding == 0) decode_debt_.clear();
         if (decoding == 0 && !pf_ && !imp_) {
             if (table_.live() != 0) return;
             if (queue_.has_queued_work()) return;
@@ -362,9 +389,17 @@ private:
         // decode first: the running requests' round, then the import poll of a prompt waiting for its RTX state
         // (the C1 MTP path stays open meanwhile), then one chunk of the prompt in prefill
         const bool importing = imp_ && imp_->import_id != 0;
-        if (decoding > 0 && !(decoding == 1 && !pf_ && mtp_round())) {
-            if (g2_ready()) g2_cycle();
-            else step_all();
+        if (decoding > 0) {
+            const auto d0 = Clock::now();
+            if (!(decoding == 1 && !pf_ && mtp_round())) {
+                if (g2_ready()) g2_cycle();
+                else step_all();
+            }
+            decode_debt_.decoded();
+            if (pf_) {
+                pf_->decode_ms += std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+                ++pf_->decode_rounds;
+            }
         }
         if (importing && decoding == 0 && !pf_) {  // nothing else runs: a heartbeat keeps the follower's status coming
             Control hb;
@@ -373,7 +408,9 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (importing) poll_import();
-        if (pf_) prefill_chunk();
+        // A grouped chunk is followed by its decode rounds (PrefillInterleave); with nothing decoding none is owed.
+        if (decoding_count() == 0) decode_debt_.clear();
+        if (pf_ && decode_debt_.ready()) prefill_chunk();
         last_round_ = Clock::now();
     }
 
@@ -489,6 +526,16 @@ private:
     }
     // A cancelled prompt in prefill or waiting for its import: its slot is freed (the next prefill there resets it).
     void drop_prefill(std::optional<Prefilling>& p) {
+        if (p->units) {  // both ranks drop the engine's session (a paused piece holds the row buffers)
+            Control x;
+            x.cmd = static_cast<std::uint32_t>(Cmd::prefill);
+            x.pslot = p->slot;
+            x.ppos = p->done;
+            x.pflags = kPrefillMtp | kPrefillUnits;
+            x.budget = 0;
+            (void)engine_round(x);
+            p->units = false;
+        }
         strix::serve::GenerationStats st;
         st.finish = "cancelled";
         st.prompt_tokens = request(p->a).prompt.size();
@@ -505,21 +552,81 @@ private:
         Prefilling& p = *pf_;
         const auto& prompt = request(p.a).prompt;
         const std::size_t n = prompt.size();
-        const bool whole = p.chunk == 0 || decoding_count() == 0;
-        const std::size_t m = whole ? n - p.done : std::min<std::size_t>(p.chunk, n - p.done);
-        const bool last = p.done + m == n;
+        const unsigned lanes = decoding_count();
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::prefill);
-        c.resets = p.done == 0 ? 1U << p.slot : 0U;
         c.pslot = p.slot;
-        c.plen = static_cast<std::uint32_t>(m);
         c.ppos = p.done;
-        c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
-        std::vector<std::uint32_t> chunk(prompt.begin() + static_cast<std::ptrdiff_t>(p.done),
-                                         prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
+        std::size_t m = 0;      // prompt tokens this call completes
+        std::uint64_t u = 0;    // prefill units: layer units of this call
+        bool last = false;
+        std::vector<std::uint32_t> chunk;
+        // Prefill units: an MTP prompt that would be chunked beside decoding requests runs as ONE prefill_mtp session
+        // over the rest of the prompt (pieces of max_rows rows, as the whole-prompt call) paused at layer boundaries.
+        // Each call runs the base chunk's work in layer units of the current piece (LayerUnits::base_units) through
+        // the same pacer; grouping is capped at one base-equivalent: a layer unit has no per-call pass to amortize.
+        // A prompt that fits one base chunk keeps the token call (one call either way).
+        if (p.units || (cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
+                        cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
+            const bool start = !p.units;
+            if (start) {
+                const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
+                p.units = true;
+                p.units_done = 0;
+                p.units_total = lu.total();
+            }
+            const strix::session::LayerUnits lu{n - p.done, cfg_.prefill_units_rows, cfg_.prefill_units_layers};
+            const std::uint64_t base = lu.base_units(p.chunk, p.units_done);
+            const auto plan = cfg_.interleave.plan(base, p.units_total - p.units_done, lanes, base, p.ms_per_unit);
+            u = plan.tokens;
+            decode_debt_.charge(plan);
+            last = p.units_done + u == p.units_total;
+            m = last ? n - p.done : 0;
+            c.resets = start && p.done == 0 ? 1U << p.slot : 0U;
+            c.plen = start ? static_cast<std::uint32_t>(n - p.done) : 0U;
+            c.budget = static_cast<std::uint32_t>(u);
+            c.pflags = kPrefillMtp | kPrefillUnits | (start ? kPrefillStart : 0U) | (last ? kPrefillLast : 0U);
+            if (start) chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.end());
+        } else {
+            const auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
+            m = plan.tokens;
+            decode_debt_.charge(plan);
+            last = p.done + m == n;
+            c.resets = p.done == 0 ? 1U << p.slot : 0U;
+            c.plen = static_cast<std::uint32_t>(m);
+            c.pflags = (p.a.mtp_ok ? kPrefillMtp : 0U) | (last ? kPrefillLast : 0U);
+            chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.begin() + static_cast<std::ptrdiff_t>(p.done + m));
+        }
+        const bool timeline = cfg_.prefill_timeline != 0 && (p.done != 0 || !last || p.units);  // chunked prompts only
+        strix::serve::PrefillTimeline::Chunk tc;
+        control_ms_ = 0;
         const auto t0 = Clock::now();
         const auto out = engine_round(c, &chunk);
         const auto t1 = Clock::now();
+        const double chunk_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (p.units) {
+            if (lanes != 0 && u != 0) p.ms_per_unit = std::max(chunk_ms / static_cast<double>(u), 1e-9);
+            p.units_done += u;
+            if (out.empty() || (out.at(0) == kPrefillPending) == last)
+                throw std::logic_error("prefill units: the engine's completion differs from the lead's unit arithmetic");
+        } else if (lanes != 0 && m != 0) {
+            p.ms_per_token = std::max(chunk_ms / static_cast<double>(m), 1e-9);
+        }
+        if (timeline) {
+            tc.tokens = static_cast<std::uint32_t>(m);
+            tc.decoding = lanes;
+            tc.decode_rounds = p.decode_rounds;
+            tc.chunk_ms = chunk_ms;
+            tc.control_ms = control_ms_;
+            tc.decode_ms = p.decode_ms;
+            p.timeline.add(tc);
+            if (last) {
+                p.timeline.window_ms = std::chrono::duration<double, std::milli>(t1 - p.a.t_admit).count();
+                std::fprintf(stderr, "serve %s\n", p.timeline.line().c_str());
+            }
+        }
+        p.decode_ms = 0;
+        p.decode_rounds = 0;
         p.done += m;
         {
             std::lock_guard<std::mutex> l(m_);
@@ -640,12 +747,15 @@ private:
     // (non-MTP) decode only (MTP verify windows / the C1 decoder can leave the engine ahead of the emitted tokens and
     // hold deferred KDA rows), a normal finish, and pos == prompt + emitted - 1. A refused store is counted, never
     // an error; the existing prompt-end entry stays.
+    // An imported slot is refused too: its prompt rows carry the optional FAST import identity, while every entry
+    // here is keyed by the native prefix identity and is restored by native-route requests (an import-eligible
+    // request never looks up). Like the prompt-end store, which the import path never reaches.
     void store_reply(std::uint32_t slot, const char* why) {
         const Active& a = *active_[slot];
         const std::string w = why;
         if (w != "stop" && w != "length") return;  // cancelled / context / failed: not a committed reply
         const auto& prompt = request(a).prompt;
-        const bool exact = !a.mtp_ok && a.generated >= 2 && a.emitted.size() == a.generated &&
+        const bool exact = !a.mtp_ok && a.imported == 0 && a.generated >= 2 && a.emitted.size() == a.generated &&
                            a.pos == prompt.size() + a.emitted.size() - 1 && a.pos < cfg_.capacity;
         if (!exact) {
             if (a.generated >= 2) { std::lock_guard<std::mutex> l(m_); ++stats_.prefix_reply_skipped; }
@@ -763,7 +873,9 @@ private:
     // A control round without an engine command (import_expect, heartbeat): seeds and last rows stay valid.
     std::vector<std::uint32_t> control_round(Control& c, std::vector<std::uint32_t>* prompt = nullptr) {
         const auto before = ch_.round();
+        const auto x0 = Clock::now();
         note_peer(ch_.exchange(c));
+        control_ms_ += std::chrono::duration<double, std::milli>(Clock::now() - x0).count();
         std::vector<std::uint32_t> none;
         auto out = replay(eng_, ch_, c, prompt ? *prompt : none, true, cfg_.slots, cfg_.capacity, prefix_cache_ ? &*prefix_cache_ : nullptr);
         { std::lock_guard<std::mutex> l(m_); stats_.rounds += ch_.round() - before; }
@@ -807,6 +919,9 @@ private:
             return import_fallback(false, mine == failed ? "rank0_staging_failed" : peer == failed ? "rank1_staging_failed"
                                           : rtx_down    ? "rtx_unavailable"
                                                         : "timeout");
+        // Keep receiving/reporting while another prompt owns the engine session, even between pieces.
+        // The import's suffix starts a new prefill session; only the lead may order that on both ranks.
+        if (pf_ && pf_->units) return;
         commit_import(waited);
     }
 
@@ -1172,6 +1287,7 @@ private:
     SlotTable table_;
     std::vector<std::optional<Active>> active_;
     std::optional<Prefilling> pf_;
+    strix::serve::PrefillDecodeDebt decode_debt_;
     std::optional<Prefilling> imp_;  // the prompt waiting for its RTX state (its slot allocated), off the prefill place
     std::uint32_t next_import_id_ = 1, peer_import_id_ = 0, peer_import_status_ = 0, peer_import_token_ = 0;
     std::atomic<bool> mtp_on_;
@@ -1198,6 +1314,7 @@ private:
     static constexpr std::uint64_t kNoBudget = ~0ULL;
     std::atomic<std::uint64_t> prefix_budget_request_{kNoBudget};
     Clock::time_point last_round_ = Clock::now();
+    double control_ms_ = 0;  // control exchanges since the last prefill chunk started (timeline)
     bool drained_ = false;
     std::string failure_;
     // Destroy Runtime first: cleanup borrows native records and engine/channel.

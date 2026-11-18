@@ -7,9 +7,9 @@
 // selection (max |d|, mean |d| / mean |o|, minimum cosine per (row, head)), the fused A8 rows against quantize_a8 of the
 // fast o (bitwise), the overlap of the fast and exact top-k and the error of the whole fast path. Exits non-zero when the
 // minimum cosine is below 0.999, the A8 rows differ or the mean overlap is below 0.97.
-#include "strix/cuda_ds41_attention.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_fast_attention.hpp"
+#include "strix/cuda/ds41_attention.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_fast_attention.hpp"
 
 #include <algorithm>
 #include <cmath>

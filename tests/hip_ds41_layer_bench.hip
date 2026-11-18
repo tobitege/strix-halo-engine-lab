@@ -305,6 +305,91 @@ void bench_hc_site(std::mt19937& rng, int iterations) {
         (void)hipFree(p);
 }
 
+// The prefill site with the collapse (HcSiteView::collapse_out) at prefill row counts: each collapse tile (4, 2, 1)
+// against tile 4 bitwise, in rounds (ABAB), beside the bytes it must move (stream and sub in, stream and collapse out)
+// and a device-to-device copy of the stream as the reachable bandwidth. STRIX_DS41_HC_COLLAPSE_BENCH=1, _ROWS (4096).
+bool bench_hc_collapse(std::mt19937& rng, int iterations) {
+    constexpr std::uint32_t H = 5120, n = H * hc_copies;
+    const char* rows_env = std::getenv("STRIX_DS41_HC_COLLAPSE_BENCH_ROWS");
+    const auto R = static_cast<std::uint32_t>(rows_env ? std::stoul(rows_env) : 4096UL);
+    std::vector<std::uint16_t> fn(std::size_t{hc_mix_count} * n);
+    {
+        std::normal_distribution<float> d(0.0F, 0.02F);
+        for (auto& x : fn) x = to_f16(d(rng));
+    }
+    std::vector<HcMix> em(R);
+    std::uniform_real_distribution<float> u(0.05F, 0.6F);
+    for (auto& x : em) {
+        for (auto& v : x.pre) v = u(rng);
+        for (auto& v : x.post) v = 2.0F * u(rng);
+        for (auto& v : x.comb) v = u(rng);
+    }
+    auto* dfn = dev(fn);
+    auto* dbase = dev(random_floats(rng, hc_mix_count, 0.5F));
+    auto* dscale = dev(std::vector<float>{0.7F, 1.3F, 2.1F});
+    auto* dres = dev(random_floats(rng, std::size_t{R} * n, 1.0F));
+    auto* dsub = dev(random_floats(rng, std::size_t{R} * H, 1.0F));
+    auto* dem = dev(em);
+    auto* st = dev<float>(std::size_t{R} * n);
+    auto* partial = dev<float>(hc_mix_partial_floats(R, H));
+    auto* counters = dev(std::vector<std::uint32_t>(hc_site_counter_count(R), 0U));
+    auto* mixes = dev<HcMix>(R);
+    auto* cout = dev<float>(std::size_t{R} * H);
+    auto view = [&](std::uint32_t tile, std::uint32_t once) {
+        HcSiteView v;
+        v.collapse_once = once;
+        v.rows = R; v.hidden = H; v.sub = dsub; v.residual = dres; v.expand_mixes = dem; v.stream = st;
+        v.fn = dfn; v.base = dbase; v.scale = dscale; v.iters = 20; v.mix_norm_eps = 1e-20F;
+        v.mixes_out = mixes; v.partial = partial; v.counters = counters;
+        v.launches = 1; v.form = 2; v.tile = tile; v.collapse_out = cout;
+        return v;
+    };
+    auto outputs = [&] {
+        std::vector<std::uint8_t> all;
+        auto add = [&](const void* p, std::size_t bytes) {
+            std::vector<std::uint8_t> h(bytes);
+            check(hipDeviceSynchronize(), "sync");
+            check(hipMemcpy(h.data(), p, bytes, hipMemcpyDeviceToHost), "download");
+            all.insert(all.end(), h.begin(), h.end());
+        };
+        add(st, std::size_t{R} * n * 4); add(mixes, R * sizeof(HcMix)); add(cout, std::size_t{R} * H * 4);
+        return all;
+    };
+    enqueue_hc_site(view(4, 1), nullptr);  // reference: the previous form, tile 4
+    const auto ref = outputs();
+    const double bytes = static_cast<double>(R) * (2.0 * n + 2.0 * H) * 4.0;
+    bool form_exact[2][3] = {{true, true, true}, {true, true, true}};
+    bool all_exact = true;
+    for (int round = 0; round < 3; ++round) {
+        for (const std::uint32_t once : {1U, 2U})
+        for (const std::uint32_t tile : {4U, 2U, 1U}) {
+            if (once == 2U && tile == 4U) continue;  // one read caps the tile at 2 rows
+            check(hipMemset(st, 0, std::size_t{R} * n * 4), "clear");
+            check(hipMemset(cout, 0, std::size_t{R} * H * 4), "clear");
+            check(hipMemset(mixes, 0, R * sizeof(HcMix)), "clear");
+            enqueue_hc_site(view(tile, once), nullptr);
+            const bool launch_exact = outputs() == ref;
+            const double ms = time_ms(iterations, [&](int) { enqueue_hc_site(view(tile, once), nullptr); });
+            const bool repeated_exact = outputs() == ref;
+            bool& exact = form_exact[once - 1U][tile / 2U];
+            exact = exact && launch_exact && repeated_exact;
+            all_exact = all_exact && exact;
+            std::printf("{\"kernel\":\"hc-collapse\",\"round\":%d,\"rows\":%u,\"once\":%u,\"tile\":%u,\"ms\":%.4f,\"gbps\":%.1f,\"exact\":%s}\n",
+                        round, R, once == 2 ? 1U : 0U, tile, ms, bytes / ms * 1e-6, exact ? "true" : "false");
+        }
+        const double cms = time_ms(iterations, [&](int) {
+            check(hipMemcpyAsync(st, dres, std::size_t{R} * n * 4, hipMemcpyDeviceToDevice, nullptr), "copy");
+        });
+        std::printf("{\"kernel\":\"d2d-copy\",\"round\":%d,\"bytes_moved\":%.0f,\"ms\":%.4f,\"gbps\":%.1f,\"site_floor_ms\":%.4f}\n", round,
+                    2.0 * R * n * 4, cms, 2.0 * R * n * 4 / cms * 1e-6, bytes / (2.0 * R * n * 4 / cms));
+    }
+    for (void* p : {static_cast<void*>(dfn), static_cast<void*>(dbase), static_cast<void*>(dscale), static_cast<void*>(dres),
+                    static_cast<void*>(dsub), static_cast<void*>(dem), static_cast<void*>(st), static_cast<void*>(partial),
+                    static_cast<void*>(counters), static_cast<void*>(mixes), static_cast<void*>(cout)})
+        (void)hipFree(p);
+    return all_exact;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -313,6 +398,9 @@ int main(int argc, char** argv) {
     if (const char* b = std::getenv("STRIX_DS41_HC_SITE_BENCH"); b && b[0] == '1') {
         bench_hc_site(rng, iterations);
         return 0;
+    }
+    if (const char* b = std::getenv("STRIX_DS41_HC_COLLAPSE_BENCH"); b && b[0] == '1') {
+        return bench_hc_collapse(rng, iterations) ? 0 : 1;
     }
     const Site sites[] = {
         {"attn_q_a 5120->1280", 5120, 1280, 1}, {"attn_q_b 1280->32768", 1280, 32768, 1},

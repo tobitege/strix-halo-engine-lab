@@ -393,6 +393,21 @@ int main() {
             cursor.progress().tail_windows==1U && cursor.progress().serial_tail_steps==7U,
             "tail backend runs complete tail blocks headless before the serial rows");
         (void)cursor.finish_greedy();
+        {   // Pipeline frames come from the cold plan: T block + tail block; the 7 serial rows are not frames.
+            const auto before=trace.size();
+            strix::KnownPromptChunkCursor planned(request,main_blocks,serial);planned.set_tail_backend(tail_blocks);
+            const auto plan=strix::known_prompt_pipeline_plan(planned.cold_plan());
+            expect(plan.units==2U && plan.rows==48U && plan.serial_rows==7U &&
+                plan.unit_rows==std::vector<std::uint64_t>{32U,16U} && trace.size()==before,
+                "pipeline plan counts tiled units only and leaves serial rows out");
+            std::vector<std::uint32_t> on_grain(48,3U);
+            strix::KnownPromptChunkRequest grain{on_grain,0,16,64,1,15};
+            grain.logical_rows=32;grain.tiled_prefill=true;grain.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+            strix::KnownPromptChunkCursor exact_plan(grain,main_blocks,serial);exact_plan.set_tail_backend(tail_blocks);
+            const auto whole=strix::known_prompt_pipeline_plan(exact_plan.cold_plan());
+            expect(whole.units==2U && whole.serial_rows==0U && whole.rows==48U && whole.identity==plan.identity,
+                "a prefix on the 16-row grain is frames only; the same frames give the same plan identity");
+        }
         // A prompt ending exactly on a tail block keeps that block's head as the terminal frontier.
         trace.clear();
         std::vector<std::uint32_t> exact(48,1U);

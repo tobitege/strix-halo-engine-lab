@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/env_flags.hpp"
+#include "strix/lever_cache.hpp"
 
 #include <atomic>
 
@@ -21,8 +22,8 @@ namespace strix::ds41 {
     inline bool fn() {                                                                     \
         const int mode = fn##_override().load(std::memory_order_relaxed);                  \
         if (mode >= 0) return mode != 0;                                                   \
-        static const bool env = env_flag_default_on(var, EnvFlagMatch::first_character);                   \
-        return env;                                                                        \
+        static ::strix::lever_cache<bool> env{[] { return env_flag_default_on(var, EnvFlagMatch::first_character); }}; \
+        return env.get();                                                                  \
     }
 
 STRIX_DS41_EXACT_FLAG(r1fuse_routes, "STRIX_DS41_R1FUSE_ROUTES")

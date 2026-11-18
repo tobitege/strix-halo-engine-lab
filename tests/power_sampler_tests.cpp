@@ -19,6 +19,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 using namespace strix::power;
@@ -420,6 +423,35 @@ void rapl_invalid_probe_baseline() {
     require(r.complete && near(r.energy_j, 0.1), "invalid predecessor cannot poison recovery");
 }
 
+// The ring's memory is fixed when the sampler is built: storing samples (thousands, as a server whose every finished
+// request asks cover() for one) does not grow the heap before the ring wraps. glibc's statistics only; a sanitizer's
+// allocator replaces them.
+void ring_memory_fixed_at_construction() {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define STRIX_POWER_TEST_SANITIZED 1
+#endif
+#endif
+#if defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__) && !defined(STRIX_POWER_TEST_SANITIZED)
+    Tree tree("ringmem");
+    tree.gpu(30.0, 2900.0, 50.0);
+    Sampler sampler(make_sources(tree.path()));  // the default ring (65536 samples), as the process sampler's
+    require(sampler.available(), "amdgpu tree available");
+    std::int64_t t = kSecond;
+    for (int i = 0; i < 16; ++i) sampler.sample_at(t += kSecond / 1000);  // the sampling path's own transient blocks
+    const auto heap = [] { malloc_trim(0); const auto m = mallinfo2(); return static_cast<long long>(m.uordblks + m.hblkhd); };
+    const auto before = heap();
+    constexpr int kSamples = 4000;
+    for (int i = 0; i < kSamples; ++i) sampler.sample_at(t += kSecond / 1000);
+    const auto growth = heap() - before;
+    std::printf("heap over %d stored samples: %+lld bytes\n", kSamples, growth);
+    require(growth < 1024, "ring memory grows with the stored samples: " + std::to_string(growth) + " bytes");
+#else
+    std::puts("SKIP ring_memory_fixed_at_construction: requires glibc without ASan/TSan");
+#endif
+#undef STRIX_POWER_TEST_SANITIZED
+}
+
 // Finding 2: sample_at() from other threads while the worker runs never enters a source twice at once, and a
 // timestamp that will not be stored does not advance a stateful source.
 void serialized_reads() {
@@ -806,6 +838,7 @@ int main() {
         registered_source();
         thread_and_ring();
         block_rendering();
+        ring_memory_fixed_at_construction();
         serialized_reads();
         status_and_receipts_read_no_sensor();
         execution_window_is_immutable();

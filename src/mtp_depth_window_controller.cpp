@@ -149,6 +149,35 @@ void MtpDepthWindowController::observe(std::size_t owner,std::size_t emitted,dou
     if(o.warmed)o.residual[std::min<std::size_t>(filled_,o.rows-1U)].add(residual);
     o.warmed=true;
 }
+std::uint32_t MtpDepthWindowController::plan_depth(std::uint32_t max_depth) {
+    max_depth=std::min<std::uint32_t>(max_depth,7U);
+    if(max_depth<=1)return max_depth;
+    ++plans_;
+    if(plans_%64U==0U)return max_depth;
+    bool draft_known=false;
+    for(std::size_t n=1;n<draft_.size();++n)draft_known=draft_known || draft_[n].samples();
+    double a[7];
+    for(std::size_t k=0;k<7;++k) {
+        double t=0,acc=0;
+        for(std::size_t b=0;b<10;++b){t+=tested_[k][b];acc+=accepted_[k][b];}
+        a[k]=t>=8?acc/t:prior_[k];
+    }
+    std::uint32_t best_d=max_depth,missing=0;double best=0;
+    for(std::uint32_t d=max_depth;d>=1;--d) {
+        const Owner* o=nullptr;for(const auto& x:owners_)if(x.rows==d+1U)o=&x;
+        if(!o)continue;
+        const auto& cell=o->residual[d];
+        if(!cell.samples() || (draft_known && !draft_[d].samples())) {
+            if(!missing && explored_[d]<4U)missing=d;
+            continue;
+        }
+        double sum=1,run=1;for(std::uint32_t k=0;k<d;++k){run*=a[k];sum+=run;}
+        const double ms=cell.value()+(draft_known?draft_[d].value():0.0);
+        if(ms>0 && sum/ms>best){best=sum/ms;best_d=d;}
+    }
+    if(missing){++explored_[missing];return missing;}
+    return best_d;
+}
 std::vector<MtpDepthWindowController::CostStats> MtpDepthWindowController::cost_stats() const {
     std::vector<CostStats> out{{1,1,serial_.samples(),serial_.value()}};
     for(const auto& o:owners_)for(std::uint32_t n=1;n<o.rows;++n)
@@ -187,6 +216,14 @@ MtpDepthWindowController::Prior mtp_depth_domain_prior() {
         require(k+1<out.size()?*end==',':!*end,"domain prior requires seven comma-separated probabilities");
         v=end+1;
     }
+    return out;
+}
+std::string mtp_depth_state_line(float cli_min_p) {
+    const char* v=std::getenv("STRIX_MTP_CONTROLLER");
+    std::string out="mtp-depth-controller=";
+    if(mtp_depth_controller_enabled())
+        out+="on (STRIX_MTP_CONTROLLER=depth) domain="+std::string(mtp_depth_domain())+" min_p="+std::to_string(mtp_depth_domain_min_probability(cli_min_p));
+    else out+=std::string("off (")+(v && *v?"STRIX_MTP_CONTROLLER="+std::string(v)+" is not 'depth'":"STRIX_MTP_CONTROLLER unset; default off")+") fixed depth, min_p="+std::to_string(cli_min_p);
     return out;
 }
 }

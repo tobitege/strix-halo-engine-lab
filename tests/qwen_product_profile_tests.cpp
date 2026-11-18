@@ -48,7 +48,7 @@ void product() {
     pr::Inputs inputs{{}, lookup(empty), false};
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
         pr::parse("quality") == pr::Name::quality, "three profile names");
-    refuses([] { (void)pr::parse("turbo"); }, "default, fast or quality");
+    refuses([] { (void)pr::parse("turbbo"); }, "default, fast, quality or turbo");
     for (const auto profile : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
         for (const bool allow : {false, true}) {
             inputs.allow_pending = allow;
@@ -106,7 +106,7 @@ void product() {
     check(pr::resolve(pr::Name::quality, inputs).json().find("\"note\":\"quality: no quality rows for this model, using default\"") != std::string::npos &&
         pr::resolve(pr::Name::standard, inputs).json().find("\"note\"") == std::string::npos, "quality receipt names the default it runs");
     for (const auto& lever : pr::levers()) {
-        check(!lever.name.empty() && !lever.option.empty() && !lever.source.empty(), "editable table has provenance and option");
+        check(!lever.name.empty() && (!lever.option.empty() || !lever.env.empty()) && !lever.source.empty(), "editable table has provenance and a CLI or environment control");
         check(lever.value[0].empty() && lever.value[2].empty(), "default and quality leave every lever alone");
         check(!lever.ready[1] && lever.runnable[1] == (lever.name == "qsa_budget" || lever.name == "moe_route_bf16" || lever.name == "gdn_fp16_chunk" ||
                 lever.name == "moe_route_prune"),
@@ -237,7 +237,7 @@ void cli_and_receipts() {
     }
     check(parse({"decoder","model.gguf","1","--profile=fast"}).product_profile.profile == pr::Name::fast, "equals syntax");
     refuses([] { (void)parse({"decoder","model.gguf","1","--profile"}); }, "requires a value");
-    refuses([] { (void)parse({"decoder","model.gguf","1","--profile","turbo"}); }, "default, fast or quality");
+    refuses([] { (void)parse({"decoder","model.gguf","1","--profile","turbbo"}); }, "default, fast, quality or turbo");
     refuses([] { (void)parse({"decoder","model.gguf","1","--profile","fast","--profile=default"}); }, "duplicate");
     check(parse({"decoder","model.gguf","1","--qsa-budget","1536"}).product_profile.find("qsa_budget")->value == "1536",
         "implemented QSA budget CLI accepted");

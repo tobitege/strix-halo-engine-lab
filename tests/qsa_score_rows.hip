@@ -12,6 +12,8 @@
 // all-zero key blocks, so both guard forms run.
 // Packed arms (STRIX_QSA_POOL_PACKED): the same scorer reading the pool's packed BF16 copy (score_kernel<..., Packed>),
 // R = 16 / 32 / 64, must equal the FP32-key R = 16 arm byte for byte too, and join the timing rounds.
+// Each arm also runs with SplitLoads=true (S suffix), comparing scores, maxima,
+// canaries and both guard counters to the original R16 form.
 #include "qsa_flash_prod.inc"
 using namespace strix;
 static void check(hipError_t e, const char* what) { if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(2); } }
@@ -97,23 +99,31 @@ int main(int argc, char** argv) {
             check(hipMemcpy(a.d, d.data(), groups * sizeof(d[0]), hipMemcpyHostToDevice), "h2d desc");
             return a;
         };
-        constexpr unsigned kArms = 6U;
-        const char* names[kArms] = {"R16", "R32", "R64", "R16P", "R32P", "R64P"};
-        Arm arm[kArms] = {make(), make(), make(), make(), make(), make()};
-        const auto launch = [&]<unsigned R, bool Stats, bool Packed>(const Arm& a) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true, Packed>),
+        constexpr unsigned kArms = 12U;
+        const char* names[kArms] = {"R16", "R32", "R64", "R16P", "R32P", "R64P",
+            "R16S", "R32S", "R64S", "R16PS", "R32PS", "R64PS"};
+        Arm arm[kArms] = {make(), make(), make(), make(), make(), make(),
+            make(), make(), make(), make(), make(), make()};
+        const auto launch = [&]<unsigned R, bool Stats, bool Packed, bool SplitLoads>(const Arm& a) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true, Packed, SplitLoads>),
                 dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, static_cast<std::uint32_t>(groups)), dim3(W * 32U), 0, s,
                 QsaRowsScoreViews<64U>{}, Packed ? static_cast<const void*>(d_p) : static_cast<const void*>(d_k), 0U, dim, nullptr, 0U, d_r,
                 Stats ? a.stats : nullptr, a.d);
         };
         const auto run = [&]<bool Stats>(unsigned which) {
             switch (which) {
-            case 0: launch.template operator()<16U, Stats, false>(arm[0]); break;
-            case 1: launch.template operator()<32U, Stats, false>(arm[1]); break;
-            case 2: launch.template operator()<64U, Stats, false>(arm[2]); break;
-            case 3: launch.template operator()<16U, Stats, true>(arm[3]); break;
-            case 4: launch.template operator()<32U, Stats, true>(arm[4]); break;
-            default: launch.template operator()<64U, Stats, true>(arm[5]); break;
+            case 0: launch.template operator()<16U, Stats, false, false>(arm[0]); break;
+            case 1: launch.template operator()<32U, Stats, false, false>(arm[1]); break;
+            case 2: launch.template operator()<64U, Stats, false, false>(arm[2]); break;
+            case 3: launch.template operator()<16U, Stats, true, false>(arm[3]); break;
+            case 4: launch.template operator()<32U, Stats, true, false>(arm[4]); break;
+            case 5: launch.template operator()<64U, Stats, true, false>(arm[5]); break;
+            case 6: launch.template operator()<16U, Stats, false, true>(arm[6]); break;
+            case 7: launch.template operator()<32U, Stats, false, true>(arm[7]); break;
+            case 8: launch.template operator()<64U, Stats, false, true>(arm[8]); break;
+            case 9: launch.template operator()<16U, Stats, true, true>(arm[9]); break;
+            case 10: launch.template operator()<32U, Stats, true, true>(arm[10]); break;
+            default: launch.template operator()<64U, Stats, true, true>(arm[11]); break;
             }
         };
         // exact gate
@@ -160,7 +170,8 @@ int main(int argc, char** argv) {
             for (unsigned w = 0; w < kArms; ++w) { timed(w); timed(w); } // warm
             std::vector<float> aa0, aa1, t[kArms];
             for (unsigned r = 0; r < rounds; ++r) { aa0.push_back(timed(0)); aa1.push_back(timed(0)); }
-            const unsigned order[2U * kArms] = {0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0};
+            const unsigned order[2U * kArms] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
             for (unsigned r = 0; r < rounds; ++r) for (unsigned o : order) t[o].push_back(timed(o));
             check(hipGetLastError(), "timed launch");
             const auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };

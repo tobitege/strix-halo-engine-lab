@@ -45,12 +45,13 @@ void install_session_service(strix::serve::ServiceFactories& factories,SessionAs
     f.early_exit=[loader](const strix::serve::ServiceSelection& s,std::ostream& out)->std::optional<int> {
         const auto& p=prepared(s);
         if(p.exit_code){out<<p.output;return p.exit_code;}
-        if(p.options.inspect){auto assets=loader(p.options);out<<effective_config(*assets.backend,p.options.request,bool(assets.drafts)).dump()<<'\n';return 0;}
+        // Same report as strix-gemma4-serve: prepare_serve's stream count sized the session-fixed choices.
+        if(p.options.inspect){auto assets=loader(p.options);out<<effective_config(*assets.backend,p.options.request,bool(assets.drafts),p.options.streams).dump()<<'\n';return 0;}
         return std::nullopt;
     };
     f.inspect=[loader](const strix::serve::ServiceSelection& s,std::ostream& out) {
         auto options=prepared(s).options;options.inspect=true;
-        auto assets=loader(options);out<<effective_config(*assets.backend,options.request,bool(assets.drafts)).dump()<<'\n';
+        auto assets=loader(options);out<<effective_config(*assets.backend,options.request,bool(assets.drafts),options.streams).dump()<<'\n';
     };
     f.create=[loader](const strix::serve::ServiceSelection& s){auto assets=loader(prepared(s).options);
         if(!assets.owner || !assets.backend || !assets.tokenizer)throw std::invalid_argument("incomplete Gemma4 service assets");

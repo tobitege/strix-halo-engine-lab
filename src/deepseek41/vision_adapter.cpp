@@ -29,15 +29,13 @@ const char* filter_name(vision::Filter f) {
     return "?";
 }
 
-float activate(VisionRecipe::Activation a, float v) {
-    const double x = static_cast<double>(v);
+vision::Activation shared_activation(VisionRecipe::Activation a) {
     switch (a) {
-        case VisionRecipe::Activation::gelu: return static_cast<float>(0.5 * x * (1.0 + std::erf(x * 0.70710678118654752440)));
-        case VisionRecipe::Activation::gelu_tanh:
-            return static_cast<float>(0.5 * x * (1.0 + std::tanh(0.79788456080286535588 * (x + 0.044715 * x * x * x))));
-        case VisionRecipe::Activation::silu: return static_cast<float>(x / (1.0 + std::exp(-x)));
+        case VisionRecipe::Activation::gelu: return vision::Activation::gelu;
+        case VisionRecipe::Activation::gelu_tanh: return vision::Activation::gelu_tanh;
+        case VisionRecipe::Activation::silu: return vision::Activation::silu;
     }
-    return v;
+    return vision::Activation::gelu;
 }
 
 void copy_row(const vision::Tensor& row, std::uint16_t* dst, std::size_t width) {
@@ -248,33 +246,25 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
     if (!aligner_w1_) bad("project() before bind()");
     const unsigned R = config_.downsample_ratio, W = config_.hidden_size, P = config_.projection_size;
     const vision::MergedGrid merged_grid = checked_grid(grid);
-    if (hidden.width != W || hidden.rows != grid.rows || hidden.hidden.size() != std::size_t{hidden.rows} * W)
+    if (hidden.width != W || hidden.rows != grid.rows ||
+        (hidden.device_epoch == 0 && hidden.hidden.size() != std::size_t{hidden.rows} * W))
         bad("the encoder output does not match the patch grid");
     const unsigned mh = merged_grid.grid_h, mw = merged_grid.grid_w, tokens = merged_grid.tokens;
-    const std::size_t in = std::size_t{W} * R * R;
 
-    // Pixel unshuffle on the raster grid: merged row (my, mx), feature c * R * R + (dy, dx). A grid that is not a
-    // multiple of R is completed with zero rows on the right and at the bottom (the vector starts as zeros).
-    std::vector<float> merged(std::size_t{tokens} * in);
-    for (unsigned my = 0; my < mh; ++my)
-        for (unsigned mx = 0; mx < mw; ++mx) {
-            float* dst = &merged[(std::size_t{my} * mw + mx) * in];
-            for (unsigned dy = 0; dy < R; ++dy)
-                for (unsigned dx = 0; dx < R; ++dx) {
-                    if (my * R + dy >= grid.grid_h || mx * R + dx >= grid.grid_w) continue;
-                    const float* src = &hidden.hidden[(std::size_t{my * R + dy} * grid.grid_w + mx * R + dx) * W];
-                    const unsigned slot = recipe_.unshuffle_row_major ? dy * R + dx : dx * R + dy;
-                    for (unsigned c = 0; c < W; ++c) dst[std::size_t{c} * R * R + slot] = src[c];
-                }
-        }
-    std::vector<float> mid(std::size_t{tokens} * P), rows(std::size_t{tokens} * P);
-    dense.linear(aligner_w1_, aligner_b1_, merged.data(), tokens, mid.data());
-    merged = {};
-    vision::parallel_for(tokens, 0, [&](std::size_t row) {  // elementwise: the thread count cannot change a value
-        float* v = &mid[row * P];
-        for (unsigned i = 0; i < P; ++i) v[i] = activate(recipe_.aligner_activation, v[i]);
-    });
-    dense.linear(aligner_w2_, aligner_b2_, mid.data(), tokens, rows.data());
+    // Pixel unshuffle on the raster grid (merged row (my, mx), feature c * R * R + (dy, dx); a grid that is not a
+    // multiple of R is completed with zero rows on the right and at the bottom), aligner w1, activation, w2: the
+    // shared projector op, on the device when the backend keeps the hidden rows there.
+    vision::MergeProjector m;
+    m.ratio = R;
+    m.row_major = recipe_.unshuffle_row_major;
+    m.act = shared_activation(recipe_.aligner_activation);
+    m.w1 = aligner_w1_;
+    m.b1 = aligner_b1_;
+    m.w2 = aligner_w2_;
+    m.b2 = aligner_b2_;
+    if (m.tokens(grid.grid_h, grid.grid_w) != tokens) bad("the merged grid differs from the projector's");
+    std::vector<float> rows(std::size_t{tokens} * P);
+    dense.merge_project(hidden, grid.grid_h, grid.grid_w, m, rows.data());
 
     // Span order: start, each grid row followed by the row end, end.
     out = {};
@@ -295,6 +285,16 @@ void VisionAdapter::project(vision::EncoderOutput& hidden, const vision::PatchGr
         }
     }
     copy_row(image_end_, dst, P);
+}
+
+std::vector<std::pair<vision::Tensor, vision::Tensor>> VisionAdapter::projector_linears() const {
+    if (!aligner_w1_) return {};
+    return {{aligner_w1_, aligner_b1_}, {aligner_w2_, aligner_b2_}};
+}
+
+unsigned VisionAdapter::max_encoder_rows() const {
+    const std::uint64_t rows = std::uint64_t{config_.max_image_tokens} * config_.downsample_ratio * config_.downsample_ratio;
+    return rows > 0x7FFFFFFFULL ? 0U : static_cast<unsigned>(rows);
 }
 
 vision::EncoderOptions VisionAdapter::device_options() const {

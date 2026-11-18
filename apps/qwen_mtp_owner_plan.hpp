@@ -50,7 +50,7 @@ inline YarnMtpOwners yarn_mtp_owners(const Options& o,const ModelContract& m,con
     const auto common=mtp_all^mtp_setup;
     const auto cache=mul(o.context_tokens,2304U);
     const auto runtime=mtp_payload::runtime(m,o.context_tokens);
-    bounded("mtp_predictor_runtime",runtime.retained,mtp.runtime_bytes,common);
+    bounded("mtp_predictor_runtime",runtime.retained,mtp_payload::runtime_budget(m,o.context_tokens,mtp.runtime_bytes,mtp.runtime_automatic),common);
     // Split cache/workspace for inspection without introducing a second charge.
     b.erase("mtp_predictor_runtime");plan.phases.erase("mtp_predictor_runtime");
     b["mtp_predictor_kv_raw"]=cache;b["mtp_predictor_workspace_alignment"]=runtime.retained-cache;

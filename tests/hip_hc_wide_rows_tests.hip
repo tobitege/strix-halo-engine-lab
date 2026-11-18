@@ -4,6 +4,7 @@
 // and input flavors. STRIX_HC_WIDE_BENCH=1 adds per-kernel timings at 2048 rows.
 #include "strix/hip_hc_wide_rows_tests.hpp"
 #include "strix/prefill_identity.hpp"
+#include "strix/env_flags.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -68,6 +69,7 @@ struct Fixture {
     std::uint64_t output_stride;
     Buffer normalized, injection, output, down, inject, up;
     std::vector<unsigned char> normalized_host;
+    mutable std::uint64_t low_generation = 0;
     Fixture(std::uint32_t r, bool bf, unsigned flavor, std::uint32_t seed)
         : rows(r), bf16(bf), output_stride((kHidden + 32U) * (bf ? 2U : 4U)),
           normalized(static_cast<std::size_t>(r) * kNormalizedStride), injection(static_cast<std::size_t>(r) * kInjectionStride),
@@ -100,6 +102,7 @@ struct Fixture {
         v.injection = static_cast<float*>(injection.p); v.injection_stride = kInjectionStride;
         v.output = output.p; v.output_stride = output_stride;
         v.rows = rows; v.down = down.p; v.inject = inject.p; v.up = up.p;
+        v.low_generation = &low_generation;
         return v;
     }
     // Poisons everything the kernels may write (lows, injection, output, padding) and restores the inputs.
@@ -142,8 +145,16 @@ void compare(std::uint32_t rows, bool bf16, unsigned flavor, unsigned projection
     check(hipStreamSynchronize(stream), "candidate");
     const auto actual = f.written();
     std::size_t differ = 0, first = 0;
-    for (std::size_t i = 0; i < expected.size(); ++i)
-        if (expected[i] != actual[i]) { if (!differ) first = i; ++differ; }
+    const bool out16_tail = projection == 4U && output == 14U;
+    const bool poison_tail = out16_tail && strix::envcfg::flag("STRIX_QPF2K_HC_LOW32_POISON", false);
+    const bool omit_tail = out16_tail && !strix::envcfg::flag("STRIX_QPF2K_HC_LOW32", false) &&
+        !strix::envcfg::flag("STRIX_QPF2K_HC_CHECK", false);
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        const auto column = i % kNormalizedStride;
+        const bool tail = i < f.normalized.n && column >= kWidth * 4U && column < (kWidth + kRank) * 4U;
+        const auto want = tail && poison_tail ? 0xffU : tail && omit_tail ? 0xa5U : expected[i];
+        if (want != actual[i]) { if (!differ) first = i; ++differ; }
+    }
     std::cout << "rows " << rows << (bf16 ? " bf16" : " fp32") << " flavor " << flavor << " projection " << projection << " output "
               << output << ": " << expected.size() << " bytes, differ " << differ << '\n';
     if (differ) throw std::runtime_error("wide HC kernels differ from the reference forms at byte " + std::to_string(first));
@@ -544,7 +555,7 @@ void bench(hipStream_t stream) {
         // STRIX_QPF2K_HC output v3 (seam kernels 7..10) against the lane-chain output 1 it replaces: A B A B A B A
         // (A = output 1, B = form 7, the engine's form), then the attribution forms 8 (no low prefetch),
         // 9 (base epilogue), 10 (prefetch two blocks ahead), 11 (32-step loop), each followed by output 1. Medians of 20 launches.
-        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 255U, stream);
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 1U, stream);
         // Band 0 / B / 0 / B, each median after its own warmup; all arms use the same lows and up weights.
         for (const unsigned band : kOutput3Bands)
             for (unsigned i = 0; i < 4U; ++i) {
@@ -584,7 +595,7 @@ void bench(hipStream_t stream) {
         std::cout << "bench rows " << n << " projection 2, FP16 rows (with pack): " << hus << " us (" << flop / hus / 1e6 << " TFLOPS)\n";
     }
     {
-        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 255U, stream);
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 1U, stream);
         const float us = time(255U, 1U), qus = time(255U, 3U);
         std::cout << "bench rows " << n << " output 1: " << us << " us (" << flop_out / us / 1e6 << " TFLOPS) | qpf2k output 3 (with pack): "
                   << qus << " us (" << flop_out / qus / 1e6 << " TFLOPS)\n";
@@ -652,7 +663,7 @@ void bench(hipStream_t stream) {
     for (unsigned output = 0; output <= 2U; ++output) {
         // The wide2 output kernel reads the transposed low values the wide2 projection writes, the WMMA output kernel
         // the FP16 low values of the WMMA projection.
-        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), output == 2U ? 2U : 1U, 255U, stream);
+        strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), output == 2U ? 2U : 1U, 1U, stream);
         const float us = time(255U, output);
         std::cout << "bench rows " << n << " output " << output << ": " << us << " us (" << flop_out / us / 1e6 << " TFLOPS)\n";
     }
@@ -665,6 +676,8 @@ void fixtures_out16(hipStream_t stream) {
         for (unsigned flavor = 0; flavor < 5U; ++flavor)
             compare(8192U, bf16, flavor, 4U, 14U, stream, 2U, 2U);
         for (const std::uint32_t rows : {8U, 33U, 513U, 8191U, 8192U}) {
+            // Check omitted/poisoned tails and every guard byte, including partial tiles.
+            compare(rows, bf16, 0U, 4U, 14U, stream, 2U, 2U);
             Fixture f(rows, bf16, 0U, 808U);
             const auto c = config(bf16);
             f.reset(0xa5);

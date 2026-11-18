@@ -316,6 +316,19 @@ void test_engram_gate(std::mt19937& rng) {
     expect(engram_gate_of(-0.0F) < 0.5F && engram_gate_of(0.0F) > 0.5F, "signed zero keeps its side (copysign)");
     expect(std::isnan(engram_gate_of(std::nanf(""))), "NaN dot stays NaN");
     auto before = stream;
+    {
+        // image position (upstream Engram.forward: gate.masked_fill(~token_mask, 0)): x passes through untouched
+        auto image = stream;
+        engram_inject(image, kv, qn, kn, 1e-20F, true);
+        bool same = true;
+        for (std::size_t i = 0; i < image.size(); ++i) same = same && image[i] == before[i] + 0.0F * kv[hc_copies * hidden + i % hidden];
+        expect(same && image == before, "image position: gate 0 on every copy, stream unchanged");
+        auto text = stream;
+        engram_inject(text, kv, qn, kn, 1e-20F, false);
+        auto plain = stream;
+        engram_inject(plain, kv, qn, kn, 1e-20F);
+        expect(text == plain && text != before, "text position: the default gate (gate_off false = the old call)");
+    }
     engram_inject(stream, kv, qn, kn, 1e-20F);
     for (std::uint32_t c = 0; c < hc_copies; ++c)
         expect(stream[c * hidden + 7] == before[c * hidden + 7] + gates[c] * kv[hc_copies * hidden + 7], "injection adds gate * value");

@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 // WeightSource over one GGUF file held in host memory: the tensor lookup every tower shipped as GGUF shares.
 // A tensor with GGUF dimensions (d0, ..., dn) is the row-major matrix [dn][d0 * ... * d(n-1)], which is the layout
 // of the source framework's [out][in...] weight; a 1-D tensor is [d0][1]. Storage types: F32, F16, BF16.
@@ -35,12 +36,17 @@ public:
     Tensor tensor(std::string_view name) override;  // std::out_of_range when absent, std::invalid_argument when unusable
 
     const gguf::FileInfo& info() const noexcept { return info_; }
-    const std::vector<std::byte>& bytes() const noexcept { return bytes_; }
+    const std::vector<std::byte>& bytes() const noexcept { return *bytes_; }
 
 private:
     void index();
     gguf::FileInfo info_;
-    std::vector<std::byte> bytes_;
+    std::shared_ptr<const std::vector<std::byte>> bytes_;
+    weight::WeightMap weights_;
+    std::shared_ptr<const weight::Source> owner_;
+public:
+    const weight::WeightMap& weight_map() const noexcept { return weights_; }
+private:
     std::unordered_map<std::string, std::size_t> by_name_;
 };
 

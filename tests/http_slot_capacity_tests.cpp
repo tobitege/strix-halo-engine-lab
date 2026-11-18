@@ -114,12 +114,11 @@ int main() {
     o.http_batch_explicit = true; o.http_batch_cap = 9;
     resolve_http_route(o); expect(o.http_batch == 9U);
     o.http_batch_cap = 0; resolve_http_route(o); expect(o.http_batch == 0U);
+    // --mtp-copy-wide-rows no longer forces the single route: the batch runner runs the wide cycle for a lone request
     o.http_batch_explicit = false; o.mtp.copy_wide_rows = {16};
-    resolve_http_route(o); expect(o.http_batch == 0U);
+    resolve_http_route(o); expect(o.http_batch == 1U && o.http_slot_reason.find("copy-wide") == std::string::npos);
     o.http_batch_explicit = true; o.http_batch_cap = 2;
-    bool rejected = false;
-    try { resolve_http_route(o); } catch (const std::invalid_argument&) { rejected = true; }
-    expect(rejected);
+    resolve_http_route(o); expect(o.http_batch == 2U);
     o.http_batch_explicit = false; o.mtp.copy_wide_rows.clear(); o.mtp.draft_chain = false;
     resolve_http_route(o); expect(o.http_batch == 0U);
     o.mtp.draft_chain = true; o.rtx_state_import = true;

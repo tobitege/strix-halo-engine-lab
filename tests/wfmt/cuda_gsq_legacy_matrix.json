@@ -1,0 +1,1085 @@
+{
+  "schema": "wfmt.matrix@1",
+  "cases": [
+    {
+      "file": "moe-g12-d7-m1-exact.wfmt",
+      "case": "moe-g12-d7-m1-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g12-d7-m1-fast.wfmt",
+      "case": "moe-g12-d7-m1-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g12-d7-m8-exact.wfmt",
+      "case": "moe-g12-d7-m8-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g12-d7-m8-fast.wfmt",
+      "case": "moe-g12-d7-m8-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g12-d7-m9-exact.wfmt",
+      "case": "moe-g12-d7-m9-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g12-d7-m9-fast.wfmt",
+      "case": "moe-g12-d7-m9-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g12-d7-m33-exact.wfmt",
+      "case": "moe-g12-d7-m33-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g12-d7-m33-fast.wfmt",
+      "case": "moe-g12-d7-m33-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g12-d7-m65-exact.wfmt",
+      "case": "moe-g12-d7-m65-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g12-d7-m65-fast.wfmt",
+      "case": "moe-g12-d7-m65-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 9216000,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g12-d8-m1-exact.wfmt",
+      "case": "moe-g12-d8-m1-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g12-d8-m1-fast.wfmt",
+      "case": "moe-g12-d8-m1-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g12-d8-m8-exact.wfmt",
+      "case": "moe-g12-d8-m8-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g12-d8-m8-fast.wfmt",
+      "case": "moe-g12-d8-m8-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g12-d8-m9-exact.wfmt",
+      "case": "moe-g12-d8-m9-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g12-d8-m9-fast.wfmt",
+      "case": "moe-g12-d8-m9-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g12-d8-m33-exact.wfmt",
+      "case": "moe-g12-d8-m33-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g12-d8-m33-fast.wfmt",
+      "case": "moe-g12-d8-m33-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g12-d8-m65-exact.wfmt",
+      "case": "moe-g12-d8-m65-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g12-d8-m65-fast.wfmt",
+      "case": "moe-g12-d8-m65-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10752000,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g13-d7-m1-exact.wfmt",
+      "case": "moe-g13-d7-m1-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g13-d7-m1-fast.wfmt",
+      "case": "moe-g13-d7-m1-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g13-d7-m8-exact.wfmt",
+      "case": "moe-g13-d7-m8-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g13-d7-m8-fast.wfmt",
+      "case": "moe-g13-d7-m8-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g13-d7-m9-exact.wfmt",
+      "case": "moe-g13-d7-m9-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g13-d7-m9-fast.wfmt",
+      "case": "moe-g13-d7-m9-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g13-d7-m33-exact.wfmt",
+      "case": "moe-g13-d7-m33-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g13-d7-m33-fast.wfmt",
+      "case": "moe-g13-d7-m33-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g13-d7-m65-exact.wfmt",
+      "case": "moe-g13-d7-m65-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g13-d7-m65-fast.wfmt",
+      "case": "moe-g13-d7-m65-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 10444800,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g13-d8-m1-exact.wfmt",
+      "case": "moe-g13-d8-m1-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g13-d8-m1-fast.wfmt",
+      "case": "moe-g13-d8-m1-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g13-d8-m8-exact.wfmt",
+      "case": "moe-g13-d8-m8-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g13-d8-m8-fast.wfmt",
+      "case": "moe-g13-d8-m8-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        8,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 56576,
+        "activation_codes": 77312,
+        "activation_scales": 36608,
+        "partials": 1235328,
+        "output": 129664
+      }
+    },
+    {
+      "file": "moe-g13-d8-m9-exact.wfmt",
+      "case": "moe-g13-d8-m9-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g13-d8-m9-fast.wfmt",
+      "case": "moe-g13-d8-m9-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g13-d8-m33-exact.wfmt",
+      "case": "moe-g13-d8-m33-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g13-d8-m33-fast.wfmt",
+      "case": "moe-g13-d8-m33-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        33,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 232976,
+        "activation_codes": 318912,
+        "activation_scales": 151008,
+        "partials": 5095728,
+        "output": 534864
+      }
+    },
+    {
+      "file": "moe-g13-d8-m65-exact.wfmt",
+      "case": "moe-g13-d8-m65-exact",
+      "arithmetic": "cuda-four-chain-imma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g13-d8-m65-fast.wfmt",
+      "case": "moe-g13-d8-m65-fast",
+      "arithmetic": "cuda-moe-mma@1",
+      "shape": [
+        65,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 11980800,
+        "state": 458768,
+        "activation_codes": 628160,
+        "activation_scales": 297440,
+        "partials": 10037040,
+        "output": 1053520
+      }
+    },
+    {
+      "file": "moe-g18-d20-m1-exact.wfmt",
+      "case": "moe-g18-d20-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6528000,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g18-d20-m9-exact.wfmt",
+      "case": "moe-g18-d20-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6528000,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g18-d42-m1-exact.wfmt",
+      "case": "moe-g18-d42-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5145600,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g18-d42-m9-exact.wfmt",
+      "case": "moe-g18-d42-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5145600,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g21-d20-m1-exact.wfmt",
+      "case": "moe-g21-d20-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6988800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g21-d20-m9-exact.wfmt",
+      "case": "moe-g21-d20-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6988800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g21-d42-m1-exact.wfmt",
+      "case": "moe-g21-d42-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5606400,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g21-d42-m9-exact.wfmt",
+      "case": "moe-g21-d42-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5606400,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g22-d20-m1-exact.wfmt",
+      "case": "moe-g22-d20-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5913600,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g22-d20-m9-exact.wfmt",
+      "case": "moe-g22-d20-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5913600,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g22-d42-m1-exact.wfmt",
+      "case": "moe-g22-d42-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 4531200,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g22-d42-m9-exact.wfmt",
+      "case": "moe-g22-d42-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 4531200,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g23-d20-m1-exact.wfmt",
+      "case": "moe-g23-d20-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 7987200,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g23-d20-m9-exact.wfmt",
+      "case": "moe-g23-d20-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 7987200,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g23-d42-m1-exact.wfmt",
+      "case": "moe-g23-d42-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6604800,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g23-d42-m9-exact.wfmt",
+      "case": "moe-g23-d42-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 6604800,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g42-d20-m1-exact.wfmt",
+      "case": "moe-g42-d20-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5529600,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g42-d20-m9-exact.wfmt",
+      "case": "moe-g42-d20-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 5529600,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    },
+    {
+      "file": "moe-g42-d42-m1-exact.wfmt",
+      "case": "moe-g42-d42-m1-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        1,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 4147200,
+        "state": 7184,
+        "activation_codes": 9664,
+        "activation_scales": 4576,
+        "partials": 154416,
+        "output": 16208
+      }
+    },
+    {
+      "file": "moe-g42-d42-m9-exact.wfmt",
+      "case": "moe-g42-d42-m9-exact",
+      "arithmetic": "cuda-native-iq-fp32@1",
+      "shape": [
+        9,
+        2560,
+        640
+      ],
+      "required_sections": {
+        "source": 4147200,
+        "state": 63632,
+        "activation_codes": 86976,
+        "activation_scales": 41184,
+        "partials": 1389744,
+        "output": 145872
+      }
+    }
+  ]
+}

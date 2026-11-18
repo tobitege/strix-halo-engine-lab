@@ -1,3 +1,4 @@
+#include "strix/env_arms.hpp"
 #include "strix/env_flags.hpp"
 
 #include <cstdint>
@@ -119,6 +120,34 @@ int main() {
             if (e.name == key) { ++hits; check(e.set && e.value == "12"); }
         check(hits == 1);  // one entry per name, last value wins
         check(strix::envcfg::describe().find(std::string("env ") + key + " 12 (set)\n") != std::string::npos);
+    }
+    {  // env_arms: launch value restored before every arm, arm pairs set, '/' and ';' separate arms
+        if (put("L") != 0) return 2;
+        const auto arms = strix::env_arms::parse("B:-/C:STRIX_ENV_FLAGS_TEST_VALUE=1+STRIX_ENV_ARMS_TEST_X=7;D:STRIX_ENV_ARMS_TEST_X=0");
+        check(arms.arms.size() == 3 && arms.arms[0].label == "B" && arms.arms[0].kv.empty() && arms.arms[1].kv.size() == 2);
+        check(arms.launch.size() == 2);
+        const auto val = [](const char* k) { const char* v = std::getenv(k); return std::string(v ? v : "<unset>"); };
+        strix::env_arms::apply(arms, arms.arms[1]);
+        check(val(key) == "1" && val("STRIX_ENV_ARMS_TEST_X") == "7");
+        strix::env_arms::apply(arms, arms.arms[2]);
+        check(val(key) == "L" && val("STRIX_ENV_ARMS_TEST_X") == "0");
+        strix::env_arms::apply(arms, arms.arms[0]);
+        check(val(key) == "L" && val("STRIX_ENV_ARMS_TEST_X") == "<unset>");
+        strix::env_arms::apply(arms, arms.arms[1]);
+        strix::env_arms::restore(arms);
+        check(val(key) == "L" && val("STRIX_ENV_ARMS_TEST_X") == "<unset>");
+        strix::env_arms::Resolved<bool> cached;  // resolved once, again only after an arm changed the environment
+        int resolves = 0;
+        check(cached.get([&] { ++resolves; return true; }) && cached.get([&] { ++resolves; return false; }) && resolves == 1);
+        strix::env_arms::apply(arms, arms.arms[0]);
+        check(!cached.get([&] { ++resolves; return false; }) && resolves == 2);
+        strix::env_arms::restore(arms);
+        bool threw = false;
+        try { (void)strix::env_arms::parse("B:K"); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw);
+        threw = false;
+        try { (void)strix::env_arms::parse(":-"); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw);
     }
     if (put(had_old ? saved.c_str() : nullptr) != 0) return 2;
     std::printf("env flags: %d checks, %d failures\n", checks, failures);

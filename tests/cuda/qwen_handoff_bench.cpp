@@ -1,4 +1,4 @@
-// CPU-only hand-off throughput bench: the CUDA service's Sender (src/cuda/qwen_handoff.cpp) streams a synthetic state at
+// CPU-only hand-off throughput bench: the CUDA service's Sender (src/cuda/models/qwen/qwen_handoff.cpp) streams a synthetic state at
 // position P to a node's import routes (e.g. `strix-rtx-state-import-tests --serve-file PORT FILE`), exactly as the service
 // does: begin, every row component in blocks of `block` rows (enqueued as they would finish), the fixed blob, commit.
 //

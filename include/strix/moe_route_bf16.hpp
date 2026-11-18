@@ -27,7 +27,7 @@ inline bool moe_route_i8_enabled() {
 }
 // Codes and exponents are hot; the cold, fixed BF16 fallback plane fits the reserved FP32 row.
 struct MoeRouteI8Layout { std::uint64_t values, groups_per_slot, exponents, fallback, bytes; };
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 __host__ __device__
 #endif
 inline constexpr MoeRouteI8Layout moe_route_i8_layout(unsigned hidden,unsigned top_k) {
@@ -38,7 +38,7 @@ inline constexpr MoeRouteI8Layout moe_route_i8_layout(unsigned hidden,unsigned t
 inline constexpr std::int16_t moe_route_i8_fallback=-32768;
 // RNE(127.5) is 128: the upper endpoint is strict. Zero groups canonically use E=0.
 // Keeping 2^E and its reciprocal normal avoids overflow/denormal scale intermediates.
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 __host__ __device__
 #endif
 inline constexpr std::int16_t moe_route_i8_exponent(std::uint32_t magnitude) {

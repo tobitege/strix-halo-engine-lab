@@ -1,12 +1,15 @@
 // FAST lever ds41-attn-f16wmma-v1 vs the exact attention: error bounds on synthetic K/V and timing of both.
 // Usage: strix-hip-ds41-fast-attn-tests [--no-timing] [--reps N]
+#include "strix/env_arms.hpp"
 #include "strix/hip_ds41_attention.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -131,6 +134,54 @@ void run_case(const char* name, std::uint64_t last, unsigned rows, unsigned head
     g::enqueue_attention_f16wmma_prefill(v, nullptr);
     check(hipDeviceSynchronize());
     const auto again = dout.get();
+    // FAST lever ds41-attn-bf16flash-v1 (calls of a multiple of 32 heads): BF16 mirrors of every ring slot and cache entry
+    float flash_ms = 0.0F;
+    Err ef{};
+    if (heads % 32U == 0U) {
+        std::vector<std::uint64_t> slots(cap);
+        for (std::uint32_t i = 0; i < cap; ++i) slots[i] = i;
+        Dev<std::uint64_t> dslots(slots);
+        Dev<std::uint16_t> dring16(std::size_t{cap} * 512), dkv16(std::size_t{ncache} * 512 + 512);
+        g::enqueue_attention_flash_mirror({dring.p, dring16.p, dslots.p, cap, cap, true}, nullptr);
+        g::enqueue_attention_flash_mirror({dkv.p, dkv16.p, nullptr, ncache, 0U, false}, nullptr);
+        g::AttentionView vf = v;
+        vf.ring16 = dring16.p; vf.kv16 = dkv16.p;
+        check(hipMemset(dout.p, 0, dout.n * sizeof(float)));
+        flash_ms = timing([&] { g::enqueue_attention_flash_prefill(vf, nullptr); });
+        const auto gf = dout.get();
+        ef = compare(ref, gf);
+        // STRIX_ATTN_FLASH_PF (pipelined loads, default ON) claims the single-stage loop's bits: both forced arms and the
+        // default call must give the same bytes, or the case fails
+        {
+            const char* had = std::getenv("STRIX_ATTN_FLASH_PF");
+            const std::optional<std::string> keep = had ? std::optional<std::string>(had) : std::nullopt;
+            std::vector<float> arm[2];
+            for (int on = 0; on < 2; ++on) {
+                strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", std::string(on ? "1" : "0"));
+                strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+                check(hipMemset(dout.p, 0, dout.n * sizeof(float)));
+                g::enqueue_attention_flash_prefill(vf, nullptr);
+                check(hipDeviceSynchronize());
+                arm[on] = dout.get();
+            }
+            strix::env_arms::set_env("STRIX_ATTN_FLASH_PF", keep);
+            strix::env_arms::generation_ref().fetch_add(1, std::memory_order_acq_rel);
+            const bool same = arm[0].size() == gf.size() && arm[1].size() == gf.size() &&
+                              std::memcmp(arm[0].data(), arm[1].data(), gf.size() * sizeof(float)) == 0 &&
+                              std::memcmp(arm[1].data(), gf.data(), gf.size() * sizeof(float)) == 0;
+            std::printf("%-22s flash pipelined loads (STRIX_ATTN_FLASH_PF 1 vs 0 vs default) bitwise %s\n", name, same ? "equal" : "DIFFER");
+            expect(same, std::string(name) + " flash STRIX_ATTN_FLASH_PF 1 / 0 / default bitwise");
+        }
+        std::printf("%-22s flash_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g nonfinite=%zu flash_bits=%016llx\n", name, flash_ms,
+                    flash_ms > 0.0F ? exact_ms / flash_ms : 0.0F, ef.rel_l2, ef.max_abs, ef.nonfinite, bits_hash(gf));
+        // Declared limit of the BF16 operands (8 significant bits): the score error is about 2^-9 of the score's size, so
+        // inputs with scores of hundreds (window scales above 134, |q| of 1e5) are reported, not bounded. The real
+        // inputs are bounded by the FAST logit gate, not by this test.
+        if (checked && !case_nan && smax <= 134U && qmax <= 2.0F) {
+            expect(ef.nonfinite == 0, std::string(name) + " flash finite");
+            expect(ef.rel_l2 < 2e-2, std::string(name) + " flash relative L2 < 2e-2");
+        }
+    }
     if (checked) {
         expect(std::memcmp(got.data(), again.data(), got.size() * sizeof(float)) == 0, std::string(name) + " repeat bits");
         if (case_nan) {

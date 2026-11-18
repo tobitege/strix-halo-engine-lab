@@ -546,7 +546,14 @@ Sampler::Sampler(std::vector<std::unique_ptr<Source>> sources, Options options) 
     life_.resize(domains_.size());
     expected_.resize(domains_.size());
     usable_ = !live_.empty();
-    if (usable_) ring_.resize(options_.capacity);
+    // Every ring slot owns its hardware readings from the start: storing a sample copies into storage the slot
+    // already holds, so the ring's memory is fixed here and the sampling path never allocates for it. (Slots that
+    // were filled lazily grew the heap by one block per sample until the ring wrapped, 65536 samples by default.)
+    if (usable_) {
+        Sample slot;
+        slot.hardware.resize(domains_.size());
+        ring_.assign(options_.capacity, slot);
+    }
 }
 
 Sampler::~Sampler() { stop(); }

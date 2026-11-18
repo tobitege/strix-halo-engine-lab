@@ -16,6 +16,7 @@
 //   Timing (informational, only after a clean gate).
 // usage: hip_glm_prefill_tests CASES_DIR [--no-timing]
 // Fixture-free dense gate: STRIX_GLM_PF_TEST_ONLY=dense; opt-in 8K paired timing: STRIX_GLM_PF_DENSE_BENCH=1.
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/prefill/glm_prefill.hpp"
@@ -1233,6 +1234,7 @@ void test_hc_mixnorm(std::mt19937& g) {
     hok(hipStreamDestroy(s), "mixnorm stream destroy");
 }
 
+bool g_only_mla = false;  // STRIX_GLM_PF_TEST_ONLY=mla: test_dsa's direct MLA blocks only (versions, fused core, GEMMs)
 void test_dsa(const std::string& cases, std::mt19937& g) {
     CaseDir c(cases + "/mla_l3_r0", {{"kv_b_proj", "u16", static_cast<std::size_t>(64) * 2 * kMlaDim * kKvLora}, {"indexer.wk", "u16", kIdxDim * kHidden},
                                      {"indexer.index_kpool_compress_gate", "u16", kIdxDim * kHidden}, {"indexer.weights_proj", "u16", kIdxHeads * kHidden},
@@ -1242,7 +1244,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
               c.v<std::uint16_t>("indexer.k_norm"), c.v<std::uint16_t>("indexer.k_norm.bias"), c.v<std::uint16_t>("kv_b_proj"),
               c.v<float>("indexer.index_kpool_compress_ape"), {}};
     auto upload_w = [&]() { fx.dw = D::IndexerDev{up(fx.wk), up(fx.gate), up(fx.wp), up(fx.knw), up(fx.knb), up(fx.ape)}; };
-    {  // 1) 6000 rows, every row queried
+    if (!g_only_mla) {  // 1) 6000 rows, every row queried
         upload_w();
         constexpr unsigned T = 6000;
         const std::vector<unsigned> chunks = {1, 2, 3, 4, 120, 1000, 917, 2048, 1, 1, 7, 1896};
@@ -1253,7 +1255,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                  {0, 1, 2, 3, 5, 10, 129, 1129, 2046, 2047, 2048, 2051, 2052, 4095, 4096, 4100, 5999});
         free_all();
     }
-    {  // 2) max-P: 33,000 rows; x periodic with 12 rows -> pooled keys repeat every 3 pools -> score ties across all blocks
+    if (!g_only_mla) {  // 2) max-P: 33,000 rows; x periodic with 12 rows -> pooled keys repeat every 3 pools -> score ties across all blocks
         upload_w();
         constexpr unsigned T = 33000, period = 12;
         std::vector<unsigned> chunks;
@@ -1272,7 +1274,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                  T - 96, {T - 96, T - 50, T - 9, T - 1});
         free_all();
     }
-    {  // One query chunk straddles the bounded score-window boundary, with all equal scores and causal tails.
+    if (!g_only_mla) {  // One query chunk straddles the bounded score-window boundary, with all equal scores and causal tails.
         upload_w();
         constexpr unsigned T = 16416;
         std::vector<unsigned> chunks(7, 2048);
@@ -1286,7 +1288,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                  T - 64, {16352, 16382, 16383, 16384, 16415});
         free_all();
     }
-    {  // 3) positive C3/C4: a latent that rounds to bf16 +inf, and a gate +inf (C3, and C4 through its pool)
+    if (!g_only_mla) {  // 3) positive C3/C4: a latent that rounds to bf16 +inf, and a gate +inf (C3, and C4 through its pool)
         upload_w();
         constexpr unsigned T = 8;
         auto x = rnd(static_cast<std::size_t>(T) * kHidden, g, 0.5F);
@@ -1385,6 +1387,28 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                 // Byte comparisons deliberately include NaN payloads and the output guard regions.
                 check(same, "MLA explicit scores/obar/gemm (incl. 7/7/3, 4/6/3, 7/10/3) == 3/5/1 bitwise intermediates/output/guards H=" + std::to_string(H) +
                       (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent") + ", n=1..2051 tile boundaries");
+                if (H == 32) {  // FAST fused core: bf16 q-tilde image (22 / 23) == FP32 q-tilde (20 / 21), bit for bit
+                    bool img = true;
+                    for (unsigned ov : {20U, 21U}) {
+                        const auto reset_image_buffers = [&] {
+                            hok(hipMemset(qt, 0xFF, (nq + 17) * sizeof(float)), "poison q-tilde image/unused half/guard");
+                            hok(hipMemset(ob, 0xFF, (nq + 17) * sizeof(float)), "poison image o-bar/guard");
+                            hok(hipMemset(out, 0xFF, (no + 17) * sizeof(float)), "poison image output/guard");
+                        };
+                        reset_image_buffers();
+                        call(7, ov, 3);
+                        const auto q32 = down(qt, nq);
+                        const auto ob32 = down(ob, nq + 17), o32 = down(out, no + 17);
+                        reset_image_buffers();
+                        call(7, ov + 2, 3);
+                        const auto q16 = down(reinterpret_cast<const std::uint16_t*>(qt), nq);
+                        // Finite query/absorb inputs: packed contents witness the image route, not just equal outputs.
+                        for (std::size_t j = 0; j < nq; ++j) img &= is_finite(q32[j]) && q16[j] == float_to_bf16(q32[j]);
+                        img &= bits_eq(ob32, down(ob, nq + 17)) && bits_eq(o32, down(out, no + 17)) && guard_ok(down(qt, nq + 17), nq / 2);
+                    }
+                    check(img, std::string("MLA attn-wmma bf16 q-tilde image (22/23) == FP32 q-tilde (20/21) bitwise o-bar/out/guards H=32") +
+                          (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent"));
+                }
             }
         }
         free_all();
@@ -1414,6 +1438,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
             const std::size_t nq = static_cast<std::size_t>(C) * H * kKvLora;
             const std::size_t ne = static_cast<std::size_t>(C) * H * P::kEStride, no = static_cast<std::size_t>(C) * H * kMlaDim;
             float *qt[2], *ep[2], *ob[2], *out[2];
+            const auto exact_calls = P::mla_wmma::calls.load();
             for (unsigned v = 0; v < 2; ++v) {  // separate poisoned buffers prevent a missed v3 store inheriting v2's result
                 qt[v] = poison<float>(nq + guard);
                 ep[v] = poison<float>(ne + guard);
@@ -1421,6 +1446,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                 out[v] = poison<float>(no + guard);
                 P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt[v], ep[v], ob[v], out[v], C, nullptr, 7, 7, v + 2);
             }
+            check(P::mla_wmma::calls.load() == exact_calls, "explicit v2/v3 executed no WMMA GEMMs");
             bool same = true;
             auto compare = [&](const float* a, const float* b, std::size_t count) {
                 const auto x = down(a, count + guard), y = down(b, count + guard);
@@ -1437,6 +1463,34 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
             compare(ob[0], ob[1], nq);
             compare(out[0], out[1], no);
             check(same, "MLA 7/7/3 == 7/7/2 bitwise intermediates/output/guards, C=129 H=" + std::to_string(H));
+            if (H == 32) {
+                // Select FAST explicitly: neither this gate nor its image arms inherit environment policy.
+                // Empty and tail key lists also exercise the flash producer, independently of q-tilde format.
+                auto counts = std::vector<std::uint32_t>(C, nt);
+                counts[0] = 0;
+                counts.back() = 1;
+                hok(hipMemcpy(nn, counts.data(), counts.size() * sizeof(counts[0]), hipMemcpyHostToDevice), "image counts");
+                for (unsigned image = 0; image < 2; ++image) {
+                    const auto before = P::mla_wmma::calls.load();
+                    P::mla_attention_rows_selected(slot.s, tk, nn, q, kv, H, qt[image], ep[image], ob[image], out[image],
+                        C, nullptr, 7, 23, 3, 0, {P::mla_gemm::Arithmetic::wmma, image != 0, true});
+                    check(P::mla_wmma::calls.load() == before + 2, "explicit FAST executed absorb and out WMMA");
+                }
+                check(bits_eq(down(qt[0], nq / 2), down(qt[1], nq / 2)), "o-bar image toggle preserves q-tilde image");
+                const auto raw = down(ob[0], nq);
+                const auto packed = down(reinterpret_cast<const std::uint16_t*>(ob[1]), nq);
+                bool image_same = true;
+                for (std::size_t j = 0; j < nq; ++j) {
+                    const _Float16 h = static_cast<_Float16>(raw[j]);
+                    std::uint16_t bits;
+                    std::memcpy(&bits, &h, sizeof(bits));
+                    image_same &= packed[j] == bits;
+                }
+                check(image_same, "flash FP16 o-bar image == conversion of FP32 flash output, including empty/tail keys");
+                check(bits_eq(down(out[0], no), down(out[1], no)), "flash producer/WMMA consumer image toggle bitwise");
+                std::fill(counts.begin(), counts.end(), nt);
+                hok(hipMemcpy(nn, counts.data(), counts.size() * sizeof(counts[0]), hipMemcpyHostToDevice), "restore counts");
+            }
             // Same full piece as an MTP consumer: internal windows must cover
             // every output and keep qt/e/ob inside their smaller poisoned arenas.
             // Odd windows move rows across GEMM/score CTA groups; the last piece
@@ -1884,6 +1938,12 @@ int main(int argc, char** argv) {
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "hcbench") {
         test_hc_expand_norm(g);  // the bitwise gate first (all stress inputs, hoist 0 / 1 / 2)
         if (failures == 0) bench_hc_seam(g);
+        std::printf("checks: %d failures: %d\n", checks, failures);
+        return failures ? 1 : 0;
+    }
+    if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr && std::string(only) == "mla") {
+        g_only_mla = true;
+        test_dsa(argv[1], g);
         std::printf("checks: %d failures: %d\n", checks, failures);
         return failures ? 1 : 0;
     }

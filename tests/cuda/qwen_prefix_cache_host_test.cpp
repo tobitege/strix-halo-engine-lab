@@ -1,6 +1,6 @@
-#include "strix/cuda_qwen_prefix_identity.hpp"
-#include "strix/cuda_qwen_prefix_store.hpp"
-#include "strix/cuda_qwen_prefix_pool.hpp"
+#include "strix/cuda/qwen_prefix_identity.hpp"
+#include "strix/cuda/qwen_prefix_store.hpp"
+#include "strix/cuda/qwen_prefix_pool.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -49,10 +49,10 @@ void identity() {
     strix::cuda::qwen_prefill::Config c;
     const std::string root = STRIX_PREFIX_TEST_SOURCE;
     c.model_gguf = root + "/CMakeLists.txt";
-    c.mtp_sidecar_gguf = root + "/include/strix/cuda_qwen_prefill.hpp";
-    c.draft_vocab = root + "/include/strix/cuda_qwen_prefix_plan.hpp";
+    c.mtp_sidecar_gguf = root + "/include/strix/cuda/qwen_prefill.hpp";
+    c.draft_vocab = root + "/include/strix/cuda/qwen_prefix_plan.hpp";
     c.tables_dir = root + "/src/cuda";
-    c.rope_table = root + "/include/strix/cuda_qwen_qsa.hpp";
+    c.rope_table = root + "/include/strix/cuda/qwen_qsa.hpp";
     const auto fields = px::identity_fields(c, 256);
     const auto key = px::identity_key(fields);
     check(key.valid(), "valid SHA-256 identity");
@@ -62,8 +62,8 @@ void identity() {
     for (const auto* name : {"layout", "model.path", "model.size", "model.mtime", "mtp.path", "mtp.size", "mtp.mtime",
                             "draft_vocab.path", "rope.path", "tables.path", "max_positions", "segment_rows", "block_rows", "ple_host_pinned"})
         check(has_field(name), "required compatibility field present");
-    // Guard: every getenv("LITERAL") in the Qwen CUDA sources and headers (src/cuda/qwen_*.{cu,cuh,cpp,hpp},
-    // include/strix/cuda_qwen_*.hpp, apps/cuda_qwen_*, include/strix/cuda_vram_guard.hpp) must be an identity field
+    // Guard: every getenv("LITERAL") in the Qwen CUDA sources and headers (src/cuda/models/qwen/qwen_*.{cu,cuh,cpp,hpp},
+    // include/strix/cuda/qwen_*.hpp, apps/cuda_qwen_*, include/strix/cuda/vram_guard.hpp) must be an identity field
     // or listed below, and no other getenv form may appear there (a variable or helper-wrapped name would not be
     // visible to this scan). qwen_prefix_identity.cpp is the reader.
     const std::regex getenv_pattern(R"re(getenv\("([^"]+)"\))re");
@@ -87,8 +87,8 @@ void identity() {
             check(all == literal, "Qwen CUDA getenv reads use a literal name");
         }
     };
-    scan(root + "/src/cuda", "qwen_", {});
-    scan(root + "/include/strix", "cuda_qwen_", {});
+    scan(root + "/src/cuda/models/qwen", "qwen_", {});
+    scan(root + "/include/strix/cuda", "qwen_", {});
     // Serve app and VRAM guard: these only schedule sessions, size buffers or decline startup; saved rows and the
     // restored output are the same under any value, so they are exempt from identity (listed, not pattern-matched).
     const std::set<std::string> serve_only = {"STRIX_QRTX_PREFIX_CACHE", "STRIX_QRTX_HTTP_SLOTS",
@@ -97,7 +97,7 @@ void identity() {
                                               "STRIX_QRTX_PREFILL_AUTO_K", "STRIX_QRTX_ALLOW_SYSMEM",
                                               "STRIX_QRTX_VRAM_HEADROOM_MIB"};
     scan(root + "/apps", "cuda_qwen_", serve_only);
-    scan(root + "/include/strix", "cuda_vram_guard", serve_only);
+    scan(root + "/include/strix/cuda", "vram_guard", serve_only);
     for (std::size_t i = 0; i < fields.size(); ++i) {
         auto changed = fields;
         changed[i].second += "changed";

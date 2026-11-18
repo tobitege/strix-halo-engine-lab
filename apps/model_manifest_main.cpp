@@ -1,7 +1,9 @@
 #include "strix/asset_manifest.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_manifest.hpp"
+#include "strix/model_content_hash.hpp"
 
+#include <chrono>
 #include <fstream>
 #include <map>
 
@@ -44,6 +46,15 @@ void print_dimensions(const std::vector<std::uint64_t>& dimensions) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if (argc == 3 && std::string(argv[1]) == "--warm-content-hash") {
+        const auto begin = std::chrono::steady_clock::now();
+        const auto identity = strix::hash_single_model_content_file({"model", argv[2]});
+        const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        std::cout << "{\"file_sha256\":\"" << strix::model_content_identity_hex(identity.file_sha256)
+                  << "\",\"content_identity\":\"" << strix::model_content_identity_hex(identity.content_identity)
+                  << "\",\"bytes\":" << identity.file_bytes << ",\"ms\":" << elapsed << "}\n";
+        return 0;
+    }
     if (argc > 1 && (std::string(argv[1]) == "bundle-create" || std::string(argv[1]) == "bundle-verify")) {
         try {
             const bool create = std::string(argv[1]) == "bundle-create";

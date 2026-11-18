@@ -1,0 +1,4 @@
+# minimax-turbo-v1 lever manifest (pair).
+msa_flash|flash|STRIX_MM_PF_MSA_FLASH=1 STRIX_MM_PF_MSA_FLASH_LAYERS=0-59||msa-flash-bf16-l0-59|pending|adapter admission/export pending; all-layer flash also needs compiler/native/fidelity/workload gates|STRIX_MM_PF_MSA_FLASH=0
+moe_invariant|moe|STRIX_MM_MOE_INVARIANT=1||mm-moe-invariant|pending|#662 rows-free MoE order|STRIX_MM_MOE_INVARIANT=0
+# fast_i4 is a separate failed-gate all-or-nothing format experiment, never a TURBO arm.

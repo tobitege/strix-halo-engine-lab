@@ -2,6 +2,7 @@
 
 #include "strix/fnv.hpp"
 #include "strix/process_environment.hpp"
+#include "strix/turbo.hpp"
 
 #include <array>
 #include <cstddef>
@@ -18,10 +19,14 @@
 #include <utility>
 #include <vector>
 
-// Product profiles of an engine: one switch '--profile default|fast|quality' selects every lever's value.
+// Product profiles of an engine: one switch '--profile default|fast|quality|turbo' selects every lever's value.
 //   default  today's exact defaults (exports nothing: the plain invocation, byte for byte)
 //   fast     default + every QUALIFIED bit-changing lever of the engine (and any marked provisional, stamped so)
 //   quality  a quality pack where the engine has one, else default plus one notice
+//   turbo    opt-in by name, never a default: every speed lever under the relative TURBO bar (strix/turbo.hpp). An
+//            empty turbo cell takes the lever's fast cell (value and admission); a cell equal to `off` keeps the lever
+//            out. Its versioned name (Engine::turbo_version) and the weight toggle enter the rank agreement and the
+//            cache namespace even with every lever off. An engine without a versioned name refuses turbo.
 // Each lever is one table row (the engine's *_profile_table.hpp). A profile column that is not qualified yet
 // (`ready = false`) is pending: it is never applied and never makes the profile refuse; the builtin keeps
 // running, the receipt lists the row with its declared target and one stderr line says so. '--allow-pending'
@@ -33,24 +38,35 @@
 // Header-only and host-only (no HIP/CUDA, no JSON library): shared by the two-node engines' apps.
 namespace strix::profile {
 
-enum class Name : unsigned { standard = 0, fast = 1, quality = 2 };  // `standard` prints as "default"
+enum class Name : unsigned { standard = 0, fast = 1, quality = 2, turbo = 3 };  // `standard` prints as "default"
+inline constexpr std::size_t kProfileColumns = 4;  // default, fast, quality, turbo
 enum class Kind { exact, bit_changing, pack };
 
 struct Lever {
     std::string_view name;                  // receipt key
     std::string_view env;                   // switch the profile exports (empty: CLI-only lever)
     std::string_view option;                // CLI option that overrides the lever (empty: none)
-    std::array<std::string_view, 3> value;  // per profile (default, fast, quality); empty: left alone
+    std::array<std::string_view, kProfileColumns> value;  // per profile (default, fast, quality, turbo); empty: left alone
     std::string_view builtin;               // behaviour of this build with the switch unset
     Kind kind = Kind::exact;
-    std::array<bool, 3> ready{};            // qualified (qualification receipt) and present; false: pending
-    std::array<bool, 3> runnable{};         // a pending column's implementation exists in this build
+    std::array<bool, kProfileColumns> ready{};     // qualified (qualification receipt) and present; false: pending
+    std::array<bool, kProfileColumns> runnable{};  // a pending column's implementation exists in this build
     std::string_view target;                // declared target of a pending column; empty: the value
     std::string_view off;                   // explicit value that switches the lever off
     std::string_view source;                // qualification receipt, or what a pending column waits for
     bool native_option = false;            // an adapter's native CLI parser owns validation/export
-    std::array<bool, 3> provisional{};      // selected ahead of qualification; still requires `runnable`; wins over `ready` until the row is flipped
+    std::array<bool, kProfileColumns> provisional{};  // selected ahead of qualification; still requires `runnable`; wins over `ready` until the row is flipped
+    bool omit_builtin_fingerprint = false;  // additive governed rows preserve the legacy identity at builtin
 };
+
+// Column of `lever` that `profile` reads: an empty turbo cell takes the fast cell (TURBO includes every FAST lever
+// unless its turbo cell says otherwise). Shared by every adapter whose rows carry `value` per profile.
+template <class Row>
+inline unsigned value_column(const Row& lever, Name profile) {
+    const auto column = static_cast<unsigned>(profile);
+    if (profile == Name::turbo && lever.value[column].empty()) return static_cast<unsigned>(Name::fast);
+    return column;
+}
 
 // One engine: its receipt tag, the allow-pending variable and the table.
 struct Engine {
@@ -58,20 +74,26 @@ struct Engine {
     std::string_view allow_env;             // e.g. STRIX_DS41_PROFILE_ALLOW_PENDING
     std::span<const Lever> table;
     bool quality_rows = false;              // false: 'quality' runs default with one notice
+    std::string_view turbo_version{};       // versioned TURBO name ("ds41-turbo-v1"); empty: turbo refused
+    turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
 };
 
 inline Name parse(std::string_view value) {
     if (value == "default") return Name::standard;
     if (value == "fast") return Name::fast;
     if (value == "quality") return Name::quality;
-    throw std::invalid_argument("--profile must be default, fast or quality (got '" + std::string(value) + "')");
+    if (value == "turbo") return Name::turbo;
+    throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + std::string(value) + "')");
 }
-inline bool is_name(std::string_view value) { return value == "default" || value == "fast" || value == "quality"; }
+inline bool is_name(std::string_view value) {
+    return value == "default" || value == "fast" || value == "quality" || value == "turbo";
+}
 inline const char* name(Name value) {
     switch (value) {
     case Name::standard: return "default";
     case Name::fast: return "fast";
     case Name::quality: return "quality";
+    case Name::turbo: return "turbo";
     }
     return "unknown";
 }
@@ -131,6 +153,7 @@ struct Entry {
     std::string target;  // pending: the declared target that is not applied
     bool cli_override = false;  // adapter provenance; does not enter the rank fingerprint
     std::string reason;         // adapter admission explanation
+    std::string requested{};    // what the profile column or the explicit setting asked for (empty: builtin)
 };
 
 struct Resolution {
@@ -138,6 +161,17 @@ struct Resolution {
     Name profile = Name::standard;
     bool allow_pending = false;
     std::vector<Entry> entries;
+    turbo::Weights weights{};             // weight toggle (native outside turbo)
+
+    [[nodiscard]] bool is_turbo() const { return profile == Name::turbo; }
+    // Versioned product name: the turbo name under turbo, else the profile name.
+    [[nodiscard]] std::string versioned() const {
+        return is_turbo() ? std::string(engine->turbo_version) : std::string(name(profile));
+    }
+    // Namespace the cache-key builders append (empty outside turbo: legacy namespaces unchanged).
+    [[nodiscard]] std::string cache_namespace() const {
+        return is_turbo() ? turbo::cache_namespace(engine->turbo_version, fingerprint(), weights.identity()) : std::string();
+    }
 
     [[nodiscard]] const Entry* find(std::string_view key) const {
         for (const auto& entry : entries) if (entry.lever->name == key) return &entry;
@@ -163,6 +197,7 @@ struct Resolution {
         std::vector<std::string> out;
         const std::string head = std::string(engine->tag) + " profile " + name(profile) + ": ";
         if (quality_fallback()) out.push_back(head + "no quality rows for this model, using default");
+        if (!weights.honoured()) out.push_back(head + weights.describe().substr(0, weights.describe().size() - 1U));
         for (const auto& entry : entries) if (entry.status == Status::provisional)
             out.push_back(head + std::string(entry.lever->name) + "=" + entry.value + " is bit-changing; qualification in progress");
         for (const auto& entry : entries) if (entry.status == Status::pending)
@@ -198,6 +233,12 @@ struct Resolution {
         }
         std::string out = "{\"profile\":" + json_string(name(profile)) + ",\"engine\":" + json_string(engine->tag) +
             ",\"qualification\":" + json_string(qualification());
+        if (is_turbo())
+            out += ",\"turbo\":{\"version\":" + json_string(engine->turbo_version) +
+                ",\"weights_requested\":" + json_string(weights.requested_text()) +
+                ",\"weights\":" + json_string(weights.identity()) + ",\"weights_origin\":" + json_string(weights.origin) +
+                ",\"weights_reason\":" + json_string(weights.reason) +
+                ",\"cache_namespace\":" + json_string(cache_namespace()) + "}";
         if (quality_fallback()) out += ",\"note\":\"quality: no quality rows for this model, using default\"";
         return out + ",\"levers\":{" + levers + "},\"pending\":[" + pending + "],\"unqualified\":[" + unqualified +
             "],\"provisional\":[" + provisional + "]}";
@@ -206,11 +247,16 @@ struct Resolution {
     [[nodiscard]] std::string describe() const {
         std::string out = std::string("profile ") + name(profile) + "\nprofile qualification " + qualification() + "\n";
         if (quality_fallback()) out += "profile note quality: no quality rows for this model, using default\n";
+        if (is_turbo())
+            out += "profile version " + versioned() + "\n" + weights.describe() + "turbo cache namespace " + cache_namespace() + "\n";
         for (const auto& entry : entries) {
             const auto& lever = *entry.lever;
             out += "profile lever " + std::string(lever.name) + " " + entry.value + " (" + status_name(entry.status) + ", " +
                 kind_name(lever.kind) + ", " + std::string(lever.env.empty() ? lever.option : lever.env) + ")";
             if (entry.status == Status::pending) out += " pending " + entry.target;
+            if (is_turbo() && !entry.requested.empty() && entry.requested != entry.value)
+                out += " requested " + entry.requested;
+            if (is_turbo() && !entry.reason.empty()) out += " reason " + entry.reason;
             out += "\n";
         }
         return out;
@@ -224,7 +270,15 @@ struct Resolution {
         };
         mix(name(profile));
         mix(qualification());
-        for (const auto& entry : entries) { mix(entry.lever->name); mix(entry.value); }
+        if (is_turbo()) {  // the versioned name and the weight identity: never equal to a non-turbo run
+            mix(engine->turbo_version);
+            mix(weights.identity());
+        }
+        for (const auto& entry : entries) {
+            if (entry.lever->omit_builtin_fingerprint && entry.value == entry.lever->builtin) continue;
+            mix(entry.lever->name);
+            mix(entry.value);
+        }
         return h;
     }
 };
@@ -293,6 +347,7 @@ struct Inputs {
     Pairs cli;                    // levers set by their own CLI option: {lever name, value}
     Lookup env;                   // environment lookup; empty: the process environment
     bool allow_pending = false;   // --allow-pending
+    turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
 };
 
 inline const char* environment(const Lookup& env, std::string_view key) {
@@ -314,15 +369,21 @@ inline Resolution resolve(const Engine& engine, const Inputs& inputs) {
     out.profile = inputs.profile.value_or(Name::standard);
     const char* allow = engine.allow_env.empty() ? nullptr : environment(inputs.env, engine.allow_env);
     out.allow_pending = inputs.allow_pending || (allow != nullptr && std::string_view(allow) == "1");
-    // 'quality' without quality rows is the default column.
-    const auto column = static_cast<unsigned>(out.quality_fallback() ? Name::standard : out.profile);
+    if (out.is_turbo() && engine.turbo_version.empty())
+        throw std::invalid_argument(std::string(engine.tag) + ": --profile turbo is not declared for this engine");
+    out.weights = turbo::resolve_weights(out.is_turbo(), inputs.weights,
+        [&inputs](const char* key) { return environment(inputs.env, key); }, engine.weight_caps);
+    // 'quality' without quality rows is the default column; an empty turbo cell is the fast cell.
+    const auto profile_column = out.quality_fallback() ? Name::standard : out.profile;
     for (const auto& lever : engine.table) {
+        const auto column = value_column(lever, profile_column);
         const std::string* cli = nullptr;
         for (const auto& [key, value] : inputs.cli) if (key == lever.name) cli = &value;
         const char* env = lever.env.empty() ? nullptr : environment(inputs.env, lever.env);
         const auto wanted = lever.value[column];
-        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}};
+        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli != nullptr || env != nullptr) {  // a set variable is explicit even when empty (the app judges it)
+            entry.requested = cli != nullptr ? *cli : std::string(env);
             entry.value = cli != nullptr ? *cli : std::string(env);
             entry.status = cli != nullptr ? Status::explicit_cli : Status::explicit_env;
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
@@ -347,6 +408,21 @@ inline bool applied(Status status) {
     return status == Status::set || status == Status::unqualified || status == Status::provisional;
 }
 
+// Variables an adapter exports after resolution: every applied profile column, plus every row whose value the
+// resolver canonicalized (`canonical`: e.g. a FAST bundle's expanded members, strix/fast_profile.hpp), so the
+// execution readers see the same values as the receipt, the rank agreement and the cache identity.
+template <class Keys>
+inline std::vector<std::pair<std::string, std::string>> exports(const Resolution& resolution, const Keys& canonical) {
+    std::vector<std::pair<std::string, std::string>> out;
+    // Pure proposal: inspection may describe a pending weight request. Execution uses apply().
+    for (const auto& e : resolution.entries)
+        if (!e.lever->env.empty() && (applied(e.status) || canonical.contains(std::string(e.lever->env))))
+            out.emplace_back(std::string(e.lever->env), e.value);
+    // Under turbo: the cache namespace every cache-key builder appends (strix/turbo.hpp).
+    if (resolution.is_turbo()) out.emplace_back(std::string(turbo::kCacheNamespaceEnv), resolution.cache_namespace());
+    return out;
+}
+
 using Export = std::function<bool(const char*, const char*)>;
 inline bool export_environment(const char* key, const char* value) {
     return process_environment::set(key, value, true);
@@ -354,13 +430,19 @@ inline bool export_environment(const char* key, const char* value) {
 // Exports the switches the profile sets (status set / unqualified / provisional, env levers only; CLI-only levers:
 // profile_args).
 // Call right after argument parsing, before anything reads (and caches) those switches. Default exports nothing.
+// Under turbo it also exports the cache namespace (turbo::kCacheNamespaceEnv) that every cache-key builder of the
+// process appends, and refuses a weight request this build cannot honour (after --print-effective-config printed it).
 inline void apply(const Resolution& resolution, const Export& put = export_environment) {
+    resolution.weights.require_honoured();
     for (const auto& entry : resolution.entries) {
         const auto& lever = *entry.lever;
         if (lever.env.empty() || !applied(entry.status)) continue;
         if (!put(std::string(lever.env).c_str(), entry.value.c_str()))
             throw std::runtime_error("cannot export profile switch " + std::string(lever.env));
     }
+    if (resolution.is_turbo() &&
+        !put(std::string(turbo::kCacheNamespaceEnv).c_str(), resolution.cache_namespace().c_str()))
+        throw std::runtime_error("cannot export " + std::string(turbo::kCacheNamespaceEnv));
 }
 
 // Options the profile adds to the app's arguments for CLI-only levers it sets ({option, value} each; put them
@@ -376,7 +458,8 @@ inline std::vector<std::string> profile_args(const Resolution& resolution) {
     return out;
 }
 
-// Removes '--profile default|fast|quality' ('--profile=NAME') and '--allow-pending' from `args` into `inputs` and records
+// Removes '--profile default|fast|quality|turbo' ('--profile=NAME'), '--allow-pending' and the turbo weight options
+// (--turbo-weights, --turbo-weight-bits, --turbo-weights-pack) from `args` into `inputs` and records
 // (without removing) the table's lever options as explicit CLI values. Any other '--profile' token ('--profile' followed
 // by something that is not a profile name, '--profile=OTHER') stays in `args` untouched, for the app's own parser: an
 // older meaning (GLM kernel timing, MiniMax timed session) or a value of another option keeps working. Only a second
@@ -389,6 +472,16 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
         const auto equal = a.find('=');
         const std::string key = a.substr(0, equal);
         if (a == "--allow-pending") { inputs.allow_pending = true; continue; }
+        if (key == turbo::kWeightsOption || key == turbo::kBitsOption || key == turbo::kPackOption) {
+            std::string value;
+            if (equal != std::string::npos) value = a.substr(equal + 1U);
+            else if (i + 1 < args.size()) value = args[++i];
+            if (value.empty()) throw std::invalid_argument(key + " requires a value");
+            auto& slot = key == turbo::kWeightsOption ? inputs.weights.source :
+                key == turbo::kBitsOption ? inputs.weights.bits : inputs.weights.pack;
+            slot = value;
+            continue;
+        }
         if (key == "--profile") {
             std::string value;
             if (equal != std::string::npos) value = a.substr(equal + 1U);
@@ -396,7 +489,7 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
             // '--profile WORD' with a plain word that is not a profile name is a typo ('--profile fastt'); a path, a
             // NAME:... session, an option ('--profile --x') or a '--profile=...' token belongs to the app.
             if (equal == std::string::npos && !value.empty() && !is_name(value) && value.find_first_of("-:/.=") == std::string::npos)
-                throw std::invalid_argument("--profile must be default, fast or quality (got '" + value + "')");
+                throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value + "')");
             if (is_name(value)) {
                 if (inputs.profile) throw std::invalid_argument("duplicate --profile");
                 inputs.profile = parse(value);
